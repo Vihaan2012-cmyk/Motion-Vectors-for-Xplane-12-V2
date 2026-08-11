@@ -1352,30 +1352,7 @@ static int   g_jitterIndex   = 0;
 // Default OFF, so nothing touches the image until it is asked for.
 //
 // This is the first stage that changes what the user sees, and it now writes
-// into X-Plane's own scene target. Something that alters rendering the moment
-// it is installed should be opted into rather than opted out of - and defaults
-// carry weight, so "on unless you find the menu" is the wrong one. taa.ini or
-// the menu turns it on and the choice is remembered.
-static int   g_upscaler  = TAA_UPSCALER_OFF;
 
-// What taa.ini asked for, held until it can be honoured.
-//
-// The request cannot be applied when the file is read: backendUsable() needs
-// g_share->availability, which the Vulkan layer fills in only once it has a
-// device and has asked NGX and FSR2 what this GPU supports. Applying early
-// would refuse every backend for the one reason that is always true at plugin
-// load - "Vulkan layer not attached" - and then never retry.
-static int   g_iniUpscaler = -1;
-static int   g_iniQuality  = -1;
-static bool  g_iniApplied  = false;
-static int   g_quality   = TAA_QUALITY_NATIVE;
-// 0.8, not 0.5. RCAS runs after the accumulation and is the only thing that
-// restores the high-frequency detail temporal blending removes; FSR2's own
-// sample ships 0.8, and at render==display there is no reconstruction upside to
-// offset the softness, so erring low is erring blurry. This was moot until now:
-// the value never reached the dispatch at all.
-static float g_sharpness = 0.8f;
-static int   g_opticalFlow = 0;
 static int   g_enabled     = 1;
 
 // ============================================================ control surface
@@ -1400,8 +1377,7 @@ static int   g_enabled     = 1;
 //   taaimpl/layer_attached     int    READ-ONLY
 
 static XPLMDataRef g_myEnabled = nullptr, g_myUpscaler = nullptr, g_myQuality = nullptr;
-static XPLMDataRef g_mySharp = nullptr, g_myOptFlow = nullptr, g_myLodBias = nullptr;
-static XPLMDataRef g_myScale = nullptr;
+static XPLMDataRef g_myLodBias = nullptr;
 static XPLMDataRef g_myAvail = nullptr, g_myAttached = nullptr;
 static XPLMDataRef g_myVramTotal = nullptr, g_myVramBudget = nullptr,
                    g_myVramUsed  = nullptr;
@@ -1412,38 +1388,10 @@ static XPLMDataRef g_myRevZMat   = nullptr, g_myViewportW  = nullptr,
 
 static int   getEnabled(void*)          { return g_enabled; }
 static void  setEnabled(void*, int v)   { g_enabled = v ? 1 : 0; }
-static int   getUpscaler(void*)         { return g_upscaler; }
-static int   getQuality(void*)          { return g_quality; }
-static float getSharp(void*)            { return g_sharpness; }
-static void  setSharp(void*, float v)   { g_sharpness = v < 0 ? 0 : (v > 1 ? 1 : v); }
-static int   getOptFlow(void*)          { return g_opticalFlow; }
 
-static bool opticalFlowUsable(int o, const char **why)
-{
-    if (o == TAA_OF_OFF) return true;
-    if (o < 0 || o >= TAA_OF_COUNT) { if (why) *why = "out of range"; return false; }
-    if (!g_share || !g_share->layerAttached) { if (why) *why = "Vulkan layer not attached"; return false; }
-    int a = g_share->ofAvailability[o];
-    if (a == TAA_AVAIL_OK) return true;
-    if (why) *why = taaAvailabilityText(a);
-    return false;
-}
 
-static void setOptFlow(void*, int v)
-{
-    const char *why = "";
-    if (!opticalFlowUsable(v, &why)) {
-        xlog("optical flow %s refused: %s", taaOpticalFlowName(v), why);
-        return;
-    }
-    if (g_opticalFlow != v) {
-        g_opticalFlow = v;
-        xlog("optical flow -> %s", taaOpticalFlowName(v));
-    }
-}
 static float getLodBias(void*)          { return g_lodBias; }
 static void  setLodBias(void*, float v) { g_lodBias = v < -3.0f ? -3.0f : (v > 1.0f ? 1.0f : v); }
-static float getScale(void*)            { return taaQualityScale(g_quality); }
 
 // VRAM, as the DRIVER reports it - not as X-Plane's pager estimates it. The two
 // have disagreed by gigabytes all afternoon, and the pager's own "available"
@@ -1489,41 +1437,20 @@ static int   getObjectCount(void*)  { return g_share ? g_share->objectCount : 0;
 static int   getReverseZ(void*)     { return g_share ? g_share->reverseZ : 0; }
 static int   getReverseZMat(void*)  { return g_share ? g_share->reverseZFromMatrix : 0; }
 
-// Selecting a backend the hardware or the runtime cannot provide is refused
-// here rather than deferred to a vendor SDK, so the caller finds out
-// immediately and in the log - whether the caller is our window or a script.
 
 
-// Defined further down, next to the other X-Plane private controls. Declared
-// here because the quality setter is what drives it now.
 
 
-static int getAvail(void*, int *out, int off, int n)
-{
-    if (!out) return TAA_UPSCALER_COUNT;
-    for (int i = 0; i < n; ++i) {
-        int idx = off + i;
-        out[i] = (idx >= 0 && idx < TAA_UPSCALER_COUNT && g_share)
-                     ? g_share->availability[idx] : TAA_AVAIL_UNKNOWN;
-    }
-    return n;
-}
 
 static void registerDatarefs()
 {
     g_myEnabled  = XPLMRegisterDataAccessor("taaimpl/enabled", xplmType_Int, 1,
                      getEnabled, setEnabled, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myOptFlow  = XPLMRegisterDataAccessor("taaimpl/optical_flow", xplmType_Int, 1,
-                     getOptFlow, setOptFlow, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
     g_myAttached = XPLMRegisterDataAccessor("taaimpl/layer_attached", xplmType_Int, 0,
                      getAttached, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
-    g_mySharp    = XPLMRegisterDataAccessor("taaimpl/sharpness", xplmType_Float, 1,
-                     0,0, getSharp, setSharp, 0,0,0,0,0,0,0,0, nullptr, nullptr);
     g_myLodBias  = XPLMRegisterDataAccessor("taaimpl/lod_bias", xplmType_Float, 1,
                      0,0, getLodBias, setLodBias, 0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myScale    = XPLMRegisterDataAccessor("taaimpl/render_scale", xplmType_Float, 0,
-                     0,0, getScale, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
 
     // VRAM, straight from the driver via the layer. Read-only - these report,
     // they do not steer.
@@ -1556,21 +1483,22 @@ static void registerDatarefs()
     g_myObjCount  = XPLMRegisterDataAccessor("taaimpl/moving_objects", xplmType_Int, 0,
                       getObjectCount, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
-    // Slot order is int, float, double, intArray, floatArray, data - twelve
-    // function pointers in six read/write pairs. An int-array accessor goes in
-    // the SEVENTH and EIGHTH slots; putting it earlier lands it on the double
-    // reader and only fails at compile time because the signatures differ.
-    g_myAvail    = XPLMRegisterDataAccessor("taaimpl/upscaler_available", xplmType_IntArray, 0,
-                     0,0, 0,0, 0,0, getAvail,nullptr, 0,0, 0,0, nullptr, nullptr);
 
     xlog("registered %d datarefs under taaimpl/ (usable from FlyWithLua or any script)", 15);
 }
 
 static void unregisterDatarefs()
 {
-    XPLMDataRef refs[] = { g_myEnabled, g_myUpscaler, g_myQuality, g_mySharp,
-                           g_myOptFlow, g_myLodBias, g_myScale,
-                           g_myAvail, g_myAttached };
+    // Every accessor this plugin registers, so none is left dangling when the
+    // plugin unloads. The previous list named nine, four of which no longer
+    // existed and eight of which were registered but never named here - an
+    // accessor that outlives its plugin is a dataref X-Plane will call into
+    // unloaded code for.
+    XPLMDataRef refs[] = { g_myEnabled, g_myAttached, g_myLodBias,
+                           g_myVramTotal, g_myVramBudget, g_myVramUsed,
+                           g_myTexFloor, g_myTexStep,
+                           g_myRevZMat, g_myViewportW, g_myViewportH,
+                           g_myJitPhases, g_myReverseZ, g_myObjCount };
     for (size_t i = 0; i < sizeof(refs)/sizeof(refs[0]); ++i)
         if (refs[i]) XPLMUnregisterDataAccessor(refs[i]);
 }
@@ -1702,9 +1630,7 @@ static void pumpControl()
 
     uint32_t m = g_ctl->mask;
     if (m & TAA_CTL_ENABLED)   g_enabled   = g_ctl->enabled ? 1 : 0;
-    if (m & TAA_CTL_SHARPNESS) g_sharpness = g_ctl->sharpness;
     if (m & TAA_CTL_LOD_BIAS)  g_lodBias   = g_ctl->lodBias;
-    if (m & TAA_CTL_OPT_FLOW)  g_opticalFlow = g_ctl->optFlow ? 1 : 0;
     if (m & TAA_CTL_OBJECTS)   g_objectsOn   = (g_ctl->movingObjects != 0);
     if (m & TAA_CTL_TRAFFIC)   g_trafficRadius   = g_ctl->trafficRadius;
     if (m & TAA_CTL_JITTER) {
@@ -1719,8 +1645,8 @@ static void pumpControl()
     }
 
     g_ctl->applied = seq;
-    xlog("control: applied request %u (mask 0x%02x) - upscaler=%s quality=%s",
-         seq, m, taaUpscalerName(g_upscaler), taaQualityName(g_quality));
+    xlog("control: applied request %u (mask 0x%02x)",
+         seq, m);
 }
 
 // Derive near/far and the depth convention straight from the projection matrix,
@@ -3090,67 +3016,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // 1 - which is why this has never shown up: the sim has been run at Native.
     // At Performance the ratio is 2, FSR2 expects 32, and feeding it 8 starves
     // its reconstruction of exactly the sample coverage upscaling needs. That
-    // reads as shimmer, and would be blamed on the upscaler rather than on the
-    // jitter that fed it.
-    //
-    // The formula is reproduced rather than called because ffxFsr2GetJitterPhaseCount
-    // lives in the layer's FSR2 build and this is the plugin. It is four lines of
-    // arithmetic from a public header, not a secret.
-    if (g_upscaler == TAA_UPSCALER_FSR2) {
-        // PREFER THE MEASURED RATIO OVER THE REQUESTED ONE.
-        //
-        // taaQualityScale() reports what this plugin asked for. It does not
-        // know about X-Plane's own FSR, which on this install renders 2953x1661
-        // into a 3840x2160 window while the quality setting still says "Native,
-        // 1.00x". Trusting the setting gives ratio 1.0 and phase count 8; the
-        // truth is 1.30 and 14. Eight phases into an accumulator expecting
-        // fourteen is a coverage shortfall, and a coverage shortfall in a
-        // temporal upscaler looks like aliasing that will not settle while the
-        // camera moves - which is the symptom that has been chased here.
-        //
-        // The layer publishes the real numbers; use them when they exist and
-        // fall back to the setting when the scene pass has not been found yet.
-        float scale = taaQualityScale(g_quality);
-        const char *src = "quality setting";
-        if (s->measRenderW && s->measDisplayW) {
-            float meas = (float)s->measDisplayW / (float)s->measRenderW;
-            // Only ever LENGTHEN on measurement. If the measured ratio came out
-            // below the requested one the pass census is mid-flight or picked
-            // something odd, and shortening the sequence on a bad measurement
-            // is the one outcome worth ruling out by construction.
-            if (meas > scale) { scale = meas; src = "measured render size"; }
-        }
-        if (scale > 0.01f) {
-            // taaQualityScale ALREADY IS display/render - it returns 1.30, 1.50,
-            // 1.70, 2.00, which are divisors applied to the display size to get
-            // the render size. FSR2's formula is
-            //
-            //     phaseCount = 8 * (displayWidth / renderWidth)^2
-            //
-            // so the value goes in directly. The first version inverted it,
-            // computing 1/scale first, and asked for 4 phases at Ultra Quality
-            // where FSR2 wants 13 - fewer than the stock 8, in the direction
-            // that starves reconstruction rather than feeding it. That is not a
-            // subtle miss: it made the shimmer this was meant to help worse, and
-            // the log line reporting "wants 4 phases" was the only sign.
-            float ratio = scale;                         // display / render
-            int want = (int)(8.0f * ratio * ratio + 0.5f);
-            if (want < 1)  want = 1;
-            if (want > 64) want = 64;                    // same clamp as the ini
-            if (want != phases) {
-                static int said = -1;
-                if (said != want) {
-                    said = want;
-                    xlog("jitter: FSR2 at %.2fx (%s: %ux%u -> %ux%u) wants %d "
-                         "phases, not %d - using FSR2's count so its "
-                         "accumulation gets the coverage it assumes",
-                         scale, src, s->measRenderW, s->measRenderH,
-                         s->measDisplayW, s->measDisplayH, want, phases);
-                }
-                phases = want;
-            }
-        }
-    }
     s->jitterX = taaHalton(g_jitterIndex + 1, 2) - 0.5f;
     s->jitterY = taaHalton(g_jitterIndex + 1, 3) - 0.5f;
     s->jitterIndex  = g_jitterIndex;
@@ -3166,11 +3031,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
 
     // Backend selection, republished every frame so changes from the window or
     // from a script take effect on the next one.
-    s->upscaler          = g_enabled ? g_upscaler : TAA_UPSCALER_OFF;
-    s->quality           = g_quality;
-    s->sharpness         = g_sharpness;
-    s->opticalFlowWanted = g_opticalFlow;
-    s->renderScale       = taaQualityScale(g_quality);
 
     updateMovingObjects(s, dt);
 
@@ -3332,11 +3192,9 @@ static float matrixCallback(float sinceLast, float, int, void *)
              s->viewType, s->fovDeg, s->nearClip, s->farClip, s->infiniteFar,
              s->reverseZ, s->reverseZFromMatrix, s->viewportW, s->viewportH,
              s->measRenderW, s->measRenderH, s->measDisplayW, s->measDisplayH);
-        xlog("state: jitter=(%.4f %.4f) idx=%d/%d  lodBias=%.2f renderScale=%.2f "
-             "upscaler=%s quality=%s sharp=%.2f",
+        xlog("state: jitter=(%.4f %.4f) idx=%d/%d  lodBias=%.2f",
              s->jitterX, s->jitterY, s->jitterIndex, s->jitterPhases,
-             s->lodBias, s->renderScale, taaUpscalerName(g_upscaler),
-             taaQualityName(g_quality), s->sharpness);
+             s->lodBias);
         xlog("state: reprojValid=%d bodyValid=%d camGap=%.3f camBodyDrift=%.4f "
              "reset=%d(%s) paused=%d",
              s->reprojValid, s->bodyReprojValid, s->camGap, s->camBodyDrift,
@@ -3485,16 +3343,6 @@ static void loadConfig(const std::string &path)
         //
         // The default stays Off, deliberately - something that changes what the
         // sim looks like the moment it is installed should be opted into. But
-        // the comment above g_upscaler has always said "taa.ini or the menu
-        // turns it on", and until now only the menu could. Without this the
-        // only way to test an upscaler is to click through the UI every launch,
-        // which is a poor way to run the same measurement twice.
-        //
-        // Validated below rather than here: availability is not known until the
-        // layer has answered, and a file asking for a backend this GPU does not
-        // have should fall back rather than refuse to start.
-        else if (!strcmp(key, "upscaler"))       g_iniUpscaler  = (int)val;
-        else if (!strcmp(key, "quality"))        g_iniQuality   = (int)val;
     }
     fclose(f);
 
