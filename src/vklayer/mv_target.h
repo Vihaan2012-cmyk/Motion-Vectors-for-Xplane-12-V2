@@ -10,13 +10,15 @@
 // the confirmed cause of the stutter. This one is exact and costs nothing extra,
 // because the geometry is already being drawn.
 //
-// FORMAT IS R16G16B16A16_SFLOAT. Half float because the values are small
-// screen-space offsets - a full screen of motion is 1.0 in UV - where half's ~3
-// decimal digits near zero are far more precision than a sub-pixel displacement
-// needs. It is also half the bandwidth of R32G32B32A32, and this is written by
-// every fragment of every draw.
+// FORMAT IS R16G16_SFLOAT: two channels, for the two numbers a motion vector
+// is. Half float because the values are small screen-space offsets - a full
+// screen of motion is 1.0 in UV - where half's ~3 decimal digits near zero are
+// far more precision than a sub-pixel displacement needs, at half the bandwidth
+// of a 32-bit format, written by every fragment of every draw.
 //
-// It began as R16G16, two channels for the two numbers a motion vector is. The
+// It briefly widened to R16G16B16A16 to carry an FSR reactive mask in .z. That
+// mask is gone, and so is the width. Anything reading .z now reads the NEXT
+// PIXEL - which is exactly the bug the readback stride comment below describes.
 
 #pragma once
 
@@ -117,7 +119,7 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     if (dd.createImage(device, &ici, nullptr, &m.image) != VK_SUCCESS) {
-        trace("MV: image creation failed (%ux%u R16G16B16A16_SFLOAT)", w, h);
+        trace("MV: image creation failed (%ux%u R16G16_SFLOAT)", w, h);
         m.failed = true;
         return false;
     }
@@ -420,15 +422,37 @@ static void mvReport(double camMoved, const float *reproj,
         // stable reading of about 1.25.
         //
         // Yaw phases (3, 4) are horizontal; pitch (5) is vertical.
-        auto medianOf = [](std::vector<float> &v) -> double {
+        auto quantile = [](std::vector<float> &v, double q) -> double {
             if (v.empty()) return 0.0;
-            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-            return v[v.size() / 2];
+            size_t k = (size_t)(q * (double)(v.size() - 1));
+            std::nth_element(v.begin(), v.begin() + k, v.end());
+            return v[k];
         };
-        const double cxPx = medianOf(axX) * m.w;
-        const double cyPx = medianOf(axY) * m.h;
+        const double cxPx = quantile(axX, 0.5) * m.w;
+        const double cyPx = quantile(axY, 0.5) * m.h;
+
+        // THE DISTANT TAIL IS THE TEST.
+        //
+        // A single number cannot separate "the vectors are wrong" from "the
+        // vectors are right and the frame contains a range of depths". Under a
+        // camera that both rotates and translates, near geometry genuinely
+        // moves further than far geometry, so a spread is CORRECT behaviour and
+        // a median lands wherever the depth histogram happens to put it.
+        //
+        // What is not free to vary is the far end. Salzburg has mountains at
+        // effectively infinite distance, so the least-moving pixels in the
+        // frame must agree with the matrix's own far prediction. If the low
+        // quantile matches, the field is right and the spread is parallax; if
+        // even the low quantile is a multiple of it, the field is wrong.
         const bool   vertical = (selfTestPhase == 5);
         const double axisPx = vertical ? cyPx : cxPx;
+        std::vector<float> &axis = vertical ? axY : axX;
+        const double scale = vertical ? (double)m.h : (double)m.w;
+        const double p05 = quantile(axis, 0.05) * scale;
+        const double p25 = quantile(axis, 0.25) * scale;
+        const double p75 = quantile(axis, 0.75) * scale;
+        const double p95 = quantile(axis, 0.95) * scale;
+
         const double ratio  = axisPx / (double)expectedPx;
 
         // Frames straight after a phase change are a camera JUMP, not the
@@ -481,16 +505,19 @@ static void mvReport(double camMoved, const float *reproj,
 
         if (settle > 0) { --settle; }
         else {
-            trace("MV RATIO: phase=%d %s  measured=%.3f px  expected=%.3f px  "
-                  "ratio=%.3f%s  | matrix predicts near=%.3f far=%.3f px "
-                  "(field/far %.3f, near/far %.3f)  [magnitude %.3f]",
+            // The verdict is read off the FAR end, not the median. p05 is the
+            // least-moving twentieth of the frame, which is the most distant
+            // geometry in it, and that is what the matrix's far prediction
+            // describes.
+            const double farRatio = predFar > 1e-6 ? p05 / predFar : 0.0;
+            trace("MV RATIO: phase=%d %s  p05=%.3f p25=%.3f med=%.3f p75=%.3f "
+                  "p95=%.3f px | matrix far=%.3f px  ->  p05/far=%.3f%s "
+                  "(expected=%.3f, near=%.3f)",
                   selfTestPhase, vertical ? "pitch" : "yaw  ",
-                  axisPx, expectedPx, ratio,
-                  (ratio > 0.95 && ratio < 1.05) ? "   <- CORRECT" : "",
-                  predNear, predFar,
-                  predFar > 1e-6 ? axisPx / predFar : 0.0,
-                  predFar > 1e-6 ? predNear / predFar : 0.0,
-                  centre);
+                  p05, p25, axisPx, p75, p95, predFar, farRatio,
+                  (farRatio > 0.95 && farRatio < 1.05) ? "  <- CORRECT" : "",
+                  expectedPx, predNear);
+            (void)ratio; (void)centre;
         }
     }
 
