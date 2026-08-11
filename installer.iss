@@ -33,20 +33,27 @@ WizardStyle=modern
 DisableWelcomePage=no
 
 [Messages]
-WelcomeLabel2=This installs motion vectors for X-Plane 12.%n%nChoose your X-Plane 12 folder on the next page - the one containing X-Plane.exe.
+WelcomeLabel2=This installs motion vectors for X-Plane 12.%n%nStart the sim from the shortcut this creates - it enables the layer for X-Plane only, so no other Vulkan application is affected.%n%nChoose your X-Plane 12 folder on the next page - the one containing X-Plane.exe.
 
 [Files]
 Source: "build\MotionVectors.xpl";        DestDir: "{app}\Resources\plugins\MotionVectors\64"; DestName: "win.xpl"; Flags: ignoreversion
 Source: "build\vklayer\VkLayer_mv.dll";   DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
 Source: "build\vklayer\VkLayer_mv.json";  DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
+Source: "build\MotionVectorsLauncher.exe"; DestDir: "{app}\MotionVectors";                    Flags: ignoreversion
 Source: "README.md";                      DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
 
-[Registry]
-; The loader reads this to discover the layer. Value name is the manifest path;
-; data 0 means enabled.
-Root: HKCU; Subkey: "SOFTWARE\Khronos\Vulkan\ImplicitLayers"; \
-    ValueType: dword; ValueName: "{app}\MotionVectors\VkLayer_mv.json"; ValueData: 0; \
-    Flags: uninsdeletevalue
+[Icons]
+; The sim must be started through this. It sets VK_LAYER_PATH and
+; VK_LOADER_LAYERS_ENABLE for that one process, which is what makes the layer
+; EXPLICIT - loaded only here, never in any other Vulkan application.
+Name: "{autoprograms}\X-Plane 12 with Motion Vectors"; Filename: "{app}\MotionVectors\MotionVectorsLauncher.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\X-Plane 12 with Motion Vectors";  Filename: "{app}\MotionVectors\MotionVectorsLauncher.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
+
+[Run]
+Filename: "{app}\MotionVectors\MotionVectorsLauncher.exe"; Description: "Start X-Plane 12 with motion vectors now"; Flags: nowait postinstall skipifsilent
 
 [Code]
 // Guess X-Plane's location so the common case needs no typing, and verify

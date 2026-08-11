@@ -27,6 +27,14 @@ Write-Host "Building Vulkan layer..."
 if ($LASTEXITCODE -ne 0) { throw "layer build failed" }
 Copy-Item "$src\vklayer\VkLayer_mv.json" "$out\vklayer" -Force
 
+Write-Host "Building launcher..."
+# -mwindows: no console window. The launcher sets the two loader variables and
+# starts the sim, so the layer is EXPLICIT and is never loaded into any other
+# Vulkan application.
+& g++ -o "$out\MotionVectorsLauncher.exe" "$src\launcher.cpp" `
+  -m64 -O2 -std=c++17 -mwindows -static -static-libgcc -static-libstdc++
+if ($LASTEXITCODE -ne 0) { throw "launcher build failed" }
+
 Write-Host "Installing..."
 $xp  = Split-Path $root -Parent
 $dst = Join-Path $xp "Resources\plugins\MotionVectors\64"
