@@ -146,6 +146,12 @@ struct Snapshot {
     bool     valid;
     uint64_t frame;
     float    reproj[16], invCurrViewProj[16], prevViewProj[16];
+    // The view and projection matrices as published, so the layer can pair its
+    // OWN consecutive frames rather than trusting the plugin's flight-loop
+    // pairing. Kept separate rather than pre-multiplied: the origin shift has
+    // to happen before the projection, or the 52 km of world translation is
+    // cancelled after it has been scaled and four significant digits go with it.
+    float    world[16], proj[16];
     float    bodyReproj[16];
     int32_t  bodyReprojValid;
     float    camBodyDrift, camGap;
@@ -178,6 +184,8 @@ static bool snapshot(Snapshot *o)
         memcpy(o->reproj,          g_share->reproj,          sizeof(o->reproj));
         memcpy(o->invCurrViewProj, g_share->invCurrViewProj, sizeof(o->invCurrViewProj));
         memcpy(o->prevViewProj,    g_share->prevViewProj,    sizeof(o->prevViewProj));
+        memcpy(o->world,           g_share->world,           sizeof(o->world));
+        memcpy(o->proj,            g_share->proj,            sizeof(o->proj));
         memcpy(o->bodyReproj,      g_share->bodyReproj,      sizeof(o->bodyReproj));
         o->bodyReprojValid = g_share->bodyReprojValid;
         o->camBodyDrift    = g_share->camBodyDrift;
@@ -1061,6 +1069,9 @@ static bool g_velWantDump = false;
 // recording. Recording happens mid-frame, before present, so it has to work
 // from the state the previous present established.
 static Snapshot g_velSnap;
+// TAA_MV_PLUGIN_REPROJ restores the plugin's own flight-loop pairing, so the
+// two can be compared rather than argued about.
+static const bool g_usePluginReproj = (getenv("TAA_MV_PLUGIN_REPROJ") != nullptr);
 static bool     g_velArmed  = false;
 static bool     g_velInjectedThisFrame = false;
 static int      dumpEvery = 0;   // frames between dumps; 0 = off, set at runtime
@@ -4453,7 +4464,72 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // it cannot be gated on anything.
     if (g_share && g_share->magic == TAA_MAGIC) {
         Snapshot fresh;
-        if (snapshot(&fresh)) g_velSnap = fresh;
+        if (snapshot(&fresh)) {
+            g_velSnap = fresh;
+
+            // ---- REPROJECTION BUILT ACROSS CONSECUTIVE PRESENTS.
+            //
+            // The plugin pairs world with prevWorld inside a flight loop. The
+            // velocity field is produced per RENDER frame, and at 4K with a
+            // 31.9 MB readback those two are not one to one - so between two
+            // rendered frames the camera can advance several self-test steps
+            // while the published matrix still describes one.
+            //
+            // That is what the surviving bad samples look like: fields uniform
+            // across the frame at 5.5x, 12.2x and 28.1x the prediction. A
+            // uniform field IS a rigid rotation - it is the field for a
+            // rotation of several steps, measured against a matrix describing
+            // one. Both halves were internally correct and simply described
+            // different pairs of frames.
+            //
+            // Presents are the frames the renderer actually drew, and this hook
+            // is the one place that knows where they end. Pairing here makes
+            // the two frames the matrix describes the two the renderer drew, by
+            // construction rather than by hoping the rates match.
+            //
+            // The origin shift is done in the plugin's order - world * Tc
+            // first, projection after - because doing it the other way cancels
+            // 52 km of world translation only after it has been scaled by the
+            // projection, which measured a 10-18% residual when it was tried.
+            static float prevWorldSaved[16], prevProjSaved[16];
+            static bool  havePrevFrame = false;
+
+            float Tc[16];
+            memset(Tc, 0, sizeof(Tc));
+            Tc[0] = Tc[5] = Tc[10] = Tc[15] = 1.0f;
+            Tc[12] = fresh.camX; Tc[13] = fresh.camY; Tc[14] = fresh.camZ;
+
+            float worldRel[16], currVPrel[16], invCurr[16];
+            taaMul(worldRel, fresh.world, Tc);
+            taaMul(currVPrel, fresh.proj, worldRel);
+
+            if (havePrevFrame && taaInverse(invCurr, currVPrel)) {
+                float prevWorldRel[16], prevVPrel[16], r[16];
+                taaMul(prevWorldRel, prevWorldSaved, Tc);
+                taaMul(prevVPrel, prevProjSaved, prevWorldRel);
+                taaMul(r, prevVPrel, invCurr);
+                if (!g_usePluginReproj) memcpy(g_velSnap.reproj, r, sizeof(r));
+
+                // Both, once in a while, so the difference is a measurement
+                // rather than a claim. Column 3 plus column 2 is the centre ray
+                // at infinity; half of it, in pixels, is the displacement.
+                if ((frames % 600) == 0 && g_mv.w) {
+                    auto farPx = [&](const float *m) {
+                        double x = (double)m[12] + (double)m[8];
+                        double w = (double)m[15] + (double)m[11];
+                        return fabs(w) < 1e-12 ? 0.0 : fabs(0.5 * x / w) * g_mv.w;
+                    };
+                    trace("MV REPROJ: layer-paired %.3f px vs plugin-paired %.3f px "
+                          "at infinity - a ratio far from 1 means the flight loop "
+                          "and the renderer are not stepping together",
+                          farPx(r), farPx(fresh.reproj));
+                }
+            }
+
+            memcpy(prevWorldSaved, fresh.world, sizeof(prevWorldSaved));
+            memcpy(prevProjSaved,  fresh.proj,  sizeof(prevProjSaved));
+            havePrevFrame = true;
+        }
     }
 
     // Report the very first call unconditionally, so "hook never invoked" is
