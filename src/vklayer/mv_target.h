@@ -50,27 +50,6 @@ struct MvTarget {
     VkImageView    view   = VK_NULL_HANDLE;
     VkImageLayout  layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    // A SECOND VIEW OF THE SAME IMAGE, swizzled so .r reads the blue channel.
-    //
-    // FSR2 wants the reactive mask as its own single-channel texture and reads
-    // .r from it. Ours lives in .z of the velocity target. The obvious answer is
-    // a compute pass copying one channel into an R8 image - an extra dispatch,
-    // an extra allocation and an extra barrier every frame, to move data that is
-    // already on the GPU in the right place.
-    //
-    // A component swizzle does it for free. Vulkan applies the swizzle on
-    // sampled reads, so a view with r <- B hands FSR2 exactly the channel it
-    // wants from the image it is already sampling for motion vectors. Same
-    // image, same layout, same barrier - so there is no second transition to get
-    // wrong either.
-    //
-    // This only works because FSR2's Vulkan backend uses the view it is GIVEN
-    // rather than building its own: ffxGetTextureResourceVK stores it in
-    // descriptorData and registerResource assigns it straight to
-    // allMipsImageView. That was checked in the FSR2 source before relying on
-    // it, because the whole approach collapses if the backend re-derives a view
-    // from the VkImage and format.
-    VkImageView    reactiveView = VK_NULL_HANDLE;
 
     // Readback, so the VALUES can be measured rather than assumed.
     //
@@ -88,8 +67,10 @@ struct MvTarget {
 };
 
 static MvTarget g_mv;
-// .xy velocity in UV units, .z reactive mask, .w spare. See the header comment.
-static const VkFormat kMvFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+// .xy velocity in UV units. Two channels is all a velocity buffer carries -
+// the predecessor's .z held an FSR2 reactive mask, which this project has no
+// consumer for, and dropping it halves the bandwidth.
+static const VkFormat kMvFormat = VK_FORMAT_R16G16_SFLOAT;
 
 static void mvDestroy(DeviceData &dd)
 {
@@ -98,7 +79,6 @@ static void mvDestroy(DeviceData &dd)
     if (m.readbackPtr) dd.unmapMemory(m.device, m.readbackMem);
     if (m.readback)    dd.destroyBuffer(m.device, m.readback, nullptr);
     if (m.readbackMem) dd.freeMemory(m.device, m.readbackMem, nullptr);
-    if (m.reactiveView) dd.destroyImageView(m.device, m.reactiveView, nullptr);
     if (m.view)  dd.destroyImageView(m.device, m.view, nullptr);
     if (m.image) dd.destroyImage(m.device, m.image, nullptr);
     if (m.mem)   dd.freeMemory(m.device, m.mem, nullptr);
@@ -192,22 +172,6 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
         return false;
     }
 
-    // The swizzled reactive view. Every channel reads B so it does not matter
-    // which one FSR2's shader samples; alpha is forced to 1 so a read of .a
-    // cannot be mistaken for a mask value.
-    //
-    // Not fatal if it fails - FSR2 simply goes back to receiving no mask, which
-    // is what it got for every frame before this existed. Losing the mask is a
-    // quality regression; refusing to create the velocity target over it would
-    // be a black screen.
-    ivci.components.r = VK_COMPONENT_SWIZZLE_B;
-    ivci.components.g = VK_COMPONENT_SWIZZLE_B;
-    ivci.components.b = VK_COMPONENT_SWIZZLE_B;
-    ivci.components.a = VK_COMPONENT_SWIZZLE_ONE;
-    if (dd.createImageView(device, &ivci, nullptr, &m.reactiveView) != VK_SUCCESS) {
-        trace("MV: reactive view creation failed - FSR2 will get no reactive mask");
-        m.reactiveView = VK_NULL_HANDLE;
-    }
 
     // Host-visible readback buffer, allocated once alongside the image. 8 bytes
     // per pixel for R16G16B16A16_SFLOAT - 63.8 MB at 3840x2160, which is why
@@ -247,7 +211,7 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
 
     m.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     m.ready  = true;
-    trace("MV: velocity target ready %ux%u RGBA16F vel.xy+reactive.z (%.1f MB) - this is "
+    trace("MV: velocity target ready %ux%u RG16F vel.xy (%.1f MB) - this is "
           "the one X-Plane's own shaders render into",
           w, h, mr.size / 1048576.0);
     return true;

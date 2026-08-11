@@ -10,7 +10,7 @@
 ; It is removed again on uninstall.
 
 #define AppName    "Motion Vectors for X-Plane 12"
-#define AppVersion "rc-.1"
+#define AppVersion "0.0.01"
 #define AppPub     "Vihaan2012-cmyk"
 
 [Setup]
@@ -40,6 +40,7 @@ Source: "build\MotionVectors.xpl";        DestDir: "{app}\Resources\plugins\Moti
 Source: "build\vklayer\VkLayer_mv.dll";   DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
 Source: "build\vklayer\VkLayer_mv.json";  DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
 Source: "build\MotionVectorsLauncher.exe"; DestDir: "{app}\MotionVectors";                    Flags: ignoreversion
+Source: "lua\MotionVectors.lua";           DestDir: "{app}\Resources\plugins\FlyWithLua\Scripts"; Flags: ignoreversion onlyifdestfileexists
 Source: "README.md";                      DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
 
 [Icons]

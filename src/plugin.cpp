@@ -3470,7 +3470,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
 // onto one of the datarefs above, so the window and any script are driving the
 // same state and cannot disagree.
 
-static XPLMWindowID g_window   = nullptr;
 static XPLMMenuID   g_menu     = nullptr;
 static int          g_menuItem = 0;
 
@@ -3485,244 +3484,13 @@ struct Row { int y; int kind; };   // kind: 0 upscaler, 1 quality, 2 optflow, 3 
 static Row g_rows[8];
 static int g_rowCount = 0;
 
-static void drawWindow(XPLMWindowID w, void *)
-{
-    int l, t, r, b;
-    XPLMGetWindowGeometry(w, &l, &t, &r, &b);
-    XPLMDrawTranslucentDarkBox(l, t, r, b);
 
-    float white[] = { 1.0f, 1.0f, 1.0f };
-    float grey[]  = { 0.55f, 0.55f, 0.55f };
-    float green[] = { 0.45f, 0.95f, 0.45f };
-    float amber[] = { 1.0f, 0.75f, 0.25f };
-
-    int x = l + 14;
-    int y = t - 22;
-    g_rowCount = 0;
-
-    char buf[256];
-
-    // Header: what the layer found. If the layer is not attached nothing below
-    // can work, and saying so plainly beats every option silently refusing.
-    bool attached = (g_share && g_share->layerAttached);
-    if (attached) {
-        snprintf(buf, sizeof(buf), "GPU: %s", g_share->gpuName);
-        XPLMDrawString(green, x, y, buf, nullptr, xplmFont_Basic);
-    } else {
-        XPLMDrawString(amber, x, y,
-            (char*)"Vulkan layer not attached - launch via the TAA shortcut",
-            nullptr, xplmFont_Basic);
-    }
-    y -= 22;
-
-    snprintf(buf, sizeof(buf), "Enabled:  [ %s ]", g_enabled ? "ON" : "OFF");
-    XPLMDrawString(g_enabled ? green : grey, x, y, buf, nullptr, xplmFont_Basic);
-    g_rows[g_rowCount].y = y; g_rows[g_rowCount].kind = 3; ++g_rowCount;
-    y -= 22;
-
-    // ---- LIVE STATE, HERE AT THE TOP.
-    //
-    // This window and the FlyWithLua panel are two front ends over the same
-    // datarefs, and only the panel got the readouts - so the one actually on
-    // screen still showed nothing. Whatever is worth watching is worth watching
-    // from either.
-    if (g_share) {
-        y -= 4;
-        XPLMDrawString(grey, x, y, (char*)"---- state", nullptr, xplmFont_Basic);
-        y -= 16;
-
-        // ---- THE SIZE X-PLANE ACTUALLY RENDERS, NOT THE WINDOW.
-        //
-        // This read viewportW, which the PLUGIN fills from a dataref - the
-        // window size. Those are the same number only when nothing is rendering
-        // sub-native, and now that Quality drives X-Plane's own FSR they
-        // routinely differ: the layer reports a 2560x1440 scene target while
-        // this row said 3840x2160 (1.00x) and claimed no upscaling was
-        // happening at all.
-        //
-        // measRenderW/measDisplayW are written by the LAYER from the images it
-        // actually sees, so they describe what happened rather than what was
-        // asked for. The ratio is computed from them for the same reason.
-        if (g_share->measRenderW > 0 && g_share->measDisplayW > 0) {
-            float meas = (float)g_share->measDisplayW / (float)g_share->measRenderW;
-            snprintf(buf, sizeof(buf), "  Render:   %ux%u -> %ux%u  (%.2fx)",
-                     g_share->measRenderW, g_share->measRenderH,
-                     g_share->measDisplayW, g_share->measDisplayH, meas);
-            XPLMDrawString(meas > 1.01f ? green : white, x, y, buf, nullptr,
-                           xplmFont_Basic);
-            y -= 16;
-        } else if (g_share->viewportW > 0) {
-            snprintf(buf, sizeof(buf), "  Render:   %dx%d  (window - layer has "
-                     "not measured yet)", g_share->viewportW, g_share->viewportH);
-            XPLMDrawString(grey, x, y, buf, nullptr, xplmFont_Basic);
-            y -= 16;
-        }
-
-        // ---- FRAME RATE, COUNTED AT THE PRESENT.
-        //
-        // Deliberately not the sim's own readout. That counts frames X-Plane
-        // rendered, and with frame generation running it is no longer what is
-        // on the monitor - a generated frame goes out between every pair of
-        // real ones and never reaches a dataref. Both numbers are shown only
-        // when they differ, because a "58 -> 58" row is just noise.
-        if (g_share->fpsPresented > 0.0f) {
-            bool generating = (g_share->fpsDisplayed >
-                               g_share->fpsPresented * 1.10f);
-            if (generating)
-                snprintf(buf, sizeof(buf), "  FPS:      %.0f sim  ->  %.0f shown  (%.2fx)",
-                         g_share->fpsPresented, g_share->fpsDisplayed,
-                         g_share->fpsDisplayed / g_share->fpsPresented);
-            else
-                snprintf(buf, sizeof(buf), "  FPS:      %.0f", g_share->fpsPresented);
-            XPLMDrawString(generating ? green : white, x, y, buf, nullptr,
-                           xplmFont_Basic);
-            y -= 16;
-        }
-
-        // BOTH depth derivations, and amber when they disagree. share.h says
-        // these are cross-checked precisely because getting it wrong "still
-        // looks plausible"; the cross-check was never shown anywhere until now.
-        bool zdis = (g_share->reverseZ != g_share->reverseZFromMatrix);
-        snprintf(buf, sizeof(buf), "  Depth:    %s%s",
-                 g_share->reverseZ ? "reverse-Z" : "standard",
-                 zdis ? (g_share->reverseZFromMatrix ? "  (matrix: reverse-Z)"
-                                                     : "  (matrix: standard)")
-                      : "");
-        XPLMDrawString(zdis ? amber : white, x, y, buf, nullptr, xplmFont_Basic);
-        y -= 16;
-
-        snprintf(buf, sizeof(buf), "  Jitter:   %d phases", g_share->jitterPhases);
-        XPLMDrawString(white, x, y, buf, nullptr, xplmFont_Basic);
-        y -= 16;
-
-        // VRAM straight from the driver. X-Plane's own "available" has been out
-        // by gigabytes all session; this is the number the hardware reports.
-        if (g_share->vramTotalMB > 0) {
-            float frac = g_share->vramBudgetMB
-                       ? (float)g_share->vramUsageMB / (float)g_share->vramBudgetMB
-                       : 0.0f;
-            snprintf(buf, sizeof(buf), "  VRAM:     %u / %u MB  of %u",
-                     g_share->vramUsageMB, g_share->vramBudgetMB,
-                     g_share->vramTotalMB);
-            XPLMDrawString(frac > 0.95f ? amber : white, x, y, buf,
-                           nullptr, xplmFont_Basic);
-            y -= 16;
-        }
-
-        snprintf(buf, sizeof(buf), "  Tex floor:%.4gx%s", (double)g_floorValue,
-                 g_floorValue >= 1.0f ? "  (no cuts)" : "");
-        XPLMDrawString(g_floorValue > 0.1f ? green : grey, x, y, buf,
-                       nullptr, xplmFont_Basic);
-        y -= 20;
-    }
-
-    y -= 6;
-
-    XPLMDrawString(white, x, y, (char*)"Upscaler   (click to cycle)", nullptr, xplmFont_Basic);
-    y -= 18;
-
-    // Every backend is listed, including ones that cannot run here, each with
-    // the reason. Hiding them would leave "why is there no DLSS option?" with
-    // no answer; greying them with a reason answers it in place.
-    y -= 10;
-
-    // Quality only means anything for a real upscaler.
-    bool upscaling = (g_upscaler == TAA_UPSCALER_FSR2 ||
-                      g_upscaler == TAA_UPSCALER_FSR4 ||
-                      g_upscaler == TAA_UPSCALER_DLSS);
-    if (upscaling)
-        snprintf(buf, sizeof(buf), "Quality:  %s  (%.2fx)",
-                 taaQualityName(g_quality), taaQualityScale(g_quality));
-    else
-        snprintf(buf, sizeof(buf), "Quality:  Native  (TAA does not upscale)");
-    XPLMDrawString(upscaling ? white : grey, x, y, buf, nullptr, xplmFont_Basic);
-    g_rows[g_rowCount].y = y; g_rows[g_rowCount].kind = 1; ++g_rowCount;
-    y -= 20;
-
-    // ---- OPTICAL FLOW ROW REMOVED, because nothing implements it.
-    //
-    // It offered Off / NVIDIA hardware / FidelityFX compute and described what
-    // it would fix - content that moves independently of the surface it is
-    // drawn on, which in an airliner means the instrument panel. All true, and
-    // all aspirational: opticalFlowWanted is written here and read by the
-    // external panel, and the VULKAN LAYER never reads it at all. Every setting
-    // did exactly the same thing as Off.
-    //
-    // The dataref and its handlers stay, so a script or a key binding that
-    // already touches taaimpl/optical_flow keeps working and the feature can be
-    // surfaced again the day the layer consumes it. A control that visibly does
-    // nothing is worse than no control.
-
-    snprintf(buf, sizeof(buf), "LOD bias %.2f    sharpness %.2f    cockpit %.1fm",
-             g_lodBias, g_sharpness, g_cockpitDist);
-    XPLMDrawString(grey, x, y, buf, nullptr, xplmFont_Basic);
-    y -= 16;
-    XPLMDrawString(grey, x, y,
-        (char*)"all settings are datarefs under taaimpl/ - scriptable",
-        nullptr, xplmFont_Basic);
-}
-
-static int handleClick(XPLMWindowID w, int mx, int my, XPLMMouseStatus st, void *)
-{
-    if (st != xplm_MouseDown) return 1;
-
-    // Nearest row within the line height. Simpler than tracking rectangles and
-    // good enough for a settings panel.
-    int bestKind = -1, bestDist = 12;
-    for (int i = 0; i < g_rowCount; ++i) {
-        int d = my - g_rows[i].y;
-        if (d < 0) d = -d;
-        if (d < bestDist) { bestDist = d; bestKind = g_rows[i].kind; }
-    }
-    if (bestKind < 0) return 1;
-
-    if (bestKind >= 100) {
-    } else if (bestKind == 1) {
-    } else if (bestKind == 2) {
-        // Cycle, skipping sources this machine cannot run, so clicking never
-        // lands on a dead option.
-        for (int i = 1; i <= TAA_OF_COUNT; ++i) {
-            int cand = (g_opticalFlow + i) % TAA_OF_COUNT;
-            if (opticalFlowUsable(cand, nullptr)) { setOptFlow(nullptr, cand); break; }
-        }
-    } else if (bestKind == 3) {
-        g_enabled = !g_enabled;
-    }
-    return 1;
-}
 
 // Plain functions rather than lambdas: the XPLM callback types are specific
 // enough that a lambda's deduced return type does not always convert.
 static void winKey(XPLMWindowID, char, XPLMKeyFlags, char, void*, int) {}
 static XPLMCursorStatus winCursor(XPLMWindowID, int, int, void*) { return xplm_CursorDefault; }
-static int  winWheel(XPLMWindowID, int, int, int, int, void*) { return 1; }
 
-static void toggleWindow()
-{
-    if (!g_window) {
-        XPLMCreateWindow_t p;
-        memset(&p, 0, sizeof(p));
-        p.structSize        = sizeof(p);
-        p.left              = 100;
-        p.top               = 100 + TAA_WIN_H;
-        p.right             = 100 + TAA_WIN_W;
-        p.bottom            = 100;
-        p.visible           = 1;
-        p.drawWindowFunc    = drawWindow;
-        p.handleMouseClickFunc = handleClick;
-        p.handleKeyFunc        = winKey;
-        p.handleCursorFunc     = winCursor;
-        p.handleMouseWheelFunc = winWheel;
-        p.decorateAsFloatingWindow = xplm_WindowDecorationRoundRectangle;
-        p.layer             = xplm_WindowLayerFloatingWindows;
-        g_window = XPLMCreateWindowEx(&p);
-        XPLMSetWindowTitle(g_window, "TAA / Upscaler");
-        XPLMSetWindowPositioningMode(g_window, xplm_WindowPositionFree, -1);
-    } else {
-        int vis = XPLMGetWindowIsVisible(g_window);
-        XPLMSetWindowIsVisible(g_window, !vis);
-    }
-}
 
 // Commands, so this can be bound to a key or a hardware button.
 static XPLMCommandRef g_cmdToggle = nullptr, g_cmdCycle = nullptr, g_cmdQuality = nullptr;
@@ -3741,7 +3509,7 @@ static int cmdSelfTest(XPLMCommandRef, XPLMCommandPhase ph, void*)
 
 static int cmdToggle(XPLMCommandRef, XPLMCommandPhase ph, void*)
 {
-    if (ph == xplm_CommandBegin) toggleWindow();
+    (void)ph;
     return 0;
 }
 
@@ -3750,7 +3518,6 @@ static int cmdToggle(XPLMCommandRef, XPLMCommandPhase ph, void*)
 static void menuHandler(void*, void *item)
 {
     switch ((intptr_t)item) {
-        case 0: toggleWindow(); break;
     }
 }
 
@@ -3888,7 +3655,6 @@ PLUGIN_API int XPluginEnable(void)
     // rate that X-Plane's own counter cannot show. Hiding it behind a menu
     // nobody can find makes all of that invisible. TAA_NO_WINDOW=1 suppresses
     // it for anyone who wants the screen clear.
-    if (!getenv("TAA_NO_WINDOW")) toggleWindow();
 
     XPLMRegisterFlightLoopCallback(matrixCallback, -1.0f, nullptr);
     XPLMRegisterDrawCallback(autoStartDrawCb, xplm_Phase_Window, 0, nullptr);
@@ -3900,7 +3666,6 @@ PLUGIN_API void XPluginDisable(void)
     XPLMUnregisterFlightLoopCallback(matrixCallback, nullptr);
     XPLMUnregisterDrawCallback(autoStartDrawCb, xplm_Phase_Window, 0, nullptr);
 
-    if (g_window) { XPLMDestroyWindow(g_window); g_window = nullptr; }
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
     if (g_cmdToggle)  XPLMUnregisterCommandHandler(g_cmdToggle,  cmdToggle,  1, nullptr);
     unregisterDatarefs();
