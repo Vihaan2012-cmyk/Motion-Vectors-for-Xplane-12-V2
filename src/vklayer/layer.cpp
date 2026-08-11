@@ -1,0 +1,7701 @@
+#include <direct.h>   // _mkdir for the screenshot folder
+// VK_LAYER_taa_impl
+//
+// The GPU half of TAAImplementation. Stage 1: READ-ONLY.
+//
+// Every call is forwarded unmodified, so this cannot change rendering or break
+// the sim. That is deliberate. Before writing any GPU code there are facts about
+// X-Plane's frame that have to be established rather than guessed:
+//
+//   1. Which image is the scene depth buffer, and what are its format, sample
+//      count and extent?
+//   2. Does that image already carry VK_IMAGE_USAGE_SAMPLED_BIT? A compute
+//      shader cannot read it otherwise, and if it is missing we have to add it
+//      at creation time - a modification, and modifying resources the app owns
+//      is where this kind of layer gets unstable.
+//   3. Is it multisampled? MSAA depth needs a resolve before it can be sampled.
+//   4. Where does the 3D scene end and the UI begin, so the resolve lands
+//      before instrument text and ATC boxes get temporally smeared?
+//
+// Answering these read-only first is the pattern that works. Modifying the
+// frame before understanding it is where things go wrong.
+//
+// Unlike that project this one builds against the REAL Vulkan headers. The
+// hand-written ABI there had a wrong constant (LOADER_INSTANCE_CREATE_INFO is
+// 47, not 1000009000) that surfaced only as a mystery runtime failure. With the
+// genuine declarations that entire class of bug becomes a compile error.
+//
+// Output: %TEMP%\taa_layer.txt
+
+#define VK_NO_PROTOTYPES
+#define VK_USE_PLATFORM_WIN32_KHR
+
+#include <vulkan/vulkan.h>
+#include <vulkan/vk_layer.h>
+
+// Not defined by the SDK headers under MinGW. The loader resolves the two entry
+// points named in the manifest by symbol name, so they must actually be
+// exported from the DLL - without this the layer loads and then silently does
+// nothing, which is hard to diagnose.
+#ifndef VK_LAYER_EXPORT
+  #define VK_LAYER_EXPORT __declspec(dllexport)
+#endif
+
+#include <windows.h>
+
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <cstdarg>
+#include <string>
+#include <map>
+#include <set>
+#include <mutex>
+#include <atomic>
+#include <vector>
+#include <cmath>
+
+#include "../share.h"
+
+// ---------------------------------------------------------------- tracing
+
+static std::mutex g_traceLock;
+
+static void trace(const char *fmt, ...)
+{
+    static const bool on = getenv("TAA_LAYER_TRACE") != nullptr;
+    if (!on) return;
+
+    static std::string path;
+    if (path.empty()) {
+        const char *t = getenv("TEMP");
+        path = std::string(t ? t : ".") + "\\taa_layer.txt";
+    }
+
+    std::lock_guard<std::mutex> g(g_traceLock);
+    FILE *f = fopen(path.c_str(), "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);   // flushed every line: the process may exit without unwinding, and
+                 // a buffered trace of the last frame would be lost.
+}
+
+// ------------------------------------------------------- shared memory
+
+static HANDLE    g_shareHandle = nullptr;
+static TaaShare *g_share       = nullptr;
+static bool      g_shareOpen   = false;
+
+// MUST retry. Vulkan initialises long before X-Plane loads plugins, so the
+// first attempt always fails - the plugin has not created the mapping yet.
+// Trying once and giving up meant the sibling project's layer never saw the
+// camera at all, which took a while to spot because "attached" was only logged
+// on success.
+static void openShare()
+{
+    if (g_shareOpen) return;
+    static int attempts = 0;
+    if (++attempts % 256 != 1) return;   // throttle, but keep trying
+
+    // READ/WRITE, not read-only.
+    //
+    // The layer is mostly a consumer of this block, and it was opened read-only
+    // to make that structurally true. But the contract has always had a status
+    // section the LAYER is supposed to fill in - layerAttached, the GPU name,
+    // per-backend availability - and a read-only mapping cannot write it. The
+    // in-sim UI therefore showed every backend as "not attached" no matter what
+    // was actually running, which is worse than useless: it is a display that
+    // reports the same thing whether the layer is working or absent.
+    g_shareHandle = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, TAA_SHARE_NAME);
+    if (!g_shareHandle) {
+        if (attempts == 1) trace("SHARE: not published yet, will retry");
+        return;
+    }
+
+    TaaShare *s = (TaaShare*)MapViewOfFile(g_shareHandle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(TaaShare));
+    if (!s) { trace("SHARE: MapViewOfFile failed %lu", GetLastError()); return; }
+    if (s->magic != TAA_MAGIC) { trace("SHARE: bad magic 0x%08X", s->magic); return; }
+
+    // Version AND size must both match. A mismatch means plugin and layer were
+    // built from different sources; reading on would produce a plausible-looking
+    // but wrong velocity field, which is far worse than refusing.
+    if (s->version != TAA_VERSION || s->structSize != sizeof(TaaShare)) {
+        trace("SHARE: MISMATCH - plugin v%u/%uB, layer v%u/%uB. Rebuild both. Disabled.",
+              s->version, s->structSize, (unsigned)TAA_VERSION, (unsigned)sizeof(TaaShare));
+        UnmapViewOfFile(s);
+        g_shareOpen = true;   // latch: do not spam, do not use
+        return;
+    }
+
+    g_share     = s;
+    g_shareOpen = true;
+    trace("SHARE: attached (v%u, %u bytes)", s->version, s->structSize);
+}
+
+// What the velocity pass needs, snapshotted coherently. The plugin writes
+// without a lock, so reading fields inline at dispatch time could tear across a
+// frame boundary - matrix from frame N, reset flag from N+1. The plugin bumps
+// `frame` only after everything else is written, so a matching counter either
+// side of the copy proves we did not tear. Cheaper and safer than a
+// cross-process mutex.
+struct Snapshot {
+    bool     valid;
+    uint64_t frame;
+    float    reproj[16], invCurrViewProj[16], prevViewProj[16];
+    float    bodyReproj[16];
+    int32_t  bodyReprojValid;
+    float    camBodyDrift, camGap;
+    int32_t  selfTestPhase;
+    float    selfTestExpectedPx;
+    int32_t  upscaler;        // TaaUpscaler, chosen in the sim
+    float    sharpness;       // 0..1, the panel's slider - drives FSR2's RCAS
+    int32_t  reverseZ, historyReset, resetReason;
+    int32_t  viewportW, viewportH;
+    float    nearClip, farClip;
+    float    fovDeg;
+
+    // Milliseconds, not seconds. FSR2 paces its history decay off this, so
+    // handing it seconds would make it behave as though a thousandth of the
+    // time had elapsed and hold history roughly sixty times too long - which
+    // would look like heavy ghosting rather than like a units mistake.
+    float    frameTimeMs;
+    double   simTime;
+    float    jitterX, jitterY;
+    int32_t  jitterIndex, jitterPhases;
+    float    lodBias;
+    float    cockpitReactiveDist, cockpitReactiveStrength;
+    float    camX, camY, camZ, camDelta;
+    int32_t  objectCount, reactiveCount;
+    TaaMovingObject    objects[TAA_MAX_OBJECTS];
+    TaaReactiveEllipse reactive[TAA_MAX_REACTIVE];
+};
+
+static bool snapshot(Snapshot *o)
+{
+    o->valid = false;
+    if (!g_share || !g_share->valid) return false;
+
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        uint64_t before = g_share->frame;
+
+        memcpy(o->reproj,          g_share->reproj,          sizeof(o->reproj));
+        memcpy(o->invCurrViewProj, g_share->invCurrViewProj, sizeof(o->invCurrViewProj));
+        memcpy(o->prevViewProj,    g_share->prevViewProj,    sizeof(o->prevViewProj));
+        memcpy(o->bodyReproj,      g_share->bodyReproj,      sizeof(o->bodyReproj));
+        o->bodyReprojValid = g_share->bodyReprojValid;
+        o->camBodyDrift    = g_share->camBodyDrift;
+        o->camGap          = g_share->camGap;
+        o->selfTestPhase      = g_share->selfTestPhase;
+        o->selfTestExpectedPx = g_share->selfTestExpectedPx;
+        o->upscaler      = g_share->upscaler;
+        o->sharpness     = g_share->sharpness;
+        o->reverseZ      = g_share->reverseZ;
+        o->historyReset  = g_share->historyReset;
+        o->resetReason   = g_share->resetReason;
+        o->viewportW     = g_share->viewportW;
+        o->viewportH     = g_share->viewportH;
+        o->nearClip      = g_share->nearClip;
+        o->farClip       = g_share->farClip;
+        o->fovDeg        = g_share->fovDeg;
+        o->simTime       = g_share->simTime;
+
+        // Derived here rather than published, because the plugin's frame and
+        // the layer's frame are not the same thing - the plugin publishes from
+        // a flight loop callback, the layer consumes at present, and the two
+        // can differ. Measuring the interval between the values we actually
+        // consume keeps it honest.
+        {
+            static double prevSim = -1.0;
+            double dt = (prevSim >= 0.0) ? (g_share->simTime - prevSim) : 0.0;
+            prevSim = g_share->simTime;
+            if (dt > 0.0 && dt < 1.0) o->frameTimeMs = (float)(dt * 1000.0);
+            else                      o->frameTimeMs = 16.6f;
+        }
+        o->jitterX       = g_share->jitterX;
+        o->jitterY       = g_share->jitterY;
+        o->jitterIndex   = g_share->jitterIndex;
+        o->jitterPhases  = g_share->jitterPhases;
+        o->lodBias       = g_share->lodBias;
+        o->cockpitReactiveDist     = g_share->cockpitReactiveDist;
+        o->cockpitReactiveStrength = g_share->cockpitReactiveStrength;
+        o->camX          = g_share->camX;
+        o->camY          = g_share->camY;
+        o->camZ          = g_share->camZ;
+        o->camDelta      = g_share->camDelta;
+        o->objectCount   = g_share->objectCount;
+        o->reactiveCount = g_share->reactiveCount;
+        if (o->objectCount   < 0) o->objectCount   = 0;
+        if (o->objectCount   > TAA_MAX_OBJECTS)  o->objectCount  = TAA_MAX_OBJECTS;
+        if (o->reactiveCount < 0) o->reactiveCount = 0;
+        if (o->reactiveCount > TAA_MAX_REACTIVE) o->reactiveCount = TAA_MAX_REACTIVE;
+        memcpy(o->objects,  g_share->objects,  sizeof(TaaMovingObject) * o->objectCount);
+        memcpy(o->reactive, g_share->reactive, sizeof(TaaReactiveEllipse) * o->reactiveCount);
+
+        MemoryBarrier();
+        if (g_share->frame == before) {
+            o->frame = before;
+            o->valid = true;
+            return true;
+        }
+    }
+    // Four consecutive tears cannot happen at one write per frame; treat as no
+    // data rather than using a half-torn matrix.
+    return false;
+}
+
+// ------------------------------------------------------------- dispatch
+//
+// Layers key their tables on the loader dispatch pointer, which is the first
+// word of any dispatchable handle - not on the handle value itself, because the
+// loader hands different layers different handle values for the same object.
+static void *dispatchKey(void *handle) { return *(void**)handle; }
+
+struct InstanceData {
+    PFN_vkGetInstanceProcAddr gipa;
+    PFN_vkDestroyInstance     destroyInstance;
+    PFN_vkGetPhysicalDeviceFormatProperties getFormatProps;
+    // The handle itself, which nothing needed until NGX. NVSDK_NGX_VULKAN_Init
+    // takes the instance, and the map is keyed by DISPATCH POINTER rather than
+    // by handle - so without this there is no way back to the VkInstance.
+    VkInstance instance;
+};
+
+struct DeviceData {
+    VkDevice         device;
+    VkPhysicalDevice phys;
+    PFN_vkGetDeviceProcAddr gdpa;
+    PFN_vkDestroyDevice     destroyDevice;
+    PFN_vkCreateImage       createImage;
+    PFN_vkDestroyImage      destroyImage;
+    PFN_vkQueuePresentKHR   queuePresent;
+    PFN_vkCreateSampler     createSampler;
+    PFN_vkCmdBeginRenderPass  cmdBeginRenderPass;
+    PFN_vkCmdBeginRendering   cmdBeginRendering;
+    PFN_vkCmdEndRendering     cmdEndRendering;
+    PFN_vkCmdSetViewport      cmdSetViewport;
+
+    // Everything below exists only for the velocity compute pass. All of it
+    // operates on resources we create ourselves; the sole exception is the
+    // depth image, which is read and restored to the layout it was found in.
+    PFN_vkGetImageMemoryRequirements  getImageMemReq;
+    PFN_vkGetBufferMemoryRequirements getBufferMemReq;
+    PFN_vkAllocateMemory      allocateMemory;
+    PFN_vkFreeMemory          freeMemory;
+    PFN_vkBindImageMemory     bindImageMemory;
+    PFN_vkBindBufferMemory    bindBufferMemory;
+    PFN_vkMapMemory           mapMemory;
+    PFN_vkCreateImageView     createImageView;
+    PFN_vkDestroyImageView    destroyImageView;
+    PFN_vkCreateBuffer        createBuffer;
+    PFN_vkDestroyBuffer       destroyBuffer;
+    PFN_vkCreateDescriptorSetLayout createDescriptorSetLayout;
+    PFN_vkCreateDescriptorPool      createDescriptorPool;
+    PFN_vkAllocateDescriptorSets    allocateDescriptorSets;
+    PFN_vkUpdateDescriptorSets      updateDescriptorSets;
+    PFN_vkCreateShaderModule    createShaderModule;
+    PFN_vkCreatePipelineLayout  createPipelineLayout;
+    PFN_vkCreateComputePipelines createComputePipelines;
+    PFN_vkCreateCommandPool     createCommandPool;
+    PFN_vkAllocateCommandBuffers allocateCommandBuffers;
+    PFN_vkBeginCommandBuffer    beginCommandBuffer;
+    PFN_vkEndCommandBuffer      endCommandBuffer;
+    PFN_vkCmdBindPipeline       cmdBindPipeline;
+    PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets;
+    PFN_vkCmdPushConstants      cmdPushConstants;
+    PFN_vkCmdDispatch           cmdDispatch;
+    PFN_vkCmdPipelineBarrier    cmdPipelineBarrier;
+    PFN_vkCmdCopyImageToBuffer  cmdCopyImageToBuffer;
+    PFN_vkCmdCopyImage          cmdCopyImage;   // resolve result -> scene colour
+    PFN_vkCmdClearColorImage    cmdClearColorImage;  // TAA_PROVE_OUTPUT probe
+    PFN_vkCmdBlitImage          cmdBlitImage;        // FSR2 output -> swapchain
+    PFN_vkCmdResolveImage       cmdResolveImage;     // X-Plane's MSAA resolve
+    PFN_vkGetSwapchainImagesKHR getSwapchainImagesKHR;
+    // GPU timing. Nothing else in the layer measures where the frame goes, and
+    // CPU-side timing cannot: the work is recorded now and executed later.
+    PFN_vkCreateQueryPool       createQueryPool;
+    PFN_vkDestroyQueryPool      destroyQueryPool;
+    PFN_vkCmdResetQueryPool     cmdResetQueryPool;
+    PFN_vkCmdWriteTimestamp     cmdWriteTimestamp;
+    PFN_vkGetQueryPoolResults   getQueryPoolResults;
+    // Owned only when frame generation replaces the swapchain. Resolved
+    // unconditionally so the pointers exist for the fall-through path too.
+    PFN_vkCreateSwapchainKHR    createSwapchainKHR;
+    PFN_vkDestroySwapchainKHR   destroySwapchainKHR;
+    PFN_vkAcquireNextImageKHR   acquireNextImageKHR;
+
+    // The resolve records into X-PLANE's command buffers, so unlike the
+    // velocity pass there is no fence of ours to wait on before destroying its
+    // resources. vkDeviceWaitIdle is the blunt but correct answer: teardown
+    // happens on resize and shutdown, where a stall costs nothing, and freeing
+    // an image the GPU is still reading is not a recoverable mistake.
+    PFN_vkDeviceWaitIdle        deviceWaitIdle;
+    PFN_vkCreateFence           createFence;
+    PFN_vkResetFences           resetFences;
+    PFN_vkWaitForFences         waitForFences;
+    PFN_vkQueueSubmit           queueSubmit;
+    PFN_vkGetDeviceQueue        getDeviceQueue;
+    PFN_vkDestroyPipeline       destroyPipeline;
+    PFN_vkDestroyPipelineLayout destroyPipelineLayout;
+    PFN_vkDestroyShaderModule   destroyShaderModule;
+    PFN_vkDestroyDescriptorPool destroyDescriptorPool;
+    PFN_vkDestroyDescriptorSetLayout destroyDescriptorSetLayout;
+    PFN_vkDestroySampler        destroySampler;
+    PFN_vkDestroyCommandPool    destroyCommandPool;
+    PFN_vkDestroyFence          destroyFence;
+    PFN_vkUnmapMemory           unmapMemory;
+};
+
+static PFN_vkGetPhysicalDeviceMemoryProperties g_getPhysMemProps = nullptr;
+// Needed by the Streamline path to clamp DLSS-G's extra queue requests against
+// the number of queues each family actually has. Asking for more than exist is
+// a validation error and, on some drivers, a device that fails to create.
+static PFN_vkGetPhysicalDeviceQueueFamilyProperties g_getPhysQueueFamProps = nullptr;
+// Needed for minUniformBufferOffsetAlignment, which sets the UBO ring stride.
+static PFN_vkGetPhysicalDeviceProperties       g_getPhysProps    = nullptr;
+static bool g_availReported = false;
+
+// ---------------------------------------------------------------- VRAM survey
+//
+// X-Plane's texture pager collapsed to 1/8 resolution on an 8 GB card, its log
+// reporting "2.45 gb out of 2.44 gb available" and the available figure FALLING
+// as it freed textures. A budget that moves away from you as you release memory
+// is not a budget you can satisfy, so the pager kept cutting.
+//
+// Two very different causes, needing opposite fixes:
+//
+//   * X-Plane is being TOLD it has little memory - by heap sizes, or by
+//     VK_EXT_memory_budget's heapBudget, which reports what the driver is
+//     willing to give right now rather than what the card has. Then the fix is
+//     at the reporting layer and no texture needs touching.
+//
+//   * The card really is full - other processes, or our own allocations, which
+//     currently come to about 112 MB before FSR2 asks for more. Then the fix is
+//     to use less, and compression is the lever.
+//
+// Guessing between them wastes the same way three wrong theories about the
+// resolve did. So: record what is asked, and what is answered.
+static PFN_vkGetPhysicalDeviceMemoryProperties2 g_nextMemProps2 = nullptr;
+static PFN_vkEnumerateDeviceExtensionProperties g_nextEnumDeviceExt = nullptr;
+static uint64_t g_memQueryCount = 0;
+static float    g_vramBudgetScale = 1.0f;   // >1 inflates the reported budget
+static PFN_vkAllocateMemory g_nextAllocateMemory = nullptr;
+// Motion vector injection accounting.
+//
+// COVERAGE is the number that matters. A vertex shader we cannot patch draws
+// geometry carrying no velocity, and that shows up as smearing confined to one
+// part of the scene with nothing in the logs to explain it - the same class of
+// silent gap that cost a day when NaN depth was quietly routing scenery into
+// the near-field branch. Counting the failures is the difference between
+// "injection works" and "injection works on the shaders I happened to look at".
+static bool     g_spirvInject  = false;
+// LIVE is a separate switch from INJECT on purpose. Injection alone patches and
+// counts; LIVE hands the patched modules to the driver and adds the attachment.
+// Keeping them apart is what allowed every earlier step to be measured against
+// a running sim without any chance of breaking it.
+static bool     g_spirvLive    = false;
+// Which fragment modules were patched. A pipeline whose fragment shader was NOT
+// patched still gains the extra attachment - it has to, or its format list
+// disagrees with the pass - but with colorWriteMask 0, so it writes nothing
+// there and leaves the cleared zero in place.
+static std::set<VkShaderModule> g_patchedFrag;
+// Carries the patched words from the injection block to the substitution below,
+// which sit in the same function but either side of the census and dump code.
+static std::vector<uint32_t> g_patchedCode;
+// Reset at present. The FIRST scene pass of a frame clears the velocity image;
+// later ones load it, so a scene split across several passes accumulates
+// instead of each pass wiping what the previous one wrote.
+// ATOMIC, because X-Plane records command buffers on several threads at once.
+//
+// This was a plain bool doing read-then-write:
+//
+//     bool first = !g_mvClearedThisFrame;
+//     g_mvClearedThisFrame = true;
+//
+// Two threads reaching that together both see first == true and both emit
+// LOAD_OP_CLEAR, so one scene pass's velocities are wiped by the other's clear.
+// It depends on thread timing, so it comes and goes - a whole-scene flicker
+// rather than a steady artefact. The same hazard is documented a few hundred
+// lines above for the in-scene-pass flag; this one was missed.
+//
+// A single atomic exchange means exactly one pass clears. It does NOT fix
+// recording order versus execution order - the pass that records first is not
+// necessarily the one that runs first - but that is a separate and much rarer
+// problem than two clears in one frame.
+static std::atomic<bool> g_mvClearedThisFrame(false);
+
+// Set once the present-time clear has run at least once. Until then the target
+// has never been zeroed and the recording-time clear is still needed for the
+// very first frames; after it, every scene pass LOADs and nothing has to decide.
+static std::atomic<bool> g_mvClearedAtPresent(false);
+
+// Declared here, ahead of vkCreateShaderModule, because that is where the
+// original words are stored - and ahead of vkCreateGraphicsPipelines, which is
+// where they are finally patched.
+static std::map<VkShaderModule, std::vector<uint32_t> > g_moduleCode;
+// The second half of the key packs the attachment index and the quantised
+// reactive value together: (attachmentIndex << 8) | reactive*255. Both are
+// baked into the patched module, so both are part of its identity.
+typedef std::pair<VkShaderModule, uint32_t> FragKey;
+static std::map<FragKey, VkShaderModule> g_fragVariant;
+static uint64_t g_fragVariants = 0, g_fragPatchFail = 0;
+static bool g_patchedWasFrag = false;
+static uint64_t g_injOk        = 0;
+static uint64_t g_injFailed    = 0;
+static uint64_t g_injNotVertex = 0;
+static uint64_t g_injFrag      = 0;   // of g_injOk, how many were fragment
+
+// ARMED FROM WHICHEVER ENTRY POINT COMES FIRST.
+//
+// This is the third appearance of the same ordering mistake, so it is a
+// function rather than a line copied into one place. Features that act on
+// FRAMES can read their environment at the first vkQueuePresentKHR; features
+// that act during LOAD cannot. Pipeline layouts and shader modules are both
+// created while the scenery loads, and neither has any fixed order with respect
+// to the other - so arming in only one of them leaves the other reading a flag
+// that is still false. The failure is silent: no patches, no errors, and
+// counters that look exactly like a clean run.
+static void armSpirvInject()
+{
+    static bool armed = false;
+    if (armed) return;
+    armed = true;
+    g_spirvInject = (getenv("TAA_SPIRV_INJECT") != nullptr);
+    g_spirvLive   = (getenv("TAA_SPIRV_LIVE") != nullptr) && g_spirvInject;
+    if (g_spirvInject)
+        trace("SPIRV INJECT: armed - %s",
+              g_spirvLive
+                ? "LIVE: patched shaders go to the driver and the velocity "
+                  "attachment is bound"
+                : "DRY RUN: patched and counted, originals still used");
+}
+
+// Frames presented. Incremented in vkQueuePresentKHR and read wherever "how
+// long has this been true" is the question - currently the FSR2 idle timeout.
+static uint64_t g_frameCount = 0;
+// Which frame FSR2 last wrote its output on. The present blit needs to know
+// the image it is about to copy was produced now, not several seconds ago.
+static uint64_t g_fsr2LastDispatchFrame = 0;
+// ---- WHICH COMMAND BUFFER WROTE outImg.
+//
+// FSR2's own copy-back reads the FULL 3840x2160 of outImg and produces a
+// perfect picture. The delivery reads the same image, same extent, and gets
+// garbage - through a blit AND through our own compute shader, so neither
+// the conversion nor the blit engine is responsible. The remaining variable
+// is which command buffer each read lands in: submission order only orders
+// work within one queue's submit sequence, and if these are separate command
+// buffers the sim is free to submit them in an order that puts our read
+// before FSR2's write. No barrier spans that, which is exactly why every
+// barrier experiment changed nothing.
+static VkCommandBuffer g_fsr2LastDispatchCb = VK_NULL_HANDLE;
+// The delivery command buffer, and a per-frame record of which of the two
+// reached the queue first.
+static VkCommandBuffer g_deliveryCb = VK_NULL_HANDLE;
+static uint32_t g_submitSeq = 0;
+static uint32_t g_seqOfDispatchCb = 0xFFFFFFFF;
+static uint32_t g_seqOfDeliveryCb = 0xFFFFFFFF;
+// Every queue family the sim creates a queue on. Needed because an image
+// written on one family and read on another must either be handed over
+// explicitly or declared shared across them; anything else leaves its
+// contents undefined for the reader, with no barrier able to help.
+static std::vector<uint32_t> g_deviceFamilies;
+
+// The driver's own figure for device-local heap usage, from the last
+// VK_EXT_memory_budget query. The ledger compares itself against this.
+static uint64_t g_lastHeapUsage = 0;
+static uint64_t g_lastHeapBudget = 0;
+
+// ---- DEGRADE ONLY WHEN IT IS ACTUALLY NEEDED.
+//
+// The pager used to reduce every texture over its threshold, always, whether
+// the card was full or empty. That is a policy from when VRAM was the binding
+// constraint - it no longer is, and the cost was visible: cockpit panel
+// surfaces read from 0.7 m away were arriving mushy while 2.5 GB sat unused.
+//
+// So paging is now conditional on headroom. Above the reserve there is no
+// reason to touch anything; below it, the pager does exactly what it did
+// before. This is the "exclusion zone" idea generalised - rather than trying to
+// name which textures matter, which vkCreateImage gives us no way to know, it
+// excludes ALL of them until the memory is genuinely wanted.
+//
+// Hysteresis matters here. A pager that switches on and off around a single
+// threshold would drop mips on some textures and not others depending on the
+// instant they happened to be created, which is a worse artefact than either
+// policy - the same surface would be sharp or soft by luck of load order. So
+// once it starts paging it keeps paging until there is comfortably more room
+// than the point it started at.
+static uint64_t g_pagerHeadroomMB = 1024;   // start paging below this
+static bool     g_pagerEngaged    = false;
+
+static bool pagerShouldEngage()
+{
+    if (!g_pagerHeadroomMB) return true;          // 0 = always page, old behaviour
+    if (!g_lastHeapBudget || !g_lastHeapUsage) return false;  // no data yet: leave textures alone
+    uint64_t freeMB = (g_lastHeapBudget > g_lastHeapUsage)
+                    ? (g_lastHeapBudget - g_lastHeapUsage) / 1048576ull : 0;
+    // Engage below the threshold, disengage only once there is 50% more room
+    // than that - see the note on hysteresis.
+    if (!g_pagerEngaged && freeMB < g_pagerHeadroomMB) {
+        g_pagerEngaged = true;
+        trace("PAGER: ENGAGING - %llu MB free is below the %llu MB reserve. "
+              "Textures above the threshold will now lose mip levels.",
+              (unsigned long long)freeMB, (unsigned long long)g_pagerHeadroomMB);
+    } else if (g_pagerEngaged && freeMB > g_pagerHeadroomMB + g_pagerHeadroomMB / 2) {
+        g_pagerEngaged = false;
+        trace("PAGER: DISENGAGING - %llu MB free. New textures are created at "
+              "full resolution again.", (unsigned long long)freeMB);
+    }
+    return g_pagerEngaged;
+}
+
+static uint64_t g_allocCount = 0, g_allocBytes = 0;
+static uint64_t g_allocFailed = 0, g_allocRescued = 0;
+static bool     g_memoryPriority = false;   // VK_EXT_memory_priority usable
+static bool     g_overcommit = false;
+
+// ======================================================== THE VRAM LEDGER
+//
+// Every image and every buffer, by ACTUAL memory requirement, split into the
+// categories the pager treats differently - and carrying the reason each one is
+// or is not pageable.
+//
+// WHY THIS EXISTS, given there is already a texture census.
+//
+// The census answers a different question and answers it deliberately wrong for
+// this purpose. It buckets textures by the size the APPLICATION ASKED FOR, not
+// the size we gave it, because its job is to choose the drop threshold and the
+// pager's own effect would hide the thing being measured. So it reads 4.20 GB
+// while the pager has already taken 3.04 GB of that back out - the real
+// resident figure is about 1.16 GB, and the two numbers are three-fold apart
+// for a completely legitimate reason.
+//
+// It also excludes, by construction:
+//
+//   - colour attachments   (filtered at the census, and skipped by the pager)
+//   - depth buffers        (same)
+//   - storage images       (same)
+//   - EVERY BUFFER         (never counted anywhere at all)
+//
+// Which is how a card reporting 6.28 GB in use could be "explained" by a 4.20
+// GB texture figure that was neither resident nor complete. The gap was about
+// five gigabytes and nothing in this layer could see any of it.
+//
+// So: actual requirements from vkGetImageMemoryRequirements rather than
+// width x height x bpp, because that includes alignment, mip tails and whatever
+// compression metadata the driver attaches - all of which is real memory that
+// the arithmetic version silently omits.
+enum VramCat {
+    VRAM_TEX = 0,      // sampled, not an attachment - the pager's territory
+    VRAM_RT,           // colour attachment
+    VRAM_DEPTH,        // depth/stencil
+    VRAM_STORAGE,      // written by shaders
+    VRAM_IMG_OTHER,    // transient, 3D, arrays - anything else
+    VRAM_BUF_GEOM,     // vertex + index
+    VRAM_BUF_UNIFORM,  // uniform + storage buffers
+    VRAM_BUF_STAGING,  // transfer only, host-visible staging
+    VRAM_BUF_OTHER,
+    VRAM_CAT_COUNT
+};
+
+static const char *vramCatName(int c)
+{
+    switch (c) {
+        case VRAM_TEX:         return "textures (sampled)";
+        case VRAM_RT:          return "render targets";
+        case VRAM_DEPTH:       return "depth buffers";
+        case VRAM_STORAGE:     return "storage images";
+        case VRAM_IMG_OTHER:   return "other images";
+        case VRAM_BUF_GEOM:    return "geometry buffers";
+        case VRAM_BUF_UNIFORM: return "uniform/storage buffers";
+        case VRAM_BUF_STAGING: return "staging buffers";
+        default:               return "other buffers";
+    }
+}
+
+// Why the pager leaves this category alone. Printed next to the size, because a
+// list of things we are not paging is only useful with the reason attached -
+// otherwise every line reads as an oversight and the ones that genuinely are
+// get lost among the ones that cannot be helped.
+static const char *vramCatWhy(int c)
+{
+    switch (c) {
+    case VRAM_TEX:
+        return "PAGED - mip levels dropped at creation";
+    case VRAM_RT:
+        return "not pageable: sized by the render resolution, not by content. "
+               "Lowering these means lowering the render scale";
+    case VRAM_DEPTH:
+        return "not pageable: one mip, exact precision required";
+    case VRAM_STORAGE:
+        return "not pageable: written by shaders, so a smaller image would be "
+               "written out of bounds";
+    case VRAM_IMG_OTHER:
+        return "not pageable: cube maps, arrays and transient targets - the "
+               "pager takes only single-layer 2D";
+    case VRAM_BUF_GEOM:
+        return "not pageable by this mechanism: mesh data has no mip chain. "
+               "X-Plane's own object LOD is what controls this";
+    case VRAM_BUF_UNIFORM:
+        return "not pageable: per-draw constants, tiny individually";
+    case VRAM_BUF_STAGING:
+        return "not pageable: upload scratch. Should be host-visible, so it "
+               "costs system RAM rather than VRAM - worth checking if large";
+    default:
+        return "not pageable";
+    }
+}
+
+struct VramCatStat { uint64_t count = 0; uint64_t bytes = 0; uint64_t peak = 0; };
+static VramCatStat g_vram[VRAM_CAT_COUNT];
+
+// ---------------------------------------------- geometry, broken down by size
+//
+// 16638 buffers holding 2423 MB is an average of 149 KB, and an average is the
+// wrong statistic for deciding what to do about it. Two very different worlds
+// produce that number:
+//
+//   - a few hundred large vertex buffers, in which case the memory is real mesh
+//     data and only X-Plane's object density controls it;
+//   - tens of thousands of small ones, in which case a large part of the cost
+//     is per-allocation ALIGNMENT PADDING rather than vertices, and that is
+//     recoverable without touching what is drawn.
+//
+// The second is worth checking because bufferImageGranularity on this class of
+// hardware is commonly 1 KB and some drivers round small buffers up hard. A
+// 3 KB buffer occupying 64 KB is a twentyfold overhead, invisible in every
+// figure anyone normally looks at.
+//
+// So: a histogram by power-of-two REQUESTED size, carrying both what was asked
+// for and what the driver actually reserved. The difference between those two
+// columns IS the padding, stated rather than inferred.
+static uint64_t g_geomCount[24];      // buffers in each bucket
+static uint64_t g_geomAsked[24];      // ci->size, summed
+static uint64_t g_geomGot[24];        // req.size, summed
+
+static int geomBucketOf(uint64_t bytes)
+{
+    int b = 0;
+    while (b < 23 && ((uint64_t)1 << (b + 10)) < bytes) ++b;   // 1 KB .. 8 GB
+    return b;
+}
+
+// What each live handle contributed, so destroy subtracts exactly what create
+// added. The texture census learned this the hard way: it only ever added, and
+// after twelve hours read 8.07 GB on a 7.77 GB card while the driver reported
+// 4.29 GB - a number that cannot be true, quoted as a measurement.
+// ---- THE LEDGER HAS A COST, AND IT IS ON THE LOADING PATH.
+//
+// Every vkCreateImage and vkCreateBuffer takes the layer's GLOBAL mutex to
+// record an entry, and calls vkGetImageMemoryRequirements first. X-Plane
+// created 26,331 geometry buffers and thousands of images in one session, from
+// several loader threads at once - so a single global lock on that path
+// serialises texture loading across all of them.
+//
+// That matters because the profiler shows TEX_obj::do_load at 40 ms per call
+// on a 24-core CPU with an NVMe SSD, where neither compute nor I/O explains it.
+// Microprofile timers are WALL CLOCK: they measure waiting just as happily as
+// working, and a contended mutex looks exactly like slow code.
+//
+// So the accounting is switchable. TAA_LEDGER=0 removes every map insert and
+// requirements query from resource creation, which turns "is our instrumen-
+// tation the stall" from a suspicion into a measurement. It is on by default
+// because the numbers it produces are the only reason we understand the memory
+// picture at all - but it should never have been assumed free.
+static bool g_ledgerOn = true;
+
+struct VramEntry { int cat; uint64_t bytes; };
+static std::map<VkImage,  VramEntry> g_vramImg;
+static std::map<VkBuffer, VramEntry> g_vramBuf;
+
+static void vramAdd(int cat, uint64_t bytes)
+{
+    g_vram[cat].count++;
+    g_vram[cat].bytes += bytes;
+    if (g_vram[cat].bytes > g_vram[cat].peak) g_vram[cat].peak = g_vram[cat].bytes;
+}
+
+static void vramRemove(int cat, uint64_t bytes)
+{
+    if (g_vram[cat].count) g_vram[cat].count--;
+    g_vram[cat].bytes = (g_vram[cat].bytes > bytes) ? (g_vram[cat].bytes - bytes) : 0;
+}
+
+static int vramCatOfImage(const VkImageCreateInfo *ci, bool depthFmt)
+{
+    // Order matters. An image can carry several usage bits and the category has
+    // to be the one that decides whether the pager may touch it - so the
+    // disqualifying bits are tested first, and SAMPLED last.
+    if (ci->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) return VRAM_DEPTH;
+    if (depthFmt)                                                return VRAM_DEPTH;
+    if (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)         return VRAM_RT;
+    if (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT)                  return VRAM_STORAGE;
+    if ((ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        ci->imageType == VK_IMAGE_TYPE_2D && ci->arrayLayers == 1)
+        return VRAM_TEX;
+    return VRAM_IMG_OTHER;
+}
+
+static int vramCatOfBuffer(VkBufferUsageFlags u)
+{
+    if (u & (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT))
+        return VRAM_BUF_GEOM;
+    if (u & (VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT))
+        return VRAM_BUF_UNIFORM;
+    // Transfer-only: nothing reads it as a resource, so it is scratch.
+    if ((u & (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) &&
+        !(u & ~(VkBufferUsageFlags)(VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT)))
+        return VRAM_BUF_STAGING;
+    return VRAM_BUF_OTHER;
+}
+
+// Texture census, by format. Answers whether compression is even the
+// opportunity: if X-Plane's textures are already BC-compressed there is nothing
+// to win, and the whole idea is dead before a line of transcoder is written.
+struct FmtStat { uint64_t count = 0; uint64_t bytes = 0; };
+static std::map<int, FmtStat> g_texCensus;
+static uint64_t g_texBytesTotal = 0;
+
+// THE CENSUS MUST SUBTRACT ON DESTROY, or it is not a census.
+//
+// It only ever added, so the printed figure was total-ever-created, not what is
+// resident - and it kept climbing for as long as the sim ran. After twelve
+// hours it read 8.07 GB on a 7.77 GB card while the driver reported 4.29 GB in
+// use, which is the contradiction that gave it away. A number that cannot be
+// true was being quoted as a measurement, including by me.
+//
+// So each censused image records what it contributed, and destroy takes exactly
+// that back out.
+struct CensusEntry { int format; uint64_t bytes; int sizeBucket; };
+static std::map<VkImage, CensusEntry> g_texCensusOf;
+
+// Resident texture memory by LONGEST SIDE, bucketed by power of two.
+//
+// The format census answered "is there anything to compress" - no, it is
+// already BC. This answers the question the custom pager actually turns on:
+// where does the memory live by SIZE, and therefore what does a drop threshold
+// have to be set to before it takes a meaningful bite.
+//
+// Without it the threshold is a guess, and the first guess - 2048 - caught
+// about twenty images and saved 150 MB against a 2.80 GB ceiling. That is not
+// a tuning error so much as a measurement that was never taken.
+static uint64_t g_sizeCount[17];
+static uint64_t g_sizeBytes[17];
+
+static int sizeBucketOf(uint32_t w, uint32_t h)
+{
+    uint32_t big = (w > h) ? w : h;
+    int b = 0;
+    while ((1u << b) < big && b < 16) ++b;
+    return b;
+}
+
+// Bytes per pixel-block, enough for a size estimate rather than an exact one.
+static double formatBytesPerPixel(VkFormat f)
+{
+    switch (f) {
+        case VK_FORMAT_R8_UNORM:                     return 1.0;
+        case VK_FORMAT_R8G8_UNORM:                   return 2.0;
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:                return 4.0;
+        case VK_FORMAT_R16G16B16A16_SFLOAT:          return 8.0;
+        case VK_FORMAT_R32G32B32A32_SFLOAT:          return 16.0;
+        // BC formats: 4x4 blocks. BC1 is 8 bytes per block, the rest 16.
+        case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+        case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+        case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+        case VK_FORMAT_BC4_UNORM_BLOCK:              return 0.5;
+        case VK_FORMAT_BC2_UNORM_BLOCK:
+        case VK_FORMAT_BC3_UNORM_BLOCK:
+        case VK_FORMAT_BC3_SRGB_BLOCK:
+        case VK_FORMAT_BC5_UNORM_BLOCK:
+        case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+        case VK_FORMAT_BC7_UNORM_BLOCK:
+        case VK_FORMAT_BC7_SRGB_BLOCK:               return 1.0;
+        default:                                     return 4.0;
+    }
+}
+
+static std::mutex                      g_lock;
+static std::map<void*, InstanceData>   g_instances;
+static VkInstance                      g_firstInstance = VK_NULL_HANDLE;
+static bool                            g_instanceGettersBound = false;
+static bool                            g_queueFamGetterBound  = false;
+static bool                            g_fsr2ShimsBound       = false;
+static std::map<void*, DeviceData>     g_devices;
+
+// Command-buffer and present functions carry no device handle we can key on
+// cheaply per call, so cache the ones we forward on a hot path. Looking these
+// up through a map on every call - and worse, default-constructing a null entry
+// on a miss - is exactly how the sibling project lost a device.
+static PFN_vkQueuePresentKHR    g_nextQueuePresent = nullptr;
+
+// Which queues X-Plane actually submits rendering to, versus the queue it
+// presents on.
+//
+// The velocity pass submits its work to the PRESENT queue and relies on
+// submission order to be sequenced after the frame's rendering. That is only
+// true if they are the same queue. If X-Plane renders on one queue and presents
+// on another, our depth barrier races against their rendering with no
+// synchronisation at all - which would produce a corrupted frame with no API
+// error, most likely during a load when queue usage is at its busiest.
+//
+// This records the truth rather than continuing to assume it.
+static std::set<VkQueue> g_submitQueues;
+static PFN_vkQueueSubmit g_nextQueueSubmit = nullptr;
+
+
+// Which of the two command buffers reaches the queue first. Both are family 0
+// and family 0 has exactly one queue, so execution is strictly serialised: the
+// ONLY way the delivery can read outImg before FSR2 writes it is if the sim
+// submits the delivery buffer first. Engines do exactly that when they
+// composite the previous frame while recording the next.
+static void noteSubmitOrder(uint32_t count, const VkCommandBuffer *cbs)
+{
+    if (!cbs) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t seq = ++g_submitSeq;
+        if (cbs[i] == g_fsr2LastDispatchCb) g_seqOfDispatchCb = seq;
+        if (cbs[i] == g_deliveryCb)         g_seqOfDeliveryCb = seq;
+    }
+    if (g_seqOfDispatchCb != 0xFFFFFFFF && g_seqOfDeliveryCb != 0xFFFFFFFF) {
+        static bool told = false;
+        if (!told) {
+            told = true;
+            trace("SUBMIT ORDER: FSR2 dispatch cb submitted #%u, delivery cb "
+                  "submitted #%u  -> %s",
+                  g_seqOfDispatchCb, g_seqOfDeliveryCb,
+                  (g_seqOfDeliveryCb < g_seqOfDispatchCb)
+                      ? "DELIVERY RUNS FIRST. Our read executes before the write "
+                        "that fills the image, on the same queue, and no barrier "
+                        "can reorder that."
+                      : "dispatch runs first, so the write is ordered before our "
+                        "read and submission order is NOT the fault.");
+        }
+    }
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueueSubmit(
+    VkQueue queue, uint32_t count, const VkSubmitInfo *submits, VkFence fence)
+{
+    for (uint32_t si = 0; si < count && submits; ++si)
+        noteSubmitOrder(submits[si].commandBufferCount,
+                        submits[si].pCommandBuffers);
+
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        if (g_submitQueues.insert(queue).second)
+            trace("QUEUE: app submits on %p (%u distinct so far)",
+                  (void*)queue, (unsigned)g_submitQueues.size());
+    }
+    // Serialised against the frame generation present worker. VkQueue is
+    // externally synchronised and that worker uses one from another thread, so
+    // without this the two race - which is what took the sim down the first
+    // time present was moved off the render thread. The layer sees both sides,
+    // so the layer is what provides the guarantee.
+    return g_nextQueueSubmit ? g_nextQueueSubmit(queue, count, submits, fence)
+                             : VK_SUCCESS;
+}
+static PFN_vkCreateSampler      g_nextCreateSampler = nullptr;
+static PFN_vkCmdSetViewport     g_nextCmdSetViewport = nullptr;
+static PFN_vkCmdBeginRenderPass g_nextCmdBeginRenderPass = nullptr;
+static PFN_vkCmdBeginRendering  g_nextCmdBeginRendering  = nullptr;
+
+// Defined below, but needed by the passes: they report the formats they bind,
+// and a bare enum value is the kind of detail that gets skimmed past.
+static const char *formatName(VkFormat f);
+
+// ---- THE DEPTH-DERIVED VELOCITY PASS IS GONE.
+//
+// It reconstructed per-pixel velocity from depth plus the two most recent camera
+// matrices. That was the original approach and it is obsolete twice over: the
+// injected shaders now emit TRUE motion vectors from the actual clip positions,
+// which is exact where reprojection is an approximation, and the pass itself was
+// the confirmed cause of the stutter - a full-resolution dispatch plus barriers
+// transitioning X-Plane's depth image every frame, forcing a pipeline flush that
+// queued texture uploads behind it.
+//
+// It has been switched off since then and only the wiring remained. All that was
+// still load-bearing is the depth LAYOUT it tracked, which FSR2 needs to know so
+// it can borrow and return X-Plane's depth image in the state it was left in.
+// That is one variable, not a compute pass.
+#include "vk_util.h"
+
+static VkImageLayout g_sceneDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
+#include "mv_target.h"
+#include "spirv_inject.h"
+
+// FSR2 is optional at BUILD time as well as run time. Its static library takes
+// several minutes to produce, so requiring it in order to compile the layer
+// would make every unrelated change slow. Build it with build-fsr2.ps1 and the
+// layer picks it up; without it everything else still works and the upscaler
+// selection falls back to the built-in resolve.
+
+// DLSS needs no static library and no link step - see dlss_loader.h for why
+// the SDK's own archive is unusable here and why that turns out not to matter.
+// The flag exists only so the NGX headers are optional at build time.
+
+// Streamline, driven from here because this is where the device, the swapchain
+// and every resource it needs to be told about actually live. The shim next to
+// X-Plane.exe only starts it.
+
+// ------------------------------------------------- scene depth discovery
+
+static bool isDepthFormat(VkFormat f)
+{
+    switch (f) {
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static const char *formatName(VkFormat f)
+{
+    switch (f) {
+        case VK_FORMAT_D16_UNORM:           return "D16_UNORM";
+        case VK_FORMAT_X8_D24_UNORM_PACK32: return "X8_D24_UNORM_PACK32";
+        case VK_FORMAT_D32_SFLOAT:          return "D32_SFLOAT";
+        case VK_FORMAT_D16_UNORM_S8_UINT:   return "D16_UNORM_S8_UINT";
+        case VK_FORMAT_D24_UNORM_S8_UINT:   return "D24_UNORM_S8_UINT";
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:  return "D32_SFLOAT_S8_UINT";
+
+        // Colour formats. The table used to hold depth only, so the scene
+        // colour target printed as "?" - which hid the single most important
+        // fact about it, namely whether it is an HDR float format or an 8-bit
+        // one that has already been tonemapped.
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return "R16G16B16A16_SFLOAT";
+        case VK_FORMAT_R32G32B32A32_SFLOAT: return "R32G32B32A32_SFLOAT";
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "A2B10G10R10_UNORM";
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32:  return "B10G11R11_UFLOAT";
+        case VK_FORMAT_R8G8B8A8_UNORM:      return "R8G8B8A8_UNORM";
+        case VK_FORMAT_R8G8B8A8_SRGB:       return "R8G8B8A8_SRGB";
+        case VK_FORMAT_B8G8R8A8_UNORM:      return "B8G8R8A8_UNORM";
+        case VK_FORMAT_B8G8R8A8_SRGB:       return "B8G8R8A8_SRGB";
+        default:                            return "?";
+    }
+}
+
+// The 3D scene's COLOUR target - what the resolve reads and writes.
+//
+// Found the same way the depth image is: from the last full-viewport pass that
+// carries depth. The 3D scene has a depth attachment, the 2D overlays do not,
+// so the last depth-bearing pass is the last one drawing world geometry, and
+// its colour attachment is the image the resolve has to operate on.
+//
+// The usage flags are the thing to watch. Reading it needs SAMPLED_BIT and
+// writing needs STORAGE_BIT, and an application has no reason to set either on
+// an image it only ever renders into. Depth had exactly this problem, and it
+// was only caught because the flags were being recorded. They can only be read
+// at creation time, so every colour target is captured and matched to the frame
+// later.
+struct ColorTarget {
+    VkImage        image  = VK_NULL_HANDLE;
+    VkFormat       format = VK_FORMAT_UNDEFINED;
+    uint32_t       w = 0, h = 0;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    VkImageUsageFlags usage = 0;
+    VkImageLayout  layout = VK_IMAGE_LAYOUT_UNDEFINED;
+};
+static std::map<VkImage, ColorTarget> g_colorImages;   // every colour image made
+static ColorTarget g_sceneColor;                       // the 3D one, this frame
+static bool        g_sceneColorReported = false;
+static uint32_t    g_sceneResolveMode   = 0;
+static VkImage     g_sceneResolveImage  = VK_NULL_HANDLE;
+static std::vector<VkImage> g_hdrTargets;    // distinct HDR scene targets seen
+static VkImage     g_sceneColorLast     = VK_NULL_HANDLE;
+static uint32_t    g_sceneColorStable   = 0;
+static bool        g_resInitTried       = false;
+
+struct DepthCandidate {
+    VkImage           image;
+    VkFormat          format;
+    uint32_t          w, h;
+    VkSampleCountFlagBits samples;
+    VkImageUsageFlags usage;
+    bool              sampled;    // usage has SAMPLED_BIT
+};
+
+static std::vector<DepthCandidate> g_depthCandidates;
+
+// imageView -> image. Render passes reference depth by VIEW, but everything we
+// need (format, extent, sample count) is recorded per IMAGE, so the two have to
+// be tied together to answer "which image does the scene actually render into".
+static std::map<VkImageView, VkImage> g_viewToImage;
+
+// commandBuffer -> device. Command recording functions carry no device handle,
+// but the dispatch table is per-device, so the two have to be tied together to
+// record anything from inside a Cmd* hook.
+static std::map<VkCommandBuffer, VkDevice> g_cbToDevice;
+
+// Index of the last full-viewport depth pass seen in the PREVIOUS frame.
+//
+// The dispatch has to go after the final depth write, but a frame's structure
+// is only known once it has finished. X-Plane's frame is stable (31-33 passes,
+// depth ending at 29), so the previous frame's index is a sound predictor, and
+// being wrong for one frame after a structural change costs one stale velocity
+// buffer rather than anything visible.
+static int g_lastDepthPassIdx     = -1;
+static int g_prevLastDepthPassIdx = -1;
+
+// Set by the present hook when the next recorded frame should also copy the
+// velocity image back for a disk dump.
+static bool g_velWantDump = false;
+
+// Snapshot and gating flags, published by the present hook for the NEXT frame's
+// recording. Recording happens mid-frame, before present, so it has to work
+// from the state the previous present established.
+static Snapshot g_velSnap;
+static bool     g_velArmed  = false;
+static bool     g_velInjectedThisFrame = false;
+static int      dumpEvery = 0;   // frames between dumps; 0 = off, set at runtime
+
+// Per-command-buffer record of whether it rendered into OUR depth image, and in
+// what layout.
+//
+// This replaces the pass-index approach, which could not work: g_passesThisFrame
+// is a plain global incremented from vkCmdBeginRendering, and X-Plane records
+// command buffers on several threads at once. The counter was racy, so "is this
+// the last depth pass" was never a meaningful question to ask of it. The
+// diagnostic showed it stuck at 24 while waiting for 29.
+//
+// Keying on the command buffer sidesteps ordering entirely: each buffer knows
+// what it contains, regardless of which thread built it.
+struct CbDepthUse {
+    bool          used = false;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    int           depthPasses = 0;   // non-clearing passes seen in this buffer
+};
+static std::map<VkCommandBuffer, CbDepthUse> g_cbDepthUse;
+static bool     g_velStable = false;
+static PFN_vkCmdEndRendering g_nextCmdEndRendering = nullptr;
+
+// The depth image bound by the LAST depth-bearing pass of the previous frame.
+//
+// This is the authoritative answer to which buffer holds scene depth, and it
+// replaces scoring candidates by format and sample count. That heuristic picked
+// a plausible-looking 2560x1440 D32_SFLOAT image out of four at that size and
+// got it wrong: the sampled depth came back constant, every reconstructed point
+// landed at the 16.5 mm near plane, and the velocity field came out ~1000 px
+// per frame. The frame tells us directly - there is no need to guess.
+static VkImage g_lastDepthPassImage = VK_NULL_HANDLE;
+static VkImage g_frameDepthImage    = VK_NULL_HANDLE;
+
+// Every full-viewport depth image the frame binds, in binding order, plus the
+// ones a content check has already disproved.
+//
+// The selection heuristic has now been wrong twice - once scoring by format,
+// once taking the last depth pass - and each wrong answer cost a rebuild and
+// another flight, because the disproof only arrived after the session ended.
+// The list plus the reject set let the layer try the next candidate a few
+// hundred frames later instead, so one flight converges on the right image
+// rather than eliminating a single hypothesis.
+// g_frameDepthList is the frame being recorded and is cleared every present.
+// g_frameDepthListDone is the last COMPLETED frame, which is what selection
+// reads.
+//
+// Two lists, because recording runs ahead of and across presents: choosing from
+// the live list would mean choosing from a half-built one, whose last entry is
+// wherever recording happens to have reached rather than the frame's final
+// depth pass. The first version had one list and never cleared it, so it
+// accumulated every distinct depth image of the session and selection settled
+// on an image no pass was still binding - the marking test never matched it,
+// nothing was ever injected, and the log showed a ready pipeline doing nothing.
+static std::vector<VkImage> g_frameDepthList;
+static std::vector<VkImage> g_frameDepthListDone;
+static std::vector<VkImage> g_depthRejected;
+static bool     g_depthProven   = false;   // a content check said yes
+static uint64_t g_depthProbeAt  = 0;       // frame to run the next probe on
+
+// Did a full-viewport depth pass actually run THIS frame, and in what layout?
+//
+// This gates the whole velocity dispatch, and it exists because of a real
+// symptom: a white flash on aircraft load. During a load X-Plane stops
+// rendering the 3D scene, so no depth pass runs - but the captured layout from
+// before the load was still sitting there, and the pass went on barriering the
+// depth image with an oldLayout it was no longer in. Declaring the wrong
+// oldLayout is undefined behaviour, and a driver may legitimately decompress or
+// clear the image, which is exactly what a flash looks like.
+//
+// So: never transition an image using a layout we did not observe this frame.
+static bool          g_depthFreshThisFrame = false;
+static VkImageLayout g_depthLayoutThisFrame = VK_IMAGE_LAYOUT_UNDEFINED;
+static VkImage  g_sceneDepth  = VK_NULL_HANDLE;
+static uint32_t g_sceneDepthW = 0, g_sceneDepthH = 0;
+static bool     g_depthReported = false;
+
+// The whole point of stage 1. Record every depth image and, critically, whether
+// it can be sampled - because if X-Plane does not already set SAMPLED_BIT we
+// cannot read depth from a compute shader without modifying image creation, and
+// that changes the risk profile of the entire project.
+static void noteDepthImage(const VkImageCreateInfo *ci, VkImage img)
+{
+    DepthCandidate c;
+    c.image   = img;
+    c.format  = ci->format;
+    c.w       = ci->extent.width;
+    c.h       = ci->extent.height;
+    c.samples = ci->samples;
+    c.usage   = ci->usage;
+    c.sampled = (ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
+
+    std::lock_guard<std::mutex> g(g_lock);
+    if (g_depthCandidates.size() < 64)
+        g_depthCandidates.push_back(c);
+
+    trace("DEPTH image %ux%u fmt=%s samples=%u usage=0x%x sampled=%s",
+          c.w, c.h, formatName(c.format), (unsigned)c.samples, c.usage,
+          c.sampled ? "YES" : "NO <-- cannot be read by compute as-is");
+}
+
+// Selection is deliberately NOT done at creation time.
+//
+// The first version was, and it never fired: X-Plane creates its depth images
+// during startup, long before the plugin has published the shared block, so the
+// viewport to match against was still unknown and every candidate was skipped.
+// The trace showed "depth=MISSING" for 2760 frames with the right image sitting
+// in the candidate list the whole time.
+//
+// So candidates are recorded as they appear and the choice is made later, from
+// present, once the viewport is actually known.
+static void selectSceneDepth()
+{
+    if (g_sceneDepth != VK_NULL_HANDLE) return;
+
+    // Take the image the frame ACTUALLY rendered depth into, captured from the
+    // last full-viewport depth pass. Not a scored guess among candidates that
+    // happen to share a resolution.
+    //
+    // The scoring version picked a 2560x1440 D32_SFLOAT image that looked ideal
+    // on paper - sampleable, single-sampled, no stencil - out of four at that
+    // size. The depth it returned was constant, so every pixel reconstructed to
+    // the 16.5 mm near plane and the velocity field came out around a thousand
+    // pixels per frame. Nothing about the format told us it was the wrong one;
+    // only the frame could.
+    // Walk backwards through the depth images this frame bound, skipping any
+    // that a content check has already disproved. With nothing rejected this is
+    // exactly the old behaviour - the last full-viewport depth pass.
+    VkImage chosen = VK_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        for (size_t i = g_frameDepthListDone.size(); i-- > 0; ) {
+            bool bad = false;
+            for (size_t k = 0; k < g_depthRejected.size(); ++k)
+                if (g_depthRejected[k] == g_frameDepthListDone[i]) { bad = true; break; }
+            if (!bad) { chosen = g_frameDepthListDone[i]; break; }
+        }
+    }
+    if (chosen == VK_NULL_HANDLE) chosen = g_frameDepthImage;
+    if (chosen == VK_NULL_HANDLE) return;
+
+    std::lock_guard<std::mutex> g(g_lock);
+    const DepthCandidate *c = nullptr;
+    for (size_t i = 0; i < g_depthCandidates.size(); ++i)
+        if (g_depthCandidates[i].image == chosen) { c = &g_depthCandidates[i]; break; }
+
+    if (!c) {
+        static bool warned = false;
+        if (!warned) { warned = true; trace("DEPTH: bound image is not a tracked candidate"); }
+        return;
+    }
+    if (!c->sampled) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            trace("DEPTH: the scene depth image (%ux%u fmt=%s usage=0x%x) has no SAMPLED_BIT. "
+                  "Compute cannot read it as-is.", c->w, c->h, formatName(c->format), c->usage);
+        }
+        return;
+    }
+
+    g_sceneDepth  = c->image;
+    g_sceneDepthW = c->w;
+    g_sceneDepthH = c->h;
+    trace("DEPTH: selected FROM THE FRAME - %ux%u fmt=%s samples=%u usage=0x%x",
+          c->w, c->h, formatName(c->format), (unsigned)c->samples, c->usage);
+
+    // Print what the choice was made FROM, not only what it landed on. Without
+    // this the log says a depth image was selected and gives no way to tell
+    // whether there was one candidate or six, which is the difference between
+    // "the pick is wrong" and "there is nothing else to pick".
+    {
+        char line[512];
+        int len = snprintf(line, sizeof(line), "DEPTH: %zu candidate(s) this frame, last bound last:",
+                           g_frameDepthListDone.size());
+        for (size_t i = 0; i < g_frameDepthListDone.size() && len < (int)sizeof(line) - 40; ++i) {
+            const char *mark = (g_frameDepthListDone[i] == c->image) ? "<==" : "";
+            bool rej = false;
+            for (size_t k = 0; k < g_depthRejected.size(); ++k)
+                if (g_depthRejected[k] == g_frameDepthListDone[i]) { rej = true; break; }
+            len += snprintf(line + len, sizeof(line) - len, " [%zu]%p%s%s",
+                            i, (void*)g_frameDepthListDone[i], rej ? "REJ" : "", mark);
+        }
+        trace("%s", line);
+    }
+    if (c->samples != VK_SAMPLE_COUNT_1_BIT)
+        trace("DEPTH: WARNING multisampled - needs a resolve before sampling");
+}
+
+// ------------------------------------------------------------- hooks
+
+// =====================================================================
+// CUSTOM TEXTURE PAGER
+//
+// X-Plane's pager decides a global "target scale" and applies it to
+// everything. It cannot be reasoned with from outside: three separate budget
+// levers were raised with no effect, and the one control that did work
+// (max_overdrive) improved residency without stopping the resolution
+// oscillation.
+//
+// This replaces the mechanism rather than arguing with it. The only lever a
+// layer genuinely owns is IMAGE CREATION: vkCreateImage passes through us, so
+// we can decide each texture's resolution before the application ever uploads
+// to it. Dropping the top mip of a 2048x2048 texture makes it 1024x1024 and
+// saves three quarters of its memory, permanently and per-texture, rather than
+// as a global slider.
+//
+// WHY THIS WORKS WHERE EVICTION CANNOT. A layer cannot free X-Plane's images -
+// it does not own them and the application still holds the handles. It cannot
+// know which ortho tile is far away either. But it does not need to know any of
+// that to decide that a 4096x4096 texture can be 2048x2048.
+//
+// THE UPLOAD MUST BE REMAPPED TO MATCH. The application still has full-size
+// pixel data and will copy it in per-mip regions. Those regions have to be
+// filtered - the dropped levels skipped - and the survivors renumbered, or the
+// copy writes mip 0's data into a smaller mip 0 and the driver either faults or
+// produces garbage. That remapping is the part that makes this honest rather
+// than a trick.
+// THE POLICY MAP IS KEYED ON A HANDLE, AND HANDLES ARE REUSED.
+//
+// This is what corrupted the ground textures after a long session, and it is
+// worth stating plainly because nothing about it looks like a lifetime bug.
+//
+// The map recorded "this image lost a mip" and was never erased on destroy.
+// Vulkan is free to hand back a previously freed VkImage value for a new image,
+// and X-Plane streams scenery tiles in and out continuously, so eventually a
+// brand new full-size texture is created at the address of a dead shrunken one.
+// It inherits dropMips from a texture that no longer exists.
+//
+// The consequence is not a crash, which is why it survived twelve hours and
+// then showed up as scenery. The new image is full size with a full mip chain -
+// only the UPLOAD is remapped, so the region targeting mip 0 is discarded as
+// "a level that no longer exists". Mip 0 is then never written, and sampling it
+// returns whatever was in that memory: hard-edged blotches of unrelated
+// content across runway and apron surfaces, worst where streaming churn is
+// highest, and absent on the aircraft, which is loaded once and stays.
+//
+// So the entry must die with the image. Every handle-keyed map in a layer has
+// this hazard; this one had teeth because a stale hit silently deletes data.
+struct TexPolicy {
+    uint32_t dropMips = 0;      // levels removed from the top
+    uint32_t origW = 0, origH = 0;
+};
+static std::map<VkImage, TexPolicy> g_texPolicy;
+static uint32_t g_pagerDropAbove = 0;     // drop a mip above this size; 0 = off
+
+// Textures left alone because X-Plane had already scaled them to a
+// non-power-of-two size. Counted rather than silent: if this is large, the two
+// pagers are fighting over the same textures and ours is doing nothing.
+static uint64_t g_pagerSkippedScaled = 0;
+static uint32_t g_pagerMaxDrop = 1;       // levels a single texture may lose
+
+// ---- AUTOGEN, TAKEN FURTHER DOWN THAN THE AIRCRAFT.
+//
+// The pager has one threshold for everything, and that is why it has always
+// been a compromise: the setting that would shrink scenery usefully is the same
+// setting that turns instrument faces to mush. A layer sees VkImage handles and
+// dimensions, never filenames, so "only the scenery" cannot be asked directly.
+//
+// TIMING answers it well enough, and the pager already relies on this to bucket
+// its own statistics: the aircraft is loaded during the loading screen, while
+// scenery streams for as long as the flight runs. An image created while the
+// share block is valid - that is, mid-flight - is streaming scenery, which on
+// this sim means autogen buildings, trees and ortho tiles. The cockpit is not
+// in that set, because it was resident before the flight started.
+//
+// So flight-time images get their own, harder target and their own drop limit,
+// and load-time images keep the conservative behaviour that protects the
+// aircraft. 0 disables it and restores a single policy for everything.
+static uint32_t g_pagerAutogenTo = 0;     // target longest side for streamed textures
+static uint64_t g_pagerSaved = 0;         // bytes not allocated
+static uint64_t g_pagerImages = 0;
+
+// WHOSE TEXTURES ARE WE SHRINKING - the aircraft's, or the scenery's?
+//
+// A layer sees VkImage handles and dimensions. It has no filenames and no
+// object names, so a 4096 livery sheet and a 4096 ortho tile are the same
+// thing to it, and "how much of the saving came out of the aircraft" cannot be
+// answered from what is logged today.
+//
+// The one discriminator available is TIMING. The aircraft is loaded during the
+// loading screen, while scenery streams continuously for as long as the flight
+// runs - and the plugin only marks the shared block valid once a flight is
+// actually running. So an image created while the share is invalid came from
+// load (aircraft plus the initial scenery), and one created after came from
+// streaming (scenery only).
+//
+// That is not a clean aircraft/scenery split and it is not presented as one:
+// the load bucket contains initial scenery too. What it does answer is the
+// question that decides policy - whether excluding load-time textures would
+// cost a couple of hundred megabytes or most of the three gigabytes. Measuring
+// that is cheaper than another round of arguing about it.
+struct PagerBucket { uint64_t images = 0; uint64_t saved = 0; uint64_t at4096 = 0; };
+static PagerBucket g_pagerLoad, g_pagerFlight;
+
+// How many top levels to remove for an image of this size.
+//
+// Deliberately conservative and size-based: the biggest textures cost the most
+// and lose the least perceptually, while small UI and instrument textures are
+// left completely alone - those are the ones a global scale slider ruins first,
+// and they are cheap to keep.
+static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
+{
+    if (!g_pagerDropAbove) return 0;
+    if (!pagerShouldEngage()) return 0;
+    if (!(ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return 0;
+    if (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) return 0;
+    if (ci->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) return 0;
+    if (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) return 0;   // written by shaders
+    if (ci->imageType != VK_IMAGE_TYPE_2D) return 0;
+    if (ci->mipLevels < 2) return 0;                        // nothing to drop
+    if (ci->arrayLayers != 1) return 0;                     // keep it simple
+
+    // ---- HANDS OFF ANYTHING X-PLANE HAS ALREADY SCALED.
+    //
+    // Two pagers, one texture, and they cannot both have it.
+    //
+    // Ours drops top mip levels and renumbers the uploads, which is only valid
+    // when every level is exactly half the last - true of a texture straight
+    // off disk. X-Plane's own pager instead multiplies the base size by a
+    // continuous ratio: released from its floor it chose 0.855262, so a 4096
+    // texture arrives here at 3502.
+    //
+    // 3502 is not a power of two and, worse for a block-compressed format, not
+    // a multiple of 4. BC stores 4x4 blocks, so the level sizes stop being
+    // clean halves and the copy regions X-Plane submits no longer describe the
+    // smaller image we made. That is a buffer overrun dressed as a texture
+    // setting, and it took the sim down on the first view change after the
+    // floor was released.
+    //
+    // So: if the dimensions are not both powers of two, X-Plane has already
+    // taken its share and we take none. It keeps whatever ratio it computed and
+    // our mip drop simply does not apply to that texture - which is the correct
+    // answer rather than a compromise, because two independent reductions
+    // multiplied together were never the intent.
+    if ((ci->extent.width  & (ci->extent.width  - 1)) != 0 ||
+        (ci->extent.height & (ci->extent.height - 1)) != 0) {
+        ++g_pagerSkippedScaled;
+        return 0;
+    }
+
+    uint32_t big = ci->extent.width > ci->extent.height
+                 ? ci->extent.width : ci->extent.height;
+    if (big <= g_pagerDropAbove) return 0;
+
+    // ONE level by default, not two, and the difference is the aircraft.
+    //
+    // At two levels a 4096 texture goes to 1024, and 4096 is where livery
+    // sheets live - 90 of them were shrunk in a two-minute session against 83
+    // resident, so it is essentially all of them. A fuselage at 1024 is
+    // visibly soft; at 2048 it is not.
+    //
+    // The measured cost of the cap is about 360 MB - 2438 MB saved at two
+    // levels against 2077 MB at one. That was worth paying once the pager
+    // freeze started holding scale 2.0 with 1.12 GB of headroom: the job
+    // stopped being "save as much as possible" and became "save enough", and
+    // the second level was buying margin we no longer need at a price paid
+    // entirely in the things you look at closest.
+    // Streamed scenery gets the harder target; anything loaded before the
+    // flight began - the aircraft, the cockpit - keeps the gentle one.
+    bool streamed = (g_share && g_share->valid);
+    if (streamed && g_pagerAutogenTo && big > g_pagerAutogenTo) {
+        uint32_t drop = 0;
+        while (big > g_pagerAutogenTo && (ci->mipLevels - drop) > 1) {
+            big >>= 1;
+            ++drop;
+        }
+        return drop;
+    }
+
+    uint32_t drop = 0;
+    while (big > g_pagerDropAbove && drop < g_pagerMaxDrop &&
+           (ci->mipLevels - drop) > 1) {
+        big >>= 1;
+        ++drop;
+    }
+    return drop;
+}
+
+// The other half of the pager, and the half that makes it correct.
+//
+// The application still holds full-size pixel data and copies it in per-mip
+// regions. For a shrunk image those regions no longer describe it: region 0
+// targets a mip that no longer exists, and every other region is numbered one
+// or two levels too high.
+//
+// So regions for dropped levels are discarded and the rest renumbered. The
+// buffer offsets are untouched - the data for mip 1 is still at mip 1's offset
+// in the staging buffer, it simply becomes the new mip 0.
+//
+// Getting this wrong does not produce a subtle artefact. Copying mip 0's data
+// into a quarter-sized mip 0 overruns the destination, and the driver either
+// faults or writes over unrelated memory.
+// Shrinking an image is not a local change.
+//
+// Dropping mip levels breaks every later call that names one: a view asking for
+// levelCount = 12 on an image that now has 11, a barrier spanning levels that
+// no longer exist, a blit generating mips into nothing. Each is undefined
+// behaviour and in practice an immediate crash - which is what happened,
+// several seconds after the shrink itself worked perfectly.
+//
+// So the pager has to fix up every entry point that references a level, not
+// just the upload. This is the real cost of the approach, and it is the reason
+// doing the shrink later rather than at load would not have helped: the same
+// calls happen whenever a tile streams in.
+static uint32_t pagerDropFor(VkImage img)
+{
+    std::lock_guard<std::mutex> g(g_lock);
+    std::map<VkImage, TexPolicy>::iterator it = g_texPolicy.find(img);
+    return (it == g_texPolicy.end()) ? 0 : it->second.dropMips;
+}
+
+// Clamp a subresource range to the levels the image actually has now.
+static void pagerClampRange(VkImage img, VkImageSubresourceRange *r)
+{
+    uint32_t drop = pagerDropFor(img);
+    if (!drop || !r) return;
+
+    // baseMipLevel counts from the ORIGINAL top, so it shifts down by the
+    // number of levels removed - and anything that pointed at a removed level
+    // now points at the new level 0.
+    r->baseMipLevel = (r->baseMipLevel > drop) ? (r->baseMipLevel - drop) : 0;
+
+    if (r->levelCount != VK_REMAINING_MIP_LEVELS) {
+        r->levelCount = (r->levelCount > drop) ? (r->levelCount - drop) : 1;
+        if (r->levelCount < 1) r->levelCount = 1;
+    }
+}
+
+// ---- WHAT LAYOUT EACH IMAGE IS ACTUALLY IN, RECORDED FROM THE SIM'S BARRIERS.
+//
+// Reading an image in a layout it is not in does not fail and does not warn.
+// It tells the driver the contents need no decompression, so the compressed
+// representation is read as if it were colour - which is the striping. It is
+// the same wrong answer whether the guess is COLOR_ATTACHMENT, TRANSFER_SRC or
+// anything else, so no better constant exists to pick.
+//
+// Every transition in the sim passes through the two hooks below. Recording
+// them makes the layout a fact rather than a guess. Record order is execute
+// order within a queue, so the value read while recording our delivery is the
+// layout the image will be in when the delivery runs.
+static std::map<VkImage, VkImageLayout> g_imgLayout;
+static std::mutex                       g_imgLayoutLock;
+
+// Only the images anyone asks about. This fired on EVERY image barrier the sim
+// issues - a lock and a map insert per barrier, thousands per frame - and cost
+// more than twenty frames a second. The table is a diagnostic for two specific
+// images; watching the other thousands was pure overhead.
+//
+// The two globals are read without the lock on purpose: a stale handle here
+// costs one missed sample in a debug table, and taking g_lock on this path is
+// exactly what made it expensive.
+static VkImage g_layoutWatchScene = VK_NULL_HANDLE;
+static VkImage g_layoutWatchOut   = VK_NULL_HANDLE;
+
+static void noteLayout(VkImage img, VkImageLayout l)
+{
+    if (img == VK_NULL_HANDLE || l == VK_IMAGE_LAYOUT_UNDEFINED) return;
+    // Compared against the live globals directly. The previous version needed
+    // "watch" handles armed first, and they were armed inside the block that
+    // logs once - so the table was always empty at the only moment anything
+    // read it, and printed UNKNOWN regardless of what the sim had recorded.
+    // Nothing to arm, nothing to get out of order.
+    if (img != g_sceneColor.image) return;
+    std::lock_guard<std::mutex> g(g_imgLayoutLock);
+    g_imgLayout[img] = l;
+}
+
+static bool knownLayout(VkImage img, VkImageLayout &out)
+{
+    std::lock_guard<std::mutex> g(g_imgLayoutLock);
+    std::map<VkImage, VkImageLayout>::iterator it = g_imgLayout.find(img);
+    if (it == g_imgLayout.end()) return false;
+    out = it->second;
+    return true;
+}
+
+static PFN_vkCmdPipelineBarrier g_nextCmdPipelineBarrier2 = nullptr;
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdPipelineBarrier(
+    VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+    VkDependencyFlags flags,
+    uint32_t mCount, const VkMemoryBarrier *mem,
+    uint32_t bCount, const VkBufferMemoryBarrier *buf,
+    uint32_t iCount, const VkImageMemoryBarrier *img)
+{
+    if (!g_nextCmdPipelineBarrier2) return;
+
+    // Recorded before any early return - the tracker must see every barrier,
+    // not only the ones the mip clamp happens to rewrite.
+    for (uint32_t i = 0; i < iCount && img; ++i)
+        noteLayout(img[i].image, img[i].newLayout);
+
+    if (!g_pagerDropAbove || iCount == 0 || !img) {
+        g_nextCmdPipelineBarrier2(cb, src, dst, flags, mCount, mem, bCount, buf,
+                                  iCount, img);
+        return;
+    }
+
+    std::vector<VkImageMemoryBarrier> fixed(img, img + iCount);
+    for (uint32_t i = 0; i < iCount; ++i)
+        pagerClampRange(fixed[i].image, &fixed[i].subresourceRange);
+
+    g_nextCmdPipelineBarrier2(cb, src, dst, flags, mCount, mem, bCount, buf,
+                              iCount, fixed.data());
+}
+
+// EVERY entry point that names a mip level, handled together.
+//
+// Shrinking an image invalidates all of them at once, and each is a crash
+// rather than an artefact - so discovering the list one launch at a time is the
+// wrong way to find it. X-Plane's extension list includes
+// VK_KHR_synchronization2 and VK_KHR_copy_commands2, so the "2" variants are
+// not hypothetical: they are most likely the ones actually in use, and hooking
+// only the originals is why an earlier attempt still crashed with the barrier
+// clamp supposedly in place.
+static PFN_vkCmdPipelineBarrier2 g_nextCmdPipelineBarrier2KHR = nullptr;
+static PFN_vkCmdBlitImage        g_nextCmdBlitImage = nullptr;
+static PFN_vkCmdCopyImage        g_nextCmdCopyImage = nullptr;
+static PFN_vkCmdClearColorImage  g_nextCmdClearColorImage = nullptr;
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdPipelineBarrier2(
+    VkCommandBuffer cb, const VkDependencyInfo *info)
+{
+    if (!g_nextCmdPipelineBarrier2KHR) return;
+
+    // X-Plane enables VK_KHR_synchronization2, so this is the variant actually
+    // carrying most transitions. Tracking only the original would have left the
+    // table describing an image the sim had since moved.
+    if (info)
+        for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i)
+            noteLayout(info->pImageMemoryBarriers[i].image,
+                       info->pImageMemoryBarriers[i].newLayout);
+
+    if (!g_pagerDropAbove || !info || !info->imageMemoryBarrierCount) {
+        g_nextCmdPipelineBarrier2KHR(cb, info);
+        return;
+    }
+    std::vector<VkImageMemoryBarrier2> fixed(
+        info->pImageMemoryBarriers,
+        info->pImageMemoryBarriers + info->imageMemoryBarrierCount);
+    for (size_t i = 0; i < fixed.size(); ++i)
+        pagerClampRange(fixed[i].image, &fixed[i].subresourceRange);
+
+    VkDependencyInfo info2 = *info;
+    info2.pImageMemoryBarriers = fixed.data();
+    g_nextCmdPipelineBarrier2KHR(cb, &info2);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdBlitImage(
+    VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+    VkImageLayout dl, uint32_t count, const VkImageBlit *regions, VkFilter filter)
+{
+    if (!g_nextCmdBlitImage) return;
+    uint32_t ds = pagerDropFor(src), dd = pagerDropFor(dst);
+    if (!ds && !dd) {
+        g_nextCmdBlitImage(cb, src, sl, dst, dl, count, regions, filter);
+        return;
+    }
+
+    // Mip generation blits level N into level N+1. Where the source level has
+    // been removed there is nothing to rebase onto, and the destination it
+    // would have filled is a level we removed too, so the blit is dropped.
+    std::vector<VkImageBlit> kept;
+    for (uint32_t i = 0; i < count; ++i) {
+        VkImageBlit b = regions[i];
+        if (b.srcSubresource.mipLevel < ds) continue;
+        if (b.dstSubresource.mipLevel < dd) continue;
+        b.srcSubresource.mipLevel -= ds;
+        b.dstSubresource.mipLevel -= dd;
+        kept.push_back(b);
+    }
+    if (!kept.empty())
+        g_nextCmdBlitImage(cb, src, sl, dst, dl, (uint32_t)kept.size(),
+                           kept.data(), filter);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdCopyImage(
+    VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+    VkImageLayout dl, uint32_t count, const VkImageCopy *regions)
+{
+    if (!g_nextCmdCopyImage) return;
+    uint32_t ds = pagerDropFor(src), dd = pagerDropFor(dst);
+    if (!ds && !dd) {
+        g_nextCmdCopyImage(cb, src, sl, dst, dl, count, regions);
+        return;
+    }
+    std::vector<VkImageCopy> kept;
+    for (uint32_t i = 0; i < count; ++i) {
+        VkImageCopy c = regions[i];
+        if (c.srcSubresource.mipLevel < ds) continue;
+        if (c.dstSubresource.mipLevel < dd) continue;
+        c.srcSubresource.mipLevel -= ds;
+        c.dstSubresource.mipLevel -= dd;
+        kept.push_back(c);
+    }
+    if (!kept.empty())
+        g_nextCmdCopyImage(cb, src, sl, dst, dl, (uint32_t)kept.size(), kept.data());
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdClearColorImage(
+    VkCommandBuffer cb, VkImage img, VkImageLayout layout,
+    const VkClearColorValue *colour, uint32_t count,
+    const VkImageSubresourceRange *ranges)
+{
+    if (!g_nextCmdClearColorImage) return;
+    if (!pagerDropFor(img) || !ranges) {
+        g_nextCmdClearColorImage(cb, img, layout, colour, count, ranges);
+        return;
+    }
+    std::vector<VkImageSubresourceRange> fixed(ranges, ranges + count);
+    for (size_t i = 0; i < fixed.size(); ++i) pagerClampRange(img, &fixed[i]);
+    g_nextCmdClearColorImage(cb, img, layout, colour, count, fixed.data());
+}
+
+static PFN_vkCmdCopyBufferToImage g_nextCmdCopyBufferToImage = nullptr;
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdCopyBufferToImage(
+    VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImageLayout layout,
+    uint32_t count, const VkBufferImageCopy *regions)
+{
+    if (!g_nextCmdCopyBufferToImage) return;
+
+    uint32_t drop = 0, origW = 0, origH = 0;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkImage, TexPolicy>::iterator it = g_texPolicy.find(dst);
+        if (it != g_texPolicy.end()) {
+            drop  = it->second.dropMips;
+            origW = it->second.origW;
+            origH = it->second.origH;
+        }
+    }
+    if (!drop || !regions || !count) {
+        g_nextCmdCopyBufferToImage(cb, src, dst, layout, count, regions);
+        return;
+    }
+
+    // TRIPWIRE for a stale policy.
+    //
+    // The application still believes this texture is its original size, so its
+    // region for mip 0 must describe exactly that. If it describes something
+    // else, the policy belongs to a different image that happened to occupy
+    // this handle earlier, and remapping would silently discard a real mip 0.
+    //
+    // That is precisely the failure that corrupted scenery, and the reason it
+    // took twelve hours and a screenshot to notice is that nothing said a word.
+    // Erasing the policy on destroy should make this unreachable; if it ever
+    // fires, that assumption is wrong and this is how we find out.
+    for (uint32_t i = 0; i < count; ++i) {
+        if (regions[i].imageSubresource.mipLevel != 0) continue;
+        if (regions[i].imageExtent.width == origW &&
+            regions[i].imageExtent.height == origH) break;
+        static uint64_t warned = 0;
+        if (++warned <= 10)
+            trace("PAGER: WARNING stale policy on image %p - upload mip 0 is "
+                  "%ux%u but policy recorded %ux%u. Handle reuse; not remapping.",
+                  (void*)dst, regions[i].imageExtent.width,
+                  regions[i].imageExtent.height, origW, origH);
+        g_nextCmdCopyBufferToImage(cb, src, dst, layout, count, regions);
+        return;
+    }
+
+    std::vector<VkBufferImageCopy> kept;
+    kept.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t lvl = regions[i].imageSubresource.mipLevel;
+        if (lvl < drop) continue;                 // this level no longer exists
+        VkBufferImageCopy r = regions[i];
+        r.imageSubresource.mipLevel = lvl - drop; // renumber what survives
+        kept.push_back(r);
+    }
+
+    static uint64_t remapped = 0;
+    if (++remapped <= 3)
+        trace("PAGER: upload remapped - %u regions in, %zu kept (dropped %u levels)",
+              count, kept.size(), drop);
+
+    if (!kept.empty())
+        g_nextCmdCopyBufferToImage(cb, src, dst, layout,
+                                   (uint32_t)kept.size(), kept.data());
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
+    VkDevice device, const VkImageCreateInfo *ci,
+    const VkAllocationCallbacks *alloc, VkImage *out)
+{
+    PFN_vkCreateImage next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.createImage;
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+
+    // Opened BEFORE the pager decision, not after, because the decision is now
+    // recorded against whether a flight is running - see the load/flight split
+    // below. It is idempotent and latched, so calling it here costs nothing.
+    openShare();
+
+    // ---- custom pager: shrink the texture before it is ever created.
+    VkImageCreateInfo ci2 = *ci;
+    uint32_t drop = pagerDropLevels(ci);
+    if (drop) {
+        ci2.extent.width  = ci->extent.width  >> drop;
+        ci2.extent.height = ci->extent.height >> drop;
+        if (ci2.extent.width  < 1) ci2.extent.width  = 1;
+        if (ci2.extent.height < 1) ci2.extent.height = 1;
+        ci2.mipLevels = ci->mipLevels - drop;
+        if (ci2.mipLevels < 1) { ci2.mipLevels = 1; drop = 0; ci2 = *ci; }
+    }
+
+    // ---- MAKE X-PLANE'S UPSCALE OUTPUT BLITTABLE.
+    //
+    // Its FSR writes a storage image, and a storage image need not be a
+    // transfer destination - so even once identified, there would be no legal
+    // way to put our result into it. Usage can only be chosen at creation, so
+    // it is added here.
+    //
+    // Narrow on purpose: 2D, non-depth, storage, and at least 720p, which is
+    // every plausible upscale target and no thumbnail or lookup table. Adding
+    // TRANSFER_DST cannot change how the image behaves for its owner; it only
+    // widens what is permitted.
+    bool addedDst = false;
+    if (!isDepthFormat(ci->format) && ci->imageType == VK_IMAGE_TYPE_2D &&
+        ci->extent.depth == 1 &&
+        (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+        !(ci->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+        ci->extent.width >= 1280 && ci->extent.height >= 720) {
+        if (!drop) ci2 = *ci;
+        ci2.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        addedDst = true;
+    }
+
+    VkResult r = next(device, (drop || addedDst) ? &ci2 : ci, alloc, out);
+    if (r != VK_SUCCESS) return r;
+
+    if (addedDst) {
+        static uint64_t n = 0;
+        if (++n <= 6)
+            trace("IMAGE: added TRANSFER_DST to a %ux%u storage image (fmt=%d, "
+                  "usage 0x%x -> 0x%x) so our upscaled result can be written "
+                  "into it if this turns out to be X-Plane's FSR output",
+                  ci->extent.width, ci->extent.height, (int)ci->format,
+                  (unsigned)ci->usage, (unsigned)ci2.usage);
+    }
+
+    if (drop) {
+        // Remember the original dimensions: the upload remap needs to know how
+        // many levels were removed to renumber what is left.
+        TexPolicy p;
+        p.dropMips = drop;
+        p.origW = ci->extent.width;
+        p.origH = ci->extent.height;
+        std::lock_guard<std::mutex> g(g_lock);
+        g_texPolicy[*out] = p;
+
+        double before = (double)ci->extent.width * ci->extent.height;
+        double after  = (double)ci2.extent.width * ci2.extent.height;
+        uint64_t saved = (uint64_t)((before - after)
+                       * formatBytesPerPixel(ci->format) * 4.0 / 3.0);
+        g_pagerSaved += saved;
+        ++g_pagerImages;
+
+        // Attribute it to load or to streaming - see PagerBucket.
+        bool inFlight = (g_share && g_share->valid);
+        PagerBucket &bk = inFlight ? g_pagerFlight : g_pagerLoad;
+        ++bk.images;
+        bk.saved += saved;
+        if (ci->extent.width >= 4096 || ci->extent.height >= 4096) ++bk.at4096;
+        // Format and mip count are logged too. Without them a shrink line says
+        // nothing about WHICH texture was affected, and "2048x4096" alone was
+        // not enough to tell a runway atlas from a normal map when the ground
+        // came out wrong.
+        if (g_pagerImages <= 5 || g_pagerImages % 500 == 0)
+            trace("PAGER: %ux%u -> %ux%u (dropped %u mip%s) fmt=%d mips %u->%u, "
+                  "%llu images, %.1f MB saved",
+                  ci->extent.width, ci->extent.height,
+                  ci2.extent.width, ci2.extent.height, drop, drop == 1 ? "" : "s",
+                  (int)ci->format, ci->mipLevels, ci2.mipLevels,
+                  (unsigned long long)g_pagerImages, g_pagerSaved / 1048576.0);
+    }
+
+    openShare();
+
+    // ---- THE LEDGER. Every image, by what the driver says it actually costs.
+    //
+    // Asked of the image we really created, so a paged texture is recorded at
+    // its REDUCED size - the opposite of the census below, and deliberately so.
+    // The census answers "where should the threshold go", this answers "what is
+    // on the card right now", and those need the size before and the size after
+    // respectively.
+    {
+        PFN_vkGetImageMemoryRequirements getReq = nullptr;
+        if (g_ledgerOn) {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<void*, DeviceData>::iterator it =
+                g_devices.find(dispatchKey(device));
+            if (it != g_devices.end()) getReq = it->second.getImageMemReq;
+        }
+        if (getReq && *out != VK_NULL_HANDLE) {
+            VkMemoryRequirements req;
+            memset(&req, 0, sizeof(req));
+            getReq(device, *out, &req);
+            int cat = vramCatOfImage(ci, isDepthFormat(ci->format));
+            std::lock_guard<std::mutex> g(g_lock);
+            vramAdd(cat, req.size);
+            VramEntry e; e.cat = cat; e.bytes = req.size;
+            g_vramImg[*out] = e;
+        }
+    }
+
+    // Census every SAMPLED image - that is what "texture" means here, as
+    // opposed to render targets, which the pager does not control.
+    if ((ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        !(ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+        !isDepthFormat(ci->format)) {
+        // Mip chains converge on 4/3 of the base level.
+        double px = (double)ci->extent.width * ci->extent.height *
+                    ci->extent.depth * ci->arrayLayers;
+        double bytes = px * formatBytesPerPixel(ci->format);
+        if (ci->mipLevels > 1) bytes *= 4.0 / 3.0;
+
+        std::lock_guard<std::mutex> g(g_lock);
+        FmtStat &st = g_texCensus[(int)ci->format];
+        ++st.count;
+        st.bytes += (uint64_t)bytes;
+        g_texBytesTotal += (uint64_t)bytes;
+
+        // Remember the contribution so destroy can remove it exactly, rather
+        // than recomputing from a VkImageCreateInfo nobody has any more.
+        CensusEntry ce;
+        ce.format = (int)ci->format;
+        ce.bytes  = (uint64_t)bytes;
+        // Bucket by the size the APPLICATION asked for, not the size we gave
+        // it. The histogram is there to decide where to set the threshold, so
+        // it has to describe the textures as X-Plane would have made them -
+        // otherwise the pager's own effect hides the thing being measured.
+        ce.sizeBucket = sizeBucketOf(ci->extent.width, ci->extent.height);
+        g_sizeCount[ce.sizeBucket]++;
+        g_sizeBytes[ce.sizeBucket] += ce.bytes;
+        g_texCensusOf[*out] = ce;
+    }
+
+    if (isDepthFormat(ci->format) && ci->imageType == VK_IMAGE_TYPE_2D &&
+        ci->extent.depth == 1)
+        noteDepthImage(ci, *out);
+
+    // Colour render targets, recorded with the usage flags they were actually
+    // created with. Which one is the 3D scene cannot be known here - that comes
+    // from the frame - but the flags can only be read at creation, so they are
+    // captured for every candidate and matched up later.
+    // STORAGE IMAGES COUNT TOO, and that omission hid the thing we were hunting.
+    //
+    // X-Plane's FSR writes i_output_texture, which is a storage image and need
+    // never be a colour attachment - so it was invisible to this map, and the
+    // display-sized search turned up only attachments (usage=0x17, storage=no).
+    // We then dropped the real upscale and wrote our result into images that
+    // were not it.
+    if (!isDepthFormat(ci->format) && ci->imageType == VK_IMAGE_TYPE_2D &&
+        ci->extent.depth == 1 &&
+        ((ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+         (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT))) {
+        ColorTarget c;
+        c.image   = *out;
+        c.format  = ci->format;
+        c.w       = ci->extent.width;
+        c.h       = ci->extent.height;
+        c.samples = ci->samples;
+        c.usage   = ci->usage;
+        std::lock_guard<std::mutex> g(g_lock);
+        if (g_colorImages.size() < 256) g_colorImages[*out] = c;
+    }
+
+    return r;
+}
+
+// ---- WHICH QUEUE FAMILY A COMMAND BUFFER WILL RUN ON.
+//
+// X-Plane creates queues on families 0, 1 AND 2. Every image here is
+// SHARING_MODE_EXCLUSIVE, and an exclusive image written on one family and read
+// on another - without a release/acquire ownership transfer and a semaphore -
+// has UNDEFINED contents for the reader. A pipeline barrier cannot substitute:
+// barriers order work within a queue.
+//
+// That is the shape of this bug exactly. A clear into the presented image is
+// clean because a clear does not read - undefined prior contents do not matter
+// when you overwrite them. Every blit is corrupt because a blit reads. Every
+// parameter is legal, so validation says nothing, and widening the barriers
+// changed nothing because barriers were never the mechanism.
+//
+// A command buffer's family is fixed by the pool it came from, so this is known
+// while recording, long before anyone submits it.
+static std::map<VkCommandPool, uint32_t>   g_poolFamily;
+static std::map<VkCommandBuffer, uint32_t> g_cbFamily;
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateCommandPool(
+    VkDevice device, const VkCommandPoolCreateInfo *ci,
+    const VkAllocationCallbacks *alloc, VkCommandPool *out)
+{
+    PFN_vkCreateCommandPool next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.createCommandPool;
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = next(device, ci, alloc, out);
+    if (r == VK_SUCCESS && ci && out) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_poolFamily[*out] = ci->queueFamilyIndex;
+    }
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_AllocateCommandBuffers(
+    VkDevice device, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *out)
+{
+    PFN_vkAllocateCommandBuffers next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.allocateCommandBuffers;
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkResult r = next(device, ai, out);
+    if (r == VK_SUCCESS && ai && out) {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandPool, uint32_t>::iterator pf =
+            g_poolFamily.find(ai->commandPool);
+        for (uint32_t i = 0; i < ai->commandBufferCount; ++i) {
+            g_cbToDevice[out[i]] = device;
+            if (pf != g_poolFamily.end()) g_cbFamily[out[i]] = pf->second;
+        }
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------- buffers
+//
+// Hooked purely to be counted. Nothing here modifies anything - buffers have no
+// mip chain, so there is no pager equivalent for them - but they were the one
+// category with no accounting whatsoever, which meant the biggest single
+// unknown in the VRAM picture was invisible by construction.
+//
+// X-Plane's scenery meshes live here. Whether that is two hundred megabytes or
+// two gigabytes changes what is worth doing next, and nothing in this layer
+// could previously tell the difference.
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateBuffer(
+    VkDevice device, const VkBufferCreateInfo *ci,
+    const VkAllocationCallbacks *alloc, VkBuffer *out)
+{
+    PFN_vkCreateBuffer next = nullptr;
+    PFN_vkGetBufferMemoryRequirements getReq = nullptr;
+    {
+        // Still needs the dispatch pointer even with the ledger off, but the
+        // ledger's own work below is skipped.
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) {
+            next   = it->second.createBuffer;
+            getReq = it->second.getBufferMemReq;
+        }
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkResult r = next(device, ci, alloc, out);
+    if (r != VK_SUCCESS || !ci || !out || *out == VK_NULL_HANDLE) return r;
+
+    if (getReq && g_ledgerOn) {
+        VkMemoryRequirements req;
+        memset(&req, 0, sizeof(req));
+        getReq(device, *out, &req);
+        int cat = vramCatOfBuffer(ci->usage);
+        std::lock_guard<std::mutex> g(g_lock);
+        vramAdd(cat, req.size);
+        VramEntry e; e.cat = cat; e.bytes = req.size;
+        g_vramBuf[*out] = e;
+
+        if (cat == VRAM_BUF_GEOM) {
+            int b = geomBucketOf(ci->size);
+            ++g_geomCount[b];
+            g_geomAsked[b] += ci->size;
+            g_geomGot[b]   += req.size;
+        }
+    }
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
+    VkDevice device, VkBuffer buf, const VkAllocationCallbacks *alloc)
+{
+    PFN_vkDestroyBuffer next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.destroyBuffer;
+
+        std::map<VkBuffer, VramEntry>::iterator ve = g_vramBuf.find(buf);
+        if (ve != g_vramBuf.end()) {
+            vramRemove(ve->second.cat, ve->second.bytes);
+            g_vramBuf.erase(ve);
+        }
+    }
+    if (next) next(device, buf, alloc);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImageView(
+    VkDevice device, const VkImageViewCreateInfo *ci,
+    const VkAllocationCallbacks *alloc, VkImageView *out)
+{
+    PFN_vkCreateImageView next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.createImageView;
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+
+    // The mip clamp belongs HERE, not in a second hook.
+    //
+    // vkCreateImageView was already hooked by this function, so the separate
+    // clamping version added later was never dispatched - the loader returns
+    // whichever function the table names, and it named this one. The clamp was
+    // dead code, which is why the run still crashed with the fix "in place" and
+    // why no "view clamped" line ever appeared. Duplicating a hook silently
+    // disables the newer one.
+    VkImageViewCreateInfo ci2;
+    const VkImageViewCreateInfo *use = ci;
+    if (ci && g_pagerDropAbove && pagerDropFor(ci->image)) {
+        ci2 = *ci;
+        pagerClampRange(ci->image, &ci2.subresourceRange);
+        use = &ci2;
+        static uint64_t n = 0;
+        if (++n <= 3)
+            trace("PAGER: view clamped - base %u->%u count %u->%u",
+                  ci->subresourceRange.baseMipLevel, ci2.subresourceRange.baseMipLevel,
+                  ci->subresourceRange.levelCount, ci2.subresourceRange.levelCount);
+    }
+
+    VkResult r = next(device, use, alloc, out);
+    if (r == VK_SUCCESS && ci) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_viewToImage[*out] = ci->image;
+    }
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
+    VkDevice device, VkImage img, const VkAllocationCallbacks *alloc)
+{
+    PFN_vkDestroyImage next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.destroyImage;
+
+        // Take this image back out of the ledger.
+        std::map<VkImage, VramEntry>::iterator ve = g_vramImg.find(img);
+        if (ve != g_vramImg.end()) {
+            vramRemove(ve->second.cat, ve->second.bytes);
+            g_vramImg.erase(ve);
+        }
+
+        // Take this image back out of the census - see CensusEntry.
+        std::map<VkImage, CensusEntry>::iterator ce = g_texCensusOf.find(img);
+        if (ce != g_texCensusOf.end()) {
+            FmtStat &st = g_texCensus[ce->second.format];
+            if (st.count) --st.count;
+            st.bytes = (st.bytes > ce->second.bytes) ? (st.bytes - ce->second.bytes) : 0;
+            g_texBytesTotal = (g_texBytesTotal > ce->second.bytes)
+                            ? (g_texBytesTotal - ce->second.bytes) : 0;
+            int b = ce->second.sizeBucket;
+            if (b >= 0 && b <= 16) {
+                if (g_sizeCount[b]) --g_sizeCount[b];
+                g_sizeBytes[b] = (g_sizeBytes[b] > ce->second.bytes)
+                               ? (g_sizeBytes[b] - ce->second.bytes) : 0;
+            }
+            g_texCensusOf.erase(ce);
+        }
+
+        // The pager's per-image policy dies with the image too. Vulkan reuses
+        // handles, so a stale entry would make the next image at this address
+        // inherit a mip drop it never had - and that is a corruption bug that
+        // would look exactly like a texture problem in the world.
+        g_texPolicy.erase(img);
+
+        // The scene depth buffer is recreated on resize. Holding a destroyed
+        // handle and later building a view from it would be a use-after-free
+        // on the GPU, which does not fail cleanly.
+        if (img == g_sceneDepth) {
+            g_sceneDepth = VK_NULL_HANDLE;
+            g_depthReported = false;
+            // The velocity pass holds this image and a view built from it.
+            // Both must go before the app frees it, or the next dispatch
+            // samples and barriers memory that is no longer there.
+            trace("DEPTH: scene depth destroyed - velocity pass will rebuild");
+        }
+        if (img == g_frameDepthImage) g_frameDepthImage = VK_NULL_HANDLE;
+
+
+        // COLOUR image lifetime. The resolve holds an image view built from the
+        // scene colour target, and X-Plane destroys and recreates that target
+        // whenever the render settings change - which is exactly what happened
+        // when the antialiasing setting was toggled mid-session: the image went
+        // away, our view did not, and the next dispatch read freed memory.
+        //
+        // The depth path already guarded against this. The colour path did not,
+        // because until this stage nothing held a colour view - the velocity
+        // pass never touched colour at all. Adding a resource means adding its
+        // lifetime, and that is the part it is easy to forget.
+        g_colorImages.erase(img);
+        if (img == g_sceneColor.image) {
+            g_sceneColor = ColorTarget();
+            g_sceneColorLast = VK_NULL_HANDLE;
+            g_sceneColorStable = 0;
+            g_sceneColorReported = false;
+        }
+        for (size_t q = 0; q < g_hdrTargets.size(); ++q)
+            if (g_hdrTargets[q] == img) {
+                g_hdrTargets.erase(g_hdrTargets.begin() + q);
+                break;
+            }
+
+        // Drop the handle from the depth lists and from the reject set.
+        //
+        // A VkImage handle is only unique while it is alive - the driver is free
+        // to hand the same value back for the next image it creates. A stale
+        // entry in the reject set would then condemn a brand-new image for the
+        // sins of a destroyed one, and the rejection would look like a content
+        // verdict rather than a recycled pointer.
+        for (size_t i = 0; i < g_depthRejected.size(); ++i)
+            if (g_depthRejected[i] == img) {
+                g_depthRejected.erase(g_depthRejected.begin() + i);
+                break;
+            }
+        for (size_t i = 0; i < g_frameDepthListDone.size(); ++i)
+            if (g_frameDepthListDone[i] == img) {
+                g_frameDepthListDone.erase(g_frameDepthListDone.begin() + i);
+                break;
+            }
+
+        for (std::map<VkImageView, VkImage>::iterator vi = g_viewToImage.begin();
+             vi != g_viewToImage.end(); ) {
+            if (vi->second == img) vi = g_viewToImage.erase(vi); else ++vi;
+        }
+        for (size_t i = 0; i < g_depthCandidates.size(); ++i)
+            if (g_depthCandidates[i].image == img) {
+                g_depthCandidates.erase(g_depthCandidates.begin() + i);
+                break;
+            }
+    }
+    if (next) next(device, img, alloc);
+}
+
+// Where the 3D scene ends and the UI begins. Knowing this is what lets the
+// resolve run before instrument text, ATC boxes and the map get temporally
+// smeared. Stage 1 only counts passes per frame and records their attachment
+// sizes so the boundary can be identified from data rather than guessed.
+static uint32_t g_passesThisFrame = 0;
+static uint32_t g_passSizes[32][2];
+static uint32_t g_passHasDepth[32];
+static uint32_t g_passColorCount[32];
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRenderPass(
+    VkCommandBuffer cb, const VkRenderPassBeginInfo *info, VkSubpassContents contents)
+{
+    if (info && g_passesThisFrame < 32) {
+        g_passSizes[g_passesThisFrame][0] = info->renderArea.extent.width;
+        g_passSizes[g_passesThisFrame][1] = info->renderArea.extent.height;
+        g_passHasDepth[g_passesThisFrame] = 0;   // unknown without the VkRenderPass
+    }
+    ++g_passesThisFrame;
+    if (g_nextCmdBeginRenderPass) g_nextCmdBeginRenderPass(cb, info, contents);
+}
+
+// X-Plane 12 uses DYNAMIC RENDERING, not render pass objects.
+//
+// Measured: vkCmdBeginRenderPass fired exactly zero times across 2760 frames.
+// Hooking it and reporting "passes=0" looked like the frame had no structure at
+// all, when in fact the whole frame goes through vkCmdBeginRendering.
+//
+// This is the hook that finds the 3D/UI boundary, which is what decides where
+// the resolve can be inserted so instrument text and ATC boxes are never
+// temporally smeared. Recording whether each pass has a depth attachment is the
+// discriminator: the 3D scene has depth, the 2D overlays do not.
+// ---------------------------------------------------------------- jitter
+//
+// Sub-pixel camera jitter, applied at the VIEWPORT rather than in the
+// projection matrix.
+//
+// This is the mechanism TAA and every upscaler run on: shifting the sample grid
+// a fraction of a pixel each frame gives the accumulation new information to
+// combine, and that is where the extra detail comes from. Without it the
+// history is just the same samples over and over and the result is blur.
+//
+// Why the viewport and not the matrix. The matrices are published to the layer
+// and consumed by the velocity pass, and jitter must NOT appear in them - a
+// jittered view-projection produces motion vectors carrying the jitter, so
+// every static pixel reads as moving by a fraction of a pixel and the whole
+// image shimmers. Offsetting the viewport moves the sample grid while leaving
+// the matrices exactly as X-Plane computed them, which makes that entire class
+// of bug structurally impossible rather than merely avoided.
+//
+// Only full-viewport passes that carry depth are jittered. The 2D panel, ATC
+// boxes and the map must not be: sub-pixel shift on glyphs reads as wobbling
+// text, which is far more objectionable than any aliasing it would fix.
+static std::map<VkCommandBuffer, bool> g_cbInScenePass;
+
+// Is this command buffer inside the 3D COCKPIT pass?
+//
+// Tracked separately from the scene pass because the two want different
+// reprojection matrices - see the note at the push site. X-Plane draws the
+// cockpit in its own full-size depth pass after the world, so it looks
+// identical to a scene pass by shape alone; what distinguishes it is that it
+// comes after the world passes in the same frame.
+static std::map<VkCommandBuffer, bool> g_cbInCockpitPass;
+static uint64_t g_bodyReprojPushes = 0;
+
+// WHICH scene pass is the cockpit, counted from 1 within a command buffer.
+//
+// Set from a MEASUREMENT, not a guess. X-Plane draws the 3D cockpit in its own
+// full-size depth pass, which by shape alone is indistinguishable from a world
+// pass - same extent, same depth attachment. The only thing separating them is
+// their order in the frame, and that order is a property of this sim version
+// and this aircraft, not something derivable from the Vulkan calls.
+//
+// So it defaults to OFF - every draw keeps the world-frame matrix, exactly as
+// before - and TAA_COCKPIT_PASS=<n> turns it on once the CB dump has said which
+// index the cockpit actually is. Shipping a guess here would put body-frame
+// motion vectors on the world, which is a far worse error than leaving the
+// cockpit on the world frame where it already is.
+static int g_cockpitPassIndex = -1;
+
+// Has this command buffer recorded a 3D pass yet, and has the resolve already
+// gone in? Both are per-command-buffer, and both are reset when the buffer is
+// closed, so a reused buffer starts clean rather than inheriting a decision
+// from whatever it was last used for.
+static std::map<VkCommandBuffer, bool> g_cbSawScenePass;
+static std::map<VkCommandBuffer, bool> g_cbResolvedThisCb;
+
+// How many full-viewport depth passes this command buffer has recorded, and how
+// many it recorded last time round.
+//
+// "The first depth-less full-viewport pass after ANY scene pass" is too weak a
+// test for the end of the 3D scene. X-Plane runs full-viewport passes without
+// depth in the MIDDLE of the scene as well as after it, and resolving at the
+// first one copied a half-drawn frame: the result was roughly half the screen
+// correct and the rest horizontal bands of stale content.
+//
+// Waiting until this buffer has recorded as many scene passes as it did last
+// frame puts the resolve after the last one instead of the first. It is derived
+// from the frame rather than from a constant, so it survives a settings change
+// altering the pass count - which a hardcoded index would not.
+static std::map<VkCommandBuffer, uint32_t> g_cbScenePassCount;
+static std::map<VkCommandBuffer, uint32_t> g_cbScenePassPrev;
+
+// The most scene passes this command buffer has ever recorded. Resolving before
+// the last of them means the remainder overdraw the result - see the note at the
+// relaxed gate.
+static std::map<VkCommandBuffer, uint32_t> g_cbScenePassHigh;
+
+// Per-command-buffer pass log, for working out WHERE the resolve can safely go.
+//
+// The question that has to be answered from data rather than reasoning: is the
+// 3D scene rendered entirely within one command buffer, and is the UI recorded
+// in that same buffer or a later one? Those two facts decide whether the
+// resolve belongs at the 3D/UI boundary inside a buffer, at the end of the
+// buffer that drew the scene, or somewhere else entirely - and guessing has
+// already produced a half-drawn frame and then a flickering one.
+//
+// Each entry: 'S' full-viewport with depth (scene), 'P' full-viewport without
+// depth (post-process or UI), 'o' anything else (shadows, reflections, small).
+// ------------------------------------------------- THE RENDER RESOLUTION
+//
+// X-Plane does not necessarily render its 3D scene at the display resolution,
+// and every part of this layer used to assume it did.
+//
+// With the sim's own FSR 1.0 enabled - renopt_FSR_04, which the settings UI
+// calls "Rendering Resolution (FSR Supersampling)" - the scene is drawn at a
+// fraction of the window and spatially upscaled at the end. Measured on a 4K
+// display at quality 3: passes at 2953x1661, which is 0.769, exactly FSR's
+// Ultra Quality 1.3x ratio.
+//
+// The consequence was total. The scene-pass test compared renderArea against
+// the DISPLAY size, so with FSR on it never matched a single pass - and that
+// test gates the depth image, the jitter, the resolve boundary and the
+// velocity target. The whole pipeline was searching for a pass that no longer
+// existed at that size, and reported nothing wrong because "no scene pass this
+// frame" is indistinguishable from "not in the scene pass yet".
+//
+// So the render resolution is LEARNED rather than assumed: the largest
+// depth-carrying pass that is a substantial fraction of the display. Shadow
+// cascades and reflection probes also carry depth, at their own much smaller
+// sizes, which is what the fraction excludes - and it has to be a fraction
+// rather than an equality test precisely because the answer is not known in
+// advance.
+// ---- WHERE THE FRAME ACTUALLY GOES.
+//
+// The frame rate has sat at 38 through native 4K, a 1440p sub-native render,
+// and frame generation on and off. Something fixed dominates, and until now
+// nothing in this project could say what: CPU-side timing measures when work is
+// RECORDED, not when the GPU runs it, so it would have reported our passes as
+// free no matter what they cost.
+//
+// Vulkan timestamps are the only honest answer. A timestamp written into the
+// command buffer is resolved by the GPU when it reaches that point, so the
+// difference between two of them is real device time.
+//
+// Results are read one frame late and without waiting - blocking on them would
+// change the thing being measured.
+struct GpuSpan {
+    const char *name;
+    double      ms;
+};
+
+static VkQueryPool g_tsPool       = VK_NULL_HANDLE;
+static uint32_t    g_tsCount      = 0;      // timestamps written this frame
+static uint32_t    g_tsCapacity   = 0;
+static bool        g_tsPending    = false;  // a frame is in flight to read back
+static float       g_tsPeriodNs   = 1.0f;   // nanoseconds per tick, from limits
+static const char *g_tsNames[16];
+static bool        g_gpuTiming    = false;
+
+static bool gpuTimingOn()
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TAA_GPU_TIMING"); on = (e && atoi(e)) ? 1 : 0; }
+    return on != 0;
+}
+
+// Begin a frame's timing. Resets the pool and clears the labels.
+static void gpuTimeBegin(DeviceData &dd, VkCommandBuffer cb)
+{
+    if (!g_gpuTiming || g_tsPool == VK_NULL_HANDLE || !dd.cmdResetQueryPool) return;
+    dd.cmdResetQueryPool(cb, g_tsPool, 0, g_tsCapacity);
+    g_tsCount = 0;
+}
+
+// Mark a point. Pairs are formed by consecutive marks, so a span is
+// gpuTimeMark("upscale") ... gpuTimeMark("upscale end").
+static void gpuTimeMark(DeviceData &dd, VkCommandBuffer cb, const char *label)
+{
+    if (!g_gpuTiming || g_tsPool == VK_NULL_HANDLE || !dd.cmdWriteTimestamp) return;
+    if (g_tsCount >= g_tsCapacity) return;
+    g_tsNames[g_tsCount] = label;
+    dd.cmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         g_tsPool, g_tsCount);
+    ++g_tsCount;
+}
+
+// Read back last frame's marks and report. Never waits.
+static void gpuTimeReport(DeviceData &dd, uint64_t frames)
+{
+    if (!g_gpuTiming || g_tsPool == VK_NULL_HANDLE || !dd.getQueryPoolResults) return;
+    if (!g_tsPending || g_tsCount < 2) return;
+    if (frames % 300 != 0) return;
+
+    uint64_t vals[16];
+    VkResult r = dd.getQueryPoolResults(dd.device, g_tsPool, 0, g_tsCount,
+                                        sizeof(vals), vals, sizeof(uint64_t),
+                                        VK_QUERY_RESULT_64_BIT);
+    if (r != VK_SUCCESS) return;   // not ready; try again in 300 frames
+
+    char line[512];
+    int  n = snprintf(line, sizeof(line), "GPU TIME:");
+    double total = (double)(vals[g_tsCount - 1] - vals[0]) * g_tsPeriodNs / 1e6;
+    for (uint32_t i = 0; i + 1 < g_tsCount && n < (int)sizeof(line) - 40; ++i) {
+        double ms = (double)(vals[i + 1] - vals[i]) * g_tsPeriodNs / 1e6;
+        n += snprintf(line + n, sizeof(line) - n, "  %s=%.2fms", g_tsNames[i], ms);
+    }
+    snprintf(line + n, sizeof(line) - n, "  | ours total %.2fms", total);
+    trace("%s", line);
+}
+
+static uint32_t g_renderW = 0, g_renderH = 0;
+static uint32_t g_sceneColourCount = 0;
+
+static bool isSceneSized(uint32_t w, uint32_t h, uint32_t colourCount = 1)
+{
+    if (!g_share) return false;
+    uint32_t dw = (uint32_t)g_share->viewportW, dh = (uint32_t)g_share->viewportH;
+    if (!dw || !dh) return false;
+
+    // Half the display in each axis. FSR's most aggressive published ratio is
+    // 2.0x - half linear - so anything smaller than that is not the scene.
+    if (w * 2 < dw || h * 2 < dh) return false;
+    if (w > dw || h > dh) return false;
+
+    // ---- ASPECT RATIO, which is what the size test alone got wrong.
+    //
+    // A 2048x2048 shadow cascade passes every size test above: it is more than
+    // half the display in both axes and smaller than the display in both. The
+    // first version latched onto exactly that, reported "scene passes are
+    // 2048x2048 (0.533x)", and the real colour target was then never matched -
+    // so the resolve found no scene target at all and disabled itself. The
+    // image came out untouched, which looks like a fixed shake and is actually
+    // a dead pipeline.
+    //
+    // Scaling the render preserves the window's aspect: 2953x1661 is 1.778 and
+    // so is 3840x2160. A shadow map is square. That is the discriminator, and
+    // it is independent of WHAT ratio the sim chose, which is the whole point -
+    // the size is unknown in advance but the shape is not.
+    double aPass = (double)w / (double)h;
+    double aDisp = (double)dw / (double)dh;
+    if (aPass < aDisp * 0.97 || aPass > aDisp * 1.03) return false;
+
+    // ---- THE G-BUFFER IS THE SCENE, AND SIZE ALONE DOES NOT FIND IT.
+    //
+    // Picking the LARGEST depth-carrying pass looked reasonable and was wrong.
+    // A frame contains both of these:
+    //
+    //     pass shape 3840x2160 colour=1 depth=yes
+    //     pass shape 2953x1661 colour=5 depth=yes
+    //
+    // The second is the 3D scene - five colour attachments plus depth is a
+    // G-buffer, and nothing else in the frame looks like that. The first is
+    // some full-window pass that merely happens to be bigger, and because it
+    // was bigger it won, so the real scene pass never matched again. Every
+    // consequence followed from that: no jitter applied, FSR2's context never
+    // created, and the resolve latching onto a post-tonemap LDR target.
+    //
+    // Attachment count is the discriminator. A deferred renderer's geometry
+    // pass writes several targets at once; shadow maps write depth only,
+    // post-process passes write one, and the UI writes one. So the pass with
+    // the MOST colour attachments wins, and size only breaks ties.
+    bool better = (colourCount > g_sceneColourCount) ||
+                  (colourCount == g_sceneColourCount &&
+                   (w > g_renderW || h > g_renderH));
+    if (better) {
+        bool first = (g_renderW == 0);
+        g_sceneColourCount = colourCount;
+        g_renderW = w; g_renderH = h;
+
+        // Hand the measured size back to the plugin. It sizes the jitter
+        // sequence off this rather than off its own quality setting, which
+        // does not know about X-Plane's FSR - see measRenderW in share.h.
+        g_share->measRenderW  = w;  g_share->measRenderH  = h;
+        // PUBLISH THE RATIO THE UPSCALER ACTUALLY RUNS AT, not the window's.
+        //
+        // The plugin sizes the jitter sequence from display/render, because
+        // FSR2's accumulation assumes 8*(display/render)^2 phases. FSR2 is now
+        // pinned 1:1 - its result is copied back into the render-sized scene
+        // target, so there is nowhere for an upscaled image to go - and
+        // publishing the 3840x2160 window here made the plugin ask for 14
+        // phases against the 8 that FSR2 assumes at 1:1. A longer sequence than
+        // the accumulator expects never converges: it is spreading samples over
+        // phases FSR2 is not counting on.
+        //
+        // When there is a display-sized target to present from, this goes back
+        // to dw/dh and the phase count follows automatically.
+        g_share->measDisplayW = w;  g_share->measDisplayH = h;
+        (void)dw; (void)dh;
+
+        if (first || w != dw) {
+            trace("RENDER RESOLUTION: scene passes are %ux%u (%u colour "
+                  "attachments) against a %ux%u display (%.3fx). %s",
+                  w, h, colourCount, dw, dh, (double)w / (double)dw,
+                  (w == dw)
+                      ? "Native - X-Plane's own FSR is off."
+                      : "SUB-NATIVE: X-Plane's FSR is rendering smaller and "
+                        "upscaling. Our velocity, depth and resolve must follow "
+                        "THIS size, not the window.");
+        }
+    }
+    return (w == g_renderW && h == g_renderH);
+}
+
+struct CbPassLog { std::string seq; uint64_t frame = 0; };
+static std::map<VkCommandBuffer, CbPassLog> g_cbPassLog;
+static bool     g_cbDumpOn = false;
+static uint64_t g_cbDumpsLeft = 0;
+
+static bool g_jitterArmed = false;
+static uint64_t g_jitterApplied = 0;
+
+// Did a resolve actually happen this frame, and how often does it not.
+//
+// A resolve that runs on only some frames is invisible in the logs and obvious
+// on screen: the frames it skips are passed through with the jitter still in
+// them, so the picture shakes. Counting the misses is the difference between
+// diagnosing that in one run and guessing at it across six.
+static bool     g_resolveRanThisFrame = false;
+static uint64_t g_resolveMissFrames = 0;
+static uint64_t g_resolveOkFrames   = 0;
+static bool     g_resolveRelaxed    = false;
+
+// Does clip Y point the opposite way to framebuffer Y.
+//
+// Read from the viewport X-Plane actually sets rather than assumed, and used by
+// the jitter push to decide which way "down the screen" is in clip space.
+static bool g_viewportYFlipped = false;
+
+// LEGACY VIEWPORT JITTER, off by default.
+//
+// This is where jitter used to be applied, and TAA_JITTER_VIEWPORT=1 brings it
+// back for a direct A/B against the vertex-shader version. Kept because the two
+// should look IDENTICAL on geometry and differ only on the full-screen passes -
+// so if the shake survives the move, that comparison says whether the diagnosis
+// was wrong rather than leaving it to be re-argued.
+static bool g_jitterViewport = false;
+
+// Metres. Anything closer than this reprojects as body-fixed rather than
+// world-fixed. A 777 panel sits about 0.6-1.2 m from the eye and the windscreen
+// frame under 2 m, while the nearest outside geometry during a landing is the
+// runway several metres away - so the threshold has real headroom on both
+// sides. Overridable because that headroom is aircraft-dependent.
+// OFF by default. Zero disables the select entirely - gl_Position.w is positive
+// for anything in front of the camera, so `w < 0` is never true.
+//
+// The idea was sound and the discriminator is not: give anything nearer than
+// this a velocity of zero because it is bolted to the airframe. Depth cannot
+// tell that. Flying low over a city puts building ROOFS inside the window, and
+// they are world geometry passing at approach speed - so they get history
+// pinned at the moment they are moving fastest. That is the roof going black
+// for a frame when passing close over it, and it is why the flicker gets worse
+// the closer you are to landing.
+//
+// The premise it was built on still holds - cockpit geometry rigid in a rigid
+// airframe genuinely has zero velocity, and the body frame is now measured to
+// 0.0022 m/frame - but the cockpit has to be IDENTIFIED, not inferred from
+// distance. TAA_NEARFIELD_M re-enables it for experiments.
+static float g_nearFieldM = 0.0f;
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetViewport(
+    VkCommandBuffer cb, uint32_t first, uint32_t count, const VkViewport *vp)
+{
+    if (!g_nextCmdSetViewport) return;
+
+    // LATCH THE Y FLIP FROM THE SCENE VIEWPORT ONLY.
+    //
+    // This used to take the flip from EVERY viewport X-Plane set - shadow
+    // cascades, UI, offscreen composites, all of it, last write wins. The
+    // clip-space jitter multiplies its Y by that flag, so the sign of the
+    // jitter depended on whichever unrelated pass happened to set a viewport
+    // most recently before the draw. A jitter whose sign changes between frames
+    // is not jitter, it is noise: FSR2 is told one sign and shown another, and
+    // the accumulation it builds is being fed contradictory samples. That is
+    // shimmer on movement and an image that will not sit still, from a
+    // one-line detail with no logging on it.
+    //
+    // Only the pass we actually jitter gets a vote, and it is stated once.
+    if (vp && count > 0 && vp[0].height != 0.0f) {
+        uint32_t vw = (uint32_t)fabsf(vp[0].width);
+        uint32_t vh = (uint32_t)fabsf(vp[0].height);
+        if (g_renderW && vw == g_renderW && vh == g_renderH) {
+            bool flip = (vp[0].height < 0.0f);
+            static int said = -1;
+            if (said != (int)flip) {
+                said = (int)flip;
+                trace("JITTER: scene viewport is %s (height %.1f) - clip-space "
+                      "jitter Y sign is %s. This is latched from the SCENE pass "
+                      "only; it used to follow whatever pass set a viewport last.",
+                      flip ? "Y-FLIPPED" : "not Y-flipped", vp[0].height,
+                      flip ? "-1" : "+1");
+            }
+            g_viewportYFlipped = flip;
+        }
+    }
+
+    // Jitter only while something is consuming it.
+    //
+    // On its own it makes the image worse: it shifts the sample grid every
+    // frame and, with nothing accumulating the result, high-contrast edges
+    // crawl. Tying it to the selected upscaler means switching to Off in the
+    // menu restores the untouched image in one frame rather than leaving a
+    // shimmering one behind.
+    // DLSS IS A CONSUMER TOO. It is a temporal upscaler with a history buffer
+    // and it is handed the jitter it must compensate for, exactly as FSR2 is -
+    // so leaving it out meant selecting DLSS silently turned the jitter off,
+    // which the trace reported as "upscaler=Off" on the JITTER line while the
+    // gate one screen away said "upscaler=DLSS(4)".
+    bool consumer = (g_velSnap.upscaler == TAA_UPSCALER_TAA)
+                 || (g_velSnap.upscaler == TAA_UPSCALER_FSR2)
+                 || (g_velSnap.upscaler == TAA_UPSCALER_DLSS);
+
+    bool scene = false;
+    if (g_jitterViewport && g_jitterArmed && consumer &&
+        vp && count > 0) {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, bool>::iterator it = g_cbInScenePass.find(cb);
+        scene = (it != g_cbInScenePass.end() && it->second);
+    }
+
+    // VIEWPORT Y SIGN, reported once.
+    //
+    // A negative height is VK_KHR_maintenance1 being used to keep OpenGL's
+    // orientation, which X-Plane has every reason to do given its history. It
+    // decides whether NDC derived from gl_FragCoord matches what a vertex
+    // shader emitted - and if it does not, motion vectors recovered in a
+    // fragment shader come out Y-flipped. That is a silent sign error, so it is
+    // worth knowing from the API rather than from the look of the result.
+    if (vp && count > 0) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            trace("VIEWPORT: x=%.1f y=%.1f w=%.1f h=%.1f -> %s",
+                  vp[0].x, vp[0].y, vp[0].width, vp[0].height,
+                  vp[0].height < 0.0f
+                      ? "NEGATIVE height: GL orientation via maintenance1. "
+                        "gl_FragCoord-derived NDC is FLIPPED relative to the "
+                        "vertex shader's clip position."
+                      : "positive height: Vulkan orientation, no flip.");
+        }
+    }
+
+    if (!scene) { g_nextCmdSetViewport(cb, first, count, vp); return; }
+
+    float jx = g_velSnap.jitterX, jy = g_velSnap.jitterY;
+    if (jx == 0.0f && jy == 0.0f) { g_nextCmdSetViewport(cb, first, count, vp); return; }
+
+    VkViewport tmp[8];
+    if (count > 8) { g_nextCmdSetViewport(cb, first, count, vp); return; }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        tmp[i] = vp[i];
+        // Only the full-size viewport. A pass can set a smaller one for a
+        // sub-region, and shifting that would move the region rather than
+        // jitter the samples within it.
+        // Compared against the RENDER resolution, which is not the window when
+        // X-Plane's FSR is on. This is the legacy viewport-jitter path and is
+        // off by default, but a size test that silently never matches is worse
+        // than one that is simply disabled.
+        uint32_t rw = g_renderW ? g_renderW : (uint32_t)g_velSnap.viewportW;
+        uint32_t rh = g_renderH ? g_renderH : (uint32_t)g_velSnap.viewportH;
+        if ((uint32_t)fabsf(tmp[i].width)  == rw &&
+            (uint32_t)fabsf(tmp[i].height) == rh) {
+            tmp[i].x += jx;
+            tmp[i].y += jy;
+            ++g_jitterApplied;
+        }
+    }
+    g_nextCmdSetViewport(cb, first, count, tmp);
+}
+
+// Appends the velocity attachment slot to a rendering pass.
+//
+// EVERY pass gets the slot, not just the scene. Under dynamic rendering a
+// pipeline's colour formats must agree with the pass, and X-Plane reuses
+// pipelines across passes - so a slot that appeared only in the scene pass
+// would make every one of those pipelines invalid everywhere else. With
+// VK_EXT_dynamic_rendering_unused_attachments the slot may be null, so
+// non-scene passes carry an empty one at no cost.
+//
+// The scene pass - full viewport, with depth - gets the real image. The first
+// such pass of a frame CLEARS it; later ones LOAD, so a scene split across
+// several passes accumulates instead of each pass wiping the last.
+// Swapchain images, recorded from vkGetSwapchainImagesKHR. Declared up here
+// because the scene-target selection needs to ask whether a pass is drawing
+// straight into the presented image, and that runs long before present.
+static std::map<VkSwapchainKHR, std::vector<VkImage> > g_swapImages;
+
+// ---- THE SIZE AND FORMAT OF WHAT WE PRESENT INTO, WHICH WE NEVER READ.
+//
+// Tracking the image handles was never enough. Every other image the layer
+// touches is recorded at vkCreateImage with its extent and format; swapchain
+// images are handed back already built, so they carried neither, and the
+// delivery blit filled the gap by assuming they matched the upscale output.
+// That assumption printed as "dst fmt=-1 0x0" the first time anything asked.
+//
+// The create info has both. Keep them.
+struct SwapInfo { uint32_t w, h; VkFormat format; };
+static std::map<VkSwapchainKHR, SwapInfo> g_swapInfo;
+
+// Whether the presented images were actually created with TRANSFER_DST usage.
+// The delivery blit is only a legal operation when they were.
+static bool g_swapTransferDst = false;
+
+// The extent of the swapchain a given presented image belongs to.
+static bool swapInfoFor(VkImage img, SwapInfo &out)
+{
+    for (std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator
+             si = g_swapImages.begin(); si != g_swapImages.end(); ++si) {
+        for (size_t k = 0; k < si->second.size(); ++k) {
+            if (si->second[k] != img) continue;
+            std::map<VkSwapchainKHR, SwapInfo>::iterator ii =
+                g_swapInfo.find(si->first);
+            if (ii == g_swapInfo.end()) return false;
+            out = ii->second;
+            return true;
+        }
+    }
+    return false;
+}
+static std::map<VkDescriptorSet, std::vector<VkImageView> > g_setViews;
+static std::map<VkCommandBuffer, bool> g_cbInSwapPass;
+
+// Every image that has ever been a render-pass colour attachment.
+static std::set<VkImage> g_seenAsAttachment;
+
+// ---- THE COMPUTE COMPOSITE, WHICH NO ATTACHMENT SEARCH COULD EVER FIND.
+//
+// Bisecting the shotgun landed on a full-window RGBA16F image that appears in
+// NO pass whatsoever. X-Plane composites its final frame with a COMPUTE shader
+// writing a storage image, and the swapchain pass then samples that. Every
+// selection rule this project has used - last full-viewport target, last HDR
+// one, the sRGB one, prefer-not-multisampled - searched render-pass colour
+// attachments, so the one image that matters was invisible to all of them.
+//
+// It also explains the two "HDR scene targets" we did find: those are real, and
+// X-Plane ping-pongs them, but they feed the compute pass rather than the
+// screen. Writing to both changed nothing for exactly that reason.
+//
+// The signature is distinctive: full window, HDR float, single sample, STORAGE
+// usage (a compute shader writes it), and never once a colour attachment.
+static VkImage g_computeComposite = VK_NULL_HANDLE;
+
+// Display-sized images that can be a transfer destination - where X-Plane's
+// dropped upscale dispatch would have written, and therefore where ours goes.
+static std::vector<VkImage> g_upscaleTargets;
+// Defined below, beside the barrier helper it needs. Declared here because the
+// upscaled result is written from the FSR2 dispatch site, which comes first.
+
+
+// Which swapchain image, if any, the pass currently recording into this command
+// buffer is writing. Cleared when the pass ends.
+struct CbSwapTarget { VkImage image; VkImageLayout layout; };
+static std::map<VkCommandBuffer, CbSwapTarget> g_cbSwapTarget;
+
+static bool isSwapImage(VkImage img)
+{
+    for (std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator
+             si = g_swapImages.begin(); si != g_swapImages.end(); ++si)
+        for (size_t k = 0; k < si->second.size(); ++k)
+            if (si->second[k] == img) return true;
+    return false;
+}
+
+
+static bool mvAppendAttachment(const VkRenderingInfo *info,
+                               std::vector<VkRenderingAttachmentInfo> &atts,
+                               VkRenderingInfo &out)
+{
+    if (!g_spirvLive || !info) return false;
+
+    // Matched against the VELOCITY IMAGE's own size, not the plugin's viewport.
+    //
+    // g_velSnap.viewportW is the window size the plugin reports. The scene is
+    // rendered at the scene target's size, which is what the velocity image was
+    // built from - and on this machine those differ, so the comparison never
+    // succeeded and the image was never bound. Every pass took the null slot,
+    // which is why the sim rendered perfectly and produced no velocity at all.
+    //
+    // Comparing against g_mv is self-consistent by construction: the image is
+    // sized from the scene target, so a pass at that size IS the scene pass.
+    bool fullViewport = g_mv.w > 0 &&
+        info->renderArea.extent.width  == g_mv.w &&
+        info->renderArea.extent.height == g_mv.h;
+    bool hasDepth = info->pDepthAttachment &&
+                    info->pDepthAttachment->imageView != VK_NULL_HANDLE;
+    bool isScene  = fullViewport && hasDepth && g_mv.ready;
+
+    // EVERY DISTINCT PASS SHAPE, once each.
+    //
+    // The pass log printed the first three and then every hundred-thousandth,
+    // which is a sample chosen by arrival order rather than by what is
+    // interesting - and it happened to contain no scene passes at all, so "no
+    // BOUND lines" could not be told apart from "scene passes exist but were
+    // never logged". Keying the log to distinct SHAPES instead means every kind
+    // of pass appears exactly once, and the one that should have matched is
+    // visible next to the reason it did not.
+    {
+        static std::set<uint64_t> seen;
+        uint64_t key = ((uint64_t)info->renderArea.extent.width << 32)
+                     | ((uint64_t)info->renderArea.extent.height << 8)
+                     | ((uint64_t)info->colorAttachmentCount << 2)
+                     | (hasDepth ? 2u : 0u) | (isScene ? 1u : 0u);
+        std::lock_guard<std::mutex> g(g_lock);
+        if (seen.size() < 40 && !seen.count(key)) {
+            seen.insert(key);
+            trace("MV: pass shape %ux%u colour=%u depth=%s -> %s "
+                  "(velocity target is %ux%u)",
+                  info->renderArea.extent.width, info->renderArea.extent.height,
+                  info->colorAttachmentCount, hasDepth ? "yes" : "no",
+                  isScene ? "SCENE - binding" : "not the scene pass",
+                  g_mv.w, g_mv.h);
+        }
+    }
+
+    // EXACTLY ONE EXTRA ATTACHMENT. No padding.
+    //
+    // The previous version padded every pass out to a fixed index of 7, so that
+    // one fragment module could write the same Location everywhere. It was
+    // valid and the driver hated it: depth-only shadow passes claiming eight
+    // colour attachments, every pipeline declaring eight formats with seven
+    // undefined, and vkCreateGraphicsPipelines returning VK_ERROR_UNKNOWN.
+    //
+    // Patching fragment shaders per PIPELINE instead removes the need for any
+    // of it. A pipeline built against a pass with N attachments gets N+1, and
+    // its fragment shader is patched to write Location N - so the index always
+    // matches without a single wasted slot.
+    if (info->colorAttachmentCount >= 8) return false;   // no room; leave alone
+
+    atts.assign(info->pColorAttachments,
+                info->pColorAttachments + info->colorAttachmentCount);
+
+    VkRenderingAttachmentInfo mv;
+    memset(&mv, 0, sizeof(mv));
+    mv.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    mv.imageView   = isScene ? g_mv.view : VK_NULL_HANDLE;
+    mv.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    mv.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    mv.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+    if (isScene) {
+        // Once the present-time clear is running, no pass clears: the target
+        // was zeroed after FSR2 consumed it last frame, so LOAD is correct and
+        // no thread has to win a race to decide it.
+        bool first = !g_mvClearedAtPresent.load() &&
+                     !g_mvClearedThisFrame.exchange(true);
+        mv.loadOp  = first ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                           : VK_ATTACHMENT_LOAD_OP_LOAD;
+        mv.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        // Zero is "did not move" - the right value for anything nothing draws
+        // over, and for any pipeline whose fragment shader we could not patch.
+        mv.clearValue.color.float32[0] = 0.0f;
+        mv.clearValue.color.float32[1] = 0.0f;
+    }
+
+    atts.push_back(mv);
+    out = *info;
+    out.colorAttachmentCount = (uint32_t)atts.size();
+    out.pColorAttachments    = atts.data();
+    return true;
+}
+
+// ---- TAKING OVER X-PLANE'S OWN FSR, WHICH IS COMPUTE AND NOT A RENDER PASS.
+//
+// Read out of the sim's own shader archive rather than guessed at.
+// Resources/shaders/bin/spv/fsr.xsa is a ZIP holding six SPIR-V modules, and
+// fsr_mapping.xsv names their resources: u_input_texture with u_input_sampler
+// in, i_output_texture out, u_fsr_data for constants. Every one of them is
+// OpEntryPoint GLCompute.
+//
+// So there is no render pass to swallow - an earlier version of this waited on
+// vkCmdBeginRendering and would have waited forever. It is a vkCmdDispatch with
+// a compute pipeline bound, and the way to take it over is to recognise the
+// shader module, recognise pipelines built from it, and drop the dispatch.
+//
+// The fingerprint is u_fsr_data: distinctive, present in all six variants, and
+// carried in OpName so it survives an X-Plane update that recompiles them.
+static std::set<VkShaderModule> g_xpFsrModules;    // modules that ARE X-Plane's FSR
+static std::set<VkPipeline>     g_xpFsrPipelines;  // compute pipelines built from them
+static std::map<void*, bool>    g_cbFsrBound;      // is an FSR pipeline bound on this cb
+static uint64_t g_xpFsrDropped   = 0;
+static bool     g_replaceXpFsr   = false;   // TAA_REPLACE_XPFSR
+
+// Does this SPIR-V belong to X-Plane's FSR?
+//
+// u_fsr_data is the uniform block every one of the six variants declares, and
+// the name survives in OpName, so this keeps working if the sim recompiles
+// them. A raw scan of the word stream is enough - SPIR-V stores literal strings
+// as packed words, so the ASCII appears contiguously.
+static bool spirvIsXpFsr(const uint32_t *code, size_t words)
+{
+    if (!code || words < 8) return false;
+    const char *p = (const char *)code;
+    size_t bytes = words * 4;
+    static const char kNeedle[] = "u_fsr_data";
+    const size_t n = sizeof(kNeedle) - 1;
+    if (bytes < n) return false;
+    for (size_t i = 0; i + n <= bytes; ++i)
+        if (!memcmp(p + i, kNeedle, n)) return true;
+    return false;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
+    VkCommandBuffer cb, const VkRenderingInfo *info)
+{
+    if (info && g_passesThisFrame < 32) {
+        g_passSizes[g_passesThisFrame][0] = info->renderArea.extent.width;
+        g_passSizes[g_passesThisFrame][1] = info->renderArea.extent.height;
+        g_passHasDepth[g_passesThisFrame] =
+            (info->pDepthAttachment && info->pDepthAttachment->imageView != VK_NULL_HANDLE) ? 1 : 0;
+
+        // Record the layout the app is using for depth. The velocity pass has
+        // to barrier from the ACTUAL layout, not an assumed one - naming the
+        // wrong oldLayout would discard the very contents we came to read.
+        if (info->pDepthAttachment && info->pDepthAttachment->imageView != VK_NULL_HANDLE) {
+            g_sceneDepthLayout = info->pDepthAttachment->imageLayout;
+
+            // Track the depth image of the last full-viewport depth pass. Full
+            // viewport only: shadow cascades and reflection passes also carry
+            // depth, at their own resolutions.
+            if (isSceneSized(info->renderArea.extent.width,
+                             info->renderArea.extent.height,
+                             info->colorAttachmentCount)) {
+                std::lock_guard<std::mutex> g(g_lock);
+
+                // Full viewport AND depth: this pass draws world geometry, so
+                // any viewport set inside it is a jitter candidate. Tracked per
+                // command buffer rather than globally because X-Plane records
+                // on several threads at once - a global "are we in the scene
+                // pass" flag would be set by one thread and read by another,
+                // which is how the pass-index approach failed earlier.
+                g_cbInScenePass[cb] = true;
+                g_cbSawScenePass[cb] = true;   // the resolve boundary needs this
+                ++g_cbScenePassCount[cb];
+
+                // Body-frame reprojection applies only to the cockpit pass, and
+                // only when a pass index has been measured and configured.
+                g_cbInCockpitPass[cb] =
+                    (g_cockpitPassIndex > 0 &&
+                     (int)g_cbScenePassCount[cb] == g_cockpitPassIndex);
+
+                // ---- WHAT EACH SCENE PASS ACTUALLY IS.
+                //
+                // The cockpit pass index was chosen from a census that showed
+                // TWO scene passes and an assumption about draw order. The trace
+                // then showed six per command buffer, so the index was picked
+                // from a set that was never characterised - and index 2 put
+                // body-frame reprojection on the world, which is how the
+                // "intense vibration" happened.
+                //
+                // Rather than guess again, describe every scene pass by the
+                // things that distinguish a G-buffer fill from a cockpit
+                // overlay: attachment count, extent, depth load/store ops, and
+                // whether depth is being cleared. A cockpit pass typically
+                // CLEARS depth so the panel draws over the world regardless of
+                // distance - that is a fingerprint, not a draw-order guess.
+                {
+                    int idx = (int)g_cbScenePassCount[cb];
+                    static std::map<int, uint64_t> seen;
+                    if (seen[idx]++ % 2000 == 0) {
+                        const VkRenderingAttachmentInfo *da = info->pDepthAttachment;
+                        trace("SCENE PASS %d: %ux%u colour=%u depth=%s "
+                              "depthLoad=%d depthStore=%d clearDepth=%.3f%s",
+                              idx, info->renderArea.extent.width,
+                              info->renderArea.extent.height,
+                              info->colorAttachmentCount,
+                              da ? "yes" : "no",
+                              da ? (int)da->loadOp : -1,
+                              da ? (int)da->storeOp : -1,
+                              da ? da->clearValue.depthStencil.depth : -1.0f,
+                              (da && da->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
+                                  ? "  <- CLEARS DEPTH (cockpit-overlay fingerprint)"
+                                  : "");
+                    }
+                }
+                std::map<VkImageView, VkImage>::iterator vi =
+                    g_viewToImage.find(info->pDepthAttachment->imageView);
+                if (vi != g_viewToImage.end()) {
+                    g_frameDepthImage = vi->second;
+                    g_lastDepthPassIdx = (int)g_passesThisFrame;
+
+                    // Keep EVERY full-viewport depth image the frame binds, in
+                    // the order it binds them, not just the last one.
+                    //
+                    // "Last full-viewport depth pass" is a good first guess but
+                    // it is still a guess, and when it is wrong the only way to
+                    // try the next candidate has been to rebuild and fly again.
+                    // With the whole ordered list retained, a wrong pick can be
+                    // rejected and replaced from inside the same session.
+                    bool seen = false;
+                    for (size_t k = 0; k < g_frameDepthList.size(); ++k)
+                        if (g_frameDepthList[k] == vi->second) { seen = true; break; }
+                    if (!seen && g_frameDepthList.size() < 32)
+                        g_frameDepthList.push_back(vi->second);
+
+                    // This pass is full-viewport AND carries depth, so it is
+                    // drawing world geometry. Its colour attachment is the
+                    // scene colour the resolve will have to work on. Taking the
+                    // LAST such pass in the frame gives the fully composed 3D
+                    // image, before any 2D overlay goes on top.
+                    if (info->colorAttachmentCount > 0 && info->pColorAttachments
+                        && info->pColorAttachments[0].imageView != VK_NULL_HANDLE) {
+                        std::map<VkImageView, VkImage>::iterator ci2 =
+                            g_viewToImage.find(info->pColorAttachments[0].imageView);
+                        if (ci2 != g_viewToImage.end()) {
+                            std::map<VkImage, ColorTarget>::iterator ct =
+                                g_colorImages.find(ci2->second);
+                            if (ct != g_colorImages.end()) {
+                                // Prefer an HDR FLOAT target over merely the
+                                // last one.
+                                //
+                                // "Last full-viewport depth pass" identifies
+                                // the depth image correctly but not the colour
+                                // image: X-Plane's final 3D composite still has
+                                // depth bound while writing to an 8-bit sRGB
+                                // target, so taking the last one latched
+                                // R8G8B8A8_SRGB and resolved the tonemapped
+                                // composite instead of the scene. It ran 600
+                                // dispatches on the wrong image and looked
+                                // completely fine, because with jitter off a
+                                // correct resolve is invisible.
+                                //
+                                // The HDR target is also the RIGHT place to
+                                // resolve: before tonemapping, which is where
+                                // upscalers want to sit too.
+                                // SINGLE-SAMPLE ONLY.
+                                //
+                                // X-Plane keeps two HDR targets of identical
+                                // size and format, one single-sample and one
+                                // 2x multisampled. The multisampled one cannot
+                                // be used at either end: a plain sampler2D view
+                                // over a multisampled image is undefined - the
+                                // same trap that made depth read back as
+                                // near-zero - and vkCmdCopyImage requires the
+                                // sample counts to match, so copying our
+                                // single-sample result into it produced the
+                                // sheared bands.
+                                //
+                                // The single-sample target is also the right
+                                // one on the merits: it is the post-resolve,
+                                // pre-tonemap image, which is exactly what a
+                                // temporal resolve and an upscaler both want.
+                                bool continueSel = true;
+                                VkFormat f = ct->second.format;
+                                bool hdr = (f == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                                            f == VK_FORMAT_R32G32B32A32_SFLOAT ||
+                                            f == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+                                        && ct->second.samples == VK_SAMPLE_COUNT_1_BIT;
+                                bool haveHdr =
+                                    (g_sceneColor.format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                                     g_sceneColor.format == VK_FORMAT_R32G32B32A32_SFLOAT ||
+                                     g_sceneColor.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+                                // Never select a multisampled target, even as a
+                                // fallback: we can neither sample it through
+                                // the view we build nor copy into it.
+                                bool usable = ct->second.samples == VK_SAMPLE_COUNT_1_BIT;
+                                // ---- TAA_SCENE_8BIT: target the composite instead.
+                                //
+                                // Preferring HDR is right on the merits -
+                                // pre-tonemap is where a resolve and an upscaler
+                                // both want to sit - and it is why the original
+                                // code was changed, because latching
+                                // R8G8B8A8_SRGB "resolved the tonemapped
+                                // composite instead of the scene".
+                                //
+                                // Except every test since says nothing reads the
+                                // HDR target after we write it: no seam from a
+                                // half copy, no change from writing both HDR
+                                // targets, no change from resolving ahead of the
+                                // composite - and a direct swapchain blit was the
+                                // only thing that ever reached the screen. The
+                                // 8-bit composite is what is actually read and
+                                // presented. Resolving post-tonemap is a real
+                                // compromise, not a preference, but a compromise
+                                // that is visible beats a purer one that is not.
+                                // ONLY 8-BIT TARGETS, or this oscillates.
+                                //
+                                // "The last full-viewport target" is not stable:
+                                // the log showed it latching fmt 37, then 97,
+                                // then 83, then 97, then 43 within a single
+                                // run, so the destination changed from pass to
+                                // pass and the resolve chased a moving target.
+                                // The composite is the 8-bit one; ignore the
+                                // HDR intermediates entirely in this mode.
+                                // ---- IS THIS PASS DRAWING STRAIGHT INTO THE SWAPCHAIN?
+                                //
+                                // Every internal target we have written to has
+                                // been invisible, and a direct swapchain blit was
+                                // the only thing that ever showed. The obvious
+                                // question - does X-Plane composite into the
+                                // swapchain image itself? - could not be asked
+                                // until the layer started tracking those images
+                                // an hour ago. If it does, that image is both the
+                                // right destination AND the one place a write is
+                                // known to survive, and the UI still goes on top
+                                // afterwards because the UI passes come later.
+                                {
+                                    bool isSwap = false;
+                                    for (std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator
+                                             si = g_swapImages.begin();
+                                         si != g_swapImages.end() && !isSwap; ++si)
+                                        for (size_t k = 0; k < si->second.size(); ++k)
+                                            if (si->second[k] == ci2->second) { isSwap = true; break; }
+                                    static std::set<VkImage> seenTargets;
+                                    if (seenTargets.size() < 16 && !seenTargets.count(ci2->second)) {
+                                        seenTargets.insert(ci2->second);
+                                        trace("PASS TARGET %p fmt=%d %ux%u samples=%d%s",
+                                              (void*)ci2->second, (int)ct->second.format,
+                                              ct->second.w, ct->second.h,
+                                              (int)ct->second.samples,
+                                              isSwap ? "  [SWAPCHAIN]" : "");
+                                    }
+                                    static int saidSwap = -1;
+                                    if (saidSwap != (int)isSwap) {
+                                        saidSwap = (int)isSwap;
+                                        trace("COLOR: full-viewport pass target %s a "
+                                              "swapchain image (fmt=%d). %s",
+                                              isSwap ? "IS" : "is NOT",
+                                              (int)ct->second.format,
+                                              isSwap
+                                                ? "So X-Plane composites straight into "
+                                                  "the presented image, and that is where "
+                                                  "the resolve belongs."
+                                                : "So the presented image is only ever "
+                                                  "written by something we have not "
+                                                  "intercepted.");
+                                    }
+                                    if (isSwap && getenv("TAA_SCENE_SWAPCHAIN")) {
+                                        g_sceneColor = ct->second;
+                                        g_sceneColor.layout =
+                                            info->pColorAttachments[0].imageLayout;
+                                        continueSel = false;
+                                    }
+                                }
+
+                                // sRGB SPECIFICALLY, not merely "not HDR".
+                                //
+                                // The full pass census finally showed where the
+                                // frame goes: a full-viewport DEPTH-LESS pass
+                                // draws straight into the swapchain image, and
+                                // the last full-viewport pass WITH depth writes
+                                //
+                                //   3840x2160 att0 -> ... fmt=43 depth=yes
+                                //
+                                // fmt 43 is R8G8B8A8_SRGB - the final 3D
+                                // composite the swapchain pass samples. "Any
+                                // 8-bit target" also matches fmt 37 at the same
+                                // size, which is an intermediate, so the earlier
+                                // version latched the wrong one and the resolve
+                                // went somewhere nothing reads.
+                                bool srgb = (f == VK_FORMAT_R8G8B8A8_SRGB ||
+                                             f == VK_FORMAT_B8G8R8A8_SRGB);
+                                bool haveSrgb = (g_sceneColor.format == VK_FORMAT_R8G8B8A8_SRGB ||
+                                                 g_sceneColor.format == VK_FORMAT_B8G8R8A8_SRGB);
+                                bool want8 = getenv("TAA_SCENE_8BIT") != nullptr;
+                                if (continueSel && usable && want8 && (srgb || !haveSrgb) && !hdr) {
+                                    // Last full-viewport target of the frame,
+                                    // whatever its format - which is the
+                                    // composite.
+                                    g_sceneColor = ct->second;
+                                    g_sceneColor.layout =
+                                        info->pColorAttachments[0].imageLayout;
+                                    static VkFormat saidFmt = VK_FORMAT_UNDEFINED;
+                                    if (saidFmt != ct->second.format) {
+                                        saidFmt = ct->second.format;
+                                        trace("COLOR: TAA_SCENE_8BIT - scene target "
+                                              "is now the LAST full-viewport target "
+                                              "(fmt=%d), not the HDR one.",
+                                              (int)ct->second.format);
+                                    }
+                                } else if (continueSel && usable && (hdr || !haveHdr)) {
+                                    g_sceneColor = ct->second;
+                                    g_sceneColor.layout =
+                                        info->pColorAttachments[0].imageLayout;
+                                }
+
+                                // How many DISTINCT HDR scene targets does the
+                                // application rotate through?
+                                //
+                                // The resolve latches one image and writes into
+                                // it every frame. If X-Plane double-buffers its
+                                // scene target - and its command buffers
+                                // demonstrably alternate between two families -
+                                // then half the time we would be resolving into
+                                // an image the current frame is not drawing to,
+                                // which would corrupt part of the picture and
+                                // flicker as it alternates. That is exactly the
+                                // symptom, so the count decides it.
+                                if (hdr) {
+                                    bool known = false;
+                                    for (size_t q = 0; q < g_hdrTargets.size(); ++q)
+                                        if (g_hdrTargets[q] == ct->second.image) { known = true; break; }
+                                    if (!known && g_hdrTargets.size() < 16) {
+                                        g_hdrTargets.push_back(ct->second.image);
+                                        trace("COLOR: distinct HDR scene target #%zu = %p "
+                                              "(%ux%u)", g_hdrTargets.size(),
+                                              (void*)ct->second.image,
+                                              ct->second.w, ct->second.h);
+                                    }
+                                }
+
+                                // Does this pass resolve MSAA on the way out?
+                                //
+                                // If it does, the resolve target is the
+                                // single-sample image an upscaler actually
+                                // wants, and it is handed to us directly - no
+                                // need to hunt for a later pass or resolve it
+                                // ourselves. The multisampled attachment is the
+                                // wrong input for FSR2 or DLSS either way.
+                                g_sceneResolveMode =
+                                    (uint32_t)info->pColorAttachments[0].resolveMode;
+                                g_sceneResolveImage = VK_NULL_HANDLE;
+                                if (info->pColorAttachments[0].resolveImageView
+                                        != VK_NULL_HANDLE) {
+                                    std::map<VkImageView, VkImage>::iterator ri =
+                                        g_viewToImage.find(
+                                            info->pColorAttachments[0].resolveImageView);
+                                    if (ri != g_viewToImage.end())
+                                        g_sceneResolveImage = ri->second;
+                                }
+                            }
+                        }
+                    }
+                    // Only trust the layout for the exact image we sample.
+                    if (g_sceneDepth == VK_NULL_HANDLE || vi->second == g_sceneDepth) {
+                        g_depthFreshThisFrame  = true;
+                        g_depthLayoutThisFrame = info->pDepthAttachment->imageLayout;
+                        // Only mark a command buffer once depth is being READ
+                        // rather than cleared.
+                        //
+                        // loadOp CLEAR means the pass is starting fresh - the
+                        // depth buffer is wiped at that point and contains
+                        // nothing to reproject from. Injecting after such a
+                        // buffer sampled an all-zero depth image, which put
+                        // every pixel on the far plane; the dump showed
+                        // depth=0.000000 everywhere while the final velocity
+                        // image (written by a later, correct dispatch) looked
+                        // fine.
+                        //
+                        // loadOp LOAD means the pass is continuing into depth
+                        // that already holds the scene, which is what we want
+                        // to read.
+                        if (info->pDepthAttachment->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                            CbDepthUse &u = g_cbDepthUse[cb];
+                            u.used   = true;
+                            u.layout = info->pDepthAttachment->imageLayout;
+                            ++u.depthPasses;
+                        }
+                    }
+                }
+            }
+        }
+        g_passColorCount[g_passesThisFrame] = info->colorAttachmentCount;
+
+        // A pass that is not full-viewport-with-depth is not the 3D scene, so
+        // nothing recorded inside it should be jittered. Setting this false
+        // explicitly matters: shadow cascades, reflection passes and the UI all
+        // reuse command buffers, and a flag left set by an earlier scene pass
+        // would jitter whichever came next.
+        // Scene-SIZED, not display-sized. With X-Plane's own FSR enabled the
+        // 3D passes are a fraction of the window, and comparing against the
+        // window made this false for every pass in the frame.
+        bool fullViewport = isSceneSized(info->renderArea.extent.width,
+                                         info->renderArea.extent.height,
+                                         info->colorAttachmentCount);
+        bool sceneNow = info->pDepthAttachment
+                     && info->pDepthAttachment->imageView != VK_NULL_HANDLE
+                     && fullViewport;
+
+        // ---- EVERY PASS, INCLUDING DEPTH-LESS ONES.
+        //
+        // The earlier target census only ran inside the depth-carrying branch,
+        // so a composite pass - full-viewport, no depth, draws the 3D result and
+        // the UI into the presented image - could never appear in it. That is
+        // precisely the shape of the pass we are missing: no render pass, blit,
+        // copy or resolve that we intercept writes a swapchain handle, yet the
+        // frame plainly gets there.
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            // Flag the pass that draws into a swapchain image, so the descriptor
+            // hook knows when to look.
+            bool anySwap = false;
+            for (uint32_t a = 0; a < info->colorAttachmentCount; ++a) {
+                if (!info->pColorAttachments ||
+                    info->pColorAttachments[a].imageView == VK_NULL_HANDLE) continue;
+                std::map<VkImageView, VkImage>::iterator vs =
+                    g_viewToImage.find(info->pColorAttachments[a].imageView);
+                if (vs != g_viewToImage.end() && isSwapImage(vs->second)) anySwap = true;
+            }
+            g_cbInSwapPass[cb] = anySwap;
+
+            // Remember every image ever bound as a colour attachment. The
+            // composite source is identified by NOT being one - see
+            // g_computeComposite below.
+            for (uint32_t a = 0; a < info->colorAttachmentCount; ++a) {
+                if (!info->pColorAttachments ||
+                    info->pColorAttachments[a].imageView == VK_NULL_HANDLE) continue;
+                std::map<VkImageView, VkImage>::iterator va =
+                    g_viewToImage.find(info->pColorAttachments[a].imageView);
+                if (va != g_viewToImage.end()) g_seenAsAttachment.insert(va->second);
+            }
+
+            static std::set<VkImage> seenAny;
+            for (uint32_t a = 0; a < info->colorAttachmentCount; ++a) {
+                if (!info->pColorAttachments ||
+                    info->pColorAttachments[a].imageView == VK_NULL_HANDLE) continue;
+                std::map<VkImageView, VkImage>::iterator vi =
+                    g_viewToImage.find(info->pColorAttachments[a].imageView);
+                if (vi == g_viewToImage.end()) {
+                    static int unknown = 0;
+                    if (++unknown <= 6)
+                        trace("ANY PASS: attachment %u view %p has NO image mapping - "
+                              "created before we hooked vkCreateImageView, so it "
+                              "could never have matched a swapchain handle.",
+                              a, (void*)info->pColorAttachments[a].imageView);
+                    continue;
+                }
+                // Remember it: the pass that writes a swapchain image is where
+                // our upscaled result has to land, and it is a DRAW pass rather
+                // than a transfer - which is why substituting a blit source
+                // never fired. Recorded before the trace throttle, or only the
+                // first two dozen frames would ever deliver.
+                // NO lock_guard HERE. This block already holds g_lock, and
+                // std::mutex is not recursive - taking it twice on one thread
+                // deadlocks the render thread outright. That is a black screen
+                // and zero frames with every feature flag switched off, which
+                // is exactly how it presented.
+                // The layout comes from the attachment info, NOT from an
+                // assumption. Transitioning from the wrong oldLayout is
+                // undefined, and guessing COLOR_ATTACHMENT_OPTIMAL is what I
+                // did the first time this was attempted.
+                // AUTHORITATIVE LAYOUT, STRAIGHT FROM THE PASS.
+            //
+            // A render pass states the layout each attachment is in. That is
+            // ground truth, and it is what made the swapchain self-blit work
+            // while every guess at the scene target's layout failed. Barriers
+            // alone could never complete the table: this layer's own
+            // transitions go through dd.cmdPipelineBarrier - the next layer's
+            // pointer - and so bypass our own hook entirely.
+            noteLayout(vi->second, info->pColorAttachments[a].imageLayout);
+
+            if (isSwapImage(vi->second)) {
+                    CbSwapTarget t;
+                    t.image  = vi->second;
+                    t.layout = info->pColorAttachments[a].imageLayout;
+                    g_cbSwapTarget[cb] = t;
+                }
+                if (seenAny.size() >= 24 || seenAny.count(vi->second)) continue;
+                seenAny.insert(vi->second);
+                std::map<VkImage, ColorTarget>::iterator ct = g_colorImages.find(vi->second);
+                trace("ANY PASS: %ux%u att%u -> %p fmt=%d depth=%s%s",
+                      info->renderArea.extent.width, info->renderArea.extent.height,
+                      a, (void*)vi->second,
+                      ct != g_colorImages.end() ? (int)ct->second.format : -1,
+                      info->pDepthAttachment && info->pDepthAttachment->imageView ? "yes" : "no",
+                      isSwapImage(vi->second) ? "  [SWAPCHAIN]" : "");
+            }
+        }
+
+        if (g_cbDumpOn && g_cbDumpsLeft > 0) {
+            std::lock_guard<std::mutex> g(g_lock);
+            CbPassLog &pl = g_cbPassLog[cb];
+            if (pl.seq.size() < 96)
+                pl.seq += sceneNow ? 'S' : (fullViewport ? 'P' : 'o');
+        }
+        if (!sceneNow) {
+            std::lock_guard<std::mutex> g(g_lock);
+            g_cbInScenePass[cb] = false;
+        }
+
+        // ---- THE 3D/UI BOUNDARY, and where the resolve goes.
+        //
+        // A full-viewport pass with NO depth, in a command buffer that has
+        // already recorded full-viewport passes WITH depth, is the first thing
+        // after the 3D scene - post-processing or UI. Recording the resolve
+        // here, before this pass is begun, means everything drawn from now on
+        // lands on top of the resolved image and is never accumulated. That is
+        // what keeps instrument text, ATC boxes and the map out of the history.
+        //
+        // Derived from the measured frame, not guessed: the pass dump showed
+        // 2560x1440 depth=yes for passes 20-29 and depth=no for 30-31, so the
+        // boundary is exactly the 29/30 transition.
+        //
+        // Tracked per command buffer for the same reason the jitter flag is -
+        // X-Plane records on several threads, and a global "have we passed the
+        // boundary yet" would be set by one thread and read by another.
+        // ---- THE BOUNDARY WAS ONE PASS TOO LATE, AND THE CODE SAID SO.
+        //
+        // "A full-viewport pass with NO depth" assumes the first thing after
+        // the 3D scene has no depth attachment. The comment on the scene-target
+        // selection records the exception and nobody joined the two up:
+        //
+        //   "X-Plane's final 3D composite still has depth bound while writing
+        //    to an 8-bit sRGB target"
+        //
+        // That composite is the pass that READS the HDR target. Because it
+        // carries depth it counts as a scene pass here, so the depth-less
+        // boundary fires only AFTER the HDR image has been consumed - and every
+        // resolve we have ever recorded went into a buffer nothing reads again.
+        // That is why the seam test produced no seam, why writing into both HDR
+        // targets changed nothing, and why blitting onto the swapchain was the
+        // only thing that ever appeared.
+        //
+        // The real boundary is the first full-viewport pass that stops writing
+        // to the HDR scene target, whether or not it has depth. Catching it
+        // means the resolve lands while the HDR image still has a reader.
+        bool leavingSceneTarget = false;
+        if (fullViewport && sceneNow && g_sceneColor.image != VK_NULL_HANDLE &&
+            info && info->colorAttachmentCount > 0 && info->pColorAttachments &&
+            info->pColorAttachments[0].imageView != VK_NULL_HANDLE) {
+            std::lock_guard<std::mutex> g(g_lock);
+            // TWO CONDITIONS, because the first version had neither tight
+            // enough and fired on the second pass of the frame.
+            //
+            // "Writes somewhere other than the HDR target" also matches the
+            // OTHER HDR target and every intermediate, so it triggered after a
+            // single scene pass and resolved a half-drawn frame - the log read
+            // "boundary after 1/1" and it cost 18 fps to do nothing.
+            //
+            // The composite is specifically the pass that writes an 8-BIT
+            // target, and it only happens once the scene is complete. So
+            // require both: an 8-bit destination, and as many scene passes as
+            // this command buffer has ever recorded.
+            std::map<VkImageView, VkImage>::iterator vi =
+                g_viewToImage.find(info->pColorAttachments[0].imageView);
+            if (vi != g_viewToImage.end() && vi->second != g_sceneColor.image) {
+                std::map<VkImage, ColorTarget>::iterator ct = g_colorImages.find(vi->second);
+                bool eightBit = ct != g_colorImages.end() &&
+                                ct->second.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+                                ct->second.format != VK_FORMAT_R32G32B32A32_SFLOAT &&
+                                ct->second.format != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+
+                uint32_t seenNow = g_cbScenePassCount.count(cb) ? g_cbScenePassCount[cb] : 0;
+                uint32_t hi      = g_cbScenePassHigh.count(cb) ? g_cbScenePassHigh[cb] : 0;
+                bool sceneDone   = hi > 0 && seenNow >= hi;
+
+                std::map<VkCommandBuffer, bool>::iterator sw = g_cbSawScenePass.find(cb);
+                leavingSceneTarget = eightBit && sceneDone &&
+                                     (sw != g_cbSawScenePass.end() && sw->second);
+            }
+        }
+        if (leavingSceneTarget) {
+            static uint64_t nlog = 0;
+            if (++nlog % 600 == 1)
+                trace("RESOLVE: composite pass - full-viewport, depth bound, "
+                      "writing an 8-bit target after all %u scene passes. This "
+                      "is the pass that READS the HDR image, so the resolve goes "
+                      "in ahead of it rather than at the depth-less pass after.",
+                      g_cbScenePassHigh.count(cb) ? g_cbScenePassHigh[cb] : 0);
+        }
+
+        // WITH AN 8-BIT DESTINATION THE TIMING INVERTS.
+        //
+        // Resolving ahead of the composite is right when the destination is the
+        // HDR image, because the composite READS it. When the destination IS
+        // the composite's output, the composite WRITES it - so going in first
+        // means X-Plane paints over us immediately. In that mode the correct
+        // point is the original one: the depth-less pass after the composite
+        // and before the UI.
+        // The composite-pass trigger fires BEFORE X-Plane's compute writes the
+        // composite. That is right when the destination is an attachment the
+        // composite reads, and wrong when the destination IS the composite's
+        // own output - we would be resolving an image that does not exist yet
+        // for this frame. In that mode the correct point is the depth-less
+        // swapchain pass, which is after the compute.
+
+        // ---- MEASURE THE FIELD, WHATEVER ELSE IS RUNNING.
+        //
+        // In the predecessor this sat inside the resolve's dispatch, so it only
+        // measured when an upscaler was active. The vectors are the product
+        // here, so the measurement is unconditional.
+        {
+            std::map<VkCommandBuffer, VkDevice>::iterator rci = g_cbToDevice.find(cb);
+            if (rci != g_cbToDevice.end()) {
+                std::map<void*, DeviceData>::iterator rdi =
+                    g_devices.find(dispatchKey(rci->second));
+                if (rdi != g_devices.end() && g_mv.ready)
+                    mvRecordReadback(rdi->second, cb);
+            }
+        }
+
+    }
+    ++g_passesThisFrame;
+
+    // Append the velocity attachment slot. The vectors have to outlive the
+    // call, so they are declared here rather than inside the helper.
+    std::vector<VkRenderingAttachmentInfo> mvAtts;
+    VkRenderingInfo info2;
+    if (mvAppendAttachment(info, mvAtts, info2)) {
+        static uint64_t nlog = 0;
+        if (++nlog <= 3 || (nlog % 100000) == 0)
+            trace("MV: pass with %u colour attachments -> %u (velocity %s)",
+                  info->colorAttachmentCount, info2.colorAttachmentCount,
+                  mvAtts.back().imageView ? "BOUND" : "null slot");
+        if (g_nextCmdBeginRendering) g_nextCmdBeginRendering(cb, &info2);
+        return;
+    }
+
+    if (g_nextCmdBeginRendering) g_nextCmdBeginRendering(cb, info);
+}
+
+// Clearing the jitter flag is the whole job here. A viewport set between one
+// pass ending and the next beginning belongs to neither, and must not be
+// treated as scene geometry.
+
+// ---- DELIVERY THROUGH A COMPUTE SHADER, BECAUSE THE BLIT ENGINE CANNOT DO IT.
+//
+// Measured on this machine, every combination tried:
+//
+//   outImg 16F  -> scene target 16F       clean   (FSR2's own copy-back)
+//   swapchain 8 -> swapchain 8-bit sRGB   clean   (self-blit, 1:1 AND scaled)
+//   outImg 16F  -> swapchain 8-bit sRGB   GARBAGE
+//   scene  16F  -> swapchain 8-bit sRGB   GARBAGE
+//
+// Same-class blits work. Every 16F -> 8-bit conversion of real pixel data
+// fails, whatever the source image, layout, extent, scaling or filter - and
+// both BLIT_SRC and BLIT_DST are advertised, so the API never objects. The
+// fast-cleared 16F source that appeared to work was metadata, not pixels: a
+// fast clear writes compression state rather than texels, which is the same
+// trap the green clear set earlier.
+//
+// The sim's own composite SAMPLES these 16F images every frame and looks
+// perfect, so the data is intact and readable. What fails is the fixed-function
+// conversion. This reads through the texture unit, like the sim does, and
+// converts in code we control.
+//
+// It stores into an R8G8B8A8_UNORM image we own rather than the swapchain,
+// because sRGB formats cannot be STORAGE images. That image reaches the
+// swapchain as a raw 8-bit -> 8-bit COPY, which converts nothing, so the
+// shader's sRGB encode lands exactly once and the channel swap in the shader
+// accounts for the copy not reordering bytes.
+
+
+struct DeliverPush { int32_t srcW, srcH, dstW, dstH; };
+
+
+
+// ---- PERIODIC SCREENSHOTS, STRAIGHT OFF THE SWAPCHAIN.
+//
+// Read back the presented image every few seconds and write it to disk. This
+// exists so the loop stops needing a human: build, launch, and look at the
+// files afterwards, instead of asking someone to alt-tab and take a picture of
+// every experiment.
+//
+// It captures the swapchain itself, so what lands on disk is exactly what was
+// on screen - including anything our delivery wrote into it.
+struct ShotCap {
+    VkBuffer       buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void          *ptr = nullptr;
+    uint32_t       w = 0, h = 0;
+    bool           ready = false, armed = false, failed = false;
+    int            wait = 0;
+    uint32_t       index = 0;
+    uint64_t       nextFrame = 0;
+};
+static ShotCap g_shot;
+
+static bool shotWriteBmp(const char *path, const unsigned char *bgra,
+                         uint32_t w, uint32_t h)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    const uint32_t rowBytes = ((w * 3u) + 3u) & ~3u;
+    const uint32_t imgBytes = rowBytes * h;
+    unsigned char hdr[54];
+    memset(hdr, 0, sizeof(hdr));
+    hdr[0] = 'B'; hdr[1] = 'M';
+    uint32_t total = 54 + imgBytes;  memcpy(hdr + 2, &total, 4);
+    uint32_t off = 54;               memcpy(hdr + 10, &off, 4);
+    uint32_t hs = 40;                memcpy(hdr + 14, &hs, 4);
+    memcpy(hdr + 18, &w, 4);
+    memcpy(hdr + 22, &h, 4);
+    uint16_t planes = 1, bpp = 24;
+    memcpy(hdr + 26, &planes, 2);
+    memcpy(hdr + 28, &bpp, 2);
+    memcpy(hdr + 34, &imgBytes, 4);
+    fwrite(hdr, 1, sizeof(hdr), f);
+
+    unsigned char *row = (unsigned char*)calloc(rowBytes, 1);
+    if (!row) { fclose(f); return false; }
+    for (int y = (int)h - 1; y >= 0; --y) {          // BMP is bottom-up
+        const unsigned char *src = bgra + (size_t)y * w * 4;
+        for (uint32_t x = 0; x < w; ++x) {
+            row[x * 3 + 0] = src[x * 4 + 0];         // B
+            row[x * 3 + 1] = src[x * 4 + 1];         // G
+            row[x * 3 + 2] = src[x * 4 + 2];         // R
+        }
+        fwrite(row, 1, rowBytes, f);
+    }
+    free(row);
+    fclose(f);
+    return true;
+}
+
+// Called with the presented image already in TRANSFER_DST_OPTIMAL, at the end
+// of the delivery, so the capture includes whatever we just wrote.
+static void shotMaybe(DeviceData &dd, VkCommandBuffer cb, VkImage swapImg,
+                      uint32_t w, uint32_t h, VkImageLayout layout)
+{
+    static int every = -1;
+    if (every < 0) {
+        const char *e = getenv("TAA_SHOT_SECONDS");
+        every = e ? atoi(e) : 0;
+    }
+    if (every <= 0 || g_shot.failed) return;
+
+    if (g_shot.armed) {
+        if (--g_shot.wait > 0) return;
+        g_shot.armed = false;
+        _mkdir("D:\\TAA Dumps");
+        char path[512];
+        // ---- BOUNDED. THESE ARE 25 MB EACH.
+        //
+        // Unbounded, this wrote about three gigabytes in one session, filled the
+        // drive, and truncated a file that happened to be mid-write at the time.
+        // Twelve slots that wrap keep the recent history and cap the cost at
+        // roughly 300 MB - enough to see what a change did, and it can never
+        // grow past that.
+        snprintf(path, sizeof(path), "D:\\TAA Dumps\\shot_%02u.bmp",
+                 g_shot.index % 12u);
+        g_shot.index++;
+        bool ok = shotWriteBmp(path, (const unsigned char*)g_shot.ptr,
+                               g_shot.w, g_shot.h);
+        trace("SHOT: %s %s", ok ? "wrote" : "FAILED", path);
+        return;
+    }
+
+    // Frames rather than a clock: no wall-clock call on the record path, and
+    // the cadence only needs to be roughly every few seconds.
+    if (g_frameCount < g_shot.nextFrame) return;
+    g_shot.nextFrame = g_frameCount + (uint64_t)(every * 20);   // ~20 fps assumed
+
+    if (!g_shot.ready) {
+        if (!g_getPhysMemProps || !dd.createBuffer) { g_shot.failed = true; return; }
+        VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
+        VkBufferCreateInfo bci;
+        memset(&bci, 0, sizeof(bci));
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = bytes;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (dd.createBuffer(dd.device, &bci, nullptr, &g_shot.buf) != VK_SUCCESS) {
+            g_shot.failed = true; trace("SHOT: buffer failed"); return;
+        }
+        VkMemoryRequirements mr;
+        dd.getBufferMemReq(dd.device, g_shot.buf, &mr);
+        VkPhysicalDeviceMemoryProperties mp;
+        memset(&mp, 0, sizeof(mp));
+        g_getPhysMemProps(dd.phys, &mp);
+        uint32_t ti = UINT32_MAX;
+        for (uint32_t k = 0; k < mp.memoryTypeCount; ++k)
+            if ((mr.memoryTypeBits & (1u << k)) &&
+                (mp.memoryTypes[k].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                (mp.memoryTypes[k].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                ti = k; break;
+            }
+        VkMemoryAllocateInfo mai;
+        memset(&mai, 0, sizeof(mai));
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = ti;
+        if (ti == UINT32_MAX ||
+            dd.allocateMemory(dd.device, &mai, nullptr, &g_shot.mem) != VK_SUCCESS ||
+            dd.bindBufferMemory(dd.device, g_shot.buf, g_shot.mem, 0) != VK_SUCCESS ||
+            dd.mapMemory(dd.device, g_shot.mem, 0, bytes, 0, &g_shot.ptr) != VK_SUCCESS) {
+            g_shot.failed = true; trace("SHOT: memory failed"); return;
+        }
+        g_shot.w = w; g_shot.h = h; g_shot.ready = true;
+        trace("SHOT: capturing %ux%u to D:\\TAA Dumps every ~%d s", w, h, every);
+    }
+    if (g_shot.w != w || g_shot.h != h) return;   // size changed; skip this one
+
+    // Own the transitions. This used to sit inside the delivery block and so
+    // only fired when delivery was active - useless for a diagnostic, which is
+    // needed most when the thing being diagnosed is switched off.
+    VkImageMemoryBarrier sb;
+    memset(&sb, 0, sizeof(sb));
+    sb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    sb.srcQueueFamilyIndex = sb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    sb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    sb.subresourceRange.levelCount = 1;
+    sb.subresourceRange.layerCount = 1;
+    sb.image         = swapImg;
+    sb.oldLayout     = layout;
+    sb.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    sb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    sb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                          0, nullptr, 1, &sb);
+
+    VkBufferImageCopy bic;
+    memset(&bic, 0, sizeof(bic));
+    bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bic.imageSubresource.layerCount = 1;
+    bic.imageExtent.width = w; bic.imageExtent.height = h; bic.imageExtent.depth = 1;
+    dd.cmdCopyImageToBuffer(cb, swapImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            g_shot.buf, 1, &bic);
+
+    sb.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    sb.newLayout     = layout;                 // hand it back as we found it
+    sb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    sb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                          0, nullptr, 1, &sb);
+
+    g_shot.armed = true;
+    g_shot.wait  = 4;    // let it actually execute before reading
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
+{
+    VkImage       swapTarget = VK_NULL_HANDLE;
+    VkImageLayout swapLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_cbInScenePass[cb] = false;
+        std::map<VkCommandBuffer, CbSwapTarget>::iterator st = g_cbSwapTarget.find(cb);
+        if (st != g_cbSwapTarget.end()) {
+            swapTarget = st->second.image;
+            swapLayout = st->second.layout;
+            g_cbSwapTarget.erase(st);
+        }
+    }
+    if (g_nextCmdEndRendering) g_nextCmdEndRendering(cb);
+
+    // Capture whatever is on screen, whether or not any of our delivery ran.
+    if (swapTarget != VK_NULL_HANDLE) {
+        DeviceData *sdd = nullptr;
+        SwapInfo    sinf;
+        bool        haveInfo = false;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+            if (ci != g_cbToDevice.end()) {
+                std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+                if (di != g_devices.end()) sdd = &di->second;
+            }
+            haveInfo = swapInfoFor(swapTarget, sinf);
+        }
+        if (sdd && haveInfo && sdd->cmdCopyImageToBuffer)
+            shotMaybe(*sdd, cb, swapTarget, sinf.w, sinf.h, swapLayout);
+    }
+
+}
+
+// THE INJECTION POINT.
+//
+// vkEndCommandBuffer, not vkCmdEndRendering. At this moment the application has
+// finished recording the buffer but has not closed it, so commands appended
+// here are guaranteed to run after everything else in it - including the final
+// depth write - without needing to know which pass was last.
+//
+// That question turned out to be unanswerable the way it was being asked:
+// X-Plane records on multiple threads, so a global pass counter is racy, and
+// the previous version silently never fired.
+//
+// Recording into the app's own buffer also fixes what the present-time submit
+// got wrong: the queue is whichever they submit this buffer to, ordering
+// follows from position in the buffer, and the layout is the one observed when
+// the pass began.
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_EndCommandBuffer(VkCommandBuffer cb)
+{
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool wants = false;
+    DeviceData dd;
+    bool haveDd = false;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, CbDepthUse>::iterator ui = g_cbDepthUse.find(cb);
+        if (ui != g_cbDepthUse.end() && ui->second.used) {
+            wants  = true;
+            layout = ui->second.layout;
+            ui->second.used = false;          // consumed; re-proven each recording
+            ui->second.depthPasses = 0;
+        }
+        // A command buffer is about to be closed and may be re-recorded next
+        // frame. Both resolve decisions must be re-earned rather than carried
+        // over, or a reused buffer would skip the resolve because a previous
+        // recording had already done it.
+        {
+            // Carry this recording's scene-pass count forward as next
+            // recording's target, then start counting again. This is what makes
+            // the boundary land after the LAST scene pass rather than the first
+            // depth-less one.
+            uint32_t n = g_cbScenePassCount.count(cb) ? g_cbScenePassCount[cb] : 0;
+            if (n > 0) g_cbScenePassPrev[cb] = n;
+            g_cbScenePassCount[cb] = 0;
+
+            // Report this buffer's shape as it closes. S=scene (full viewport
+            // with depth), P=full viewport without depth, o=everything else.
+            // What matters is whether S and P appear in the same buffer, and
+            // whether S ever appears in more than one.
+            if (g_cbDumpOn && g_cbDumpsLeft > 0) {
+                std::map<VkCommandBuffer, CbPassLog>::iterator pi = g_cbPassLog.find(cb);
+                if (pi != g_cbPassLog.end() && !pi->second.seq.empty()) {
+                    --g_cbDumpsLeft;
+                    trace("CBDUMP cb=%p  %s", (void*)cb, pi->second.seq.c_str());
+                    pi->second.seq.clear();
+                }
+            }
+
+            g_cbSawScenePass[cb]   = false;
+            g_cbResolvedThisCb[cb] = false;
+            g_cbInScenePass[cb]    = false;
+        }
+        if (wants) {
+            std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+            if (ci != g_cbToDevice.end()) {
+                std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+                if (di != g_devices.end()) { dd = di->second; haveDd = true; }
+            }
+        }
+    }
+
+    // The depth-derived pass used to be recorded into X-Plane's own command
+    // buffer here. It is gone; the injected shaders write velocity as part of
+    // the scene draw itself, so there is nothing to inject and nothing to hold
+    // stable before injecting it.
+    (void)wants;
+
+    PFN_vkEndCommandBuffer next = haveDd ? dd.endCommandBuffer : nullptr;
+    if (!next) {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+            if (di != g_devices.end()) next = di->second.endCommandBuffer;
+        }
+    }
+    return next ? next(cb) : VK_SUCCESS;
+}
+
+
+// ---------------------------------------------------------------- arming
+//
+// Every one-time switch the layer reads from the environment, in ONE place
+// that runs regardless of what else is enabled.
+//
+// This used to live inside the velocity pass's lazy initialiser, purely
+// because that was a convenient spot when it was written. That created a
+// dependency nobody would ever guess at: turning off TAA_VELOCITY - the
+// depth-derived compute pass, which the SPIR-V injection made redundant -
+// silently disabled the JITTER, the RESOLVE, FSR2, the cockpit reprojection
+// and the pass dump as well. The layer attached, logged, and did nothing, and
+// the image was X-Plane's own output with no sign anything was wrong.
+//
+// It also poisoned a measurement: disabling the velocity pass appeared to be
+// worth +15 fps and every stutter, and that was the whole layer switching off
+// rather than one dispatch.
+static void armLayerOnce()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+            // 120 frames is ~2-4 s: frequent enough to spot-check, rare
+            // enough that the readback stall is not felt. Override with
+            // TAA_VELOCITY_DUMP=<frames>; 10 is usable for a short capture
+            // but costs several stalls per second and ~4 MB/s of disk.
+            // TAA_VELOCITY_DUMP=0 disables dumping entirely, including the
+            // startup burst. Necessary for a clean flash test: the readback
+            // copies 28 MB per dump and three of those firing right after a
+            // load would add stutter that has nothing to do with what is
+            // being measured.
+            dumpEvery = 0;
+            if (const char *d = getenv("TAA_VELOCITY_DUMP")) dumpEvery = atoi(d);
+
+            // Jitter is OFF unless asked for, and will later be gated on a
+            // resolve being present.
+            //
+            // On its own it makes the image worse, not better: it shifts
+            // the sample grid every frame and nothing accumulates the
+            // result, so high-contrast edges crawl. It is only useful to
+            // whatever consumes it. Shipping it enabled ahead of the
+            // resolve would look like a regression, and would be one.
+            g_jitterArmed = (getenv("TAA_JITTER") != nullptr);
+            g_jitterViewport = (getenv("TAA_JITTER_VIEWPORT") != nullptr);
+            if (const char *nf = getenv("TAA_NEARFIELD_M")) {
+                g_nearFieldM = (float)atof(nf);
+                if (g_nearFieldM < 0.0f)  g_nearFieldM = 0.0f;
+                if (g_nearFieldM > 50.0f) g_nearFieldM = 50.0f;
+            }
+            trace("NEAR FIELD: geometry closer than %.2f m reprojects as "
+                  "body-fixed (velocity zero) instead of world-fixed. %s "
+                  "Set TAA_NEARFIELD_M to change it, 0 to disable.",
+                  g_nearFieldM,
+                  g_nearFieldM > 0.0f
+                      ? "Active only once the plugin reports the camera rigid in "
+                        "the body frame; off in external views."
+                      : "DISABLED.");
+            if (const char *lg = getenv("TAA_LEDGER"))
+                g_ledgerOn = (lg[0] != '0');
+            trace("LEDGER: per-resource accounting is %s. %s", 
+                  g_ledgerOn ? "ON" : "OFF",
+                  g_ledgerOn
+                      ? "Every image and buffer creation takes the global "
+                        "lock and queries memory requirements - set "
+                        "TAA_LEDGER=0 to measure what that costs."
+                      : "Resource creation is untouched; the VRAM ledger "
+                        "and geometry histogram will report nothing.");
+            if (const char *cp = getenv("TAA_COCKPIT_PASS")) {
+                g_cockpitPassIndex = atoi(cp);
+                trace("COCKPIT: scene pass %d will be reprojected in the "
+                      "AIRCRAFT BODY frame instead of the world frame. "
+                      "Cockpit surfaces travel with the camera, so the "
+                      "world matrix claims most of a screen of motion where "
+                      "the true value is near zero.", g_cockpitPassIndex);
+            } else {
+                trace("COCKPIT: body-frame reprojection OFF. Set "
+                      "TAA_COCKPIT_PASS=<n> once TAA_CB_DUMP has shown "
+                      "which scene pass draws the cockpit.");
+            }
+            if (g_jitterArmed)
+                trace("JITTER: ARMED - %s. Expect crawling edges until the "
+                      "resolve consumes it.",
+                      g_jitterViewport
+                          ? "LEGACY viewport offset, every full-size draw in a "
+                            "3D pass including full-screen ones"
+                          : "clip-space offset in the patched vertex shaders, "
+                            "geometry pipelines inside a 3D pass only");
+
+            if (getenv("TAA_CB_DUMP")) {
+                g_cbDumpOn = true;
+                g_cbDumpsLeft = 40;   // a couple of frames' worth, then quiet
+                trace("CBDUMP: logging per-command-buffer pass structure. "
+                      "S=full-viewport+depth (scene), P=full-viewport no depth, "
+                      "o=other. Question: do S and P share a buffer, and does "
+                      "S span more than one?");
+            }
+
+
+            // SPIR-V injection is NOT armed here - see TAA_CreateShaderModule.
+            // Shader modules are created during load, before any present,
+            // so anything armed in this function arrives too late for them.
+
+            if (const char *md = getenv("TAA_PAGER_MAX_DROP")) {
+                int v = atoi(md);
+                if (v >= 1 && v <= 4) g_pagerMaxDrop = (uint32_t)v;
+            }
+            if (const char *dp = getenv("TAA_PAGER_DROP_ABOVE")) {
+                g_pagerDropAbove = (uint32_t)atoi(dp);
+                trace("PAGER: custom texture pager armed - textures larger "
+                      "than %u px lose up to %u mip level%s at creation, and "
+                      "their uploads are remapped to match",
+                      g_pagerDropAbove, g_pagerMaxDrop,
+                      g_pagerMaxDrop == 1 ? "" : "s");
+            }
+
+            if (const char *ag = getenv("TAA_PAGER_AUTOGEN_TO")) {
+                g_pagerAutogenTo = (uint32_t)atoi(ag);
+                if (g_pagerAutogenTo)
+                    trace("PAGER: streamed scenery capped at %u px - textures "
+                          "created mid-flight are autogen and ortho, and lose as "
+                          "many levels as it takes. The aircraft loads before the "
+                          "flight starts and is not in that set.",
+                          g_pagerAutogenTo);
+            }
+            g_replaceXpFsr = (getenv("TAA_REPLACE_XPFSR") != nullptr);
+            if (g_replaceXpFsr)
+                trace("XP FSR: TAA_REPLACE_XPFSR - X-Plane's own upscale "
+                      "dispatches will be dropped once its shader modules are "
+                      "recognised, and FSR2's display-sized result written in "
+                      "their place.");
+            g_overcommit = (getenv("TAA_OVERCOMMIT") != nullptr);
+            if (g_overcommit)
+                trace("ALLOC: overcommit armed - device-local failures will retry "
+                      "from host-visible memory");
+
+            if (const char *vb = getenv("TAA_VRAM_BUDGET")) {
+                g_vramBudgetScale = (float)atof(vb);
+                trace("VRAM: budget override armed, scale x%.2f", g_vramBudgetScale);
+            }
+
+}
+
+// ---- THE SWAPCHAIN, WHICH NOTHING HAS EVER TRACKED.
+//
+// The seam test settled it: copying only the left half of FSR2's output into
+// g_sceneColor.image produced no seam at all, so nothing written there reaches
+// the display. The scene target we have been resolving into is an intermediate
+// X-Plane has already finished with by the time the 3D/UI boundary fires.
+//
+// The swapchain image is the one thing that is definitionally on screen. To
+// compare against it - or eventually to present our own upscaled result - the
+// layer has to know which images belong to the swapchain, and it never asked.
+
+// ---- WHO WRITES THE PRESENTED IMAGE?
+//
+// The scene-target census answered a question that had been unanswerable: no
+// full-viewport render pass ever draws into a swapchain image. So X-Plane gets
+// its final frame there some other way, and the only candidates are a blit or a
+// copy - neither of which this layer has ever intercepted.
+//
+// Whatever the SOURCE of that transfer is, it is by definition the last image
+// that matters, and it is the one place a resolve would survive. Every target we
+// have written to today has been invisible because none of them was it.
+static VkImage g_presentSource = VK_NULL_HANDLE;
+
+// Every DISTINCT transfer, once. Not just the ones into a swapchain image.
+//
+// Three targeted guesses have now missed - a blit into the swapchain, a copy
+// into it, and an MSAA resolve (that call site never runs; renopt_MSAA is 0).
+// Guessing one candidate per launch is the expensive way to search a space this
+// small, so this prints the whole transfer graph in a single run and the
+// swapchain handles beside it.
+static void noteTransfer(const char *how, VkImage src, VkImage dst)
+{
+    std::lock_guard<std::mutex> g(g_lock);
+    static std::set<std::pair<VkImage,VkImage> > seen;
+    std::pair<VkImage,VkImage> k(src,dst);
+    if (seen.size() < 24 && !seen.count(k)) {
+        seen.insert(k);
+        std::map<VkImage, ColorTarget>::iterator cs = g_colorImages.find(src);
+        std::map<VkImage, ColorTarget>::iterator cd = g_colorImages.find(dst);
+        trace("XFER %-4s %p (fmt=%d %ux%u)%s -> %p (fmt=%d %ux%u)%s", how,
+              (void*)src, cs != g_colorImages.end() ? (int)cs->second.format : -1,
+              cs != g_colorImages.end() ? cs->second.w : 0,
+              cs != g_colorImages.end() ? cs->second.h : 0,
+              isSwapImage(src) ? " [SWAPCHAIN]" : "",
+              (void*)dst, cd != g_colorImages.end() ? (int)cd->second.format : -1,
+              cd != g_colorImages.end() ? cd->second.w : 0,
+              cd != g_colorImages.end() ? cd->second.h : 0,
+              isSwapImage(dst) ? " [SWAPCHAIN]" : "");
+    }
+}
+
+static void notePresentSource(const char *how, VkImage src, VkImage dst)
+{
+    noteTransfer(how, src, dst);
+    std::lock_guard<std::mutex> g(g_lock);
+    if (!isSwapImage(dst)) return;
+    if (g_presentSource == src) return;
+    g_presentSource = src;
+    std::map<VkImage, ColorTarget>::iterator ct = g_colorImages.find(src);
+    trace("PRESENT SOURCE: %s into a swapchain image from %p (fmt=%d %ux%u). "
+          "THIS is the image that reaches the screen - the resolve belongs here, "
+          "and it is not the one we have been writing to (%p).",
+          how, (void*)src,
+          ct != g_colorImages.end() ? (int)ct->second.format : -1,
+          ct != g_colorImages.end() ? ct->second.w : 0,
+          ct != g_colorImages.end() ? ct->second.h : 0,
+          (void*)g_sceneColor.image);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdBlitImage(
+    VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+    VkImageLayout dl, uint32_t n, const VkImageBlit *regions, VkFilter filter)
+{
+    notePresentSource("BLIT", src, dst);
+    PFN_vkCmdBlitImage next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+            if (di != g_devices.end()) next = di->second.cmdBlitImage;
+        }
+    }
+    if (next) next(cb, src, sl, dst, dl, n, regions, filter);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdCopyImage(
+    VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+    VkImageLayout dl, uint32_t n, const VkImageCopy *regions)
+{
+    notePresentSource("COPY", src, dst);
+    PFN_vkCmdCopyImage next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+            if (di != g_devices.end()) next = di->second.cmdCopyImage;
+        }
+    }
+    if (next) next(cb, src, sl, dst, dl, n, regions);
+}
+
+// ---- X-PLANE'S MSAA RESOLVE, WHICH HAS BEEN ERASING OUR WORK.
+//
+// Found by disassembling the renderer rather than guessing at pass shapes.
+// There is exactly one vkCmdResolveImage call site, at 0x140638eb8:
+//
+//     mov r8d, 6                ; srcImageLayout = TRANSFER_SRC_OPTIMAL
+//     mov dword [rsp+0x20], 7   ; dstImageLayout = TRANSFER_DST_OPTIMAL
+//     mov rdx, [rdx+0x78]       ; srcImage   (the 2x MSAA target)
+//     mov r9,  [r9+0x78]        ; dstImage   (the single-sample target)
+//     call qword ptr [rip+...]  ; vkCmdResolveImage
+//
+// X-Plane renders the scene MULTISAMPLED and resolves it down into the
+// single-sample HDR image - the very image every resolve we have recorded has
+// been written into. Our copy goes in at the pass boundary; this resolve then
+// lands on top and overwrites it. That is why the accumulation measured
+// correct, the copy measured correct, and the screen never changed.
+//
+// The existing code knew both targets existed - "one single-sample and one 2x
+// multisampled" - and deliberately avoided the multisampled one because
+// copying into it "produced the sheared bands". It never followed that through
+// to the consequence: the MSAA image is the source of truth, and the
+// single-sample one is downstream of it.
+//
+// Nothing is changed here yet. The resolve is intercepted, reported once, and
+// passed straight through, so the ordering can be confirmed before anything
+// depends on it.
+static VkImage g_msaaResolveSrc = VK_NULL_HANDLE;
+static VkImage g_msaaResolveDst = VK_NULL_HANDLE;
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdResolveImage(
+    VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+    VkImageLayout dl, uint32_t n, const VkImageResolve *regions)
+{
+    PFN_vkCmdResolveImage next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+            if (di != g_devices.end()) next = di->second.cmdResolveImage;
+        }
+        if (g_msaaResolveDst != dst || g_msaaResolveSrc != src) {
+            g_msaaResolveSrc = src; g_msaaResolveDst = dst;
+            std::map<VkImage, ColorTarget>::iterator cs = g_colorImages.find(src);
+            std::map<VkImage, ColorTarget>::iterator cd = g_colorImages.find(dst);
+            trace("MSAA RESOLVE: %p (fmt=%d samples=%d) -> %p (fmt=%d samples=%d). "
+                  "Our scene target is %p, and we are %s. If they match, X-Plane "
+                  "overwrites our resolve here every frame.",
+                  (void*)src,
+                  cs != g_colorImages.end() ? (int)cs->second.format : -1,
+                  cs != g_colorImages.end() ? (int)cs->second.samples : -1,
+                  (void*)dst,
+                  cd != g_colorImages.end() ? (int)cd->second.format : -1,
+                  cd != g_colorImages.end() ? (int)cd->second.samples : -1,
+                  (void*)g_sceneColor.image,
+                  dst == g_sceneColor.image ? "WRITING INTO ITS DESTINATION"
+                                            : "writing somewhere else");
+        }
+    }
+    if (next) next(cb, src, sl, dst, dl, n, regions);
+}
+
+// ---- WHAT DOES THE SWAPCHAIN PASS ACTUALLY SAMPLE?
+//
+// Every destination so far has been inferred from render order - the last
+// full-viewport target, the last HDR one, the last 8-bit one, the sRGB one -
+// and every one of them was invisible. Inference has now been wrong five times
+// in a row, so read the binding instead of guessing it.
+//
+// vkUpdateDescriptorSets records which image views each descriptor set holds.
+// vkCmdBindDescriptorSets, while the pass writing a swapchain image is open,
+// says which of those sets that pass is about to sample. The intersection is
+// the image the final composite reads, which is the only correct destination.
+
+static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSets(
+    VkDevice device, uint32_t nw, const VkWriteDescriptorSet *w,
+    uint32_t nc, const VkCopyDescriptorSet *c)
+{
+    PFN_vkUpdateDescriptorSets next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.updateDescriptorSets;
+        for (uint32_t i = 0; i < nw && w; ++i) {
+            if (!w[i].pImageInfo) continue;
+            if (w[i].descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                w[i].descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) continue;
+            std::vector<VkImageView> &v = g_setViews[w[i].dstSet];
+            for (uint32_t k = 0; k < w[i].descriptorCount; ++k)
+                if (w[i].pImageInfo[k].imageView != VK_NULL_HANDLE)
+                    v.push_back(w[i].pImageInfo[k].imageView);
+            if (v.size() > 64) v.erase(v.begin(), v.begin() + (v.size() - 64));
+        }
+    }
+    if (next) next(device, nw, w, nc, c);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
+    VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout,
+    uint32_t first, uint32_t n, const VkDescriptorSet *sets,
+    uint32_t nd, const uint32_t *dyn)
+{
+    PFN_vkCmdBindDescriptorSets next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+            if (di != g_devices.end()) next = di->second.cmdBindDescriptorSets;
+        }
+        std::map<VkCommandBuffer, bool>::iterator sp = g_cbInSwapPass.find(cb);
+        if (sp != g_cbInSwapPass.end() && sp->second && sets) {
+            static std::set<VkImage> reported;
+            for (uint32_t i = 0; i < n; ++i) {
+                std::map<VkDescriptorSet, std::vector<VkImageView> >::iterator sv =
+                    g_setViews.find(sets[i]);
+                if (sv == g_setViews.end()) continue;
+                for (size_t k = 0; k < sv->second.size(); ++k) {
+                    std::map<VkImageView, VkImage>::iterator vi =
+                        g_viewToImage.find(sv->second[k]);
+                    if (vi == g_viewToImage.end()) continue;
+                    std::map<VkImage, ColorTarget>::iterator ct =
+                        g_colorImages.find(vi->second);
+                    if (ct == g_colorImages.end()) continue;          // not a render target
+                    if (ct->second.w < 1920) continue;                // not full-window
+                    if (reported.size() >= 12 || reported.count(vi->second)) continue;
+                    reported.insert(vi->second);
+                    trace("SWAP PASS SAMPLES: %p fmt=%d %ux%u  (our scene target is "
+                          "%p fmt=%d) -> %s",
+                          (void*)vi->second, (int)ct->second.format,
+                          ct->second.w, ct->second.h,
+                          (void*)g_sceneColor.image, (int)g_sceneColor.format,
+                          vi->second == g_sceneColor.image
+                              ? "MATCH - we are writing the right image"
+                              : "MISMATCH - THIS is what reaches the screen");
+                }
+            }
+        }
+    }
+    if (next) next(cb, bp, layout, first, n, sets, nd, dyn);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_GetSwapchainImagesKHR(
+    VkDevice device, VkSwapchainKHR sc, uint32_t *count, VkImage *images)
+{
+    PFN_vkGetSwapchainImagesKHR next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.getSwapchainImagesKHR;
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+
+
+    VkResult r = next ? next(device, sc, count, images)
+                      : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS && images && count && *count) {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::vector<VkImage> &v = g_swapImages[sc];
+        v.assign(images, images + *count);
+        static bool said = false;
+        if (!said) {
+            said = true;
+            trace("SWAPCHAIN: %u images tracked - the layer can now see what is "
+                  "actually presented, which it never could before.", *count);
+            for (uint32_t k = 0; k < *count; ++k)
+                trace("SWAPCHAIN:   image[%u] = %p", k, (void*)images[k]);
+        }
+    }
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
+    VkQueue queue, const VkPresentInfoKHR *info)
+{
+    // Global rather than a static local, because the FSR2 idle timeout needs a
+    // frame count too and it runs in vkEndCommandBuffer, nowhere near here.
+    // One counter with one definition of "a frame" - a second one incremented
+    // somewhere else would drift from this and the two would disagree in logs
+    // for reasons nobody could reconstruct later.
+    uint64_t frames = ++g_frameCount;
+
+    // Last frame's timings, read without blocking - waiting on them would
+    // change what is being measured.
+    {
+        std::map<void*, DeviceData>::iterator dit;
+        { std::lock_guard<std::mutex> g(g_lock); dit = g_devices.begin(); }
+        if (dit != g_devices.end()) { g_tsPending = true; gpuTimeReport(dit->second, frames); }
+    }
+
+    // Arm everything on the first present, unconditionally. Present runs no
+    // matter which subsystems are enabled, which is the whole point - see the
+    // note on armLayerOnce.
+    armLayerOnce();
+
+    // ---- FRAME RATE, MEASURED HERE AND NOWHERE ELSE.
+    //
+    // The sim's own readout counts frames the SIM rendered. With generation on
+    // that stops being the number on the monitor, and no plugin callback can
+    // ever see the difference - a flight loop runs once per sim frame by
+    // definition. This is the one place both are visible.
+    //
+    // Averaged over half a second: per-frame reciprocals jitter far too much to
+    // read, and a full second is slow to respond when something starts costing.
+    if (g_share && g_share->magic == TAA_MAGIC) {
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+
+        static LARGE_INTEGER windowStart = { 0 };
+        static uint64_t      framesAtStart = 0;
+        static uint64_t      displayedAtStart = 0;
+
+        g_share->framesPresented = frames;
+        // Zero while frame generation is off, and the sim's own count is then
+        // the honest answer for both rows rather than a zero that reads as a
+        // stall.
+        g_share->framesDisplayed = frames;
+
+        if (windowStart.QuadPart == 0) {
+            windowStart = now;
+            framesAtStart = frames;
+            displayedAtStart = g_share->framesDisplayed;
+        } else {
+            double elapsed = (double)(now.QuadPart - windowStart.QuadPart) /
+                             (double)freq.QuadPart;
+            if (elapsed >= 0.5) {
+                g_share->fpsPresented =
+                    (float)((double)(frames - framesAtStart) / elapsed);
+                g_share->fpsDisplayed =
+                    (float)((double)(g_share->framesDisplayed - displayedAtStart) / elapsed);
+
+                // ---- SAY IT IN THE LOG TOO, NOT ONLY IN THE PANEL.
+                //
+                // The panel row is for the person flying; this is for reading
+                // back afterwards. Without it "is frame generation actually
+                // producing frames" can only be answered by someone looking at
+                // the screen and reporting, which is a slow way to learn that a
+                // ratio is 1.00 and nothing is being generated at all.
+                static uint64_t lastSaid = 0;
+                if (frames - lastSaid >= 300) {
+                    lastSaid = frames;
+                    float ratio = g_share->fpsPresented > 0.0f
+                                ? g_share->fpsDisplayed / g_share->fpsPresented : 0.0f;
+                    trace("FPS: %.1f rendered by the sim -> %.1f presented "
+                          "(%.2fx)%s", g_share->fpsPresented, g_share->fpsDisplayed,
+                          ratio,
+                          ratio < 1.5f ? "  <- frame generation is NOT doubling"
+                                       : "");
+                }
+                windowStart = now;
+                framesAtStart = frames;
+                displayedAtStart = g_share->framesDisplayed;
+            }
+        }
+    }
+
+    // Tuning file, once a second, HERE rather than inside the FSR2 dispatch.
+    // Present runs whatever the upscaler is set to - including Off, which is
+    // exactly where someone investigating a bad image ends up, and exactly
+    // where the old placement made every diagnostic control silently inert.
+
+    // ---- PUBLISH THE SNAPSHOT, UNCONDITIONALLY.
+    //
+    // g_velSnap is what the recording hooks read: vkCmdBindPipeline needs the
+    // selected upscaler to decide whether to jitter, and the resolve and FSR2
+    // paths read the same struct.
+    //
+    // It used to be published only inside the velocity pass's block, so with
+    // TAA_VELOCITY off it kept its zero-initialised value forever. upscaler 0
+    // is "Off", so the jitter's consumer test was false on every one of 400,000
+    // pipeline binds while the log cheerfully printed "upscaler=FSR2" from a
+    // different snapshot. Measured: inScene=326723 isGeometry=385927 and
+    // consumer=0.
+    //
+    // Same shape of bug as the arming block - per-frame state written inside a
+    // subsystem that turned out to be optional. Published here instead, where
+    // it cannot be gated on anything.
+    if (g_share && g_share->magic == TAA_MAGIC) {
+        Snapshot fresh;
+        if (snapshot(&fresh)) g_velSnap = fresh;
+    }
+
+    // Report the very first call unconditionally, so "hook never invoked" is
+    // distinguishable from "invoked but my logging condition never fired". That
+    // ambiguity cost real time on the sibling project.
+    if (frames == 1) trace("PRESENT: first call (share=%s)", g_share ? "attached" : "null");
+
+    // Report once whether the present queue is one the app renders on. If it is
+    // not, submission order guarantees us nothing and the whole approach of
+    // submitting at present time is unsound.
+    static bool queueChecked = false;
+    if (!queueChecked && !g_submitQueues.empty()) {
+        queueChecked = true;
+        std::lock_guard<std::mutex> g(g_lock);
+        bool same = g_submitQueues.count(queue) > 0;
+        trace("QUEUE: present queue %p %s one the app submits rendering to "
+              "(%u distinct app queues) -- %s",
+              (void*)queue, same ? "IS" : "is NOT",
+              (unsigned)g_submitQueues.size(),
+              same ? "submission order sequences us after the frame"
+                   : "NO ORDERING GUARANTEE - our depth read races their writes");
+    }
+
+    openShare();
+    selectSceneDepth();
+
+    // Report what this layer can actually do, once per attach.
+    //
+    // Written from the layer rather than guessed by the plugin, because the
+    // plugin has no way to know whether the layer is loaded at all, let alone
+    // which backends were compiled into it. Availability is stated per backend
+    // with a reason, so "FSR 2 - not built into this layer" and "FSR 2 -
+    // unsupported GPU" are distinguishable in the UI instead of both reading as
+    // a blank entry.
+    // RE-ASSERTED EVERY FRAME, not written once.
+    //
+    // The plugin memsets the whole shared block when it maps it, and that
+    // happens on entering flight - AFTER the layer has already reported. With a
+    // one-shot write the flag was simply erased and never restored, so the
+    // panel read "Vulkan layer NOT attached" while the layer was demonstrably
+    // running and had logged its own attach a moment earlier.
+    //
+    // Worse than cosmetic: the plugin refuses every upscaler when the layer
+    // looks absent, so the whole path switched itself off. Intermittent,
+    // because it depended purely on whether the plugin's map landed before or
+    // after the layer's report.
+    //
+    // One store per frame is free next to everything else here, and it cannot
+    // be lost by anyone else clearing the block.
+    if (g_share) g_share->layerAttached = 1;
+
+    if (g_share && !g_availReported) {
+        g_availReported = true;
+
+        VkPhysicalDeviceProperties props;
+        memset(&props, 0, sizeof(props));
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<void*, DeviceData>::iterator it = g_devices.begin();
+            if (it != g_devices.end() && g_getPhysProps && it->second.phys)
+                g_getPhysProps(it->second.phys, &props);
+        }
+        if (props.deviceName[0]) {
+            strncpy(g_share->gpuName, props.deviceName, sizeof(g_share->gpuName) - 1);
+            g_share->gpuName[sizeof(g_share->gpuName) - 1] = 0;
+        }
+
+        g_share->availability[TAA_UPSCALER_OFF] = TAA_AVAIL_OK;
+        g_share->availability[TAA_UPSCALER_TAA] = TAA_AVAIL_OK;
+#ifdef TAA_HAVE_FSR2
+        g_share->availability[TAA_UPSCALER_FSR2] = TAA_AVAIL_OK;
+#else
+        g_share->availability[TAA_UPSCALER_FSR2] = TAA_AVAIL_NO_SUPPORT;
+#endif
+        // Not integrated yet. NO_SUPPORT rather than NO_LIBRARY: the SDKs are
+        // present on disk, so telling someone to install a runtime would send
+        // them after a file they already have.
+        g_share->availability[TAA_UPSCALER_FSR4] = TAA_AVAIL_NO_SUPPORT;
+
+        // DLSS IS INTEGRATED NOW - dlss_sr.h - so this must not claim
+        // otherwise. It used to say NO_SUPPORT here, "not implemented yet",
+        // and that answer arrived long before NGX could give a real one: the
+        // capability query runs on a worker thread precisely so a stalled NGX
+        // cannot hang the sim, so it is seconds behind this point.
+        //
+        // The plugin reads availability to decide whether taa.ini's request is
+        // usable, and it gave up with "asked for upscaler DLSS but it is not
+        // usable: not implemented yet" - refusing a backend that was in the
+        // build, over a line that had simply gone stale.
+        //
+        // NO_LIBRARY means "no answer yet" here and is corrected the moment the
+        // NGX thread reports, one way or the other.
+        g_share->availability[TAA_UPSCALER_DLSS] = TAA_AVAIL_NO_LIBRARY;
+
+        MemoryBarrier();
+        trace("SHARE: reported attach + availability (gpu=%s)", g_share->gpuName);
+    }
+
+    // Report the 3D colour target once, with the verdict on whether a resolve
+    // can touch it as it stands.
+    //
+    // This is the same question that cost time on depth: an application sets
+    // only the usage flags it needs, and an image it merely renders into needs
+    // neither SAMPLED nor STORAGE. Without SAMPLED we cannot read the frame;
+    // without STORAGE we cannot write the result back in place. Both are fixable
+    // by adding flags in vkCreateImage - the layer already sees every creation -
+    // but that is a real change to something X-Plane owns, so it is worth
+    // knowing before designing around it rather than after.
+    if (!g_sceneColorReported && g_sceneColor.image != VK_NULL_HANDLE) {
+        g_sceneColorReported = true;
+        bool sampled = (g_sceneColor.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
+        bool storage = (g_sceneColor.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+        bool xfer    = (g_sceneColor.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+        // The numeric format goes in alongside the name: the name table only
+        // covers depth formats, so a colour format prints as "?" and the one
+        // piece of information that identifies it is lost.
+        trace("COLOR: scene target %ux%u fmt=%s(%d) samples=%u usage=0x%x layout=%d",
+              g_sceneColor.w, g_sceneColor.h, formatName(g_sceneColor.format),
+              (int)g_sceneColor.format,
+              (unsigned)g_sceneColor.samples, g_sceneColor.usage,
+              (int)g_sceneColor.layout);
+        trace("COLOR: readable(SAMPLED)=%s  writable(STORAGE)=%s  copyable(TRANSFER_SRC)=%s",
+              sampled ? "yes" : "NO", storage ? "yes" : "NO", xfer ? "yes" : "NO");
+        if (!sampled || !storage) {
+            trace("COLOR: the resolve cannot work in place on this image as created. "
+                  "Options: add usage flags in vkCreateImage, or resolve into our own "
+                  "image and blit back.");
+        }
+        if (g_sceneColor.samples != VK_SAMPLE_COUNT_1_BIT) {
+            if (g_sceneResolveImage != VK_NULL_HANDLE) {
+                std::map<VkImage, ColorTarget>::iterator rt =
+                    g_colorImages.find(g_sceneResolveImage);
+                trace("COLOR: multisampled, but the pass RESOLVES (mode=%u) into "
+                      "%ux%u fmt=%d usage=0x%x - that single-sample image is the "
+                      "upscaler input, handed to us directly.",
+                      g_sceneResolveMode,
+                      rt != g_colorImages.end() ? rt->second.w : 0,
+                      rt != g_colorImages.end() ? rt->second.h : 0,
+                      rt != g_colorImages.end() ? (int)rt->second.format : -1,
+                      rt != g_colorImages.end() ? rt->second.usage : 0u);
+            } else {
+                trace("COLOR: WARNING multisampled with no resolve attachment - an "
+                      "upscaler wants a single-sample input, so the insertion point "
+                      "has to move to wherever X-Plane resolves this.");
+            }
+        }
+    }
+
+    Snapshot snap = {};
+    bool have = snapshot(&snap);
+
+    if ((frames % 120) == 0) {
+        trace("FRAME %llu  shareframe=%llu valid=%d  cam=(%.1f %.1f %.1f) moved=%.2fm "
+              "revZ=%d near=%.4f objs=%d react=%d reset=%d passes=%u depth=%s",
+              (unsigned long long)frames, (unsigned long long)snap.frame,
+              have ? 1 : 0, snap.camX, snap.camY, snap.camZ, snap.camDelta,
+              snap.reverseZ, snap.nearClip, snap.objectCount, snap.reactiveCount,
+              snap.historyReset, g_passesThisFrame,
+              g_sceneDepth != VK_NULL_HANDLE ? "found" : "MISSING");
+
+        // Render-pass sizes, once, so the 3D/UI boundary can be read off rather
+        // than guessed at.
+        if (frames == 120 || frames == 600) {
+            uint32_t n = g_passesThisFrame < 32 ? g_passesThisFrame : 32;
+            trace("PASSES this frame (%u total, first %u shown):", g_passesThisFrame, n);
+            // The 3D/UI boundary is the last pass that still has a depth
+            // attachment: the scene renders with depth, the 2D overlays do not.
+            // The resolve has to land there, before instrument text and ATC
+            // boxes can be temporally smeared.
+            int lastDepth = -1;
+            for (uint32_t i = 0; i < n; ++i) {
+                trace("   [%2u] %ux%u  depth=%s  color=%u",
+                      i, g_passSizes[i][0], g_passSizes[i][1],
+                      g_passHasDepth[i] ? "yes" : "no ", g_passColorCount[i]);
+                if (g_passHasDepth[i]) lastDepth = (int)i;
+            }
+            trace("   last depth pass = %d  -> resolve insertion point is after it",
+                  lastDepth);
+        }
+    }
+
+    // Dump interval, re-read from a FILE at runtime rather than fixed at
+    // startup from an environment variable.
+    //
+    // An env var is latched when the process starts, so turning dumps on meant
+    // restarting the sim, re-loading an aircraft and re-flying - and twice that
+    // was discovered only after the flight was already over and nothing had
+    // been captured. A file can be changed while the sim is running.
+    //
+    // %TEMP%	aa_dump_every.txt containing an integer: frames between dumps,
+    // 0 to disable. Checked once a second, which costs nothing.
+    {
+        static uint64_t lastCheck = 0;
+        if (frames - lastCheck >= 60) {
+            lastCheck = frames;
+            const char *t = getenv("TEMP");
+            // "\\taa_..." - the backslash MUST be escaped. This read
+            // "\taa_dump_every.txt", where \t is a TAB, so it looked for a file
+            // called <TAB>aa_dump_every.txt and silently found nothing. The
+            // runtime dump control advertised in the comments had never worked.
+            std::string path = std::string(t ? t : ".") + "\\taa_dump_every.txt";
+            FILE *f = fopen(path.c_str(), "r");
+            if (f) {
+                int v = 0;
+                if (fscanf(f, "%d", &v) == 1 && v >= 0 && v != dumpEvery) {
+                    trace("VEL: dump interval -> %d frames (was %d)", v, dumpEvery);
+                    dumpEvery = v;
+                }
+                fclose(f);
+            }
+        }
+    }
+
+    // RESOLVE MODE, switchable while the sim is running - same reasoning as the
+    // dump interval above, for the same reason it was written.
+    //
+    // The outline has now survived four explanations: the alpha channel, the
+    // min/max clamp, the jitter, and the jitter delta. Two of those were real
+    // bugs and got fixed; none of them was this. That record is the argument
+    // against producing a fifth theory and spending a flight on it.
+    //
+    // These two modes do not test an idea, they SPLIT THE PROBLEM. Pass-through
+    // writes the current frame straight out - no history sample, no
+    // reprojection, no blend - so an outline that survives it is in the read,
+    // the copy, the barriers or the target selection, and every theory about
+    // temporal logic is irrelevant. Debug 2 paints red where history was
+    // rejected and green where it was kept, which images the mechanism
+    // directly rather than inferring it from how the result looks.
+    //
+    // Being a file rather than an env var means the modes can be cycled from
+    // outside while a flight continues, so one launch answers all of it. Fly
+    // per hypothesis was the thing this project kept doing wrong.
+    //
+    // %TEMP%\taa_resolve_mode.txt: 0 normal, 1 pass-through, 2 show history
+    // rejection, 3 show velocity.
+    {
+        static uint64_t lastCheck = 0;
+        static int lastMode = -1;
+        if (frames - lastCheck >= 60) {
+            lastCheck = frames;
+            const char *t = getenv("TEMP");
+            std::string path = std::string(t ? t : ".") + "\\taa_resolve_mode.txt";
+            FILE *f = fopen(path.c_str(), "r");
+            if (f) {
+                int v = 0;
+                if (fscanf(f, "%d", &v) == 1 && v >= 0 && v <= 5 && v != lastMode) {
+                    lastMode = v;
+                    static const char *kName[6] = {
+                        "normal",
+                        "PASS-THROUGH (no history, no blend)",
+                        "DEBUG: red=history rejected, green=kept",
+                        "DEBUG: velocity field",
+                        "NO JITTER DELTA (history sampled at uv - velocity only)",
+                        "JITTER OFF (accumulation still running)" };
+                    trace("RESOLVE: mode -> %d, %s", v, kName[v]);
+                }
+                fclose(f);
+            }
+        }
+    }
+
+
+    // ---- velocity pass.
+    //
+    // Opt-in via TAA_VELOCITY=1. Unset, the layer stays purely observational
+    // and cannot influence rendering at all - which is the state anyone should
+    // be able to fall back to instantly if something looks wrong.
+    // DISARMED unless TAA_VELOCITY is explicitly "1".
+    //
+    // Presence of the variable used to be enough, which meant a leftover
+    // TAA_VELOCITY= from an earlier shell still armed it. Requiring an exact
+    // value makes "off" the state you get from anything other than a
+    // deliberate opt-in.
+    //
+    // Off, this layer forwards every call unmodified: no GPU work, no
+    // allocations, no barriers on X-Plane's resources.
+    static const bool velWanted = []{
+        const char *e = getenv("TAA_VELOCITY");
+        bool on = (e && e[0] == '1' && e[1] == '\0');
+        trace("VEL: velocity pass %s", on ? "ARMED (TAA_VELOCITY=1)"
+                                          : "DISARMED - observation only");
+        return on;
+    }();
+    g_velArmed = velWanted;
+    static bool velInitTried = false;
+
+    // Tear down BEFORE any other use, and outside the selection path, so a
+    // recreated depth buffer can never be sampled through a stale handle.
+    // ---- resolve creation. Needs the velocity pass up first: it samples the
+    // velocity image, so there is nothing to build a descriptor against until
+    // that exists. It also needs the scene colour target, which only the frame
+    // can identify.
+    // Wait for the scene colour target to STOP CHANGING before building
+    // against it.
+    //
+    // During load, X-Plane draws full-viewport depth-bearing passes into
+    // targets that are not the 3D scene, and the first version latched one of
+    // those: it built against an R8G8B8A8_SRGB image, ran for exactly one
+    // frame, then tore itself down when the real R16G16B16A16_SFLOAT target
+    // appeared. Requiring the choice to hold still for a couple of seconds
+    // costs nothing and skips the whole unsettled period.
+    // Stability is measured on the SET of HDR targets, not on which one is
+    // current. The current one alternates every frame by design, so a counter
+    // keyed on it resets forever and the resolve is never created at all.
+    {
+        static size_t lastCount = 0;
+        if (g_hdrTargets.size() != lastCount) {
+            lastCount = g_hdrTargets.size();
+            g_sceneColorStable = 0;
+        } else if (g_sceneColorStable < 100000) {
+            ++g_sceneColorStable;
+        }
+    }
+
+    // NOT gated on the compute velocity pass.
+    //
+    // g_vel.ready and g_velStable both describe the DEPTH-DERIVED pass, which
+    // the SPIR-V injection replaced and which is now off by default. This block
+    // creates the resolve AND the injected motion-vector target, so requiring
+    // that pass meant: pass off -> no resolve, no MV target -> FSR2's gate
+    // never opened -> the jitter ran with nothing consuming it. That is the
+    // shake, and it was five layers of accidental dependency deep.
+    //
+    // What this actually needs is a settled scene target and a depth image -
+    // which is what it uses. `stable` is now derived from the scene target
+    // holding still rather than from a subsystem that may not be running.
+    bool velOrInjected = g_spirvLive;
+    bool stableEnough  = (g_sceneDepth != VK_NULL_HANDLE);
+    // ---- THE VELOCITY TARGET, SIZED TO THE SCENE.
+    //
+    // Built when the scene's real size is finally known, not at device creation:
+    // the render size moves, and a velocity image of different dimensions than
+    // the pass it is bound to is a silent mismatch rather than an error.
+    //
+    // This used to live inside the resolve's setup, so it only happened when an
+    // upscaler was being built.
+    if (velOrInjected && stableEnough && !g_mv.ready && !g_mv.failed &&
+        g_sceneColor.image != VK_NULL_HANDLE && g_sceneColor.w && g_sceneColor.h &&
+        g_sceneColorStable >= 120) {
+        std::map<void*, DeviceData>::iterator mvi = g_devices.begin();
+        if (mvi != g_devices.end())
+            mvCreate(mvi->second, mvi->second.device, mvi->second.phys,
+                     g_sceneColor.w, g_sceneColor.h);
+    }
+
+
+    // Rebuild if the frame starts using a target we have no view for.
+    //
+    // This used to compare against a single latched image, which meant it fired
+    // every other frame once X-Plane's two targets started alternating - a
+    // continuous teardown/rebuild that also permanently disabled the pass,
+    // because the retry flag was never cleared. Now it only fires for a target
+    // genuinely outside the set we built.
+
+
+
+
+
+    // A short settling period before dispatching.
+    //
+    // This is now a convenience, NOT a correctness requirement. It was
+    // introduced to mask a load-time flash, and it did - but the flash was
+    // caused by submitting our own work to the queue passed to
+    // vkQueuePresentKHR and assuming submission order sequenced it after the
+    // frame's rendering. X-Plane submits on THREE queues, so that ordering
+    // never existed and the depth barrier raced their writes.
+    //
+    // Recording into X-Plane's own command buffer fixed it properly. Tested
+    // with this gate at 5 frames and dumping disabled: injection active from
+    // the moment of load, no flash.
+    //
+    // A small value is still worth keeping: the pass has nothing to contribute
+    // during a load - no temporal history to build, nothing on screen to
+    // anti-alias - so there is no reason to spend GPU time there.
+    static int stableFrames = 0;
+    if (have && !snap.historyReset && g_depthFreshThisFrame) ++stableFrames;
+    else stableFrames = 0;
+
+    // Overridable so the gate can be tested independently of the injection fix.
+    // Both changes landed together, so "no flash" could be either one; lowering
+    // this is the only way to tell them apart.
+    static const int kStableRequired = []{
+        const char *e = getenv("TAA_VELOCITY_STABLE");
+        int v = e ? atoi(e) : 10;
+        return v < 0 ? 0 : v;
+    }();
+
+    // The depth-derived pass is no longer created, dispatched, settled or read
+    // back. Everything between here and the jitter accounting used to do that:
+    // pick a depth image, build a compute pipeline against it, wait for the
+    // scene to hold still, dispatch it every frame and periodically copy the
+    // result back for verification.
+    //
+    // All of it is obsolete. The injected shaders emit velocity from the real
+    // clip positions during the scene draw, which is exact rather than
+    // reconstructed, costs no extra dispatch, and needs no depth barrier - and
+    // that barrier was the confirmed cause of the stutter.
+    (void)velWanted; (void)have;
+
+    // Jitter accounting. A count of zero with jitter armed means the viewport
+    // hook never fired inside a scene pass, which is a silent failure - the
+    // image would look completely normal and the resolve would have nothing to
+    // accumulate. Counting it is how that gets noticed.
+    //
+    // But zero is only a FAULT when something was asking to be jittered. With
+    // the upscaler set to Off there is no consumer, the gate in
+    // Layer_CmdSetViewport correctly declines, and zero is the right answer.
+    //
+    // The old warning did not make that distinction and reported a fault every
+    // time, in every session where the menu was left on Off - which is most of
+    // them. Combined with the resolve counter that logged whether or not it
+    // recorded anything, the pair described a sim that was jittering nothing
+    // while resolving 116401 times, and I spent a round chasing the hook rather
+    // than reading the gate. A diagnostic that cries wolf is worse than none.
+    if (g_jitterArmed && (frames % 600) == 0) {
+        const char *selName = (snap.upscaler == TAA_UPSCALER_TAA)  ? "TAA"
+                            : (snap.upscaler == TAA_UPSCALER_FSR2) ? "FSR2"
+                            : "Off";
+        trace("JITTER: %llu draws offset so far, current=(%.3f %.3f) px "
+              "phase %d/%d, upscaler=%s", (unsigned long long)g_jitterApplied,
+              snap.jitterX, snap.jitterY, snap.jitterIndex, snap.jitterPhases,
+              selName);
+        if (g_jitterApplied == 0) {
+            if (snap.upscaler != TAA_UPSCALER_TAA && snap.upscaler != TAA_UPSCALER_FSR2)
+                trace("JITTER: idle - upscaler is %s, so there is no consumer and "
+                      "nothing SHOULD be jittered. Select TAA or FSR2 in the sim "
+                      "to arm it. This is not a fault.", selName);
+            else
+                trace("JITTER: WARNING %s is selected but nothing has been "
+                      "jittered - the hook is not firing inside a scene pass.",
+                      selName);
+        }
+    }
+
+    // ---- did the resolve actually run this frame?
+    //
+    // Self-correcting rather than something to be discovered by staring at the
+    // picture. If a frame presents with TAA selected and no resolve recorded,
+    // that frame reached the screen with the jitter still in it - and a stream
+    // of those alternating with resolved frames is precisely what "the screen
+    // is shaky" means.
+    g_resolveRanThisFrame = false;
+
+    // Measure the injected velocity field. Read one frame after the copy was
+    // recorded, so the GPU has certainly finished with it - reading the same
+    // frame would race the submission and produce numbers describing nothing.
+
+    if (g_spirvLive && g_mv.ready) {
+        mvReport(snap.camDelta, snap.reproj);
+        if (dumpEvery > 0 && (frames % (uint64_t)dumpEvery) == 0)
+            g_mv.wantDump = true;
+    }
+
+    g_velInjectedThisFrame = false;
+    g_prevLastDepthPassIdx = g_lastDepthPassIdx;   // predicts where to inject next frame
+    g_lastDepthPassIdx     = -1;
+    g_passesThisFrame      = 0;
+
+    g_mvClearedThisFrame.store(false);
+    g_depthFreshThisFrame  = false;   // must be re-proven every frame
+
+    // Retire this frame's depth bindings and start the next frame's list empty,
+    // so selection always reads one whole frame in binding order.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        if (!g_frameDepthList.empty()) {
+            g_frameDepthListDone = g_frameDepthList;
+            g_frameDepthList.clear();
+        }
+    }
+
+
+    // ---- TAA_PRESENT_BLIT: put FSR2's result on the swapchain directly.
+    //
+    // The seam test proved that writing into g_sceneColor.image reaches nothing.
+    // The swapchain image is the one surface that is definitionally displayed,
+    // so this blits FSR2's output straight onto it, immediately before the
+    // present goes down.
+    //
+    // It uses our OWN command pool, buffer and fence rather than borrowing
+    // X-Plane's, because there is no application command buffer open at this
+    // point - present is past the end of the frame's recording.
+    //
+    // THIS OVERWRITES THE WHOLE IMAGE, INCLUDING THE UI. That is deliberate for
+    // a diagnostic: if the picture becomes the accumulated 3D scene with the
+    // panel and windows gone, the path from FSR2 to the display works and the
+    // only remaining question is where to composite. If the screen is unchanged,
+    // even the swapchain write does nothing and the problem is not where any of
+    // us have been looking.
+    //
+    // A blit rather than a copy: the output is R16G16B16A16_SFLOAT and the
+    // swapchain is an 8-bit format, and vkCmdCopyImage requires matching size
+    // classes while vkCmdBlitImage converts.
+    // ONLY IF SOMETHING WAS ACTUALLY DISPATCHED INTO IT THIS FRAME.
+    //
+    // g_fsr2.ready means the context exists, not that this frame produced a
+    // picture. Selecting Off in the menu stops the dispatch while the context
+    // stays alive, so the blit went on painting the last thing FSR2 wrote - or
+    // an untouched image - over every frame. That is a black screen the moment
+    // the upscaler is switched off, and it looks exactly like the layer
+    // breaking rather than the layer being asked to do nothing.
+
+
+    return g_nextQueuePresent ? g_nextQueuePresent(queue, info) : VK_SUCCESS;
+}
+
+
+// Report sampler configuration. Stage 2 applies the LOD bias here; stage 1 only
+// establishes how many samplers exist and what bias they already carry, so a
+// change can be attributed rather than assumed.
+static uint64_t g_samplerCount = 0;
+static bool     g_samplerReported = false;
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSampler(
+    VkDevice device, const VkSamplerCreateInfo *ci,
+    const VkAllocationCallbacks *alloc, VkSampler *out)
+{
+    if (!g_samplerReported && ci) {
+        g_samplerReported = true;
+        trace("SAMPLER first: minLod=%.2f maxLod=%.2f mipLodBias=%.2f aniso=%.1f mipmapMode=%d",
+              ci->minLod, ci->maxLod, ci->mipLodBias,
+              ci->anisotropyEnable ? ci->maxAnisotropy : 0.0f, (int)ci->mipmapMode);
+    }
+    ++g_samplerCount;
+    return g_nextCreateSampler ? g_nextCreateSampler(device, ci, alloc, out)
+                               : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
+    VkDevice device, const VkAllocationCallbacks *alloc)
+{
+    PFN_vkDestroyDevice next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) { next = it->second.destroyDevice; g_devices.erase(it); }
+    }
+    trace("DestroyDevice: %llu samplers seen, %u depth images tracked",
+          (unsigned long long)g_samplerCount, (unsigned)g_depthCandidates.size());
+    if (next) next(device, alloc);
+}
+
+// ------------------------------------------------------- chain construction
+
+static VkLayerInstanceCreateInfo *findInstanceLink(const VkInstanceCreateInfo *ci)
+{
+    VkLayerInstanceCreateInfo *p = (VkLayerInstanceCreateInfo*)ci->pNext;
+    while (p && !(p->sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO &&
+                  p->function == VK_LAYER_LINK_INFO))
+        p = (VkLayerInstanceCreateInfo*)p->pNext;
+    return p;
+}
+
+static VkLayerDeviceCreateInfo *findDeviceLink(const VkDeviceCreateInfo *ci)
+{
+    VkLayerDeviceCreateInfo *p = (VkLayerDeviceCreateInfo*)ci->pNext;
+    while (p && !(p->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO &&
+                  p->function == VK_LAYER_LINK_INFO))
+        p = (VkLayerDeviceCreateInfo*)p->pNext;
+    return p;
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+TAA_GetDeviceProcAddr(VkDevice device, const char *name);
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
+    const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *alloc, VkInstance *out)
+{
+    trace("=== TAA layer CreateInstance ===");
+
+    // Read here rather than in armLayerOnce: the instance is created long before
+    // that runs, and the apiVersion decision below cannot wait.
+    static bool g_slWanted = (getenv("TAA_STREAMLINE") != nullptr);
+
+    VkLayerInstanceCreateInfo *link = findInstanceLink(ci);
+    if (!link || !link->u.pLayerInfo) {
+        trace("  NO LINK FOUND - layer cannot chain");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    PFN_vkGetInstanceProcAddr nextGIPA = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    // Advance the chain for the next layer down BEFORE calling through.
+    link->u.pLayerInfo = link->u.pLayerInfo->pNext;
+
+    PFN_vkCreateInstance nextCreate = (PFN_vkCreateInstance)nextGIPA(nullptr, "vkCreateInstance");
+    if (!nextCreate) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkInstanceCreateInfo ci2 = *ci;
+
+    // ---- RAISE THE INSTANCE API VERSION TO 1.3 FOR STREAMLINE.
+    //
+    // The shim log says "vkCreatePrivateDataSlot not available (driver pre-1.3)"
+    // and that is wrong about the driver - 610.74 supports 1.3 comfortably. It
+    // is right about the INSTANCE: entry points that became core in 1.3 only
+    // resolve if the instance was created asking for 1.3, and X-Plane asks for
+    // less. Streamline needs private data slots to attach its own state to the
+    // swap chain, and losing them is the last thing before it throws.
+    //
+    // Raising it is safe: apiVersion is a maximum the application promises not
+    // to exceed, not a demand for behaviour changes. X-Plane keeps using exactly
+    // the calls it always did.
+    // pApplicationInfo may be NULL, and that is the case here.
+    //
+    // The first version guarded on it being present, so the fix never ran and
+    // no log line appeared. A null pApplicationInfo means apiVersion defaults to
+    // 1.0, which is the lowest possible - so it is exactly the case that most
+    // needs raising, and the guard skipped it.
+    VkApplicationInfo appInfo;
+    memset(&appInfo, 0, sizeof(appInfo));
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    // Log it whether or not it needs raising.
+    //
+    // Absence of the "raising" line below was read as "X-Plane already asks for
+    // 1.3", which is one of two readings - the other is that the whole block was
+    // skipped. Streamline's "vkCreatePrivateDataSlot not available (driver
+    // pre-1.3)" turns on exactly this number, so it gets stated rather than
+    // inferred from a line that did not appear.
+    trace("INSTANCE: application requests API %u.%u (appInfo %s)",
+          ci->pApplicationInfo ? VK_API_VERSION_MAJOR(ci->pApplicationInfo->apiVersion) : 1u,
+          ci->pApplicationInfo ? VK_API_VERSION_MINOR(ci->pApplicationInfo->apiVersion) : 0u,
+          ci->pApplicationInfo ? "present" : "absent, so 1.0 by default");
+
+    if (g_slWanted) {
+        if (ci->pApplicationInfo) appInfo = *ci->pApplicationInfo;
+        else trace("INSTANCE: application supplied no VkApplicationInfo, so the "
+                   "instance defaults to API 1.0 - synthesising one");
+        if (appInfo.apiVersion < VK_API_VERSION_1_3) {
+            trace("INSTANCE: raising apiVersion %u.%u -> 1.3 so Streamline can "
+                  "reach vkCreatePrivateDataSlot (core in 1.3)",
+                  VK_API_VERSION_MAJOR(appInfo.apiVersion),
+                  VK_API_VERSION_MINOR(appInfo.apiVersion));
+            appInfo.apiVersion = VK_API_VERSION_1_3;
+            ci2.pApplicationInfo = &appInfo;
+        }
+    }
+    std::vector<const char*> instExts;
+
+
+
+    VkResult r = nextCreate(&ci2, alloc, out);
+
+    // Fall back to X-Plane's original request if our additions were refused.
+    // An instance extension the loader rejects would otherwise stop the sim
+    // starting, which is an absurd price for an optional upscaler.
+    if (r != VK_SUCCESS && !instExts.empty()) {
+        trace("INSTANCE: creation failed (%d) with the DLSS/Streamline extensions "
+              "added - retrying with X-Plane's original list", (int)r);
+        r = nextCreate(ci, alloc, out);
+    }
+    if (r != VK_SUCCESS) return r;
+
+    InstanceData id;
+    id.instance        = *out;
+    id.gipa            = nextGIPA;
+    id.destroyInstance = (PFN_vkDestroyInstance)nextGIPA(*out, "vkDestroyInstance");
+    id.getFormatProps  = (PFN_vkGetPhysicalDeviceFormatProperties)
+                             nextGIPA(*out, "vkGetPhysicalDeviceFormatProperties");
+    // ---- BIND THESE ONCE, FROM THE APPLICATION'S INSTANCE ONLY.
+    //
+    // These are GLOBALS, and they were rebound by every vkCreateInstance in the
+    // process. Streamline creates its own instances during slInit - in
+    // commonEntry.cpp getNGXFeatureRequirements - and destroys them again, so
+    // the last rebind before the sim starts rendering pointed into an instance
+    // that no longer exists.
+    //
+    // A physical device function resolved from instance B, called with a
+    // physical device belonging to instance A, makes the loader look the handle
+    // up in the wrong instance's list. It does not find it, and it does not
+    // return an error - it __fastfails:
+    //
+    //   vkGetPhysicalDeviceMemoryProperties: Invalid physicalDevice
+    //
+    // which is the 0xc0000409 the Windows event log blames on vulkan-1.dll, and
+    // it kills X-Plane before the window opens. g_getPhysMemProps is named in
+    // that message, which is what gave it away.
+    //
+    // The application's instance is the first one created and outlives every
+    // probe, so binding once is both correct and the fix.
+    if (!g_instanceGettersBound) {
+        g_instanceGettersBound = true;
+        g_getPhysMemProps  = (PFN_vkGetPhysicalDeviceMemoryProperties)
+                                 nextGIPA(*out, "vkGetPhysicalDeviceMemoryProperties");
+        g_getPhysProps     = (PFN_vkGetPhysicalDeviceProperties)
+                                 nextGIPA(*out, "vkGetPhysicalDeviceProperties");
+        g_nextEnumDeviceExt = (PFN_vkEnumerateDeviceExtensionProperties)
+                                 nextGIPA(*out, "vkEnumerateDeviceExtensionProperties");
+        g_nextMemProps2    = (PFN_vkGetPhysicalDeviceMemoryProperties2)
+                                 nextGIPA(*out, "vkGetPhysicalDeviceMemoryProperties2");
+        // The KHR fallback belongs INSIDE the guard. Left outside it, a probe
+        // instance would rebind it whenever the core name happened to be null,
+        // which is the same dangling pointer by a quieter route.
+        if (!g_nextMemProps2)
+            g_nextMemProps2 = (PFN_vkGetPhysicalDeviceMemoryProperties2)
+                                 nextGIPA(*out, "vkGetPhysicalDeviceMemoryProperties2KHR");
+    } else {
+        trace("INSTANCE: %p is not the application's - leaving the global "
+              "physical-device getters bound to the first instance", (void*)*out);
+    }
+
+
+
+    std::lock_guard<std::mutex> g(g_lock);
+    // THE APPLICATION'S OWN INSTANCE, remembered by being first.
+    //
+    // Streamline creates further instances of its own during slInit and
+    // destroys them again; telling them apart matters at destroy time, and
+    // creation order is the only thing that distinguishes them here.
+    if (g_firstInstance == VK_NULL_HANDLE) g_firstInstance = *out;
+    g_instances[dispatchKey(*out)] = id;
+    trace("  instance created ok");
+    return r;
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL TAA_DestroyInstance(
+    VkInstance inst, const VkAllocationCallbacks *alloc)
+{
+    // LOG EVERY INSTANCE DEATH, with the handle.
+    //
+    // The loader aborts with "vkGetPhysicalDeviceMemoryProperties: Invalid
+    // physicalDevice" - a __fastfail, which is the 0xc0000409 in the Windows
+    // event log - and immediately before it unloads the layer libraries. That
+    // ordering says an instance was destroyed and something then used a
+    // physical device belonging to it.
+    //
+    // Three instances exist in this process and only one is X-Plane's. If the
+    // one handed to Streamline dies while Streamline is still using its
+    // physical device, this line and the publish line together will say so.
+    PFN_vkDestroyInstance next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, InstanceData>::iterator it = g_instances.find(dispatchKey(inst));
+        trace("INSTANCE: destroying %p (known=%s, %zu tracked before this)",
+              (void*)inst, it != g_instances.end() ? "yes" : "NO",
+              g_instances.size());
+        if (it != g_instances.end()) { next = it->second.destroyInstance; g_instances.erase(it); }
+    }
+
+    // ---- KEEP STREAMLINE'S PROBE INSTANCES ALIVE, DELIBERATELY.
+    //
+    // sl.common creates a VkInstance in getNGXFeatureRequirements, enumerates a
+    // physical device from it, destroys the instance - and then keeps using
+    // that physical device. The loader catches it and kills the process:
+    //
+    //   vkGetPhysicalDeviceMemoryProperties: Invalid physicalDevice
+    //
+    // a __fastfail, which is the 0xc0000409 the event log blames on
+    // vulkan-1.dll, and it lands inside slSetVulkanInfo so that call never
+    // returns. It is Streamline's bug and it is not reachable from here.
+    //
+    // What IS reachable is the destroy. A physical device stays valid as long
+    // as its instance lives, so not destroying these leaves the handles
+    // Streamline kept using still legal. The cost is one leaked instance per
+    // probe, for the life of the process, which is a few hundred kilobytes -
+    // against the sim being killed outright.
+    //
+    // X-Plane's own instance is destroyed normally: it is the first one
+    // created, and leaking it would keep the whole device alive at shutdown.
+    if (next) next(inst, alloc);
+}
+
+// What is X-Plane actually told about memory?
+//
+// vkGetPhysicalDeviceMemoryProperties2 is where VK_EXT_memory_budget answers
+// arrive, and heapBudget is the number a pager will believe. It is NOT the size
+// of the card: it is what the driver is currently willing to hand out, and it
+// moves with what every other process on the machine is doing. A pager reading
+// it during a period of pressure sees a small number, frees textures, and can
+// see an even smaller one if something else grabbed the memory meanwhile -
+// which is exactly the falling "available" figure in X-Plane's log.
+//
+// This only observes. Changing the answer is a decision to take after seeing
+// the numbers, not before.
+static VKAPI_ATTR void VKAPI_CALL TAA_GetPhysicalDeviceMemoryProperties2(
+    VkPhysicalDevice phys, VkPhysicalDeviceMemoryProperties2 *props)
+{
+    if (g_nextMemProps2) g_nextMemProps2(phys, props);
+    if (!props) return;
+
+    // ---- BUDGET OVERRIDE. An experiment, not a feature.
+    //
+    // The question it answers: does X-Plane's texture pager read this at all?
+    //
+    // What we know is that the driver reports budget=7.02 GB of a 7.77 GB heap
+    // with 2.96 GB in use - four gigabytes free - and the pager still cut
+    // textures to an eighth, reporting "2.13 gb available" in its own log. So
+    // either it derives its budget from this number in a way that leaves a huge
+    // reserve, or it never reads this number and the figure comes from
+    // somewhere else entirely.
+    //
+    // Raising what we report distinguishes those in one run: if X-Plane's
+    // "available" moves, it is reading this and the reserve is the lever; if it
+    // does not move at all, the pager is working from its own arithmetic and no
+    // amount of reporting will change it. Either answer redirects the work.
+    //
+    // Capped at the true heap size. Reporting more memory than physically
+    // exists invites an allocation failure at a moment of the driver's
+    // choosing, and an out-of-memory crash mid-flight is a far worse outcome
+    // than low-resolution ground textures.
+    // PUBLISHED TO THE PLUGIN FIRST, unconditionally.
+    //
+    // This runs whatever g_vramBudgetScale is, because reporting the numbers and
+    // altering them are different jobs and only the second one is optional. The
+    // driver's own figures are the only authoritative VRAM data in the process,
+    // and every VRAM argument in this project so far has been settled - and
+    // usually overturned - by finally looking at them.
+    {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT *rb = nullptr;
+        for (VkBaseOutStructure *p = (VkBaseOutStructure*)props->pNext; p; p = p->pNext)
+            if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT)
+                rb = (VkPhysicalDeviceMemoryBudgetPropertiesEXT*)p;
+        if (rb && g_share) {
+            const VkPhysicalDeviceMemoryProperties &mp0 = props->memoryProperties;
+            for (uint32_t i = 0; i < mp0.memoryHeapCount; ++i) {
+                if (!(mp0.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+                g_share->vramTotalMB  = (uint32_t)(mp0.memoryHeaps[i].size / 1048576ull);
+                g_share->vramBudgetMB = (uint32_t)(rb->heapBudget[i] / 1048576ull);
+                g_share->vramUsageMB  = (uint32_t)(rb->heapUsage[i]  / 1048576ull);
+                break;   // the first device-local heap is the one that runs out
+            }
+        }
+    }
+
+    if (g_vramBudgetScale > 1.0f) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT *b = nullptr;
+        for (VkBaseOutStructure *p = (VkBaseOutStructure*)props->pNext; p; p = p->pNext)
+            if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT)
+                b = (VkPhysicalDeviceMemoryBudgetPropertiesEXT*)p;
+
+        if (b) {
+            const VkPhysicalDeviceMemoryProperties &mp0 = props->memoryProperties;
+            for (uint32_t i = 0; i < mp0.memoryHeapCount; ++i) {
+                if (!(mp0.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+                VkDeviceSize want = (VkDeviceSize)(b->heapBudget[i] * g_vramBudgetScale);
+                if (want > mp0.memoryHeaps[i].size) want = mp0.memoryHeaps[i].size;
+                if (want > b->heapBudget[i]) {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        trace("VRAM: reporting heap%u budget %.2f -> %.2f GB (x%.2f, "
+                              "capped at the %.2f GB heap). Watch X-Plane's own "
+                              "\"available\" figure: if it does not move, the pager "
+                              "is not reading this.", i,
+                              b->heapBudget[i] / 1073741824.0, want / 1073741824.0,
+                              g_vramBudgetScale, mp0.memoryHeaps[i].size / 1073741824.0);
+                    }
+                    b->heapBudget[i] = want;
+                }
+            }
+        } else {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                trace("VRAM: budget override requested but the application did not "
+                      "chain VK_EXT_memory_budget - so it is NOT reading a live "
+                      "budget, and its texture limit comes from somewhere else.");
+            }
+        }
+    }
+
+    // Report the first few, then every few hundred: a pager queries this every
+    // frame and the log would be nothing else.
+    ++g_memQueryCount;
+    bool report = (g_memQueryCount <= 3) || (g_memQueryCount % 600 == 0);
+    if (!report) return;
+
+    const VkPhysicalDeviceMemoryProperties &mp = props->memoryProperties;
+
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget = nullptr;
+    for (VkBaseOutStructure *p = (VkBaseOutStructure*)props->pNext; p; p = p->pNext)
+        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT)
+            budget = (VkPhysicalDeviceMemoryBudgetPropertiesEXT*)p;
+
+    for (uint32_t i = 0; i < mp.memoryHeapCount; ++i) {
+        bool devLocal = (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+        if (!devLocal) continue;
+        if (budget) {
+            // Kept so the ledger can compare itself against the driver rather
+            // than being read as VRAM when part of it is in host memory.
+            g_lastHeapUsage  = budget->heapUsage[i];
+            g_lastHeapBudget = budget->heapBudget[i];
+            trace("VRAM[q%llu] heap%u: size=%.2f GB  budget=%.2f GB  usage=%.2f GB",
+                  (unsigned long long)g_memQueryCount, i,
+                  mp.memoryHeaps[i].size / 1073741824.0,
+                  budget->heapBudget[i] / 1073741824.0,
+                  budget->heapUsage[i]  / 1073741824.0);
+        } else {
+            trace("VRAM[q%llu] heap%u: size=%.2f GB  (no memory_budget in the chain - "
+                  "X-Plane is reading heap SIZE, not a live budget)",
+                  (unsigned long long)g_memQueryCount, i,
+                  mp.memoryHeaps[i].size / 1073741824.0);
+        }
+    }
+
+    // The texture census alongside it, so the two can be compared directly.
+    if (g_memQueryCount <= 3 || g_memQueryCount % 600 == 0) {
+        std::lock_guard<std::mutex> g(g_lock);
+        if (!g_texCensus.empty()) {
+            // ---- THE LEDGER, first, because it is the one that adds up.
+            //
+            // Printed ahead of the census deliberately. The census figure looks
+            // like a total and is not one: it is what X-Plane ASKED for, before
+            // the pager, and counts only sampled images. Reading it as "VRAM in
+            // use" is what made a 6.28 GB card appear to be 4.20 GB of
+            // textures, and left five gigabytes unexplained.
+            {
+                uint64_t total = 0, pageable = 0;
+                for (int c = 0; c < VRAM_CAT_COUNT; ++c) {
+                    total += g_vram[c].bytes;
+                    if (c == VRAM_TEX) pageable += g_vram[c].bytes;
+                }
+                trace("VRAM LEDGER: %.2f GB resident across images and buffers "
+                      "(actual driver requirements, after paging)",
+                      total / 1073741824.0);
+                for (int c = 0; c < VRAM_CAT_COUNT; ++c) {
+                    if (!g_vram[c].count) continue;
+                    trace("  %-24s %6llu objs  %9.1f MB  peak %8.1f MB   %s",
+                          vramCatName(c),
+                          (unsigned long long)g_vram[c].count,
+                          g_vram[c].bytes / 1048576.0,
+                          g_vram[c].peak  / 1048576.0,
+                          vramCatWhy(c));
+                }
+                trace("  ---- %.1f MB of that is pageable (%.0f%%). The rest is "
+                      "listed above with the reason it is not.",
+                      pageable / 1048576.0,
+                      total ? (100.0 * pageable / total) : 0.0);
+
+                // THIS TOTAL IS NOT VRAM, and the gap says by how much.
+                //
+                // vkGetImageMemoryRequirements reports what a resource NEEDS,
+                // not which heap it was given. With overcommit armed, allocation
+                // failures retry from host-visible memory - system RAM, which
+                // never appears in heap0's usage. So the ledger can and does
+                // exceed the driver's figure, and the difference is roughly what
+                // has spilled off the card.
+                //
+                // Printed as a signed comparison rather than left for someone to
+                // spot, because the first populated ledger read 6.25 GB against
+                // a 4.23 GB heap and a table that contradicts the driver by two
+                // gigabytes should say so on its own line.
+                if (g_lastHeapUsage) {
+                    double led = total / 1073741824.0;
+                    double drv = g_lastHeapUsage / 1073741824.0;
+                    trace("  ---- driver reports %.2f GB in heap0; ledger is "
+                          "%+.2f GB against that. %s",
+                          drv, led - drv,
+                          led > drv * 1.05
+                              ? "The excess is memory that is NOT on the card - "
+                                "host-visible allocations, via the overcommit "
+                                "path or by the application's own choice."
+                              : "Close enough that everything counted is "
+                                "resident; the shortfall is pipelines, "
+                                "descriptor pools and driver overhead.");
+                }
+            }
+
+            // ---- geometry, the largest unpaged category, by size.
+            {
+                uint64_t n = 0, asked = 0, got = 0;
+                for (int b = 0; b < 24; ++b) {
+                    n += g_geomCount[b]; asked += g_geomAsked[b]; got += g_geomGot[b];
+                }
+                if (n) {
+                    trace("GEOMETRY BUFFERS: %llu created, %.1f MB asked for, "
+                          "%.1f MB reserved - %.1f MB (%.1f%%) is alignment "
+                          "padding",
+                          (unsigned long long)n, asked / 1048576.0,
+                          got / 1048576.0, (got - asked) / 1048576.0,
+                          asked ? (100.0 * (got - asked) / asked) : 0.0);
+                    for (int b = 0; b < 24; ++b) {
+                        if (!g_geomCount[b]) continue;
+                        double overhead = g_geomAsked[b]
+                            ? (100.0 * (g_geomGot[b] - g_geomAsked[b]) / g_geomAsked[b])
+                            : 0.0;
+                        trace("  <=%6llu KB  %7llu bufs  %8.1f MB asked  "
+                              "%8.1f MB reserved  (+%.1f%%)",
+                              (unsigned long long)(1ull << b),
+                              (unsigned long long)g_geomCount[b],
+                              g_geomAsked[b] / 1048576.0,
+                              g_geomGot[b] / 1048576.0, overhead);
+                    }
+                }
+            }
+
+            trace("TEXTURES REQUESTED (pre-pager, sampled only - NOT resident): "
+                  "%.2f GB across %zu formats",
+                  g_texBytesTotal / 1073741824.0, g_texCensus.size());
+            for (std::map<int, FmtStat>::iterator it = g_texCensus.begin();
+                 it != g_texCensus.end(); ++it) {
+                if (it->second.bytes < 16u * 1024 * 1024) continue;   // noise
+                // The numeric format matters more than the name here: the name
+                // table does not cover the block-compressed formats, and "?"
+                // for the two largest consumers is precisely the fact the whole
+                // question turns on. Already-compressed textures mean there is
+                // nothing for a transcoder to win.
+                trace("  %-22s(%3d) %6llu images  %8.2f MB",
+                      formatName((VkFormat)it->first), it->first,
+                      (unsigned long long)it->second.count,
+                      it->second.bytes / 1048576.0);
+            }
+
+            // EVERY COLOUR ATTACHMENT, with format - looking for a velocity
+            // buffer X-Plane might already be rendering.
+            //
+            // Vulkan has no API that hands you an application's motion vectors;
+            // the application has to produce them. But if X-Plane produces them
+            // for its own purposes, they are sitting in a render target we can
+            // see, and taking an existing correct buffer beats deriving one
+            // from depth. A velocity target is recognisable: two-channel float
+            // (R16G16_SFLOAT is 83, R32G32_SFLOAT is 103) at scene resolution.
+            //
+            // This prints the whole set once so the question is answered from
+            // the frame rather than from an assumption about what X-Plane does.
+            {
+                static bool dumped = false;
+                if (!dumped) {
+                    dumped = true;
+                    trace("COLOUR ATTACHMENTS (%zu): looking for a 2-channel "
+                          "float target at scene resolution", g_colorImages.size());
+                    std::map<int, int> seen;
+                    for (std::map<VkImage, ColorTarget>::iterator ci = g_colorImages.begin();
+                         ci != g_colorImages.end(); ++ci) {
+                        int key = (int)ci->second.format * 1000000
+                                + (int)ci->second.w * 10 + (int)ci->second.h % 10;
+                        if (seen.count(key)) continue;
+                        seen[key] = 1;
+                        trace("  fmt=%-3d %-22s %ux%u samples=%d usage=0x%x",
+                              (int)ci->second.format,
+                              formatName(ci->second.format),
+                              ci->second.w, ci->second.h,
+                              (int)ci->second.samples, ci->second.usage);
+                    }
+                }
+            }
+
+            // By size, with the saving each threshold would produce.
+            //
+            // Dropping one mip quarters a texture, so a threshold's saving is
+            // three quarters of everything ABOVE it. Printed directly rather
+            // than left to be worked out from the histogram, because that
+            // arithmetic is the entire decision and doing it by eye is how the
+            // threshold ended up at 2048 in the first place.
+            trace("TEXTURES by longest side:");
+            for (int b = 0; b <= 16; ++b) {
+                if (!g_sizeCount[b]) continue;
+                uint64_t above = 0;
+                for (int k = b + 1; k <= 16; ++k) above += g_sizeBytes[k];
+                trace("  %5u px  %6llu images  %8.2f MB   "
+                      "(threshold here would save %.2f MB)",
+                      1u << b, (unsigned long long)g_sizeCount[b],
+                      g_sizeBytes[b] / 1048576.0, above * 0.75 / 1048576.0);
+            }
+
+            // What excluding the aircraft would cost. The load bucket is an
+            // UPPER BOUND on the aircraft's share, not the aircraft's share:
+            // the initial scenery loads in the same window. If that bound is
+            // small the exclusion is free and worth doing outright; if it is
+            // most of the saving, the aircraft has to be separated properly
+            // rather than by timing.
+            trace("PAGER split: load %llu images %.1f MB saved (%llu at 4096) | "
+                  "flight %llu images %.1f MB saved (%llu at 4096)",
+                  (unsigned long long)g_pagerLoad.images,
+                  g_pagerLoad.saved / 1048576.0,
+                  (unsigned long long)g_pagerLoad.at4096,
+                  (unsigned long long)g_pagerFlight.images,
+                  g_pagerFlight.saved / 1048576.0,
+                  (unsigned long long)g_pagerFlight.at4096);
+            if (g_pagerSkippedScaled)
+                trace("PAGER: %llu textures left alone because X-Plane had "
+                      "already scaled them to a non-power-of-two size. Both "
+                      "pagers cannot reduce the same texture - see the note in "
+                      "pagerDropLevels. A large number here means X-Plane's "
+                      "scale is doing the work and ours is not.",
+                      (unsigned long long)g_pagerSkippedScaled);
+        }
+    }
+}
+
+// ---------------------------------------------- SPIR-V patching reconnaissance
+//
+// Before any of that is worth attempting, three facts decide whether it is even
+// possible on THIS application, and all three are cheap to measure:
+//
+//   1. Does X-Plane call vkCreateShaderModule at all, or does it chain
+//      VkShaderModuleCreateInfo into VkPipelineShaderStageCreateInfo under
+//      VK_KHR_maintenance5? Hooking only the former would silently miss every
+//      shader while looking like it worked - the worst possible failure for
+//      something this invasive.
+//   2. How many modules and pipelines are there? This sets the cost of
+//      analysing and caching, and whether a per-launch cache is mandatory or
+//      merely nice.
+//   3. How big are the modules? A backward slice from Position is meant to be
+//      20-60 instructions after normalisation; megabyte modules with dozens of
+//      entry points would change that estimate.
+static uint64_t g_shaderModules = 0;
+static uint64_t g_shaderBytes   = 0;
+static uint64_t g_gfxPipelines  = 0;
+
+static uint64_t g_inlineModules = 0;   // maintenance5 path - no module object
+static PFN_vkCreateShaderModule     g_nextCreateShaderModule = nullptr;
+static PFN_vkCreateGraphicsPipelines g_nextCreateGfxPipelines = nullptr;
+
+// Defined with the rest of the injection plumbing below. Declared here because
+// the refusals they count happen at module creation, which comes first in the
+// file - the reason tally was originally attached only to the pipeline-time
+// path, where almost nothing fails, so it printed nothing while 79 shaders were
+// being refused up here.
+static void mvNoteInjectReason(spvinj::Result r);
+static void mvLogInjectReasons();
+
+static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
+    VkDevice device, const VkShaderModuleCreateInfo *ci,
+    const VkAllocationCallbacks *alloc, VkShaderModule *out)
+{
+    // Note X-Plane's own FSR shaders as they are created, so the compute
+    // pipelines built from them can be recognised later. Six variants ship in
+    // Resources/shaders/bin/spv/fsr.xsa and every one declares u_fsr_data.
+    // ---- NOT EVERY SHADER THAT MENTIONS u_fsr_data IS THE UPSCALER.
+    //
+    // fsr.xsa holds six variants and three of them turn up in a session:
+    //
+    //   58436 bytes  EASU - the actual spatial upscale
+    //   15280 bytes  RCAS - the sharpen that follows it
+    //    3876 bytes  a copy/passthrough, far too small to be either
+    //
+    // The small one is used elsewhere in the frame, so dropping it did not skip
+    // an upscale - it removed work the rest of the frame depended on. That is
+    // why the scene came back white on one half and black on the other whether
+    // we sampled FSR2's output or the composite directly, and why it only went
+    // wrong once the takeover engaged a few seconds after load.
+    //
+    // Size is the discriminator because it is a property of the shader rather
+    // than of any binding, and the gap here is fifteenfold rather than marginal.
+    bool isXpFsr = ci && spirvIsXpFsr(ci->pCode, ci->codeSize / 4) &&
+                   ci->codeSize >= 10000;
+    if (ci && ci->codeSize < 10000 && spirvIsXpFsr(ci->pCode, ci->codeSize / 4))
+        trace("XP FSR: shader module (%zu bytes) mentions u_fsr_data but is too "
+              "small to be EASU or RCAS - left alone, it is used elsewhere in "
+              "the frame", ci->codeSize);
+
+    if (ci) {
+        ++g_shaderModules;
+        g_shaderBytes += ci->codeSize;
+        if (g_shaderModules <= 3 || g_shaderModules % 500 == 0)
+            trace("SPIRV: module %llu, %zu bytes (%.1f MB total)",
+                  (unsigned long long)g_shaderModules, ci->codeSize,
+                  g_shaderBytes / 1048576.0);
+
+        // DUMP THE SPIR-V, so the injection question can be answered by reading
+        // X-Plane's actual shaders instead of assuming what they contain.
+        //
+        // The whole approach hinges on ONE property. A true motion vector needs
+        //     prevClip = prevViewProj * model * vertex
+        // and we already have prevViewProj from the plugin. So if these shaders
+        // take view-projection and model as SEPARATE matrices, we substitute
+        // ours, keep theirs, and get exact vectors for every static object -
+        // with no per-object identity, which is the thing a layer cannot get.
+        //
+        // If instead they receive one pre-combined MVP per draw, there is
+        // nothing to substitute: we would have to snapshot per-draw uniforms
+        // and match objects frame to frame, and Vulkan gives a layer no stable
+        // identity to match on. Same effort, completely different odds.
+        //
+        // ARMED HERE, LAZILY, not in the present path.
+        //
+        // Every other feature reads its environment variable at the first
+        // vkQueuePresentKHR, which is fine for things that act on frames. It is
+        // useless for this one: shader modules are compiled while the scenery
+        // loads, long before a single frame is presented, so arming at first
+        // present meant 1503 modules went past before injection was switched
+        // on and the coverage count came back empty. The counters were right -
+        // there was simply nothing left to count by the time they existed.
+        armSpirvInject();
+
+        // ---- motion vector injection.
+        //
+        // DRY RUN BY DEFAULT. The patched module is produced and counted but
+        // NOT handed to the driver, because a patched vertex shader declares a
+        // push constant that the pipeline layout does not yet contain and
+        // writes to an attachment that the render pass does not yet have.
+        // Substituting it before that plumbing exists would not degrade - it
+        // would fail pipeline creation outright and take the sim with it.
+        //
+        // So this measures coverage first: how many vertex shaders can be
+        // patched, and how many cannot. That number decides whether the rest of
+        // the work is worth doing, and it costs nothing to learn.
+        if (g_spirvInject) {
+            std::vector<uint32_t> patched;
+            uint32_t loc = 0;
+            bool isFrag = false;
+
+            // Vertex first; if it is not a vertex shader, try the fragment
+            // transform on the same module. One of the two applies, or neither
+            // does and it is a compute shader we have no business touching.
+            spvinj::Result r = spvinj::inject(ci->pCode, ci->codeSize, patched, &loc);
+            if (r == spvinj::INJ_NOT_VERTEX) {
+                // USE THE REAL ATTACHMENT INDEX, NOT A NOMINAL 1.
+                //
+                // This call is only a coverage probe - the patch that gets used
+                // is built at pipeline creation - but the index still decides
+                // the answer. injectFragment refuses with LOCATION_TAKEN when
+                // the shader already writes the attachment it was asked for, and
+                // asking for 1 means every ordinary shader that writes colour
+                // attachment 1 was counted as a refusal. That is where "79
+                // shaders collide with our varying pair" came from: a probe
+                // against the wrong attachment, reported as a coverage hole and
+                // chased as one, while the location census says 16..31 are
+                // entirely free and 30/31 was never contended at all.
+                r = spvinj::injectFragment(ci->pCode, ci->codeSize, patched,
+                                           spvinj::mvAttachmentIndex(), 0.0f);
+                isFrag = true;
+            }
+
+            switch (r) {
+            case spvinj::INJ_OK:
+                ++g_injOk;
+                if (isFrag) ++g_injFrag;
+                g_patchedCode = patched;
+                g_patchedWasFrag = isFrag;
+                if (g_injOk <= 6)
+                    trace("SPIRV INJECT: module %llu patched (%s) - %zu -> %zu "
+                          "words, %s %u",
+                          (unsigned long long)g_shaderModules,
+                          isFrag ? "FRAGMENT" : "vertex",
+                          ci->codeSize / 4, patched.size(),
+                          isFrag ? "writes attachment" : "prevClip at Location",
+                          loc);
+                break;
+            case spvinj::INJ_NOT_VERTEX: ++g_injNotVertex; break;
+            default:
+                ++g_injFailed;
+                // Tally the REASON, not just the count. The refusals live on
+                // this path, not on the pipeline-time one that was instrumented
+                // first - which is why that tally never printed anything while
+                // 79 shaders were being refused here.
+                mvNoteInjectReason(r);
+                if (g_injFailed <= 5 || (g_injFailed % 25) == 0) mvLogInjectReasons();
+                trace("SPIRV INJECT: module %llu FAILED (reason %d, %zu bytes) - "
+                      "this shader would leave holes in the velocity buffer",
+                      (unsigned long long)g_shaderModules, (int)r, ci->codeSize);
+                break;
+            }
+            // Reported against the MODULE count, not against the patch count.
+            //
+            // The first version fired when (patched + failed) hit a multiple of
+            // 200, which meant that if there were fewer vertex shaders than
+            // that it never printed at all - and it did not, so a run with zero
+            // failures was indistinguishable from a run where nothing ever
+            // executed. Keying it to a counter that is guaranteed to advance
+            // makes the number appear whether it is good news or bad.
+            if ((g_shaderModules % 250) == 0)
+                trace("SPIRV INJECT: %llu patched (%llu frag), %llu failed, %llu other (of %llu modules)",
+                      (unsigned long long)g_injOk,
+                      (unsigned long long)g_injFrag,
+                      (unsigned long long)g_injFailed,
+                      (unsigned long long)g_injNotVertex,
+                      (unsigned long long)g_shaderModules);
+        }
+
+        // Cheap to answer and expensive to guess at, so: TAA_DUMP_SHADERS=1
+        // writes the first modules to disk for spirv-dis.
+        if (getenv("TAA_DUMP_SHADERS") && g_shaderModules <= 40) {
+            const char *tmp = getenv("TEMP");
+            char dir[512], path[640];
+            snprintf(dir, sizeof(dir), "%s\\taa_shaders", tmp ? tmp : ".");
+            CreateDirectoryA(dir, nullptr);
+            snprintf(path, sizeof(path), "%s\\mod_%03llu.spv", dir,
+                     (unsigned long long)g_shaderModules);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(ci->pCode, 1, ci->codeSize, f);
+                fclose(f);
+                if (g_shaderModules <= 3)
+                    trace("SPIRV: dumped %s (%zu bytes)", path, ci->codeSize);
+            }
+        }
+    }
+    // Keep the original words so the fragment patch can be built later, when
+    // the attachment index is known. Only under LIVE - in dry run nothing will
+    // ever ask for them, and this is several megabytes.
+    if (g_spirvLive) {
+        VkResult rr = g_nextCreateShaderModule
+            ? g_nextCreateShaderModule(device, ci, alloc, out)
+            : VK_ERROR_INITIALIZATION_FAILED;
+        if (rr == VK_SUCCESS && out) {
+            std::lock_guard<std::mutex> g(g_lock);
+            g_moduleCode[*out].assign(ci->pCode, ci->pCode + ci->codeSize / 4);
+            if (isXpFsr) g_xpFsrModules.insert(*out);
+        }
+        if (isXpFsr)
+            trace("XP FSR: shader module %p is one of X-Plane's FSR variants "
+                  "(u_fsr_data present, %zu bytes)", (void*)(out ? *out : 0),
+                  ci->codeSize);
+        g_patchedCode.clear();
+        return rr;
+    }
+
+    // The FRAGMENT patch happens at pipeline creation, not here - see
+    // mvPatchFragment. The vertex patch could happen here, but keeping both in
+    // one place makes the pairing obvious: a pipeline gets a patched vertex
+    // shader only when its fragment shader could also be patched.
+    g_patchedCode.clear();
+    {
+        VkResult rr = g_nextCreateShaderModule
+            ? g_nextCreateShaderModule(device, ci, alloc, out)
+            : VK_ERROR_INITIALIZATION_FAILED;
+        if (rr == VK_SUCCESS && out && isXpFsr) {
+            std::lock_guard<std::mutex> g(g_lock);
+            g_xpFsrModules.insert(*out);
+            trace("XP FSR: shader module %p is one of X-Plane's FSR variants "
+                  "(u_fsr_data present, %zu bytes)", (void*)*out, ci->codeSize);
+        }
+        return rr;
+    }
+}
+
+// Compute pipelines built from those modules ARE the upscaler. Hooked purely to
+// learn which VkPipeline handles to watch for at bind time - the pipeline is
+// created exactly as the application asked.
+static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateComputePipelines(
+    VkDevice device, VkPipelineCache cache, uint32_t count,
+    const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *alloc,
+    VkPipeline *out)
+{
+    PFN_vkCreateComputePipelines next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.createComputePipelines;
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkResult r = next(device, cache, count, ci, alloc, out);
+    if (r == VK_SUCCESS && ci && out) {
+        std::lock_guard<std::mutex> g(g_lock);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!g_xpFsrModules.count(ci[i].stage.module)) continue;
+            g_xpFsrPipelines.insert(out[i]);
+            trace("XP FSR: compute pipeline %p is X-Plane's upscaler - its "
+                  "dispatches will be dropped and replaced by FSR2's result",
+                  (void*)out[i]);
+        }
+    }
+    return r;
+}
+
+// THE PUSH CONSTANT THE INJECTED SHADERS DECLARE HAS TO EXIST IN THE LAYOUT.
+//
+// A patched vertex shader reads a mat4 from push constant offset 0. If the
+// pipeline layout does not declare a range covering that, pipeline creation
+// fails outright - so this hook adds one.
+//
+// WHY OFFSET 0 IS SAFE HERE, AND WHY IT IS CHECKED ANYWAY. Vulkan forbids two
+// push constant ranges in one layout from naming the same stage
+// (VUID-VkPipelineLayoutCreateInfo-pPushConstantRanges-00292), but ranges for
+// DIFFERENT stages may overlap freely. X-Plane's push constants live in its
+// fragment shaders - the fifteen vertex shaders use none, which was measured
+// from the dumps rather than assumed - so a VERTEX range at offset 0 collides
+// with nothing.
+//
+// "Measured rather than assumed" is doing real work in that sentence, so it is
+// verified per layout instead of trusted: if a layout already has a range
+// naming the vertex stage, we cannot add a second one and cannot move the
+// shader's offset after the fact, so that layout is left alone and recorded.
+// Pipelines built from it keep their original shaders - a hole in the velocity
+// buffer rather than a dead sim.
+static std::map<VkPipelineLayout, bool> g_layoutHasOurPC;
+static uint64_t g_layoutPatched = 0, g_layoutSkipped = 0;
+
+
+static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreatePipelineLayout(
+    VkDevice device, const VkPipelineLayoutCreateInfo *ci,
+    const VkAllocationCallbacks *alloc, VkPipelineLayout *out)
+{
+    PFN_vkCreatePipelineLayout next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.createPipelineLayout;
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+
+    armSpirvInject();
+    if (!g_spirvInject || !ci)
+        return next(device, ci, alloc, out);
+
+    bool vertexRangeExists = false;
+    for (uint32_t i = 0; i < ci->pushConstantRangeCount; ++i)
+        if (ci->pPushConstantRanges[i].stageFlags & VK_SHADER_STAGE_VERTEX_BIT)
+            vertexRangeExists = true;
+
+    if (vertexRangeExists) {
+        VkResult r = next(device, ci, alloc, out);
+        if (r == VK_SUCCESS) {
+            std::lock_guard<std::mutex> g(g_lock);
+            g_layoutHasOurPC[*out] = false;
+            if (++g_layoutSkipped <= 5)
+                trace("SPIRV INJECT: layout already has a VERTEX push constant "
+                      "range - left unpatched (%llu so far). Draws using it will "
+                      "carry no velocity.",
+                      (unsigned long long)g_layoutSkipped);
+        }
+        return r;
+    }
+
+    std::vector<VkPushConstantRange> ranges(
+        ci->pPushConstantRanges,
+        ci->pPushConstantRanges + ci->pushConstantRangeCount);
+
+    VkPushConstantRange ours;
+    ours.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    ours.offset     = spvinj::pushConstantOffset();
+    ours.size       = spvinj::kPushConstantBytes;   // one mat4
+    ranges.push_back(ours);
+
+    VkPipelineLayoutCreateInfo ci2 = *ci;
+    ci2.pushConstantRangeCount = (uint32_t)ranges.size();
+    ci2.pPushConstantRanges    = ranges.data();
+
+    VkResult r = next(device, &ci2, alloc, out);
+    if (r != VK_SUCCESS) {
+        // Fall back rather than fail the application's call. A layout we cannot
+        // extend is a velocity hole; a layout we fail to create is a crash.
+        trace("SPIRV INJECT: layout with our push constant range was REJECTED "
+              "(%d) - retrying unmodified", (int)r);
+        r = next(device, ci, alloc, out);
+        if (r == VK_SUCCESS) {
+            std::lock_guard<std::mutex> g(g_lock);
+            g_layoutHasOurPC[*out] = false;
+        }
+        return r;
+    }
+
+    std::lock_guard<std::mutex> g(g_lock);
+    g_layoutHasOurPC[*out] = true;
+    if (++g_layoutPatched <= 3 || (g_layoutPatched % 250) == 0)
+        trace("SPIRV INJECT: pipeline layout extended with a %u-byte VERTEX "
+              "push constant range (%llu patched, %llu skipped)",
+              spvinj::kPushConstantBytes,
+              (unsigned long long)g_layoutPatched,
+              (unsigned long long)g_layoutSkipped);
+    return r;
+}
+
+// PUSHING uReproj: which pipelines can receive it, and when.
+//
+// A push constant is not stored in the pipeline - it is command buffer state,
+// bound to a layout, and it is invalidated whenever a pipeline with an
+// incompatible layout is bound. So it cannot be written once per frame; it has
+// to be written after each bind of a pipeline whose layout carries our range.
+//
+// Recording pipeline -> layout at creation is what makes that possible.
+// vkCmdBindPipeline names only the pipeline, and there is no Vulkan query that
+// takes a VkPipeline and returns its layout - the association exists only in
+// the create info, which is gone by the time the draw happens.
+static std::map<VkPipeline, VkPipelineLayout> g_pipelineLayoutOf;
+
+// Does this pipeline draw geometry from vertex buffers, and how many of each
+// kind exist. Filled at pipeline creation; read at bind time to decide whether
+// this draw is jittered. See the note where it is written.
+static std::map<VkPipeline, bool> g_pipelineIsGeometry;
+static uint64_t g_pipeGeometry = 0, g_pipeFullscreen = 0;
+
+// ---- DRAW-WEIGHTED MOTION VECTOR COVERAGE.
+//
+// "79 of 1250 modules refused" was the only coverage figure this project had,
+// and it was both wrong (a probe artefact) and the wrong unit. What decides
+// whether the image shimmers is how much of the SCREEN is drawn by pipelines
+// that write no motion vectors, and a module census cannot see that. A single
+// unpatched pipeline drawing terrain covers more pixels than fifty patched ones
+// drawing cockpit switches.
+//
+// Counted per bind inside a scene pass, which is the closest cheap proxy for
+// draw calls and needs no vkCmdDraw interception.
+static std::map<VkPipeline, bool> g_pipelineMvPatched;
+static uint64_t g_bindScenePatched = 0, g_bindSceneUnpatched = 0;
+static uint64_t g_bindCockpitPatched = 0, g_bindCockpitUnpatched = 0;
+static uint64_t g_pushCount = 0;
+
+// Original SPIR-V, kept so fragment shaders can be patched LATER.
+//
+// A fragment shader's velocity output Location must equal the render pass's
+// colour attachment count, and that is not known at vkCreateShaderModule - only
+// at vkCreateGraphicsPipelines. So the words are stored here and the patch
+// happens when the answer exists.
+//
+// Costs a few megabytes for X-Plane's ~1500 modules, which is the price of not
+// guessing an index. Both earlier guesses failed: deriving it from the shader's
+// own outputs wrote velocity over a live G-buffer target, and pinning it to a
+// fixed index needed every pass padded to eight attachments, which the driver
+// rejected outright.
+
+// The VERTEX half. Without it the fragment shaders read varyings nobody writes.
+//
+// This was briefly lost: moving the fragment patch to pipeline creation meant
+// vkCreateShaderModule handed back every module unpatched, vertex included. The
+// fragment shaders still read currClip and prevClip at their fixed Locations,
+// nothing wrote them, undefined inputs read as zero, and (0 - 0) * 0.5 gave a
+// velocity field that was uniformly zero while the camera moved six metres.
+//
+// Keyed on the module alone, unlike the fragment variants: the vertex locations
+// are fixed device-wide, so one patched copy serves every pipeline.
+static std::map<VkShaderModule, VkShaderModule> g_vertVariant;
+static uint64_t g_vertVariants = 0, g_vertPatchFail = 0;
+
+// Choose the varying pair from what X-Plane actually uses, once.
+//
+// chooseLocations() picked the top of the device limit - 31/30 on a card
+// reporting 128 output components. That is within the limit and says nothing
+// about whether anything already lives there, and 79 of 1250 modules did:
+// refused with LOCATION_TAKEN, patched into nothing, writing no motion vectors
+// at all. Every pixel those draws produced had FSR2 reject history and crawl.
+//
+// Done here rather than at device creation because this is the first moment a
+// representative set of modules exists - vertex variants are built lazily at
+// pipeline creation, by which point X-Plane has handed us most of its shaders.
+// Set the moment the first module is patched. After that the varying pair is
+// frozen, because it is a CONTRACT BETWEEN TWO SHADERS: the vertex stage writes
+// Location N and the fragment stage of the same pipeline reads it. Both are
+// patched with whatever the global pair is at the time. Move the pair midway
+// and a vertex module cached under the old pair can be linked against a
+// fragment module patched under the new one - the fragment then reads a
+// location nothing wrote, which is undefined data feeding the motion vectors.
+// That is worse than the refusals this whole census exists to remove, and it
+// would appear as corruption in some pipelines and not others.
+static bool g_locLatched = false;
+
+// WHY THE REFUSAL REASON IS COUNTED AND NOT JUST THE REFUSAL.
+//
+// The old counter said "105 refused" and stopped there, so the only way to
+// learn WHY was to add logging and fly again. The reasons are not equivalent:
+// NOT_VERTEX is expected and harmless, NO_POSITION means the shader does not
+// draw geometry, and LOCATION_TAKEN is the one that is our fault and fixable.
+// A single number cannot distinguish "everything that could be patched was"
+// from "a fifth of the scene silently writes no motion vectors", and those two
+// look identical on screen except that the second one shimmers.
+static uint64_t g_injReason[spvinj::INJ_MALFORMED + 1] = {0};
+
+static void mvNoteInjectReason(spvinj::Result r)
+{
+    if ((int)r >= 0 && (int)r <= (int)spvinj::INJ_MALFORMED) ++g_injReason[(int)r];
+}
+
+static void mvLogInjectReasons()
+{
+    static const char *kName[] = {
+        "patched", "not-a-vertex-shader", "no-gl_Position",
+        "never-writes-gl_Position", "LOCATION-TAKEN", "malformed"
+    };
+    std::string s;
+    char buf[96];
+    for (int i = 0; i <= (int)spvinj::INJ_MALFORMED; ++i) {
+        if (!g_injReason[i]) continue;
+        snprintf(buf, sizeof(buf), "%s%s=%llu", s.empty() ? "" : "  ",
+                 kName[i], (unsigned long long)g_injReason[i]);
+        s += buf;
+    }
+    trace("SPIRV INJECT: outcomes at locations %u/%u - %s",
+          spvinj::currClipLocation(), spvinj::prevClipLocation(),
+          s.empty() ? "(nothing attempted)" : s.c_str());
+    if (g_injReason[spvinj::INJ_LOCATION_TAKEN])
+        trace("SPIRV INJECT: %llu shaders still collide with our varying pair "
+              "and write NO motion vectors. Those draws reproject from depth "
+              "only, which is what shimmers on moving geometry.",
+              (unsigned long long)g_injReason[spvinj::INJ_LOCATION_TAKEN]);
+}
+
+// Re-run until it has a big enough sample, then commit once.
+//
+// WHY THIS IS ALLOWED TO MOVE THE PAIR AFTER PATCHING HAS STARTED.
+//
+// The first version refused to: it latched on the first patch, X-Plane creates
+// its first pipeline when only 16 modules exist, and the census therefore never
+// ran at all - locations stayed at 30/31 and the shaders that collide with them
+// kept writing no motion vectors. The latch was protecting against a real
+// hazard but with the wrong instrument.
+//
+// The hazard is a CACHED vertex variant patched under the old pair being linked
+// against a fragment patched under the new one. It is not that two pipelines
+// disagree - each pipeline patches its vertex and fragment together at creation,
+// so a pipeline built at pair A and another built at pair B are both internally
+// consistent and both correct. Only the caches can straddle the change.
+//
+// So the fix is to flush the caches at the instant the pair moves, not to
+// forbid the move. Pipelines already built keep the modules they were built
+// with, which are still valid; everything created afterwards is re-patched at
+// the new pair.
+//
+// The old patched modules are dropped rather than destroyed. They may still be
+// referenced by pipelines already created, and a VkShaderModule is a few KB of
+// driver-side object - a few hundred of them is not a leak worth risking a
+// use-after-free to reclaim.
+static void mvPickLocationsOnce()
+{
+    static bool done = false;
+    if (done) return;
+
+    std::vector<std::vector<uint32_t> > mods;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        // A census of 16 modules is barely better than none - it can move the
+        // pair onto locations the other 1200 use heavily. Wait for a real
+        // sample; patching in the meantime is fine because the pair can still
+        // move afterwards.
+        if (g_moduleCode.size() < 512) return;
+        for (std::map<VkShaderModule, std::vector<uint32_t> >::iterator it =
+                 g_moduleCode.begin(); it != g_moduleCode.end(); ++it)
+            mods.push_back(it->second);
+    }
+    done = true;
+
+    const uint32_t kMax = 32;
+    bool used[kMax];
+    memset(used, 0, sizeof(used));
+    for (size_t i = 0; i < mods.size(); ++i)
+        spvinj::scanUsedLocations(mods[i].data(), mods[i].size() * 4, used, kMax);
+
+    uint32_t before[2] = { spvinj::currClipLocation(), spvinj::prevClipLocation() };
+    if (spvinj::placeLocations(used, kMax)) {
+        std::string map;
+        for (uint32_t L = 0; L < kMax; ++L) map += used[L] ? '#' : '.';
+        bool moved = (before[0] != spvinj::currClipLocation() ||
+                      before[1] != spvinj::prevClipLocation());
+        size_t flushedV = 0, flushedF = 0;
+        if (moved) {
+            std::lock_guard<std::mutex> g(g_lock);
+            flushedV = g_vertVariant.size();
+            flushedF = g_fragVariant.size();
+            g_vertVariant.clear();
+            g_fragVariant.clear();
+            // The refusal tally described the OLD pair. Keeping it would blend
+            // two different experiments into one number.
+            memset(g_injReason, 0, sizeof(g_injReason));
+        }
+        trace("SPIRV INJECT: varyings %s %u/%u -> %u/%u after scanning %zu "
+              "modules (flushed %zu vertex / %zu fragment variants so later "
+              "pipelines re-patch at the new pair). Location map "
+              "(# = used by X-Plane): %s",
+              moved ? "moved" : "kept", before[0], before[1],
+              spvinj::currClipLocation(), spvinj::prevClipLocation(),
+              mods.size(), flushedV, flushedF, map.c_str());
+    } else {
+        std::string map;
+        for (uint32_t L = 0; L < kMax; ++L) map += used[L] ? '#' : '.';
+        trace("SPIRV INJECT: no free adjacent Location pair in %zu modules - "
+              "keeping %u/%u. Shaders using those will still be refused. "
+              "Location map (# = used by X-Plane): %s",
+              mods.size(), before[0], before[1], map.c_str());
+    }
+}
+
+static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
+{
+    mvPickLocationsOnce();
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkShaderModule, VkShaderModule>::iterator it = g_vertVariant.find(orig);
+        if (it != g_vertVariant.end()) return it->second;
+    }
+
+    std::vector<uint32_t> src;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkShaderModule, std::vector<uint32_t> >::iterator it =
+            g_moduleCode.find(orig);
+        if (it == g_moduleCode.end()) return VK_NULL_HANDLE;
+        src = it->second;
+    }
+
+    std::vector<uint32_t> patched;
+    uint32_t loc = 0;
+    VkShaderModule out = VK_NULL_HANDLE;
+    spvinj::Result ir = spvinj::inject(src.data(), src.size() * 4, patched, &loc);
+    mvNoteInjectReason(ir);
+    if (ir == spvinj::INJ_OK) {
+        VkShaderModuleCreateInfo smci;
+        memset(&smci, 0, sizeof(smci));
+        smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = patched.size() * 4;
+        smci.pCode    = patched.data();
+        if (!g_nextCreateShaderModule ||
+            g_nextCreateShaderModule(device, &smci, nullptr, &out) != VK_SUCCESS)
+            out = VK_NULL_HANDLE;
+    }
+
+    std::lock_guard<std::mutex> g(g_lock);
+    g_vertVariant[orig] = out;
+    if (out == VK_NULL_HANDLE) {
+        ++g_vertPatchFail;
+        // Report the breakdown on a schedule tied to failures, so a run that
+        // refuses a lot says so early rather than only in a summary at exit -
+        // the sim is often killed before any exit path runs.
+        if (g_vertPatchFail <= 3 || (g_vertPatchFail % 50) == 0)
+            mvLogInjectReasons();
+    } else if (++g_vertVariants <= 5 || (g_vertVariants % 100) == 0) {
+        trace("SPIRV INJECT: vertex variant %llu (%llu refused)",
+              (unsigned long long)g_vertVariants,
+              (unsigned long long)g_vertPatchFail);
+        if ((g_vertVariants % 500) == 0) mvLogInjectReasons();
+    }
+    return out;
+}
+
+// `reactive` is baked into the patched module, so it is part of the cache
+// identity: the same fragment shader used by an opaque pipeline and by an
+// additive one needs two variants. It is quantised into the key because it
+// arrives as a float from a fixed set of four values, and a float is a poor
+// thing to compare for equality in a map key.
+static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
+                                      uint32_t attachmentIndex, float reactive)
+{
+    uint32_t q = (uint32_t)(reactive * 255.0f + 0.5f);
+    if (q > 255) q = 255;
+    FragKey key(orig, (attachmentIndex << 8) | q);
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<FragKey, VkShaderModule>::iterator it = g_fragVariant.find(key);
+        if (it != g_fragVariant.end()) return it->second;
+    }
+
+    std::vector<uint32_t> src;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkShaderModule, std::vector<uint32_t> >::iterator it =
+            g_moduleCode.find(orig);
+        if (it == g_moduleCode.end()) return VK_NULL_HANDLE;
+        src = it->second;
+    }
+
+    std::vector<uint32_t> patched;
+    spvinj::Result fr = spvinj::injectFragment(src.data(), src.size() * 4, patched,
+                                               attachmentIndex, reactive);
+    if (fr != spvinj::INJ_OK) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_fragVariant[key] = VK_NULL_HANDLE;   // remember the refusal too
+        ++g_fragPatchFail;
+        // EVERY unpatched pipeline this session refused here, with the vertex
+        // stage patched and the fragment stage declining - 200 of 200, one
+        // cause, not a mixture. The counter said "how many" and never "why",
+        // so the reason had to be inferred from reading the injector, twice,
+        // wrongly. Print it instead. attachmentIndex is included because it
+        // varies per pipeline - it is the pass's colorAttachmentCount - and a
+        // refusal that depends on it means the slot is contested, while one
+        // that does not means the varyings are.
+        static uint64_t nSaid = 0;
+        static const char *kWhy[] = {
+            "OK", "not-a-fragment-shader", "no-gl_Position",
+            "never-writes-gl_Position", "LOCATION-TAKEN", "malformed"
+        };
+        if (++nSaid <= 10 || (nSaid % 250) == 0)
+            trace("MV FRAGMENT REFUSED #%llu: reason=%s at attachmentIndex=%u "
+                  "(varyings %u/%u). The vertex stage patched; both-or-neither "
+                  "then discards that too, so these draws write no velocity.",
+                  (unsigned long long)nSaid,
+                  ((int)fr >= 0 && (int)fr <= 5) ? kWhy[(int)fr] : "?",
+                  attachmentIndex, spvinj::currClipLocation(),
+                  spvinj::prevClipLocation());
+        return VK_NULL_HANDLE;
+    }
+
+    VkShaderModuleCreateInfo smci;
+    memset(&smci, 0, sizeof(smci));
+    smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = patched.size() * 4;
+    smci.pCode    = patched.data();
+
+    VkShaderModule out = VK_NULL_HANDLE;
+    if (!g_nextCreateShaderModule ||
+        g_nextCreateShaderModule(device, &smci, nullptr, &out) != VK_SUCCESS) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_fragVariant[key] = VK_NULL_HANDLE;
+        ++g_fragPatchFail;
+        return VK_NULL_HANDLE;
+    }
+
+    std::lock_guard<std::mutex> g(g_lock);
+    g_fragVariant[key] = out;
+    if (++g_fragVariants <= 5 || (g_fragVariants % 200) == 0)
+        trace("SPIRV INJECT: fragment variant %llu - velocity at attachment %u "
+              "(%llu refused)",
+              (unsigned long long)g_fragVariants, attachmentIndex,
+              (unsigned long long)g_fragPatchFail);
+    return out;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
+    VkDevice device, VkPipelineCache cache, uint32_t count,
+    const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *alloc,
+    VkPipeline *out)
+{
+    if (ci) {
+        for (uint32_t i = 0; i < count; ++i) {
+            ++g_gfxPipelines;
+            for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
+                // A stage with no module handle must be carrying its SPIR-V
+                // inline via maintenance5. That is the case that would be
+                // missed by hooking vkCreateShaderModule alone.
+                if (ci[i].pStages[s].module == VK_NULL_HANDLE) {
+                    ++g_inlineModules;
+                    if (g_inlineModules <= 3)
+                        trace("SPIRV: INLINE module in pipeline stage (maintenance5) "
+                              "- vkCreateShaderModule alone would miss this");
+                }
+            }
+        }
+        if (g_gfxPipelines <= 3 || g_gfxPipelines % 500 == 0)
+            trace("SPIRV: %llu graphics pipelines, %llu modules, %llu inline",
+                  (unsigned long long)g_gfxPipelines,
+                  (unsigned long long)g_shaderModules,
+                  (unsigned long long)g_inlineModules);
+    }
+    // EVERY graphics pipeline gains the velocity attachment format, not just
+    // the ones we patched.
+    //
+    // Under dynamic rendering a pipeline's colour formats must agree with the
+    // pass it runs in. We add the attachment slot to every pass, so every
+    // pipeline has to declare it or become invalid everywhere. Pipelines whose
+    // fragment shader could not be patched get colorWriteMask 0 for that slot:
+    // present, correctly formatted, writing nothing, leaving the cleared zero -
+    // which reads as "did not move" and is the honest answer for geometry we
+    // have no vectors for.
+    std::vector<VkGraphicsPipelineCreateInfo> ci2;
+    std::vector<VkPipelineRenderingCreateInfo> rinfo;
+    std::vector<std::vector<VkFormat> > fmts;
+    std::vector<VkPipelineColorBlendStateCreateInfo> blends;
+    std::vector<std::vector<VkPipelineColorBlendAttachmentState> > blendAtt;
+    std::vector<std::vector<VkPipelineShaderStageCreateInfo> > stages;
+    std::vector<char> mvPatchedThisCall;
+
+    if (ci && count) mvPatchedThisCall.assign(count, 0);
+
+    if (g_spirvLive && ci && count) {
+        ci2.assign(ci, ci + count);
+        rinfo.resize(count);
+        fmts.resize(count);
+        blends.resize(count);
+        blendAtt.resize(count);
+        stages.resize(count);
+
+        for (uint32_t i = 0; i < count; ++i) {
+            // Find the dynamic rendering info in the pNext chain. A pipeline
+            // without one is using a render pass object, which X-Plane does not
+            // - measured, 0 vkCmdBeginRenderPass calls in 2760 frames - so
+            // leaving those alone costs nothing.
+            const VkPipelineRenderingCreateInfo *src = nullptr;
+            for (const VkBaseInStructure *p = (const VkBaseInStructure*)ci[i].pNext;
+                 p; p = p->pNext)
+                if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
+                    src = (const VkPipelineRenderingCreateInfo*)p;
+            if (!src || !ci[i].pColorBlendState) continue;
+
+            // One extra format, at index colorAttachmentCount - matching the
+            // single extra slot the pass hook appends, and matching the
+            // Location the fragment shader is patched to write.
+            if (src->colorAttachmentCount >= 8) continue;
+            uint32_t mvIndex = src->colorAttachmentCount;
+            fmts[i].assign(src->pColorAttachmentFormats,
+                           src->pColorAttachmentFormats + src->colorAttachmentCount);
+            fmts[i].push_back(kMvFormat);
+
+            rinfo[i] = *src;
+            rinfo[i].colorAttachmentCount    = (uint32_t)fmts[i].size();
+            rinfo[i].pColorAttachmentFormats = fmts[i].data();
+
+            // ---- REACTIVE CLASSIFICATION, from the blend state we are already
+            // holding. Done BEFORE the shader patch below, because the value is
+            // baked into the patched module rather than pushed at draw time.
+            //
+            // A temporal upscaler's worst case is content that does not obey
+            // motion vectors: smoke, cloud, glass, particles, sprites. Their
+            // pixels move in ways no reprojection predicts, so history is wrong
+            // there and blending it in produces smear. FSR2 and DLSS both take a
+            // mask saying "distrust history at these pixels" - and we have never
+            // supplied one. FSR2's `reactive` input has been null every frame.
+            //
+            // The depth field does compute something called reactive, but from
+            // DISTANCE ellipses around the cockpit. That cannot tell a cloud
+            // from a wall; it only knows how far away a thing is.
+            //
+            // Blend state can. A draw that alpha-blends or adds is, almost by
+            // definition, the transparent content this mask exists for, and the
+            // pipeline declares it right here at creation. This is the cheapest
+            // accurate signal available and it costs one struct read.
+            //
+            //   blendEnable off        -> opaque geometry, history is reliable
+            //   SRC_ALPHA/1-SRC_ALPHA  -> ordinary transparency: glass, decals
+            //   additive (dst = ONE)   -> particles, lights, volumetrics, the
+            //                             worst offenders, so the strongest mask
+            const VkPipelineColorBlendStateCreateInfo *sb = ci[i].pColorBlendState;
+
+            float reactive = 0.0f;
+            if (sb && sb->attachmentCount > 0 && sb->pAttachments &&
+                sb->pAttachments[0].blendEnable) {
+                VkBlendFactor d = sb->pAttachments[0].dstColorBlendFactor;
+                if (d == VK_BLEND_FACTOR_ONE)                       reactive = 0.9f;
+                else if (d == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)  reactive = 0.5f;
+                else                                                reactive = 0.4f;
+            }
+
+            // Counted by class so the value of doing this stays measurable. The
+            // first run answered the question it was added for: opaque 26%,
+            // alpha 51%, additive 23% - three quarters of an X-Plane frame's
+            // pipelines blend, which is why this mask is worth the bandwidth.
+            {
+                static uint64_t nOpaque = 0, nAlpha = 0, nAdd = 0, nOther = 0;
+                if (reactive == 0.0f)      ++nOpaque;
+                else if (reactive == 0.9f) ++nAdd;
+                else if (reactive == 0.5f) ++nAlpha;
+                else                       ++nOther;
+                uint64_t tot = nOpaque + nAlpha + nAdd + nOther;
+                if (tot == 200 || tot == 1000 || tot % 5000 == 0)
+                    trace("REACTIVE: pipelines by blend class - opaque %llu (%.0f%%), "
+                          "alpha %llu (%.0f%%), additive %llu (%.0f%%), other %llu",
+                          (unsigned long long)nOpaque, 100.0 * nOpaque / tot,
+                          (unsigned long long)nAlpha,  100.0 * nAlpha  / tot,
+                          (unsigned long long)nAdd,    100.0 * nAdd    / tot,
+                          (unsigned long long)nOther);
+            }
+
+            // ---- WHY DEPTH STATE IS ONLY MEASURED HERE, NOT ACTED ON.
+            //
+            // The velocity attachment is written with blending OFF, so the last
+            // draw covering a pixel wins outright. That is right for geometry -
+            // the frontmost surface owns the pixel's motion - but it means a
+            // single full-screen composite could stamp its own vectors over the
+            // whole frame, and the reactive mask reading 100% at a uniform 0.5
+            // looked exactly like that happening.
+            //
+            // Acting on that reading was wrong, twice over, and both mistakes
+            // are worth leaving written down:
+            //
+            //   The premise did not survive arithmetic. "13 px everywhere with
+            //   the camera still" was called implausible before it was checked.
+            //   The dump reported 0.002 m of camera movement, and 2 mm against
+            //   cockpit geometry half a metre away is ~0.23 deg, which over a
+            //   60 deg field at 3840 px is ~15 px. The measurement was fine.
+            //
+            //   The discriminator did not survive contact. Excluding pipelines
+            //   whose depthTestEnable is false removed 79% of them and zeroed
+            //   the velocity field. Nothing renders 79% of its pipelines without
+            //   depth testing - so that field is not saying what it appears to.
+            //   The likely reason is dynamic state: if a pipeline lists
+            //   VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, the driver ignores the value
+            //   in pDepthStencilState entirely and takes it from the command
+            //   buffer, leaving whatever the application happened to put in the
+            //   struct - frequently zero.
+            //
+            // So this counts the three cases apart and reports them. No pipeline
+            // is excluded until the numbers say which signal is real.
+            {
+                const VkPipelineDepthStencilStateCreateInfo *ds = ci[i].pDepthStencilState;
+                bool dynDepth = false;
+                if (ci[i].pDynamicState && ci[i].pDynamicState->pDynamicStates) {
+                    for (uint32_t d = 0; d < ci[i].pDynamicState->dynamicStateCount; ++d) {
+                        VkDynamicState s = ci[i].pDynamicState->pDynamicStates[d];
+                        if (s == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE ||
+                            s == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT) { dynDepth = true; break; }
+                    }
+                }
+                // AND THE SAME QUESTION ASKED OF BLEND STATE, which is the far
+                // more important one.
+                //
+                // The reactive mask classifies every pipeline by reading
+                // pColorBlendState->pAttachments[0]. If X-Plane sets blend
+                // dynamically the way it sets depth test dynamically, that read
+                // is meaningless too and the entire mask is built on whatever
+                // happens to be in an ignored struct. The depth-test result
+                // makes that a live possibility rather than a paranoid one, and
+                // it is cheap to settle.
+                bool dynBlend = false;
+                if (ci[i].pDynamicState && ci[i].pDynamicState->pDynamicStates) {
+                    for (uint32_t d = 0; d < ci[i].pDynamicState->dynamicStateCount; ++d) {
+                        VkDynamicState s = ci[i].pDynamicState->pDynamicStates[d];
+                        if (s == VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT ||
+                            s == VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT) { dynBlend = true; break; }
+                    }
+                }
+
+                static uint64_t nNull = 0, nDyn = 0, nOff = 0, nOn = 0, nDynBlend = 0;
+                if (!ds)                          ++nNull;
+                else if (dynDepth)                ++nDyn;
+                else if (!ds->depthTestEnable)    ++nOff;
+                else                              ++nOn;
+                if (dynBlend) ++nDynBlend;
+                uint64_t tot = nNull + nDyn + nOff + nOn;
+                if (tot == 1000 || tot % 5000 == 0)
+                    trace("MV DEPTH STATE: no-ds %llu, dynamic %llu, static-off %llu, "
+                          "static-on %llu (of %llu) | BLEND dynamic %llu - if that "
+                          "last number is not 0 the reactive classification is "
+                          "reading a struct the driver ignores",
+                          (unsigned long long)nNull, (unsigned long long)nDyn,
+                          (unsigned long long)nOff,  (unsigned long long)nOn,
+                          (unsigned long long)tot,   (unsigned long long)nDynBlend);
+            }
+
+            // PATCH THE FRAGMENT SHADER HERE, now that the attachment index and
+            // the reactive value are both known. Cached per (module, index,
+            // reactive) - X-Plane builds ~16000 pipelines from ~1500 modules, so
+            // without the cache this would re-patch and re-create the same
+            // module thousands of times.
+            bool fragPatched = false;
+            stages[i].assign(ci[i].pStages, ci[i].pStages + ci[i].stageCount);
+            bool vertPatched = false;
+            for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
+                if (ci[i].pStages[s].stage & VK_SHADER_STAGE_FRAGMENT_BIT) {
+                    VkShaderModule use = mvPatchFragment(
+                        device, ci[i].pStages[s].module, mvIndex, reactive);
+                    if (use != VK_NULL_HANDLE) {
+                        stages[i][s].module = use;
+                        fragPatched = true;
+                    }
+                } else if (ci[i].pStages[s].stage & VK_SHADER_STAGE_VERTEX_BIT) {
+                    VkShaderModule use = mvPatchVertex(device, ci[i].pStages[s].module);
+                    if (use != VK_NULL_HANDLE) {
+                        stages[i][s].module = use;
+                        vertPatched = true;
+                    }
+                }
+            }
+
+            // BOTH OR NEITHER. A patched fragment shader reads varyings only a
+            // patched vertex shader writes; pairing one with an unpatched
+            // partner gives undefined inputs, which read as zero and produce a
+            // velocity field of zeros that looks like working plumbing.
+            mvPatchedThisCall[i] = (fragPatched && vertPatched);
+
+            // ---- WHICH PIPELINES FAIL, AND ON WHICH STAGE.
+            //
+            // The MV target is cleared to zero every frame, so a pipeline that
+            // is not patched does not degrade gracefully - it writes nothing,
+            // the pixels keep zero, and zero means "this pixel did not move".
+            // FSR2 then fetches history from the same screen position while the
+            // camera moves, which pins those pixels and trails them. That is a
+            // patchy smear on exactly the geometry that failed to patch, which
+            // is what the terrain is doing while the cockpit stays clean.
+            //
+            // Bind-weighted coverage said 98.6% and that was reassuring for the
+            // wrong reason: it counts DRAWS, not AREA. A terrain tile and a
+            // cockpit switch are one bind each, and 1.4% of binds can be most of
+            // the screen. So the useful number is not the percentage, it is
+            // WHICH pipelines and WHY.
+            if (!mvPatchedThisCall[i]) {
+                static uint64_t nFail = 0, nVertOnly = 0, nFragOnly = 0, nNeither = 0;
+                ++nFail;
+                if (vertPatched && !fragPatched) ++nVertOnly;
+                else if (!vertPatched && fragPatched) ++nFragOnly;
+                else ++nNeither;
+                if (nFail <= 8 || (nFail % 200) == 0) {
+                    trace("MV PIPELINE UNPATCHED #%llu: vert=%d frag=%d "
+                          "(running: vertex-only %llu, fragment-only %llu, "
+                          "neither %llu). These draws write no velocity and the "
+                          "target is cleared to zero, so their pixels read as "
+                          "stationary and trail.",
+                          (unsigned long long)nFail, vertPatched ? 1 : 0,
+                          fragPatched ? 1 : 0,
+                          (unsigned long long)nVertOnly,
+                          (unsigned long long)nFragOnly,
+                          (unsigned long long)nNeither);
+                    mvLogInjectReasons();
+                }
+            }
+            if (fragPatched && vertPatched) {
+                ci2[i].pStages = stages[i].data();
+            } else {
+                fragPatched = false;   // no velocity from this pipeline
+                stages[i].clear();
+            }
+
+            blendAtt[i].assign(sb->pAttachments,
+                               sb->pAttachments + sb->attachmentCount);
+                        VkPipelineColorBlendAttachmentState mvBlend;
+            memset(&mvBlend, 0, sizeof(mvBlend));
+            mvBlend.blendEnable    = VK_FALSE;   // a velocity is replaced, never blended
+            // B carries the reactive mask alongside RG's velocity. Leaving it
+            // out of the write mask - as the first version did, when the target
+            // was RG only - would let the shader compute the value and the
+            // blend stage silently drop it, which looks exactly like a mask of
+            // zeros.
+            mvBlend.colorWriteMask = fragPatched
+                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                   VK_COLOR_COMPONENT_B_BIT) : 0;
+            blendAtt[i].push_back(mvBlend);
+
+            blends[i] = *sb;
+            blends[i].attachmentCount = (uint32_t)blendAtt[i].size();
+            blends[i].pAttachments    = blendAtt[i].data();
+
+            // Rebuild the pNext chain with our rendering info in place of the
+            // original. The struct is copied, so the application's own remains
+            // untouched - it may well reuse it for the next pipeline.
+            rinfo[i].pNext = src->pNext;
+            ci2[i].pNext = &rinfo[i];
+            ci2[i].pColorBlendState = &blends[i];
+        }
+    }
+
+    VkResult r = g_nextCreateGfxPipelines
+        ? g_nextCreateGfxPipelines(device, cache, count,
+                                   ci2.empty() ? ci : ci2.data(), alloc, out)
+        : VK_ERROR_INITIALIZATION_FAILED;
+
+    // If the extended pipelines were rejected, retry unmodified. A pipeline we
+    // cannot extend is a hole in the velocity buffer; a pipeline that fails to
+    // create is a dead sim.
+    if (r != VK_SUCCESS && !ci2.empty()) {
+        trace("SPIRV INJECT: extended pipeline creation REJECTED (%d) - "
+              "retrying with the application's originals", (int)r);
+        r = g_nextCreateGfxPipelines(device, cache, count, ci, alloc, out);
+    }
+
+    // Remember each pipeline's layout. vkCmdBindPipeline names only the
+    // pipeline, and no Vulkan query maps a VkPipeline back to its layout - the
+    // association exists only here, in the create info, which is gone by the
+    // time a draw is recorded.
+    if (r == VK_SUCCESS && ci && out && g_spirvInject) {
+        std::lock_guard<std::mutex> g(g_lock);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (out[i] == VK_NULL_HANDLE) continue;
+            g_pipelineLayoutOf[out[i]] = ci[i].layout;
+
+            // IS THIS PIPELINE GEOMETRY, OR A FULL-SCREEN QUAD?
+            //
+            // The jitter must reach the scene's triangles and nothing else. A
+            // full-screen composite or post-process pass that is ALSO jittered
+            // displaces the image a second time on top of the geometry that
+            // already moved - which is precisely what viewport jitter did, and
+            // what moving jitter into the vertex shader is meant to stop. Doing
+            // it per-draw only helps if there is something to decide on.
+            //
+            // Vertex attributes are that something, and unlike depthTestEnable -
+            // which the census found to be dynamic state on 100% of X-Plane's
+            // pipelines, and therefore worth nothing at creation time - this is
+            // fixed at creation and cannot be overridden later. Scene geometry
+            // is drawn from vertex buffers; the modern full-screen triangle is
+            // drawn from gl_VertexIndex with no vertex input at all.
+            //
+            // Wrong in the safe direction if X-Plane turns out to draw a quad
+            // from a buffer: that quad gets jittered, which is the behaviour we
+            // already have. The census below says how often it fires, so this is
+            // a measurement rather than a belief.
+            bool hasAttribs = ci[i].pVertexInputState &&
+                              ci[i].pVertexInputState->vertexAttributeDescriptionCount > 0;
+            g_pipelineIsGeometry[out[i]] = hasAttribs;
+            // Whether THIS pipeline ended up writing motion vectors. Module
+            // counts cannot answer the question that matters - a module is not
+            // a pixel. One unpatched pipeline drawing the terrain matters more
+            // than fifty patched ones drawing cockpit switches.
+            g_pipelineMvPatched[out[i]] =
+                (i < mvPatchedThisCall.size()) && mvPatchedThisCall[i] != 0;
+            if (hasAttribs) ++g_pipeGeometry; else ++g_pipeFullscreen;
+        }
+    }
+    return r;
+}
+
+// Push uReproj after any bind of a pipeline whose layout carries our range.
+//
+// Once per bind rather than once per frame, because push constants are command
+// buffer state tied to a layout and are invalidated when a pipeline with an
+// incompatible layout is bound. Pushing once at the start of a frame would
+// survive exactly until X-Plane's next bind.
+//
+// The value is g_velSnap.reproj - prevViewProj * inverse(currViewProj) - which
+// the plugin already computes and the scripted self-test already verified at
+// 8.78 px against 8.77 predicted. This is the same matrix the depth path uses;
+// the only difference is that the shader applies it to a position it knows
+// exactly rather than one recovered from a quantised depth value.
+static PFN_vkCmdBindPipeline  g_nextCmdBindPipeline = nullptr;
+static PFN_vkCmdPushConstants g_nextCmdPushConstants = nullptr;
+
+// A colour image layout transition. Small, explicit, and local: the blit that
+// replaces X-Plane's upscale needs both its source and destination in transfer
+// layouts and back again, and the surrounding code has no idea what layout
+// either was in.
+static void velImageBarrier(DeviceData &dd, VkCommandBuffer cb, VkImage img,
+                            VkImageLayout from, VkImageLayout to,
+                            VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                            VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage)
+{
+    if (img == VK_NULL_HANDLE || !dd.cmdPipelineBarrier) return;
+    VkImageMemoryBarrier bar;
+    memset(&bar, 0, sizeof(bar));
+    bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    bar.oldLayout = from;
+    bar.newLayout = to;
+    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image = img;
+    bar.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bar.subresourceRange.levelCount = 1;
+    bar.subresourceRange.layerCount = 1;
+    bar.srcAccessMask = srcAccess;
+    bar.dstAccessMask = dstAccess;
+    dd.cmdPipelineBarrier(cb, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &bar);
+}
+
+
+// Put the upscaled result into the images X-Plane's own FSR would have written.
+//
+// Called from the FSR2 dispatch site, in the SAME command buffer as the work
+// that produced it. Doing this at X-Plane's dispatch instead put the read in a
+// different buffer from the write, with three queues in play and nothing
+// ordering them - a race, and the tiled corruption that comes with one.
+
+// X-Plane's FSR is a compute dispatch, so this is the interception point: the
+// dispatch is simply never forwarded. Nothing else in the frame changes, and
+// the sim has no way to observe that its upscale did not happen.
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
+    VkCommandBuffer cb, uint32_t gx, uint32_t gy, uint32_t gz)
+{
+    if (g_replaceXpFsr) {
+        bool isFsr = false;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<void*, bool>::iterator it = g_cbFsrBound.find((void*)cb);
+            isFsr = (it != g_cbFsrBound.end() && it->second);
+        }
+        // NEVER DROP WITH NOWHERE TO PUT THE REPLACEMENT.
+        //
+        // The candidate list is not populated until the composite search has
+        // run, so the first frames dropped X-Plane's upscale and wrote nothing
+        // at all - "into 0 display-sized target(s)" in the trace, and a frame
+        // with no upscale in it on screen. If we cannot replace it, let it run.
+        if (isFsr && g_upscaleTargets.empty()) isFsr = false;
+
+        // ONE TARGET, NOT BOTH.
+        //
+        // Writing every display-sized candidate assumed they were interchangeable
+        // halves of a double buffer. They are not necessarily: if one is an input
+        // to later work rather than the final destination, overwriting it corrupts
+        // whatever reads it - which is what the tiled green chevrons were.
+        //
+        // TAA_XPFSR_TARGET picks by index so the right one can be found the same
+        // way the composite was, by bisection rather than by argument.
+        static int targetIdx = getenv("TAA_XPFSR_TARGET")
+                             ? atoi(getenv("TAA_XPFSR_TARGET")) : 0;
+
+        if (isFsr) {
+            ++g_xpFsrDropped;
+            if (g_xpFsrDropped <= 3 || (g_xpFsrDropped % 600) == 0)
+                trace("XP FSR: dropped its upscale dispatch (%llu total, groups "
+                      "%ux%ux%u). FSR2's result is written here instead, into "
+                      "%zu display-sized target(s).",
+                      (unsigned long long)g_xpFsrDropped, gx, gy, gz,
+                      g_upscaleTargets.size());
+
+            // The replacement is NOT written here any more - see
+            // fsr2BlitToTargets, called from the FSR2 dispatch site so the
+            // write shares a command buffer with the work that produces it.
+            // This hook now only removes X-Plane's upscale.
+            // ---- TAA_XPFSR_KEEP: let its dispatch run, and still write ours.
+            //
+            // We match three of the six variants in fsr.xsa, and the two small
+            // ones are about 4 KB - far too small for EASU or RCAS, so they are
+            // copy or passthrough shaders X-Plane uses elsewhere in the frame.
+            // Dropping those does not just skip an upscale, it removes work the
+            // rest of the frame depends on, which is why the scene we then read
+            // was already white on one half and black on the other whether we
+            // sampled FSR2's output or the composite directly.
+            //
+            // Keeping the dispatch costs the upscale we were trying to avoid
+            // and proves whether dropping is what broke the picture. If it is,
+            // the fix is to narrow WHICH dispatch gets dropped rather than to
+            // stop dropping.
+            static const bool keepDispatch = (getenv("TAA_XPFSR_KEEP") != nullptr);
+            if (keepDispatch) {
+                DeviceData *fd = nullptr;
+                {
+                    std::lock_guard<std::mutex> g(g_lock);
+                    std::map<void*, DeviceData>::iterator it = g_devices.begin();
+                    if (it != g_devices.end()) fd = &it->second;
+                }
+                if (fd && fd->cmdDispatch) fd->cmdDispatch(cb, gx, gy, gz);
+            }
+            return;   // ours has been written; the app's ran only if kept
+        }
+    }
+    DeviceData *dd = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(cb));
+        if (it == g_devices.end()) it = g_devices.begin();
+        if (it != g_devices.end()) dd = &it->second;
+    }
+    if (dd && dd->cmdDispatch) dd->cmdDispatch(cb, gx, gy, gz);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
+    VkCommandBuffer cb, VkPipelineBindPoint bind, VkPipeline pipeline)
+{
+    if (!g_nextCmdBindPipeline) return;
+    g_nextCmdBindPipeline(cb, bind, pipeline);
+
+    // Remember whether the compute pipeline now bound is X-Plane's upscaler.
+    if (bind == VK_PIPELINE_BIND_POINT_COMPUTE) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_cbFsrBound[(void*)cb] = (g_xpFsrPipelines.count(pipeline) != 0);
+    }
+
+    if (!g_spirvInject || bind != VK_PIPELINE_BIND_POINT_GRAPHICS) return;
+    if (!g_nextCmdPushConstants) return;
+
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    bool isGeometry = false, inScene = false, inCockpit = false;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+
+        // ---- COVERAGE ACCOUNTING FIRST, BEFORE ANY EARLY RETURN.
+        //
+        // This function bails out below for pipelines whose layout does not
+        // carry our push constant range - i.e. exactly the pipelines that write
+        // no motion vectors. Counting after those returns would tally only the
+        // pipelines that ARE working and report 100% coverage forever, which is
+        // the same shape of mistake as the module census: measuring the thing
+        // that succeeded and inferring the thing that failed.
+        {
+            std::map<VkCommandBuffer, bool>::iterator st0 = g_cbInScenePass.find(cb);
+            bool inScene0 = (st0 != g_cbInScenePass.end() && st0->second);
+            std::map<VkPipeline, bool>::iterator gt0 = g_pipelineIsGeometry.find(pipeline);
+            bool isGeom0 = (gt0 != g_pipelineIsGeometry.end() && gt0->second);
+            if (inScene0 && isGeom0) {
+                std::map<VkPipeline, bool>::iterator pt = g_pipelineMvPatched.find(pipeline);
+                bool patched = (pt != g_pipelineMvPatched.end() && pt->second);
+                std::map<VkCommandBuffer, bool>::iterator ck0 = g_cbInCockpitPass.find(cb);
+                bool inCk = (ck0 != g_cbInCockpitPass.end() && ck0->second);
+                if (patched) { ++g_bindScenePatched;   if (inCk) ++g_bindCockpitPatched; }
+                else         { ++g_bindSceneUnpatched; if (inCk) ++g_bindCockpitUnpatched; }
+
+                uint64_t tot = g_bindScenePatched + g_bindSceneUnpatched;
+                if (tot == 20000 || (tot % 200000) == 0) {
+                    uint64_t ctot = g_bindCockpitPatched + g_bindCockpitUnpatched;
+                    trace("MV COVERAGE (draw-weighted): %llu of %llu geometry "
+                          "binds in scene passes write motion vectors (%.1f%%); "
+                          "%llu do NOT. Cockpit passes: %llu of %llu (%.1f%%). "
+                          "Unpatched geometry reprojects from depth only, which "
+                          "is what shimmers while the camera moves.",
+                          (unsigned long long)g_bindScenePatched,
+                          (unsigned long long)tot,
+                          tot ? 100.0 * (double)g_bindScenePatched / (double)tot : 0.0,
+                          (unsigned long long)g_bindSceneUnpatched,
+                          (unsigned long long)g_bindCockpitPatched,
+                          (unsigned long long)ctot,
+                          ctot ? 100.0 * (double)g_bindCockpitPatched / (double)ctot : 0.0);
+                }
+            }
+        }
+
+        std::map<VkPipeline, VkPipelineLayout>::iterator it =
+            g_pipelineLayoutOf.find(pipeline);
+        if (it == g_pipelineLayoutOf.end()) return;
+        layout = it->second;
+        std::map<VkPipelineLayout, bool>::iterator lt = g_layoutHasOurPC.find(layout);
+        if (lt == g_layoutHasOurPC.end() || !lt->second) return;
+
+        std::map<VkPipeline, bool>::iterator gt = g_pipelineIsGeometry.find(pipeline);
+        isGeometry = (gt != g_pipelineIsGeometry.end() && gt->second);
+        std::map<VkCommandBuffer, bool>::iterator st = g_cbInScenePass.find(cb);
+        inScene = (st != g_cbInScenePass.end() && st->second);
+        std::map<VkCommandBuffer, bool>::iterator ck = g_cbInCockpitPass.find(cb);
+        inCockpit = (ck != g_cbInCockpitPass.end() && ck->second);
+    }
+
+    // Column-major, 16 floats, exactly the mat4 the injected shader declares
+    // with ColMajor and MatrixStride 16.
+    // TAA_MV_IDENTITY: push the IDENTITY instead of the reprojection.
+    //
+    // A test with no prediction in it. prevClip = I * gl_Position = gl_Position,
+    // so the motion vector is exactly (p/w - p/w) = 0 for every fragment, at
+    // every camera speed, with no arithmetic to get wrong. Anything other than
+    // a field of zeros means the shader is not reading what we push - which is
+    // a completely different problem from the reprojection being wrong, and the
+    // two are indistinguishable from the magnitudes alone.
+    //
+    // The matrix itself has already been cleared of suspicion: printed in full
+    // it is a well-formed clip-to-clip reprojection, and at screen centre it
+    // predicts about 10 px where 730 was measured.
+    static const float kIdentity[16] = {
+        1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1
+    };
+    // The environment variable still works, but the tuning file can flip it
+    // mid-flight - which is when the question actually comes up.
+    static const bool envIdentity = (getenv("TAA_MV_IDENTITY") != nullptr);
+    bool useIdentity = envIdentity;
+
+    // 16 floats of reprojection, then 4 of jitter. One push rather than two:
+    // the block is contiguous and a second call would cost a command per draw
+    // for eight bytes of payload.
+    // ---- WHICH REPROJECTION THIS DRAW GETS.
+    //
+    // `reproj` is a WORLD-frame matrix: it answers "where was this point last
+    // frame, given it did not move in the world". For the cockpit that answer
+    // is wrong by most of a screen. Panel surfaces sit about 0.7 m from the eye
+    // and travel WITH the camera, so a few metres of aircraft motion implies
+    // enormous parallax while their true screen motion is nearly zero. Measured
+    // previously at 451 px/frame peak, with the panel the largest contributor.
+    //
+    // `bodyReproj` is the same matrix in the aircraft's body frame, where a
+    // bolted-down panel has constant coordinates and therefore no motion. The
+    // plugin already computes and publishes it, and the depth-derived compute
+    // path already uses it - the injected shaders never did, so every cockpit
+    // pixel drawn by X-Plane's own geometry carried world-frame motion.
+    //
+    // Chosen per BIND rather than per pixel, because a push constant is one
+    // matrix and the shader has no depth to branch on at vertex time. The
+    // discriminator is the pass: X-Plane draws the 3D cockpit in its own
+    // render pass, and g_cbInCockpitPass tracks it the same way the scene pass
+    // is tracked.
+    //
+    // Gated on bodyReprojValid, which the plugin clears whenever the camera is
+    // NOT rigid with the airframe - an external view, or a head that has moved.
+    // Using the body frame then would be as wrong as the world frame is now.
+    bool useBody = inCockpit && g_velSnap.bodyReprojValid && !useIdentity;
+
+    float block[20];
+    memcpy(block, useIdentity ? kIdentity
+                 : (useBody ? g_velSnap.bodyReproj : g_velSnap.reproj), 64);
+    if (useBody) ++g_bodyReprojPushes;
+    block[16] = block[17] = block[18] = block[19] = 0.0f;
+
+    // ---- JITTER, converted from framebuffer pixels to a clip-space offset.
+    //
+    // The shader adds jitter.xy * w to gl_Position, so this has to be in NDC:
+    // NDC spans 2 units across the screen while the viewport spans W pixels,
+    // hence the factor of two.
+    //
+    // THE Y SIGN IS TAKEN FROM THE VIEWPORT, not assumed. X-Plane sets a
+    // negative-height viewport (GL orientation via maintenance1), which makes
+    // clip Y point UP while framebuffer Y points DOWN - so moving the image
+    // down by jy pixels means DECREASING clip y. Reading the sign from the
+    // viewport we actually saw rather than hardcoding it means a future build
+    // that switches to Vulkan orientation flips with it instead of silently
+    // jittering the wrong way, which is a bug that looks like shimmer rather
+    // than like an error.
+    //
+    // Gated twice. Only inside a scene pass, and only on pipelines that draw
+    // from vertex buffers - everything else gets zero, which is the point of
+    // pushing this per draw instead of setting a viewport once.
+    // DLSS IS A CONSUMER TOO. It is a temporal upscaler with a history buffer
+    // and it is handed the jitter it must compensate for, exactly as FSR2 is -
+    // so leaving it out meant selecting DLSS silently turned the jitter off,
+    // which the trace reported as "upscaler=Off" on the JITTER line while the
+    // gate one screen away said "upscaler=DLSS(4)".
+    bool consumer = (g_velSnap.upscaler == TAA_UPSCALER_TAA)
+                 || (g_velSnap.upscaler == TAA_UPSCALER_FSR2)
+                 || (g_velSnap.upscaler == TAA_UPSCALER_DLSS);
+
+    // Which of the four conditions is failing, counted rather than guessed.
+    // "0 draws offset" says the result; it does not say which gate closed, and
+    // there are four of them.
+    static uint64_t nBind = 0, nScene = 0, nGeom = 0, nBoth = 0;
+    ++nBind;
+    if (inScene) ++nScene;
+    if (isGeometry) ++nGeom;
+    if (inScene && isGeometry) ++nBoth;
+    if ((nBind % 200000) == 0)
+        trace("JITTER GATE: %llu binds, inScene=%llu isGeometry=%llu both=%llu, "
+              "armed=%d consumer=%d jitterOff=%d",
+              (unsigned long long)nBind, (unsigned long long)nScene,
+              (unsigned long long)nGeom, (unsigned long long)nBoth,
+              g_jitterArmed ? 1 : 0, consumer ? 1 : 0, 0);
+
+    if (g_jitterArmed && consumer && inScene && isGeometry) {
+        // The RENDER resolution, not the window. Converting a pixel offset to
+        // NDC against the display size would scale the jitter by 0.769 when
+        // X-Plane's FSR is on - a wrong jitter rather than none, which is
+        // harder to notice.
+        float w = (float)(g_renderW ? g_renderW : (uint32_t)g_velSnap.viewportW);
+        float h = (float)(g_renderH ? g_renderH : (uint32_t)g_velSnap.viewportH);
+        if (w > 0.0f && h > 0.0f) {
+            float ySign = g_viewportYFlipped ? -1.0f : 1.0f;
+            // g_jitterScale is the live amplitude knob - see fsr2_pass.h. FSR2
+            // is told the same scaled value, so the two cannot drift apart.
+            // ---- JITTER IS PHASE TWO. AMPLITUDE IS ZERO.
+            //
+            // The vectors are the product right now, and they are measured
+            // against an unjittered render - which removes a whole class of
+            // sign and amplitude bugs from the calibration. The injection path
+            // stays so it can be switched on once the vectors read a ratio of
+            // one, but it contributes nothing until then.
+            const float jitterScale = 0.0f;
+            block[16] =  2.0f * g_velSnap.jitterX * jitterScale / w;
+            block[17] = ySign * 2.0f * g_velSnap.jitterY * jitterScale / h;
+            if (block[16] != 0.0f || block[17] != 0.0f) ++g_jitterApplied;
+        }
+    }
+
+    // ---- NEAR-FIELD DISTANCE, in metres, into the spare .z of the jitter vec4.
+    //
+    // The patched vertex shader uses this to decide, per vertex, whether to
+    // reproject through uReproj (the world) or to reuse the current clip
+    // position (velocity zero). See the long note in spirv_inject.h: for
+    // geometry bolted to the airframe, viewed from a camera bolted to the
+    // airframe, the previous clip position IS the current one.
+    //
+    // GATED ON bodyReprojValid, which is the plugin's statement that it has
+    // measured the camera to be rigid in the body frame - 0.0022 m/frame over
+    // 120 rotating cockpit frames. In an external view, or before that has
+    // resolved, the premise does not hold: the camera moves independently, the
+    // panel is not stationary relative to it, and zeroing its velocity would be
+    // a new bug rather than a fix. Zero disables the select entirely, because
+    // gl_Position.w is positive for anything in front of the camera.
+    if (g_velSnap.bodyReprojValid && g_nearFieldM > 0.0f)
+        block[18] = g_nearFieldM;
+
+    g_nextCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT,
+                           spvinj::pushConstantOffset(),
+                           spvinj::kPushConstantBytes,
+                           block);
+
+    if (++g_pushCount <= 3 || (g_pushCount % 100000) == 0)
+        trace("SPIRV INJECT: pushed uReproj + jitter (%llu times), body-frame "
+              "%llu, bodyValid=%d cockpitPass=%d | jitter now (%.5f %.5f) ndc, "
+              "pipelines: %llu geometry / %llu full-screen",
+              (unsigned long long)g_pushCount,
+              (unsigned long long)g_bodyReprojPushes,
+              g_velSnap.bodyReprojValid, g_cockpitPassIndex,
+              block[16], block[17],
+              (unsigned long long)g_pipeGeometry,
+              (unsigned long long)g_pipeFullscreen);
+}
+
+// ------------------------------------------------------- VRAM overcommit
+//
+// Recreates what an OpenGL driver used to do for you: when a device-local
+// allocation cannot be satisfied, put the resource in system RAM and let it
+// stream over PCIe instead of failing.
+//
+// This is why the texture pager exists at all. Under OpenGL the driver
+// virtualised VRAM, so an application could allocate past the card's capacity
+// and merely get slower. Vulkan removed that - allocations are explicit and a
+// failure is a failure - so X-Plane had to write a pager, and its conservative
+// budget is the consequence we are looking at.
+//
+// Failing SOFT is the whole point. Raising X-Plane's budget makes it believe it
+// has room it may not have, and the allocation failure then lands somewhere it
+// cannot recover from - which is the overrun that -gfx-no-pager already caused.
+// A fallback means the worst case is a slow texture.
+//
+// HONEST CAVEAT, and the reason this logs before it acts: on Windows, WDDM
+// already demotes device-local allocations to system memory under pressure, so
+// vkAllocateMemory may simply never fail. If the fallback counter stays at zero
+// while the pager is still cutting textures, then overcommit is not the lever
+// and the stored budget is - and knowing that is worth more than the hook.
+//
+// State for this lives with the other VRAM globals near the top, because the
+// present hook reads g_overcommit long before this point in the file.
+
+static VKAPI_ATTR VkResult VKAPI_CALL TAA_AllocateMemory(
+    VkDevice device, const VkMemoryAllocateInfo *ai,
+    const VkAllocationCallbacks *alloc, VkDeviceMemory *out)
+{
+    if (!g_nextAllocateMemory) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkResult r = g_nextAllocateMemory(device, ai, alloc, out);
+
+    if (ai) {
+        ++g_allocCount;
+        if (r == VK_SUCCESS) g_allocBytes += ai->allocationSize;
+        if (g_allocCount % 2000 == 0)
+            trace("ALLOC: %llu allocations, %.2f GB live-ish, %llu failures, "
+                  "%llu rescued to host memory",
+                  (unsigned long long)g_allocCount, g_allocBytes / 1073741824.0,
+                  (unsigned long long)g_allocFailed,
+                  (unsigned long long)g_allocRescued);
+    }
+
+    if (r == VK_SUCCESS || !ai) return r;
+    if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY) return r;
+
+    ++g_allocFailed;
+    trace("ALLOC: OUT OF DEVICE MEMORY for %.1f MB (type %u) - this is the "
+          "moment X-Plane's pager is trying to avoid",
+          ai->allocationSize / 1048576.0, ai->memoryTypeIndex);
+
+    if (!g_overcommit) return r;
+
+    // Retry from a host-visible heap.
+    //
+    // The catch, and it may make this impossible for images: the allowed
+    // memory types come from the RESOURCE, via memoryTypeBits, and
+    // vkAllocateMemory is not told which resource this is for. Drivers commonly
+    // permit only device-local types for optimally-tiled images, in which case
+    // no host-visible type is legal and this cannot work for textures - only
+    // for buffers. The attempt is logged either way so the answer is recorded
+    // rather than assumed.
+    VkPhysicalDeviceMemoryProperties mp;
+    memset(&mp, 0, sizeof(mp));
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it == g_devices.end() || !g_getPhysMemProps) return r;
+        g_getPhysMemProps(it->second.phys, &mp);
+    }
+
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+        if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)    continue;   // same heap
+        if (i == ai->memoryTypeIndex) continue;
+
+        VkMemoryAllocateInfo ai2 = *ai;
+        ai2.memoryTypeIndex = i;
+        VkResult r2 = g_nextAllocateMemory(device, &ai2, alloc, out);
+        if (r2 == VK_SUCCESS) {
+            ++g_allocRescued;
+            trace("ALLOC: rescued %.1f MB into host memory type %u - it will "
+                  "stream over PCIe rather than fail",
+                  ai->allocationSize / 1048576.0, i);
+            return VK_SUCCESS;
+        }
+    }
+
+    trace("ALLOC: no host-visible type accepted the allocation. For optimally "
+          "tiled images the driver usually permits device-local types only, so "
+          "overcommit cannot help textures on this driver.");
+    return r;
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
+    VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
+    const VkAllocationCallbacks *alloc, VkDevice *out)
+{
+    VkLayerDeviceCreateInfo *link = findDeviceLink(ci);
+    if (!link || !link->u.pLayerInfo) return VK_ERROR_INITIALIZATION_FAILED;
+
+    PFN_vkGetInstanceProcAddr nextGIPA = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    PFN_vkGetDeviceProcAddr   nextGDPA = link->u.pLayerInfo->pfnNextGetDeviceProcAddr;
+    link->u.pLayerInfo = link->u.pLayerInfo->pNext;
+
+    PFN_vkCreateDevice nextCreate = (PFN_vkCreateDevice)nextGIPA(nullptr, "vkCreateDevice");
+    if (!nextCreate) return VK_ERROR_INITIALIZATION_FAILED;
+
+    // ---- ADD DEVICE EXTENSIONS. This is the only moment it is possible.
+    //
+    // A device's extension set is fixed at creation. Anything needed later -
+    // NVIDIA's optical flow engine, and DLSS when it arrives - has to be asked
+    // for HERE, before the device exists, or it is simply unavailable for the
+    // lifetime of the process and there is no second chance.
+    //
+    // Adding an extension the driver does not support makes vkCreateDevice fail
+    // outright, which would stop X-Plane starting at all. So each one is
+    // checked against the driver's list first, and anything missing is silently
+    // left out rather than risking the sim over a feature we can do without.
+    // ---- X-PLANE'S OWN REQUEST, DUMPED VERBATIM.
+    //
+    // NvLL_VK_InitLowLatencyDevice accepts a bare device on this machine and
+    // refuses X-Plane's, and every property varied so far - the low latency
+    // extensions, our layer, Steam's overlay and fossilize layers, being the
+    // second caller in a process - has left the -229 exactly where it was. What
+    // has never been varied is what X-PLANE asks for, because it has never been
+    // written down.
+    //
+    // Dumped once, in a form that can be pasted straight into a standalone
+    // harness, so the bisection runs in a second per attempt instead of a sim
+    // launch per attempt.
+    std::vector<const char*> exts;
+    for (uint32_t i = 0; i < ci->enabledExtensionCount; ++i)
+        exts.push_back(ci->ppEnabledExtensionNames[i]);
+
+    {
+        trace("XP DEVICE REQUEST: %u extensions, %u queue create infos",
+              ci->enabledExtensionCount, ci->queueCreateInfoCount);
+        for (uint32_t i = 0; i < ci->enabledExtensionCount; ++i)
+            trace("XP DEVICE EXT: %s", ci->ppEnabledExtensionNames[i]);
+        g_deviceFamilies.clear();
+        for (uint32_t i = 0; i < ci->queueCreateInfoCount; ++i) {
+            uint32_t fam = ci->pQueueCreateInfos[i].queueFamilyIndex;
+            bool dup = false;
+            for (size_t k = 0; k < g_deviceFamilies.size(); ++k)
+                if (g_deviceFamilies[k] == fam) dup = true;
+            if (!dup) g_deviceFamilies.push_back(fam);
+        }
+        for (uint32_t i = 0; i < ci->queueCreateInfoCount; ++i)
+            trace("XP DEVICE QUEUE: family %u count %u flags 0x%x",
+                  ci->pQueueCreateInfos[i].queueFamilyIndex,
+                  ci->pQueueCreateInfos[i].queueCount,
+                  ci->pQueueCreateInfos[i].flags);
+        // The pNext chain is where feature structs live, and a feature is at
+        // least as likely a culprit as an extension name.
+        for (const VkBaseInStructure *p = (const VkBaseInStructure*)ci->pNext;
+             p; p = p->pNext)
+            trace("XP DEVICE pNext: sType %d", (int)p->sType);
+    }
+
+    VkDeviceCreateInfo ci2 = *ci;
+    {
+        // What the driver actually offers.
+        // USE THE POINTER RESOLVED WITH A REAL INSTANCE.
+        //
+        // This used to call nextGIPA(nullptr, "vkEnumerateDeviceExtensionProperties").
+        // vkGetInstanceProcAddr with a NULL instance resolves only the handful
+        // of global entry points - vkCreateInstance and the instance-level
+        // enumerations - and returns NULL for everything else. So the pointer
+        // was null, `have` stayed empty, and EVERY extension was reported "not
+        // supported by this driver".
+        //
+        // That message was believed. Optical flow, format_feature_flags2,
+        // pageable_device_local_memory and memory_priority were all recorded as
+        // unavailable and quietly dropped, while X-Plane's own log listed every
+        // one of them as present. The extension injection has never once
+        // worked, and it announced its failure in a form indistinguishable from
+        // a hardware limitation.
+        //
+        // g_nextEnumDeviceExt is resolved at instance creation with the real
+        // VkInstance and has been correct all along.
+        uint32_t n = 0;
+        std::vector<VkExtensionProperties> have;
+        if (g_nextEnumDeviceExt &&
+            g_nextEnumDeviceExt(phys, nullptr, &n, nullptr) == VK_SUCCESS && n) {
+            have.resize(n);
+            g_nextEnumDeviceExt(phys, nullptr, &n, have.data());
+        }
+        trace("DEVICE: driver offers %zu device extensions", have.size());
+
+        // ---- STREAMLINE'S OWN REQUIREMENTS, ADDED FROM ITS OWN LIST.
+        //
+        // The static list below covers what this layer needs. Streamline needs
+        // more, and it tells us exactly what - we were printing that list and
+        // then ignoring it. VK_KHR_push_descriptor, VK_KHR_maintenance4 and the
+        // external_*_win32 pair are not core, so a device created without them
+        // cannot host DLSS-G, and Reflex says so with -229.
+        //
+        // Taking the names from Streamline rather than hardcoding them means the
+        // list cannot drift when the SDK changes what it wants.
+        std::vector<const char*> slWanted;
+
+        static const char *kWanted[] = {
+            // Reflex needs this and Streamline does NOT list it.
+            //
+            // slSetVulkanInfo returns 24 (eErrorExceptionHandler) - Streamline
+            // throwing internally - and immediately before it the shim log has
+            // "Low latency API for VK failed to initialize device -229". Reflex
+            // is the upstream failure and everything after it is fallout.
+            //
+            // Reflex on Vulkan is implemented over VK_NV_low_latency2, which is
+            // absent from the eleven extensions slGetFeatureRequirements
+            // reports. DLSS-G requires Reflex, so a device without it cannot
+            // host frame generation no matter how many of the listed
+            // requirements are met - which is why adding all eleven and growing
+            // every queue changed nothing.
+            "VK_NV_low_latency2",
+
+            // The ORIGINAL low latency extension, asked for alongside the "2".
+            //
+            // Reflex is the first failure in the chain - "Low latency API for
+            // VK failed to initialize device -229" arrives before the private
+            // data warning and before the exception - and it comes from
+            // NvLowLatencyVk.dll, which predates VK_NV_low_latency2. Only the
+            // newer extension has ever been requested here. Adding the older
+            // one costs nothing if the driver does not offer it: the list below
+            // is filtered against what the driver advertises, and anything
+            // missing is skipped and logged rather than failing the device.
+            "VK_NV_low_latency",
+            "VK_NV_optical_flow",          // hardware motion estimation
+            "VK_KHR_format_feature_flags2",// required by the optical flow spec
+
+            // Streamline attaches its own state to the swap chain through a
+            // private data slot, and reports losing that immediately before it
+            // throws. The entry point is core in 1.3, and X-Plane's instance
+            // already asks for 1.3 - but a core promotion only guarantees the
+            // command exists, not that vkGetDeviceProcAddr will hand it over.
+            // Enabling the extension by name removes the question.
+            "VK_EXT_private_data",
+
+            // The two that make a custom pager possible.
+            //
+            // A layer cannot evict X-Plane's textures - it does not own them
+            // and has no idea which ortho tile is forty kilometres away. But it
+            // does not need to: pageable_device_local_memory lets the DRIVER
+            // demote allocations to system RAM under pressure instead of
+            // failing, and memory_priority decides what it demotes first.
+            //
+            // So the division of labour is: X-Plane's pager off, we classify
+            // what matters, the driver does the eviction. That is the OpenGL
+            // behaviour whose loss forced X-Plane to write a pager in the first
+            // place, with the residency decisions made explicitly rather than
+            // guessed at by the driver alone.
+            "VK_EXT_pageable_device_local_memory",
+            "VK_EXT_memory_priority",
+
+            // WHAT MAKES THE VELOCITY ATTACHMENT POSSIBLE WITHOUT DUPLICATING
+            // EVERY PIPELINE.
+            //
+            // Under dynamic rendering a pipeline's colour attachment formats
+            // must match the render pass it is used in. X-Plane reuses the same
+            // pipelines across several passes, so adding an attachment to the
+            // scene pass alone would make those pipelines invalid in every
+            // other pass they appear in - and the only way out would be to
+            // build a second variant of each, which is a lot of pipelines and a
+            // lot of memory.
+            //
+            // This extension relaxes the match: a pipeline may declare a format
+            // for an attachment the pass leaves undefined, and vice versa. So
+            // EVERY pass gains one attachment slot and every pipeline declares
+            // one extra format, uniformly - and only the scene pass actually
+            // binds an image to it. Everywhere else the slot is null and costs
+            // nothing.
+            "VK_EXT_dynamic_rendering_unused_attachments"
+        };
+
+        // ---- TAA_SL_NO_LL: leave the low latency extensions OFF the device.
+        //
+        // NvLL_VK_InitLowLatencyDevice rejects our device with -229, measured
+        // directly rather than inferred - our own call to it fails exactly as
+        // Reflex's does, while NvLL_VK_Initialize returns 0. So the API and the
+        // driver are fine and the DEVICE is what is refused.
+        //
+        // The suspect is an addition of ours. VK_NV_low_latency2 is NOT in the
+        // eleven extensions slGetFeatureRequirements reports; it was added here
+        // on the reasoning that "Reflex is implemented over low_latency2, so it
+        // must need it". That reasoning has no evidence behind it, and the
+        // opposite reading fits better: NvLL_VK is NVIDIA's PRIVATE low latency
+        // path and VK_NV_low_latency2 is the PUBLIC one, two implementations of
+        // the same thing, and a driver refusing the private path on a device
+        // that enabled the public one would produce exactly this. Streamline
+        // omitting it from its own requirements is then deliberate, not an
+        // oversight to be corrected.
+        static const bool noLL = (getenv("TAA_SL_NO_LL") != nullptr);
+
+        for (size_t k = 0; k < sizeof(kWanted)/sizeof(kWanted[0]); ++k) {
+            if (noLL && (!strcmp(kWanted[k], "VK_NV_low_latency2") ||
+                         !strcmp(kWanted[k], "VK_NV_low_latency"))) {
+                trace("DEVICE: TAA_SL_NO_LL - deliberately NOT enabling %s", kWanted[k]);
+                continue;
+            }
+            bool supported = false;
+            for (size_t i = 0; i < have.size(); ++i)
+                if (!strcmp(have[i].extensionName, kWanted[k])) { supported = true; break; }
+
+            bool already = false;
+            for (size_t i = 0; i < exts.size(); ++i)
+                if (!strcmp(exts[i], kWanted[k])) { already = true; break; }
+
+            if (supported && !already) {
+                exts.push_back(kWanted[k]);
+                trace("DEVICE: adding %s", kWanted[k]);
+            } else if (!supported) {
+                trace("DEVICE: %s not supported by this driver - skipping", kWanted[k]);
+            }
+        }
+
+        // The same treatment for Streamline's list.
+        for (size_t k = 0; k < slWanted.size(); ++k) {
+            // The same exclusion as above, and it has to be here too:
+            // kSlDeviceExt carries VK_NV_low_latency2 as well, so filtering
+            // only kWanted would leave the extension enabled by this loop and
+            // the test would silently measure nothing.
+            if (noLL && (!strcmp(slWanted[k], "VK_NV_low_latency2") ||
+                         !strcmp(slWanted[k], "VK_NV_low_latency"))) {
+                trace("DEVICE: TAA_SL_NO_LL - deliberately NOT enabling %s (Streamline list)",
+                      slWanted[k]);
+                continue;
+            }
+            bool supported = false;
+            for (size_t i = 0; i < have.size(); ++i)
+                if (!strcmp(have[i].extensionName, slWanted[k])) { supported = true; break; }
+            bool already = false;
+            for (size_t i = 0; i < exts.size(); ++i)
+                if (!strcmp(exts[i], slWanted[k])) { already = true; break; }
+            if (supported && !already) {
+                exts.push_back(slWanted[k]);
+                trace("DEVICE: adding %s (Streamline)", slWanted[k]);
+            } else if (!supported) {
+                // Worth saying loudly: a Streamline requirement the driver does
+                // not offer means DLSS-G cannot run on this machine, and that is
+                // a different answer from "we forgot to ask for it".
+                trace("DEVICE: %s REQUIRED BY STREAMLINE but not offered by this "
+                      "driver - DLSS-G cannot run", slWanted[k]);
+            }
+        }
+
+
+        // ENABLING THE EXTENSION IS NOT ENABLING THE FEATURE.
+        //
+        // Adding the extension name only makes the entry points legal. The
+        // relaxed format matching is a FEATURE bit and stays off until it is
+        // requested through the pNext chain - and with it off, the driver
+        // silently keeps enforcing exact format matching, so the first pipeline
+        // built against a pass with a null velocity slot is rejected. That
+        // failure would arrive far from its cause.
+        //
+        // The struct is static because the chain must outlive this call: the
+        // driver reads pNext during vkCreateDevice, and a stack local would be
+        // gone. Chained ahead of whatever X-Plane already had, which stays
+        // intact behind it.
+        static VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT unusedFeat;
+        bool haveUnused = false;
+        for (size_t i = 0; i < exts.size(); ++i)
+            if (!strcmp(exts[i], "VK_EXT_dynamic_rendering_unused_attachments"))
+                haveUnused = true;
+        if (haveUnused) {
+            memset(&unusedFeat, 0, sizeof(unusedFeat));
+            unusedFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT;
+            unusedFeat.dynamicRenderingUnusedAttachments = VK_TRUE;
+            unusedFeat.pNext = (void*)ci2.pNext;
+            ci2.pNext = &unusedFeat;
+            trace("DEVICE: dynamicRenderingUnusedAttachments feature requested "
+                  "- lets one pipeline serve passes with and without the "
+                  "velocity attachment");
+        }
+
+        // ---- MEMORY PRIORITY, which we have been requesting and not using.
+        //
+        // VK_EXT_memory_priority and VK_EXT_pageable_device_local_memory are
+        // both on the device already - X-Plane asks for them itself - and the
+        // layer has never set a priority on anything, so the driver had no way
+        // to know which allocations it should spill first. Under pressure it
+        // guesses, and what it guesses wrong costs texture resolution: the log
+        // has X-Plane's pager going 1.0 -> 0.5 -> 0.25 -> 0.0625 in one second.
+        //
+        // VkMemoryPriorityAllocateInfoEXT is IGNORED unless this feature is
+        // enabled, so asking for the extension without it did nothing at all.
+        // With it on, our own buffers can be marked low and demoted to system
+        // RAM ahead of the sim's textures - which is the right order, because
+        // an upscaler's history streaming over PCIe costs frame time while a
+        // texture at a sixteenth costs the picture.
+        static VkPhysicalDeviceMemoryPriorityFeaturesEXT prioFeat;
+        bool havePrio = false;
+        for (size_t i = 0; i < exts.size(); ++i)
+            if (!strcmp(exts[i], "VK_EXT_memory_priority")) havePrio = true;
+        if (havePrio) {
+            memset(&prioFeat, 0, sizeof(prioFeat));
+            prioFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
+            prioFeat.memoryPriority = VK_TRUE;
+            prioFeat.pNext = (void*)ci2.pNext;
+            ci2.pNext = &prioFeat;
+            g_memoryPriority = true;
+            trace("DEVICE: memoryPriority feature requested - our own "
+                  "allocations will be marked low so the driver demotes them "
+                  "before X-Plane's textures");
+        }
+
+
+        ci2.enabledExtensionCount   = (uint32_t)exts.size();
+        ci2.ppEnabledExtensionNames = exts.data();
+    }
+
+
+    // ---- FRAME GENERATION NEEDS QUEUES THE SIM NEVER TOUCHES.
+    //
+    // Deliberately after the Streamline block and reading ci2 rather than ci:
+    // both augmenters grow the same queue list, and one that started again from
+    // X-Plane's original request would drop the other's queues on the floor. The
+    // device would still be created, and the lost index would surface much later
+    // as a submit to a queue that does not exist.
+    //
+    // Queues cannot be added once the device exists, so if this does not happen
+    // here there is no frame generation for the rest of the session.
+    {
+        VkDeviceCreateInfo fgCi;
+    }
+
+    VkResult r = nextCreate(phys, &ci2, alloc, out);
+
+    // If the modified create fails, fall back to X-Plane's original request.
+    // Failing to start the sim because a diagnostic extension was refused would
+    // be an absurd trade, and a driver can reject a combination even when each
+    // extension is individually advertised.
+    if (r != VK_SUCCESS) {
+        trace("DEVICE: creation with added extensions failed (%d) - retrying "
+              "with the application's original list", (int)r);
+        r = nextCreate(phys, ci, alloc, out);
+    }
+    if (r != VK_SUCCESS) return r;
+
+
+    DeviceData dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.device        = *out;
+    dd.phys          = phys;
+    dd.gdpa          = nextGDPA;
+    dd.destroyDevice = (PFN_vkDestroyDevice)nextGDPA(*out, "vkDestroyDevice");
+    dd.createImage   = (PFN_vkCreateImage)nextGDPA(*out, "vkCreateImage");
+    dd.destroyImage  = (PFN_vkDestroyImage)nextGDPA(*out, "vkDestroyImage");
+    dd.queuePresent  = (PFN_vkQueuePresentKHR)nextGDPA(*out, "vkQueuePresentKHR");
+    dd.createSampler = (PFN_vkCreateSampler)nextGDPA(*out, "vkCreateSampler");
+    dd.cmdBeginRenderPass = (PFN_vkCmdBeginRenderPass)nextGDPA(*out, "vkCmdBeginRenderPass");
+    // Core in 1.3, KHR extension before that. X-Plane uses dynamic rendering
+    // exclusively - vkCmdBeginRenderPass fired zero times in 2760 frames - so
+    // failing to resolve this means seeing no frame structure at all.
+    dd.cmdBeginRendering = (PFN_vkCmdBeginRendering)nextGDPA(*out, "vkCmdBeginRendering");
+    if (!dd.cmdBeginRendering)
+        dd.cmdBeginRendering = (PFN_vkCmdBeginRendering)nextGDPA(*out, "vkCmdBeginRenderingKHR");
+    dd.cmdSetViewport     = (PFN_vkCmdSetViewport)nextGDPA(*out, "vkCmdSetViewport");
+
+#define GD(m, N) dd.m = (PFN_vk##N)nextGDPA(*out, "vk" #N)
+    GD(getImageMemReq, GetImageMemoryRequirements);  GD(getBufferMemReq, GetBufferMemoryRequirements);
+    GD(allocateMemory, AllocateMemory);              GD(freeMemory, FreeMemory);
+    GD(bindImageMemory, BindImageMemory);             GD(bindBufferMemory, BindBufferMemory);
+    GD(mapMemory, MapMemory);
+    GD(createImageView, CreateImageView);             GD(destroyImageView, DestroyImageView);
+    GD(createBuffer, CreateBuffer);                GD(destroyBuffer, DestroyBuffer);
+    GD(createDescriptorSetLayout, CreateDescriptorSetLayout);   GD(createDescriptorPool, CreateDescriptorPool);
+    GD(allocateDescriptorSets, AllocateDescriptorSets);      GD(updateDescriptorSets, UpdateDescriptorSets);
+    GD(createShaderModule, CreateShaderModule);          GD(createPipelineLayout, CreatePipelineLayout);
+    GD(createComputePipelines, CreateComputePipelines);
+    GD(createCommandPool, CreateCommandPool);           GD(allocateCommandBuffers, AllocateCommandBuffers);
+    GD(beginCommandBuffer, BeginCommandBuffer);          GD(endCommandBuffer, EndCommandBuffer);
+    GD(cmdBindPipeline, CmdBindPipeline);             GD(cmdBindDescriptorSets, CmdBindDescriptorSets);
+    GD(cmdPushConstants, CmdPushConstants);            GD(cmdDispatch, CmdDispatch);
+    GD(cmdPipelineBarrier, CmdPipelineBarrier);          GD(cmdCopyImageToBuffer, CmdCopyImageToBuffer);
+    GD(cmdCopyImage, CmdCopyImage);                   GD(deviceWaitIdle, DeviceWaitIdle);
+    GD(cmdClearColorImage, CmdClearColorImage);
+    GD(cmdBlitImage, CmdBlitImage);
+    GD(cmdResolveImage, CmdResolveImage);
+    GD(getSwapchainImagesKHR, GetSwapchainImagesKHR);
+    GD(createQueryPool, CreateQueryPool);       GD(destroyQueryPool, DestroyQueryPool);
+    GD(cmdResetQueryPool, CmdResetQueryPool);   GD(cmdWriteTimestamp, CmdWriteTimestamp);
+    GD(getQueryPoolResults, GetQueryPoolResults);
+    GD(createSwapchainKHR, CreateSwapchainKHR);   GD(destroySwapchainKHR, DestroySwapchainKHR);
+    GD(acquireNextImageKHR, AcquireNextImageKHR);
+    g_nextAllocateMemory = (PFN_vkAllocateMemory)nextGDPA(*out, "vkAllocateMemory");
+    g_nextCmdPipelineBarrier2KHR = (PFN_vkCmdPipelineBarrier2)
+                                       nextGDPA(*out, "vkCmdPipelineBarrier2");
+    if (!g_nextCmdPipelineBarrier2KHR)
+        g_nextCmdPipelineBarrier2KHR = (PFN_vkCmdPipelineBarrier2)
+                                       nextGDPA(*out, "vkCmdPipelineBarrier2KHR");
+        // Choose the motion vector varying locations from the DEVICE, not from a
+    // sample of shaders. Fixing them at 15/16 - reasoned from a 40-module dump
+    // where the highest was 7 - was refused by 97 of X-Plane's 1500 modules,
+    // because its large shaders already use both.
+    // USE THE PHYSICAL DEVICE THIS FUNCTION WAS HANDED.
+    //
+    // The first version looked the device up in g_devices to find its
+    // VkPhysicalDevice, and found nothing: the DeviceData entry is not inserted
+    // until later in this function, so the lookup failed and the whole block
+    // was skipped in silence - no trace line, locations left at their defaults,
+    // and 105 shaders refused for exactly the reason this was meant to fix.
+    //
+    // TAA_CreateDevice receives the physical device as its first argument.
+    // There was never anything to look up.
+    if (g_getPhysProps && phys) {
+        VkPhysicalDeviceProperties pp;
+        memset(&pp, 0, sizeof(pp));
+        g_getPhysProps(phys, &pp);
+        spvinj::chooseLocations(pp.limits.maxVertexOutputComponents,
+                                pp.limits.maxFragmentInputComponents);
+        spvinj::chooseAttachment(pp.limits.maxColorAttachments);
+        uint32_t pcOff = spvinj::choosePushOffset(pp.limits.maxPushConstantsSize);
+        trace("SPIRV INJECT: push block of %u bytes at offset %u of %u - leaves "
+              "X-Plane's own push constants %u bytes before they share storage "
+              "with ours%s",
+              spvinj::kPushConstantBytes, pcOff, pp.limits.maxPushConstantsSize,
+              pcOff,
+              pcOff < 64 ? " *** TIGHT: a fragment block reaching past this "
+                           "would silently overwrite the matrix ***" : "");
+        trace("SPIRV INJECT: varyings at Location %u/%u, velocity at colour "
+              "attachment %u (maxVertexOutputComponents=%u maxColorAttachments=%u)",
+              spvinj::currClipLocation(), spvinj::prevClipLocation(),
+              spvinj::mvAttachmentIndex(),
+              pp.limits.maxVertexOutputComponents,
+              pp.limits.maxColorAttachments);
+    } else {
+        trace("SPIRV INJECT: could not read device limits - varyings stay at "
+              "Location %u/%u, which some shaders may already use",
+              spvinj::currClipLocation(), spvinj::prevClipLocation());
+    }
+    g_nextCmdBindPipeline = (PFN_vkCmdBindPipeline)nextGDPA(*out, "vkCmdBindPipeline");
+    g_nextCmdPushConstants = (PFN_vkCmdPushConstants)nextGDPA(*out, "vkCmdPushConstants");
+    g_nextCmdBlitImage = (PFN_vkCmdBlitImage)nextGDPA(*out, "vkCmdBlitImage");
+    g_nextCmdCopyImage = (PFN_vkCmdCopyImage)nextGDPA(*out, "vkCmdCopyImage");
+    g_nextCmdClearColorImage = (PFN_vkCmdClearColorImage)
+                                   nextGDPA(*out, "vkCmdClearColorImage");
+    g_nextCmdPipelineBarrier2 = (PFN_vkCmdPipelineBarrier)
+                                    nextGDPA(*out, "vkCmdPipelineBarrier");
+    g_nextCmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)
+                                     nextGDPA(*out, "vkCmdCopyBufferToImage");
+    g_nextCreateShaderModule = (PFN_vkCreateShaderModule)
+                                   nextGDPA(*out, "vkCreateShaderModule");
+    g_nextCreateGfxPipelines = (PFN_vkCreateGraphicsPipelines)
+                                   nextGDPA(*out, "vkCreateGraphicsPipelines");
+    GD(createFence, CreateFence);                 GD(resetFences, ResetFences);  GD(waitForFences, WaitForFences);
+    GD(queueSubmit, QueueSubmit);                 GD(getDeviceQueue, GetDeviceQueue);
+    GD(destroyPipeline, DestroyPipeline);         GD(destroyPipelineLayout, DestroyPipelineLayout);
+    GD(destroyShaderModule, DestroyShaderModule); GD(destroyDescriptorPool, DestroyDescriptorPool);
+    GD(destroyDescriptorSetLayout, DestroyDescriptorSetLayout);
+    GD(destroySampler, DestroySampler);           GD(destroyCommandPool, DestroyCommandPool);
+    GD(destroyFence, DestroyFence);               GD(unmapMemory, UnmapMemory);
+#undef GD
+
+
+    g_nextQueueSubmit        = dd.queueSubmit;
+    g_nextQueuePresent       = dd.queuePresent;
+
+
+    // ---- FINISH dd AND REGISTER THE DEVICE, BEFORE ANYTHING CAN ASK ABOUT IT.
+    //
+    // This used to sit at the very end of the function, below the Streamline
+    // block - so the comment there described a fix the code did not make. The
+    // measurement that caught it, logged three ways at the call site:
+    //
+    //   vkCreatePrivateDataSlot - loader export yes, vkGetDeviceProcAddr NO,
+    //                             EXT spelling NO, vkGetInstanceProcAddr yes
+    //
+    // Instance-level lookups answered because they do not come through us.
+    // Device-level lookups did not, because they do: TAA_GetDeviceProcAddr ends
+    // in a g_devices lookup and returns nullptr for a device that is not in the
+    // map yet. Streamline was asking a layer that had not finished admitting the
+    // device exists.
+    g_nextCreateSampler      = dd.createSampler;
+    g_nextCmdBeginRenderPass = dd.cmdBeginRenderPass;
+    g_nextCmdBeginRendering  = dd.cmdBeginRendering;
+    dd.cmdEndRendering = (PFN_vkCmdEndRendering)nextGDPA(*out, "vkCmdEndRendering");
+    if (!dd.cmdEndRendering)
+        dd.cmdEndRendering = (PFN_vkCmdEndRendering)nextGDPA(*out, "vkCmdEndRenderingKHR");
+    g_nextCmdEndRendering = dd.cmdEndRendering;
+    g_nextCmdSetViewport     = dd.cmdSetViewport;
+
+    // ---- THE GPU TIMING POOL.
+    //
+    // timestampPeriod converts ticks to nanoseconds and is per-device, so it
+    // has to come from the physical device rather than be assumed. A device
+    // that reports timestampComputeAndGraphics false cannot do this at all, and
+    // saying so beats silently reporting zeroes.
+    g_gpuTiming = gpuTimingOn();
+    if (g_gpuTiming && dd.createQueryPool) {
+        VkPhysicalDeviceProperties pdp;
+        memset(&pdp, 0, sizeof(pdp));
+        if (g_getPhysProps) g_getPhysProps(phys, &pdp);
+        g_tsPeriodNs = pdp.limits.timestampPeriod;
+
+        if (g_tsPeriodNs <= 0.0f) {
+            trace("GPU TIME: this device reports no timestamp period - cannot "
+                  "measure where the frame goes");
+            g_gpuTiming = false;
+        } else {
+            VkQueryPoolCreateInfo qpi;
+            memset(&qpi, 0, sizeof(qpi));
+            qpi.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qpi.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+            qpi.queryCount = 16;
+            if (dd.createQueryPool(*out, &qpi, nullptr, &g_tsPool) == VK_SUCCESS) {
+                g_tsCapacity = 16;
+                trace("GPU TIME: on - %.2f ns per tick. Spans are reported every "
+                      "300 frames as real device time, which is the only kind "
+                      "that means anything here.", (double)g_tsPeriodNs);
+            } else {
+                g_gpuTiming = false;
+            }
+        }
+    }
+
+    trace("CreateDevice ok: present=%p sampler=%p beginRP=%p beginRendering=%p setViewport=%p",
+          (void*)dd.queuePresent, (void*)dd.createSampler,
+          (void*)dd.cmdBeginRenderPass, (void*)dd.cmdBeginRendering,
+          (void*)dd.cmdSetViewport);
+
+    // The reserved queues, now that there is a device to fetch them from. This
+    // also catches the case where creation fell back to X-Plane's original
+    // request: on that device the reserved indices address queues that were
+    // never created, and fgBindQueues turns that into a log line instead of a
+    // driver fault on the first submit.
+
+    // Scoped, NOT function-scoped. The Streamline block below takes g_lock for
+    // its own instance lookup, and a second lock_guard on a non-recursive mutex
+    // already held by this thread is a deadlock, not an error.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_devices[dispatchKey(*out)] = dd;
+    }
+
+
+    return r;
+}
+
+// ------------------------------------------------------------- proc addr
+
+#define RETURN_IF(nm, fn) if (!strcmp(name, nm)) return (PFN_vkVoidFunction)(fn);
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+TAA_GetDeviceProcAddr(VkDevice device, const char *name)
+{
+    RETURN_IF("vkGetDeviceProcAddr",   TAA_GetDeviceProcAddr)
+    RETURN_IF("vkDestroyDevice",       Layer_DestroyDevice)
+    RETURN_IF("vkCreateImage",         Layer_CreateImage)
+    RETURN_IF("vkCreateImageView",     Layer_CreateImageView)
+    RETURN_IF("vkDestroyImage",        Layer_DestroyImage)
+    RETURN_IF("vkCreateBuffer",        Layer_CreateBuffer)
+    RETURN_IF("vkDestroyBuffer",       Layer_DestroyBuffer)
+    RETURN_IF("vkQueuePresentKHR",     Layer_QueuePresentKHR)
+    RETURN_IF("vkGetSwapchainImagesKHR", Layer_GetSwapchainImagesKHR)
+    RETURN_IF("vkCmdBlitImage",        Layer_CmdBlitImage)
+    RETURN_IF("vkCmdResolveImage",     Layer_CmdResolveImage)
+    RETURN_IF("vkUpdateDescriptorSets", Layer_UpdateDescriptorSets)
+    RETURN_IF("vkCmdBindDescriptorSets", Layer_CmdBindDescriptorSets)
+    RETURN_IF("vkCmdCopyImage",        Layer_CmdCopyImage)
+    RETURN_IF("vkQueueSubmit",         Layer_QueueSubmit)
+    RETURN_IF("vkCreateSampler",       Layer_CreateSampler)
+    RETURN_IF("vkCmdBeginRenderPass",  Layer_CmdBeginRenderPass)
+    RETURN_IF("vkCmdBeginRendering",    Layer_CmdBeginRendering)
+    RETURN_IF("vkEndCommandBuffer",     Layer_EndCommandBuffer)
+    RETURN_IF("vkAllocateCommandBuffers", Layer_AllocateCommandBuffers)
+    RETURN_IF("vkCreateCommandPool",      Layer_CreateCommandPool)
+    RETURN_IF("vkCmdBeginRenderingKHR", Layer_CmdBeginRendering)
+    RETURN_IF("vkCmdEndRendering",      Layer_CmdEndRendering)
+    RETURN_IF("vkCmdEndRenderingKHR",   Layer_CmdEndRendering)
+    RETURN_IF("vkCmdSetViewport",       Layer_CmdSetViewport)
+    RETURN_IF("vkAllocateMemory",      TAA_AllocateMemory)
+    RETURN_IF("vkCmdCopyBufferToImage", TAA_CmdCopyBufferToImage)
+    RETURN_IF("vkCmdPipelineBarrier",  TAA_CmdPipelineBarrier)
+    RETURN_IF("vkCmdPipelineBarrier2", TAA_CmdPipelineBarrier2)
+    RETURN_IF("vkCmdPipelineBarrier2KHR", TAA_CmdPipelineBarrier2)
+    RETURN_IF("vkCmdBlitImage",        TAA_CmdBlitImage)
+    RETURN_IF("vkCmdCopyImage",        TAA_CmdCopyImage)
+    RETURN_IF("vkCmdClearColorImage",  TAA_CmdClearColorImage)
+    RETURN_IF("vkCreateShaderModule",   TAA_CreateShaderModule)
+    RETURN_IF("vkCreateComputePipelines", TAA_CreateComputePipelines)
+    RETURN_IF("vkCmdDispatch",          TAA_CmdDispatch)
+    RETURN_IF("vkCreatePipelineLayout", TAA_CreatePipelineLayout)
+    RETURN_IF("vkCmdBindPipeline",     TAA_CmdBindPipeline)
+    RETURN_IF("vkCreateGraphicsPipelines", TAA_CreateGraphicsPipelines)
+
+    PFN_vkGetDeviceProcAddr next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.gdpa;
+    }
+    return next ? next(device, name) : nullptr;
+}
+
+// ---- KEEP VALIDATION MESSAGES OUT OF THE SIM'S MODAL DIALOG.
+//
+// X-Plane registers its own debug messenger and raises a blocking X-System
+// Message box for every error the validation layer reports. That is fine for
+// one message and unusable for a per-frame synchronisation hazard, which is
+// exactly what we turned validation on to find.
+//
+// Refusing to pass the messenger down leaves the sim without a callback, so
+// validation reports go only to the log file the settings name. A cooked
+// handle is returned so the sim believes it succeeded; the matching destroy
+// swallows it rather than handing a fabricated pointer to the loader.
+//
+// Only while TAA_SILENCE_APP_VALIDATION is set - the sim's own error reporting
+// is worth having the rest of the time.
+static bool silenceAppValidation()
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("TAA_SILENCE_APP_VALIDATION");
+        on = (e && atoi(e)) ? 1 : 0;
+    }
+    return on != 0;
+}
+
+// A recognisable, never-allocated value. Only ever compared, never dereferenced
+// and never handed to the loader.
+#define TAA_FAKE_MESSENGER ((VkDebugUtilsMessengerEXT)(uintptr_t)0xFA15EDBEEFULL)
+
+static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDebugUtilsMessengerEXT(
+    VkInstance inst, const VkDebugUtilsMessengerCreateInfoEXT *ci,
+    const VkAllocationCallbacks *alloc, VkDebugUtilsMessengerEXT *out)
+{
+    if (silenceAppValidation()) {
+        if (out) *out = TAA_FAKE_MESSENGER;
+        trace("VALIDATION: withheld the sim's debug messenger - reports go to "
+              "the validation log only, not to a modal dialog per frame.");
+        return VK_SUCCESS;
+    }
+    PFN_vkCreateDebugUtilsMessengerEXT next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, InstanceData>::iterator it = g_instances.find(dispatchKey(inst));
+        if (it != g_instances.end() && it->second.gipa)
+            next = (PFN_vkCreateDebugUtilsMessengerEXT)
+                       it->second.gipa(inst, "vkCreateDebugUtilsMessengerEXT");
+    }
+    return next ? next(inst, ci, alloc, out) : VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_DestroyDebugUtilsMessengerEXT(
+    VkInstance inst, VkDebugUtilsMessengerEXT m, const VkAllocationCallbacks *alloc)
+{
+    if (m == TAA_FAKE_MESSENGER) return;   // never existed below us
+    PFN_vkDestroyDebugUtilsMessengerEXT next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, InstanceData>::iterator it = g_instances.find(dispatchKey(inst));
+        if (it != g_instances.end() && it->second.gipa)
+            next = (PFN_vkDestroyDebugUtilsMessengerEXT)
+                       it->second.gipa(inst, "vkDestroyDebugUtilsMessengerEXT");
+    }
+    if (next) next(inst, m, alloc);
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+TAA_GetInstanceProcAddr(VkInstance inst, const char *name)
+{
+    RETURN_IF("vkCreateDebugUtilsMessengerEXT",  TAA_CreateDebugUtilsMessengerEXT)
+    RETURN_IF("vkDestroyDebugUtilsMessengerEXT", TAA_DestroyDebugUtilsMessengerEXT)
+    RETURN_IF("vkGetInstanceProcAddr", TAA_GetInstanceProcAddr)
+    RETURN_IF("vkCreateInstance",      TAA_CreateInstance)
+    RETURN_IF("vkDestroyInstance",     TAA_DestroyInstance)
+    RETURN_IF("vkCreateDevice",        TAA_CreateDevice)
+    RETURN_IF("vkGetDeviceProcAddr",   TAA_GetDeviceProcAddr)
+
+    // Both spellings. The KHR alias is what an application targeting Vulkan 1.0
+    // with VK_KHR_get_physical_device_properties2 will ask for, and hooking only
+    // the core name would miss it entirely - the layer would look installed and
+    // simply never see the query.
+    RETURN_IF("vkGetPhysicalDeviceMemoryProperties2",
+              TAA_GetPhysicalDeviceMemoryProperties2)
+    RETURN_IF("vkGetPhysicalDeviceMemoryProperties2KHR",
+              TAA_GetPhysicalDeviceMemoryProperties2)
+
+    PFN_vkGetInstanceProcAddr next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, InstanceData>::iterator it = g_instances.find(dispatchKey(inst));
+        if (it != g_instances.end()) next = it->second.gipa;
+    }
+    return next ? next(inst, name) : nullptr;
+}

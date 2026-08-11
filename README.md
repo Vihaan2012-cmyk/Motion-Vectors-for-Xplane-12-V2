@@ -11,14 +11,19 @@ frame.
 Also included are the VRAM systems — budget reporting, texture paging controls
 and memory priority.
 
-## Status
-
-Motion vectors are the whole project until they are provably correct. Nothing is
-built on top of them before that.
-
-Correctness is measured, not judged by eye: the camera is driven through a known
+Correctness is measured, not judged by eye. The camera is driven through a known
 yaw and pitch, and the vectors are compared against the pixel displacement that
 motion must produce. A build is correct when that ratio is 1.
+
+## Progress
+
+- [x] Project set up, logging and measurement harness planned
+- [x] Camera reprojection published each frame
+- [x] Shader patching: previous-frame clip position per vertex
+- [x] Velocity target written per fragment
+- [ ] Measured ratio of 1 through yaw and pitch
+- [x] VRAM systems
+- [ ] Jitter
 
 ## Requirements
 
@@ -37,6 +42,6 @@ Everything is written to a dedicated log beside the plugin, not to X-Plane's
 
 ---
 
-Later work may consume these vectors. That is not this project.
+Work that consumes these vectors is in progress.
 
 [minimal project](https://github.com/Vihaan2012-cmyk/Motion-Vectors-For-Xplane-12)
