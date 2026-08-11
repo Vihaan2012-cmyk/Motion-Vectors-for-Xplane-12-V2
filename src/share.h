@@ -41,17 +41,6 @@
 //        unprojects depth to world space and, inside a sphere, reprojects using
 //        that object's motion instead of the static assumption.
 //
-//   Prop discs / rotor blades -> `reactive[]`. Deliberately NOT solved with
-//        velocity. A spinning prop is unresolvable by TAA on principle: blade
-//        tips move at hundreds of m/s, the disc is semi-transparent, and at 30-60
-//        fps it aliases temporally no matter what (the wagon-wheel effect is not
-//        a bug you can clamp away). Even perfect per-vertex rotational velocity
-//        would not help, because alpha blending means the colour under a pixel
-//        changes completely between frames. So the goal is not correctness, it
-//        is invisibility: force the resolve toward the current frame and let the
-//        disc alias the way it would with no AA at all. That reads as motion
-//        blur on a spinning prop, which people accept instantly; ghosting reads
-//        as a broken renderer, which they do not.
 //
 //   Sky and clouds -> handled in the shader, not here. See the note on
 //        `reverseZ`: distant geometry must reproject by ROTATION, not be given
@@ -229,7 +218,6 @@ static inline const char *taaAvailabilityText(int a)
 #define TAA_SHARE_NAME  "Local\\TAAImpl_Matrices"
 
 #define TAA_MAX_OBJECTS   32
-#define TAA_MAX_REACTIVE  16
 
 // Why temporal history has to be thrown away this frame. Reprojection is only
 // valid when the previous frame shows the same world from a nearby viewpoint;
@@ -286,13 +274,6 @@ struct TaaMovingObject {
 // A screen-space region that should ignore history and take the current frame.
 // Used for prop/rotor discs, which are stamped on the CPU from known geometry
 // rather than detected on the GPU.
-struct TaaReactiveEllipse {
-    float cx, cy;             // centre, in uv (0..1)
-    float rx, ry;             // radii, in uv
-    float strength;           // 0..1; 1 = take the current frame entirely
-    float feather;            // uv units to ramp over, so there is no hard seam
-    float pad0, pad1;
-};
 
 // Matrices are float[16], column-major, column-vector convention (v' = M * v)
 // - the layout X-Plane's datarefs use and the one GLSL's mat4 expects, so they
@@ -423,33 +404,6 @@ struct TaaShare {
     float   lodBias;
     float   renderScale;      // 1.0 = native
 
-    // ---- near-field (cockpit panel) reactive ramp.
-    //
-    // THE WORST CASE FOR THIS WHOLE APPROACH, and it is not an edge case - it
-    // is the panel of every airliner.
-    //
-    // Glass cockpit displays are 2D content drawn onto static 3D surfaces. In a
-    // cockpit view the panel barely moves relative to the camera, so
-    // depth-reprojection gives it CORRECT geometric velocity: near zero. But
-    // the content on that surface - a scrolling ND map, CDU text, a blinking
-    // annunciator - moves independently of the surface carrying it. History
-    // reprojects to exactly the right pixel and exactly the wrong content.
-    //
-    // The result is smeared map symbology and ghosting text, and no improvement
-    // to the velocity field can fix it, because the velocity field is already
-    // right. The fix has to be refusing history.
-    //
-    // The general mechanism for that is colour-difference rejection in the
-    // resolve (large |current - reprojected history| with near-zero velocity is
-    // the signature). This ramp is a deterministic backstop underneath it:
-    // anything closer than `cockpitReactiveDist` gets its history weight pulled
-    // down regardless of what the heuristic decides.
-    //
-    // The trade is explicit: panel edges get less temporal smoothing and alias
-    // slightly more. Panel edges are low-contrast; display text is not. Losing
-    // AA on the former to keep the latter readable is the right direction.
-    float   cockpitReactiveDist;      // metres; 0 disables
-    float   cockpitReactiveStrength;  // 0..1 at zero distance
 
     int32_t historyReset;     // 1 => discard history (see resetReason)
     int32_t resetReason;
@@ -464,10 +418,6 @@ struct TaaShare {
     int32_t pad1;
     TaaMovingObject objects[TAA_MAX_OBJECTS];
 
-    // ---- reactive regions (prop and rotor discs).
-    int32_t reactiveCount;
-    int32_t pad2;
-    TaaReactiveEllipse reactive[TAA_MAX_REACTIVE];
 
     // ---- backend selection (plugin -> layer).
     //

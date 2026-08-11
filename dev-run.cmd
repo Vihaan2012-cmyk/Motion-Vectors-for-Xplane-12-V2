@@ -2,14 +2,18 @@
 rem Development launcher.
 rem
 rem The shipped launcher is a small exe that sets the two loader variables and
-rem nothing else. This one adds the debugging switches and starts the sim
-rem straight into a saved situation, so a build can be tested without anyone
-rem picking an aircraft and waiting for the world to load.
+rem nothing else. This one adds the debugging switches and then clicks RESUME
+rem LAST FLIGHT on the menu, so a build can be measured without anyone present.
 rem
-rem --load_smo is the ONLY option that bypasses the flight configuration screen.
-rem --load_acf, --load_apt, --go_to_apt and --new_flight_json are all parsed and
-rem all only pre-fill it, and no XPLM callback runs while it is up. That was
-rem established by trying every one of them.
+rem No command line reaches a LIVE flight. --load_smo is the only switch that
+rem bypasses the menu at all - --load_acf, --load_apt, --go_to_apt and
+rem --new_flight_json are parsed but only pre-fill it - and the saved situation
+rem was captured during a replay, so it always returns to one. A replay flies
+rem the aeroplane and drags the camera with it, which is the worst case for this
+rem measurement: once the camera translates, near geometry moves further than
+rem far geometry and a single expected displacement no longer fits the frame.
+rem Resuming gives a PARKED flight, where a camera rotation moves every depth
+rem alike.
 
 setlocal
 set "XPROOT=%~dp0.."
@@ -63,4 +67,8 @@ rem normally and fly it.
 
 echo Layer:     %LAYERDIR%
 start "" /D "%XPROOT%" "%XPROOT%\X-Plane.exe"
+
+rem Wait for the menu, then resume. The script polls for the window itself, so
+rem the delay here only has to cover the sim getting far enough to draw one.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0resume-flight.ps1"
 endlocal

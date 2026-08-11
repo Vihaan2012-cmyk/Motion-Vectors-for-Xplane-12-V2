@@ -337,7 +337,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
             // SPIR-V requires constants to be UNIQUE: two OpConstants of the
             // same type and value make the module invalid. So an existing 0 or 1
             // has to be found and reused rather than declared again - the same
-            // rule that bit the reactive-value constant in the fragment path.
+            // rule that bit the duplicate-constant case in the fragment path.
             if (d.len >= 4 && p[1] == idInt && p[3] == 0 && !idConst0) idConst0 = p[2];
             if (d.len >= 4 && p[1] == idInt && p[3] == 1 && !idConst1) idConst1 = p[2];
             break;
@@ -673,13 +673,8 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 // also mean extending each pipeline layout with a fragment-visible range, which
 // is the kind of change that turns a rendering bug into a validation error.
 //
-// Baking it costs one OpConstant and nothing at runtime. The price is that the
-// patched-module cache has to key on the value as well as the attachment index,
-// since one module used by an opaque pipeline and an additive one now needs two
-// variants. In practice that is a handful of extra modules against ~1500.
 inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
-                             std::vector<uint32_t> &out, uint32_t attachmentIndex,
-                             float reactive)
+                             std::vector<uint32_t> &out, uint32_t attachmentIndex)
 {
     if (!code || sizeBytes < 20) return INJ_MALFORMED;
     std::vector<uint32_t> w(code, code + sizeBytes / 4);
@@ -702,7 +697,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
 
     uint32_t idFloat = 0, idV4 = 0, idV2 = 0;
     uint32_t idPtrOutV4 = 0, idPtrInV4 = 0;
-    uint32_t idConstHalf = 0, idConstZero = 0, idConstReactive = 0;
+    uint32_t idConstHalf = 0, idConstZero = 0;
     size_t   entryAt = 0;
     bool     isFragment = false;
     uint32_t maxOutLocation = 0;
@@ -731,10 +726,6 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
                 float v; memcpy(&v, &p[3], 4);
                 if (v == 0.5f && !idConstHalf) idConstHalf = p[2];
                 if (v == 0.0f && !idConstZero) idConstZero = p[2];
-                // Reuse a constant the shader already has rather than adding a
-                // second one with the same value - the module is full of them
-                // and duplicates are pure noise in a disassembly.
-                if (v == reactive && !idConstReactive) idConstReactive = p[2];
             }
             break;
         case OpDecorate:
@@ -826,23 +817,6 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     if (!idPtrInV4)   { newPtrInV4  = bound++; idPtrInV4   = newPtrInV4; }
     if (!idConstHalf) { newHalf     = bound++; idConstHalf = newHalf; }
     if (!idConstZero) { newZero     = bound++; idConstZero = newZero; }
-    // The reactive constant, reusing rather than duplicating.
-    //
-    // The scan above already adopts any constant the module happens to have with
-    // this value. What it cannot see is the two constants THIS function is about
-    // to add: if the shader had no 0.0 and reactive is 0.0, the line above just
-    // minted one, and minting a second with the same type and value would put
-    // two identical constants in the module. That is not merely untidy - SPIR-V
-    // requires constant instructions to be unique for a given type and value, so
-    // a strict driver is entitled to reject the module outright. It would fail
-    // as "no velocity from this pipeline", which looks like a refused patch
-    // rather than a malformed one.
-    uint32_t newReactive = 0;
-    if (!idConstReactive) {
-        if (reactive == 0.0f)      idConstReactive = idConstZero;
-        else if (reactive == 0.5f) idConstReactive = idConstHalf;
-        else { newReactive = bound++; idConstReactive = newReactive; }
-    }
 
     uint32_t idInCurr  = bound++, idInPrev = bound++, idOutMV = bound++;
     uint32_t idLc = bound++, idLp = bound++;
@@ -865,8 +839,6 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newHalf); globals.push_back(bits); }
     if (newZero)     { uint32_t bits; float z = 0.0f; memcpy(&bits, &z, 4);
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newZero); globals.push_back(bits); }
-    if (newReactive) { uint32_t bits; memcpy(&bits, &reactive, 4);
-                       globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newReactive); globals.push_back(bits); }
 
     globals.push_back(head(OpVariable, 4)); globals.push_back(idPtrInV4);  globals.push_back(idInCurr); globals.push_back(SC_Input);
     globals.push_back(head(OpVariable, 4)); globals.push_back(idPtrInV4);  globals.push_back(idInPrev); globals.push_back(SC_Input);
@@ -888,11 +860,10 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     uint32_t idMx = bound++;
     body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idScaled); body.push_back(1);
     uint32_t idMy = bound++;
-    // (velocity.x, velocity.y, reactive, 0). The .z slot was already being
-    // written as a second zero - the vec4 exists because a colour attachment
-    // output is a vec4 - so carrying the reactive mask there costs no extra
-    // instruction, only the wider attachment format to stop it being discarded.
-    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(idMx); body.push_back(idMy); body.push_back(idConstReactive); body.push_back(idConstZero);
+    // (velocity.x, velocity.y, 0, 0). A colour attachment output is a
+    // vec4; the target is two channels, so the last two are shape, not
+    // information, and the format discards them.
+    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(idMx); body.push_back(idMy); body.push_back(idConstZero); body.push_back(idConstZero);
     body.push_back(head(OpStore, 3)); body.push_back(idOutMV); body.push_back(idResult);
 
     out.clear();

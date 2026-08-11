@@ -71,13 +71,10 @@ enum {
     TAA_CTL_QUALITY    = 1 << 2,
     TAA_CTL_SHARPNESS  = 1 << 3,
     TAA_CTL_LOD_BIAS   = 1 << 4,
-    TAA_CTL_COCKPIT    = 1 << 5,
     TAA_CTL_OPT_FLOW   = 1 << 6,
     TAA_CTL_JITTER     = 1 << 7,   // jitter phase count
     TAA_CTL_OBJECTS    = 1 << 8,   // moving-object velocity
-    TAA_CTL_REACTIVE   = 1 << 9,   // reactive discs
     TAA_CTL_TRAFFIC    = 1 << 10,  // AI traffic bounding radius
-    TAA_CTL_COCKPIT_S  = 1 << 11,  // cockpit reactive strength
     TAA_CTL_XPFSR      = 1 << 12   // X-Plane's own render resolution
 };
 
@@ -98,12 +95,10 @@ struct TaaControl {
     int32_t  optFlow;
     float    sharpness;
     float    lodBias;
-    float    cockpitReactiveDist;
     float    pad2;
 
     int32_t  jitterPhases;
     int32_t  movingObjects;
-    int32_t  reactiveDiscs;
     float    trafficRadius;
     float    cockpitStrength;
 

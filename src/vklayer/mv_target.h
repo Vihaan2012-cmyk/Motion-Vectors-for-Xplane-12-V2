@@ -17,18 +17,6 @@
 // every fragment of every draw.
 //
 // It began as R16G16, two channels for the two numbers a motion vector is. The
-// third channel now carries the REACTIVE MASK: a per-pipeline constant, baked
-// into each patched fragment shader from its blend state, saying how far the
-// upscaler should distrust temporal history at that pixel. The fragment
-// injector always built a vec4 - a colour output has to be one - so .z was
-// already being written as a zero and discarded by the narrower format.
-// Widening it costs 4 bytes per pixel and no extra shader work. .w is spare.
-//
-// CLEARED TO ZERO EVERY FRAME. Zero means "did not move", which is the right
-// answer for anything nothing drew over - the sky, and any pipeline we could
-// not patch. An uncleared buffer would hand the resolve last frame's vectors
-// for those pixels, which is worse than useless: stale motion is confidently
-// wrong, where zero is merely conservative.
 
 #pragma once
 
@@ -68,8 +56,6 @@ struct MvTarget {
 
 static MvTarget g_mv;
 // .xy velocity in UV units. Two channels is all a velocity buffer carries -
-// the predecessor's .z held an FSR2 reactive mask, which this project has no
-// consumer for, and dropping it halves the bandwidth.
 static const VkFormat kMvFormat = VK_FORMAT_R16G16_SFLOAT;
 
 // DERIVED, never restated. The readback size and the index stride both have to
@@ -292,6 +278,12 @@ static void mvReport(double camMoved, const float *reproj,
     // The median is immune to the first and reads the factor straight off in
     // the second - so one measurement decides it instead of a flight per guess.
     std::vector<float> mags;
+    // Per-axis samples. A MEDIAN over the whole frame is robust to near-field
+    // geometry: with any camera translation at all, close surfaces move far
+    // more than distant ones, and a mean over a centre region is dominated by
+    // them. Under pure rotation every depth moves alike, so the median is the
+    // honest estimate of the rotation the camera actually performed.
+    std::vector<float> axX, axY;
     mags.reserve(600000);
 
     // A CENTRE REGION, reported separately.
@@ -327,9 +319,6 @@ static void mvReport(double camMoved, const float *reproj,
     // the flip outright.
     double cSx = 0.0, cSy = 0.0;
 
-    // Reactive-mask coverage, in PIXELS rather than pipelines.
-    double   reacSum = 0.0;
-    uint64_t reacN = 0, reacNonZero = 0, reacAdditive = 0;
 
     // Strided. A full 8.3 M pixel scan per dump costs more than it tells us -
     // every 4th pixel in each direction is 500k samples, which settles any of
@@ -340,24 +329,17 @@ static void mvReport(double camMoved, const float *reproj,
             float vx = velHalfToFloat(px[i]);
             float vy = velHalfToFloat(px[i + 1]);
 
-            // .z is the reactive mask, baked per pipeline from its blend state.
-            // Measured here for the same reason the velocity is: the pipeline
-            // census said 74% of pipelines blend, but pipelines are not pixels.
-            // A shader used by two lens flares counts the same as one drawing
-            // the sky, so the census cannot say what fraction of the SCREEN the
-            // mask actually covers. This can.
-            {
-                float rv = velHalfToFloat(px[i + 2]);
-                if (rv == rv) {
-                    reacSum += rv;
-                    if (rv > 0.0f)  ++reacNonZero;
-                    if (rv >= 0.8f) ++reacAdditive;
-                    ++reacN;
-                }
-            }
 
             if (vx != vx || vy != vy) { ++nan; ++n; continue; }
             double mag = sqrt((double)vx * vx + (double)vy * vy);
+            // Sky and anything else with no geometry behind it writes zero, and
+            // at 4K that can be most of the frame - enough to drag a median to
+            // zero regardless of how the rest of the field moved. A pixel with
+            // no surface in it carries no motion, so it is not a sample.
+            if (mag > 0.0) {
+                axX.push_back(fabsf(vx));
+                axY.push_back(fabsf(vy));
+            }
             if (mag == 0.0) ++zero;
             if (mag > maxMag) maxMag = mag;
             sum += mag;
@@ -438,8 +420,13 @@ static void mvReport(double camMoved, const float *reproj,
         // stable reading of about 1.25.
         //
         // Yaw phases (3, 4) are horizontal; pitch (5) is vertical.
-        const double cxPx = fabs(cSx / (double)(cN ? cN : 1)) * m.w;
-        const double cyPx = fabs(cSy / (double)(cN ? cN : 1)) * m.h;
+        auto medianOf = [](std::vector<float> &v) -> double {
+            if (v.empty()) return 0.0;
+            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            return v[v.size() / 2];
+        };
+        const double cxPx = medianOf(axX) * m.w;
+        const double cyPx = medianOf(axY) * m.h;
         const bool   vertical = (selfTestPhase == 5);
         const double axisPx = vertical ? cyPx : cxPx;
         const double ratio  = axisPx / (double)expectedPx;
@@ -450,38 +437,40 @@ static void mvReport(double camMoved, const float *reproj,
         static int lastPhase = -1;
         static int settle    = 0;
         if (selfTestPhase != lastPhase) { lastPhase = selfTestPhase; settle = 3; }
+        // WHAT THE MATRIX ITSELF PREDICTS, so the column can be split.
+        //
+        // `expectedPx` comes from the PLUGIN: it is the angle between the two
+        // view matrices, turned into pixels. `reproj` is what the SHADER was
+        // actually handed. They can disagree - the cockpit pass is pushed a
+        // body-frame matrix while this comparison is against the world-frame
+        // one - and when they do, "the vectors are wrong" and "the vectors are
+        // right and the yardstick is wrong" look identical from one number.
+        //
+        // A point at infinity down the centre ray is clip (0,0,0,1) under a
+        // reverse-Z infinite projection, so reproj * that is simply the
+        // matrix's fourth column - and the shader's own subtraction against a
+        // centre NDC of zero is then -prevNDC * 0.5. Column-major, as the
+        // shader consumes it.
+        double predX = 0.0, predY = 0.0;
+        if (reproj && reproj[15] != 0.0f) {
+            predX = fabs(0.5 * (double)reproj[12] / (double)reproj[15]) * m.w;
+            predY = fabs(0.5 * (double)reproj[13] / (double)reproj[15]) * m.h;
+        }
+        const double predPx = vertical ? predY : predX;
+
         if (settle > 0) { --settle; }
         else {
             trace("MV RATIO: phase=%d %s  measured=%.3f px  expected=%.3f px  "
-                  "ratio=%.3f%s  [magnitude %.3f]",
+                  "ratio=%.3f%s  | matrix predicts %.3f px (field/matrix %.3f)"
+                  "  [magnitude %.3f]",
                   selfTestPhase, vertical ? "pitch" : "yaw  ",
                   axisPx, expectedPx, ratio,
                   (ratio > 0.95 && ratio < 1.05) ? "   <- CORRECT" : "",
+                  predPx, predPx > 1e-6 ? axisPx / predPx : 0.0,
                   centre);
         }
     }
 
-    // REACTIVE MASK COVERAGE, in pixels.
-    //
-    // The pipeline census answered "is this worth building" (74% of pipelines
-    // blend). This answers the different and more useful question of how much of
-    // the SCREEN the mask marks, which is what decides whether it improves the
-    // image or merely costs bandwidth.
-    //
-    // Two ways this can read wrong, both worth naming before the number is
-    // trusted. All-zero means the value is not reaching the attachment - a write
-    // mask or a format problem, not an absent signal. Near-100% means the
-    // classification is too generous and the mask is telling the upscaler to
-    // distrust history everywhere, which throws away the entire point of a
-    // temporal upscaler and would look like heavy noise rather than smear.
-    if (reacN) {
-        trace("  reactive mask: %.1f%% of pixels marked (%.1f%% strongly), "
-              "mean=%.3f over %llu samples",
-              100.0 * (double)reacNonZero  / (double)reacN,
-              100.0 * (double)reacAdditive / (double)reacN,
-              reacSum / (double)reacN,
-              (unsigned long long)reacN);
-    }
 
     // The direction check, stated so it cannot be misread. Signed means over
     // the same centre region, in pixels, for both fields side by side - and

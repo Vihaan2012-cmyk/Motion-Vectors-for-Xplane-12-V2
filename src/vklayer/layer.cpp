@@ -167,11 +167,9 @@ struct Snapshot {
     float    jitterX, jitterY;
     int32_t  jitterIndex, jitterPhases;
     float    lodBias;
-    float    cockpitReactiveDist, cockpitReactiveStrength;
     float    camX, camY, camZ, camDelta;
-    int32_t  objectCount, reactiveCount;
+    int32_t  objectCount;
     TaaMovingObject    objects[TAA_MAX_OBJECTS];
-    TaaReactiveEllipse reactive[TAA_MAX_REACTIVE];
 };
 
 static bool snapshot(Snapshot *o)
@@ -220,20 +218,14 @@ static bool snapshot(Snapshot *o)
         o->jitterIndex   = g_share->jitterIndex;
         o->jitterPhases  = g_share->jitterPhases;
         o->lodBias       = g_share->lodBias;
-        o->cockpitReactiveDist     = g_share->cockpitReactiveDist;
-        o->cockpitReactiveStrength = g_share->cockpitReactiveStrength;
         o->camX          = g_share->camX;
         o->camY          = g_share->camY;
         o->camZ          = g_share->camZ;
         o->camDelta      = g_share->camDelta;
         o->objectCount   = g_share->objectCount;
-        o->reactiveCount = g_share->reactiveCount;
         if (o->objectCount   < 0) o->objectCount   = 0;
         if (o->objectCount   > TAA_MAX_OBJECTS)  o->objectCount  = TAA_MAX_OBJECTS;
-        if (o->reactiveCount < 0) o->reactiveCount = 0;
-        if (o->reactiveCount > TAA_MAX_REACTIVE) o->reactiveCount = TAA_MAX_REACTIVE;
         memcpy(o->objects,  g_share->objects,  sizeof(TaaMovingObject) * o->objectCount);
-        memcpy(o->reactive, g_share->reactive, sizeof(TaaReactiveEllipse) * o->reactiveCount);
 
         MemoryBarrier();
         if (g_share->frame == before) {
@@ -437,8 +429,6 @@ static std::atomic<bool> g_mvClearedAtPresent(false);
 // where they are finally patched.
 static std::map<VkShaderModule, std::vector<uint32_t> > g_moduleCode;
 // The second half of the key packs the attachment index and the quantised
-// reactive value together: (attachmentIndex << 8) | reactive*255. Both are
-// baked into the patched module, so both are part of its identity.
 typedef std::pair<VkShaderModule, uint32_t> FragKey;
 static std::map<FragKey, VkShaderModule> g_fragVariant;
 static uint64_t g_fragVariants = 0, g_fragPatchFail = 0;
@@ -4529,10 +4519,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
 
     if ((frames % 120) == 0) {
         trace("FRAME %llu  shareframe=%llu valid=%d  cam=(%.1f %.1f %.1f) moved=%.2fm "
-              "revZ=%d near=%.4f objs=%d react=%d reset=%d passes=%u depth=%s",
+              "revZ=%d near=%.4f objs=%d reset=%d passes=%u depth=%s",
               (unsigned long long)frames, (unsigned long long)snap.frame,
               have ? 1 : 0, snap.camX, snap.camY, snap.camZ, snap.camDelta,
-              snap.reverseZ, snap.nearClip, snap.objectCount, snap.reactiveCount,
+              snap.reverseZ, snap.nearClip, snap.objectCount,
               snap.historyReset, g_passesThisFrame,
               g_sceneDepth != VK_NULL_HANDLE ? "found" : "MISSING");
 
@@ -5632,7 +5622,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
                 // chased as one, while the location census says 16..31 are
                 // entirely free and 30/31 was never contended at all.
                 r = spvinj::injectFragment(ci->pCode, ci->codeSize, patched,
-                                           spvinj::mvAttachmentIndex(), 0.0f);
+                                           spvinj::mvAttachmentIndex());
                 isFrag = true;
             }
 
@@ -6126,17 +6116,13 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
     return out;
 }
 
-// `reactive` is baked into the patched module, so it is part of the cache
-// identity: the same fragment shader used by an opaque pipeline and by an
-// additive one needs two variants. It is quantised into the key because it
-// arrives as a float from a fixed set of four values, and a float is a poor
-// thing to compare for equality in a map key.
+// Cached per (module, attachment index). X-Plane builds ~16000 pipelines from
+// ~1500 modules, so without the cache this would re-patch and re-create the
+// same module thousands of times.
 static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
-                                      uint32_t attachmentIndex, float reactive)
+                                      uint32_t attachmentIndex)
 {
-    uint32_t q = (uint32_t)(reactive * 255.0f + 0.5f);
-    if (q > 255) q = 255;
-    FragKey key(orig, (attachmentIndex << 8) | q);
+    FragKey key(orig, attachmentIndex);
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<FragKey, VkShaderModule>::iterator it = g_fragVariant.find(key);
@@ -6154,7 +6140,7 @@ static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
 
     std::vector<uint32_t> patched;
     spvinj::Result fr = spvinj::injectFragment(src.data(), src.size() * 4, patched,
-                                               attachmentIndex, reactive);
+                                               attachmentIndex);
     if (fr != spvinj::INJ_OK) {
         std::lock_guard<std::mutex> g(g_lock);
         g_fragVariant[key] = VK_NULL_HANDLE;   // remember the refusal too
@@ -6287,60 +6273,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             rinfo[i].colorAttachmentCount    = (uint32_t)fmts[i].size();
             rinfo[i].pColorAttachmentFormats = fmts[i].data();
 
-            // ---- REACTIVE CLASSIFICATION, from the blend state we are already
-            // holding. Done BEFORE the shader patch below, because the value is
-            // baked into the patched module rather than pushed at draw time.
-            //
-            // A temporal upscaler's worst case is content that does not obey
-            // motion vectors: smoke, cloud, glass, particles, sprites. Their
-            // pixels move in ways no reprojection predicts, so history is wrong
-            // there and blending it in produces smear. FSR2 and DLSS both take a
-            // mask saying "distrust history at these pixels" - and we have never
-            // supplied one. FSR2's `reactive` input has been null every frame.
-            //
-            // The depth field does compute something called reactive, but from
-            // DISTANCE ellipses around the cockpit. That cannot tell a cloud
-            // from a wall; it only knows how far away a thing is.
-            //
-            // Blend state can. A draw that alpha-blends or adds is, almost by
-            // definition, the transparent content this mask exists for, and the
-            // pipeline declares it right here at creation. This is the cheapest
-            // accurate signal available and it costs one struct read.
-            //
-            //   blendEnable off        -> opaque geometry, history is reliable
-            //   SRC_ALPHA/1-SRC_ALPHA  -> ordinary transparency: glass, decals
-            //   additive (dst = ONE)   -> particles, lights, volumetrics, the
-            //                             worst offenders, so the strongest mask
-            const VkPipelineColorBlendStateCreateInfo *sb = ci[i].pColorBlendState;
-
-            float reactive = 0.0f;
-            if (sb && sb->attachmentCount > 0 && sb->pAttachments &&
-                sb->pAttachments[0].blendEnable) {
-                VkBlendFactor d = sb->pAttachments[0].dstColorBlendFactor;
-                if (d == VK_BLEND_FACTOR_ONE)                       reactive = 0.9f;
-                else if (d == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)  reactive = 0.5f;
-                else                                                reactive = 0.4f;
-            }
-
-            // Counted by class so the value of doing this stays measurable. The
-            // first run answered the question it was added for: opaque 26%,
-            // alpha 51%, additive 23% - three quarters of an X-Plane frame's
-            // pipelines blend, which is why this mask is worth the bandwidth.
-            {
-                static uint64_t nOpaque = 0, nAlpha = 0, nAdd = 0, nOther = 0;
-                if (reactive == 0.0f)      ++nOpaque;
-                else if (reactive == 0.9f) ++nAdd;
-                else if (reactive == 0.5f) ++nAlpha;
-                else                       ++nOther;
-                uint64_t tot = nOpaque + nAlpha + nAdd + nOther;
-                if (tot == 200 || tot == 1000 || tot % 5000 == 0)
-                    trace("REACTIVE: pipelines by blend class - opaque %llu (%.0f%%), "
-                          "alpha %llu (%.0f%%), additive %llu (%.0f%%), other %llu",
-                          (unsigned long long)nOpaque, 100.0 * nOpaque / tot,
-                          (unsigned long long)nAlpha,  100.0 * nAlpha  / tot,
-                          (unsigned long long)nAdd,    100.0 * nAdd    / tot,
-                          (unsigned long long)nOther);
-            }
 
             // ---- WHY DEPTH STATE IS ONLY MEASURED HERE, NOT ACTED ON.
             //
@@ -6348,8 +6280,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // draw covering a pixel wins outright. That is right for geometry -
             // the frontmost surface owns the pixel's motion - but it means a
             // single full-screen composite could stamp its own vectors over the
-            // whole frame, and the reactive mask reading 100% at a uniform 0.5
-            // looked exactly like that happening.
             //
             // Acting on that reading was wrong, twice over, and both mistakes
             // are worth leaving written down:
@@ -6385,51 +6315,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 // AND THE SAME QUESTION ASKED OF BLEND STATE, which is the far
                 // more important one.
                 //
-                // The reactive mask classifies every pipeline by reading
-                // pColorBlendState->pAttachments[0]. If X-Plane sets blend
-                // dynamically the way it sets depth test dynamically, that read
-                // is meaningless too and the entire mask is built on whatever
-                // happens to be in an ignored struct. The depth-test result
-                // makes that a live possibility rather than a paranoid one, and
-                // it is cheap to settle.
-                bool dynBlend = false;
-                if (ci[i].pDynamicState && ci[i].pDynamicState->pDynamicStates) {
-                    for (uint32_t d = 0; d < ci[i].pDynamicState->dynamicStateCount; ++d) {
-                        VkDynamicState s = ci[i].pDynamicState->pDynamicStates[d];
-                        if (s == VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT ||
-                            s == VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT) { dynBlend = true; break; }
-                    }
-                }
 
-                static uint64_t nNull = 0, nDyn = 0, nOff = 0, nOn = 0, nDynBlend = 0;
+                static uint64_t nNull = 0, nDyn = 0, nOff = 0, nOn = 0;
                 if (!ds)                          ++nNull;
                 else if (dynDepth)                ++nDyn;
                 else if (!ds->depthTestEnable)    ++nOff;
                 else                              ++nOn;
-                if (dynBlend) ++nDynBlend;
                 uint64_t tot = nNull + nDyn + nOff + nOn;
                 if (tot == 1000 || tot % 5000 == 0)
                     trace("MV DEPTH STATE: no-ds %llu, dynamic %llu, static-off %llu, "
-                          "static-on %llu (of %llu) | BLEND dynamic %llu - if that "
-                          "last number is not 0 the reactive classification is "
-                          "reading a struct the driver ignores",
+                          "static-on %llu (of %llu)",
                           (unsigned long long)nNull, (unsigned long long)nDyn,
                           (unsigned long long)nOff,  (unsigned long long)nOn,
-                          (unsigned long long)tot,   (unsigned long long)nDynBlend);
+                          (unsigned long long)tot);
             }
 
             // PATCH THE FRAGMENT SHADER HERE, now that the attachment index and
-            // the reactive value are both known. Cached per (module, index,
-            // reactive) - X-Plane builds ~16000 pipelines from ~1500 modules, so
-            // without the cache this would re-patch and re-create the same
-            // module thousands of times.
             bool fragPatched = false;
             stages[i].assign(ci[i].pStages, ci[i].pStages + ci[i].stageCount);
             bool vertPatched = false;
             for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
                 if (ci[i].pStages[s].stage & VK_SHADER_STAGE_FRAGMENT_BIT) {
                     VkShaderModule use = mvPatchFragment(
-                        device, ci[i].pStages[s].module, mvIndex, reactive);
+                        device, ci[i].pStages[s].module, mvIndex);
                     if (use != VK_NULL_HANDLE) {
                         stages[i][s].module = use;
                         fragPatched = true;
@@ -6491,19 +6399,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 stages[i].clear();
             }
 
+            // Non-null: the loop skipped this pipeline otherwise.
+            const VkPipelineColorBlendStateCreateInfo *sb = ci[i].pColorBlendState;
             blendAtt[i].assign(sb->pAttachments,
                                sb->pAttachments + sb->attachmentCount);
-                        VkPipelineColorBlendAttachmentState mvBlend;
+
+            VkPipelineColorBlendAttachmentState mvBlend;
             memset(&mvBlend, 0, sizeof(mvBlend));
             mvBlend.blendEnable    = VK_FALSE;   // a velocity is replaced, never blended
-            // B carries the reactive mask alongside RG's velocity. Leaving it
-            // out of the write mask - as the first version did, when the target
-            // was RG only - would let the shader compute the value and the
-            // blend stage silently drop it, which looks exactly like a mask of
-            // zeros.
+            // R and G only. The target is two channels, so enabling B would
+            // name a component the attachment does not have.
             mvBlend.colorWriteMask = fragPatched
-                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                   VK_COLOR_COMPONENT_B_BIT) : 0;
+                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT) : 0;
             blendAtt[i].push_back(mvBlend);
 
             blends[i] = *sb;

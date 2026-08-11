@@ -1343,13 +1343,10 @@ static float g_lodBias      = -0.5f;
 static float g_renderScale  = 1.0f;
 static int   g_jitterPhases = 8;
 static bool  g_objectsOn    = true;
-static bool  g_reactiveOn   = true;
 static float g_trafficRadius = 35.0f;
 static int   g_jitterIndex   = 0;
 // 2.5 m covers the panel and glareshield of an airliner without reaching the
 // windscreen pillars or anything outside.
-static float g_cockpitDist     = 2.5f;
-static float g_cockpitStrength = 0.85f;
 
 // ---- backend selection, live-adjustable.
 // Default OFF, so nothing touches the image until it is asked for.
@@ -1398,14 +1395,13 @@ static int   g_enabled     = 1;
 //   taaimpl/sharpness          float  0..1
 //   taaimpl/optical_flow       int    0/1 use NV optical flow if available
 //   taaimpl/lod_bias           float  texture mip bias
-//   taaimpl/cockpit_reactive   float  metres; 0 disables the panel ramp
 //   taaimpl/render_scale       float  READ-ONLY, derived from quality
 //   taaimpl/upscaler_available int[5] READ-ONLY availability per backend
 //   taaimpl/layer_attached     int    READ-ONLY
 
 static XPLMDataRef g_myEnabled = nullptr, g_myUpscaler = nullptr, g_myQuality = nullptr;
 static XPLMDataRef g_mySharp = nullptr, g_myOptFlow = nullptr, g_myLodBias = nullptr;
-static XPLMDataRef g_myCockpit = nullptr, g_myScale = nullptr;
+static XPLMDataRef g_myScale = nullptr;
 static XPLMDataRef g_myAvail = nullptr, g_myAttached = nullptr;
 static XPLMDataRef g_myVramTotal = nullptr, g_myVramBudget = nullptr,
                    g_myVramUsed  = nullptr;
@@ -1447,8 +1443,6 @@ static void setOptFlow(void*, int v)
 }
 static float getLodBias(void*)          { return g_lodBias; }
 static void  setLodBias(void*, float v) { g_lodBias = v < -3.0f ? -3.0f : (v > 1.0f ? 1.0f : v); }
-static float getCockpit(void*)          { return g_cockpitDist; }
-static void  setCockpit(void*, float v) { g_cockpitDist = v < 0 ? 0 : v; }
 static float getScale(void*)            { return taaQualityScale(g_quality); }
 
 // VRAM, as the DRIVER reports it - not as X-Plane's pager estimates it. The two
@@ -1528,8 +1522,6 @@ static void registerDatarefs()
                      0,0, getSharp, setSharp, 0,0,0,0,0,0,0,0, nullptr, nullptr);
     g_myLodBias  = XPLMRegisterDataAccessor("taaimpl/lod_bias", xplmType_Float, 1,
                      0,0, getLodBias, setLodBias, 0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myCockpit  = XPLMRegisterDataAccessor("taaimpl/cockpit_reactive", xplmType_Float, 1,
-                     0,0, getCockpit, setCockpit, 0,0,0,0,0,0,0,0, nullptr, nullptr);
     g_myScale    = XPLMRegisterDataAccessor("taaimpl/render_scale", xplmType_Float, 0,
                      0,0, getScale, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
 
@@ -1577,7 +1569,7 @@ static void registerDatarefs()
 static void unregisterDatarefs()
 {
     XPLMDataRef refs[] = { g_myEnabled, g_myUpscaler, g_myQuality, g_mySharp,
-                           g_myOptFlow, g_myLodBias, g_myCockpit, g_myScale,
+                           g_myOptFlow, g_myLodBias, g_myScale,
                            g_myAvail, g_myAttached };
     for (size_t i = 0; i < sizeof(refs)/sizeof(refs[0]); ++i)
         if (refs[i]) XPLMUnregisterDataAccessor(refs[i]);
@@ -1712,12 +1704,9 @@ static void pumpControl()
     if (m & TAA_CTL_ENABLED)   g_enabled   = g_ctl->enabled ? 1 : 0;
     if (m & TAA_CTL_SHARPNESS) g_sharpness = g_ctl->sharpness;
     if (m & TAA_CTL_LOD_BIAS)  g_lodBias   = g_ctl->lodBias;
-    if (m & TAA_CTL_COCKPIT)   g_cockpitDist = g_ctl->cockpitReactiveDist;
     if (m & TAA_CTL_OPT_FLOW)  g_opticalFlow = g_ctl->optFlow ? 1 : 0;
     if (m & TAA_CTL_OBJECTS)   g_objectsOn   = (g_ctl->movingObjects != 0);
-    if (m & TAA_CTL_REACTIVE)  g_reactiveOn  = (g_ctl->reactiveDiscs != 0);
     if (m & TAA_CTL_TRAFFIC)   g_trafficRadius   = g_ctl->trafficRadius;
-    if (m & TAA_CTL_COCKPIT_S) g_cockpitStrength = g_ctl->cockpitStrength;
     if (m & TAA_CTL_JITTER) {
         int p = g_ctl->jitterPhases;
         // Clamped here as well as in the panel. The panel is one writer of this
@@ -2014,70 +2003,6 @@ static void updateMovingObjects(TaaShare *s, double dt)
     }
 }
 
-// ------------------------------------------------------- reactive discs
-//
-// Prop and rotor discs, stamped as screen-space ellipses. Deliberately NOT
-// given motion vectors - see the long note in share.h for why a spinning prop
-// is unresolvable by TAA on principle, and why aliasing is the better failure.
-static void updateReactive(TaaShare *s)
-{
-    s->reactiveCount = 0;
-    if (!g_reactiveOn || !g_drNumEngines || !g_drOwnX) return;
-
-    int nEng = XPLMGetDatai(g_drNumEngines);
-    if (nEng <= 0) return;
-    if (nEng > 8) nEng = 8;
-
-    float rpm[8] = {0};
-    if (g_drPropRpm) XPLMGetDatavf(g_drPropRpm, rpm, 0, nEng);
-
-    float ownX = (float)XPLMGetDatad(g_drOwnX);
-    float ownY = (float)XPLMGetDatad(g_drOwnY);
-    float ownZ = (float)XPLMGetDatad(g_drOwnZ);
-
-    for (int e = 0; e < nEng && s->reactiveCount < TAA_MAX_REACTIVE; ++e)
-    {
-        // Gate on RPM and ramp in, rather than stamping unconditionally. A
-        // shut-down or feathered prop is static geometry and deserves full TAA;
-        // stamping it anyway would leave a permanently aliased patch, and
-        // switching hard at some threshold would pop on start-up.
-        //
-        // Below 200 rpm the blades are individually resolvable and TAA handles
-        // them fine. By 800 rpm the disc is a blur and history is useless.
-        float r = rpm[e];
-        if (r < 200.0f) continue;
-        float strength = (r - 200.0f) / 600.0f;
-        if (strength > 1.0f) strength = 1.0f;
-
-        // Without per-engine geometry datarefs the disc is placed at the
-        // aircraft origin. That is right for a single-engine nose prop and for
-        // a helicopter rotor seen from outside, and wrong for wing-mounted
-        // engines - which is why the radius is generous and the edge feathered.
-        // Refining this needs the per-engine offsets from the acf, which are
-        // not exposed as datarefs; a later pass can read them from the model.
-        float u, v, w;
-        if (!taaProjectToUv(s->currViewProj, ownX, ownY, ownZ, &u, &v, &w)) continue;
-        if (u < -0.5f || u > 1.5f || v < -0.5f || v > 1.5f) continue;
-
-        // Angular size of a ~2 m disc radius at this distance. w is the
-        // view-space depth, so the projected radius scales as 1/w.
-        float discR = 2.0f;
-        float rxNdc = (discR * s->proj[0]) / w;    // proj[0] = 1/(tan(fov/2)*aspect)
-        float ryNdc = (discR * s->proj[5]) / w;
-        float rx = fabsf(rxNdc) * 0.5f;
-        float ry = fabsf(ryNdc) * 0.5f;
-        if (rx < 0.002f || rx > 1.5f) continue;    // off-screen or vanishingly small
-
-        TaaReactiveEllipse &el = s->reactive[s->reactiveCount++];
-        el.cx = u; el.cy = v;
-        el.rx = rx; el.ry = ry;
-        el.strength = strength;
-        // Feather over roughly 6 px so the transition to full TAA on the
-        // surrounding scenery is not a visible seam.
-        el.feather = 6.0f / (float)(s->viewportW > 0 ? s->viewportW : 2560);
-        el.pad0 = el.pad1 = 0.0f;
-    }
-}
 
 // Every frame. A handful of dataref reads, one 4x4 inverse and two multiplies -
 // nowhere near a measurable cost, and deliberately kept that way. Nothing in
@@ -2315,7 +2240,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
         s->historyReset = 1;
         s->resetReason  = TAA_RESET_STARTUP;
         s->objectCount   = 0;
-        s->reactiveCount = 0;
 
         // Drop the caches so re-entering a flight starts clean rather than
         // differencing against wherever the menu camera happened to sit.
@@ -2552,7 +2476,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // These matrices are UNJITTERED and must stay that way - see the jitter rule
     // in share.h. Jitter is applied later, by the layer, at the viewport.
     // World-space form. Semantically correct, and used ONLY for the CPU-side
-    // projection of reactive discs and the semantic self-check - never inverted.
+    // projection for the semantic self-check - never inverted.
     float currVP[16], prevVP[16];
     taaMul(currVP, s->proj,     s->world);
     taaMul(prevVP, s->prevProj, s->prevWorld);
@@ -3238,11 +3162,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
 
     // Only meaningful from inside the cockpit. In an external view the near
     // field is the airframe, which is ordinary rigid geometry that reprojects
-    // correctly and deserves full TAA - stamping it reactive there would just
-    // throw away anti-aliasing on the fuselage for nothing.
     bool cockpitView = (s->viewType == 1026);
-    s->cockpitReactiveDist     = cockpitView ? g_cockpitDist : 0.0f;
-    s->cockpitReactiveStrength = g_cockpitStrength;
 
     // Backend selection, republished every frame so changes from the window or
     // from a script take effect on the next one.
@@ -3253,7 +3173,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
     s->renderScale       = taaQualityScale(g_quality);
 
     updateMovingObjects(s, dt);
-    updateReactive(s);
 
     g_prevFov      = s->fovDeg;
     g_prevViewType = s->viewType;
@@ -3394,12 +3313,12 @@ static float matrixCallback(float sinceLast, float, int, void *)
 
     if (reason != TAA_RESET_NONE) ++g_resetCounts[reason];
 
-    // Object and reactive counts change slowly; sampling is enough and keeps
+    // Object counts change slowly; sampling is enough and keeps
     // the log readable during a long flight.
     if (g_flightFrames % 600 == 0) {
-        xlog("flight frame %llu: %d moving objects, %d reactive discs, "
+        xlog("flight frame %llu: %d moving objects, "
              "cam=(%.0f %.0f %.0f) moved=%.2fm jitter=(%.3f %.3f)",
-             (unsigned long long)g_flightFrames, s->objectCount, s->reactiveCount,
+             (unsigned long long)g_flightFrames, s->objectCount,
              s->camX, s->camY, s->camZ, s->camDelta, s->jitterX, s->jitterY);
 
         // ---- FULL STATE DUMP.
@@ -3490,54 +3409,41 @@ static XPLMCursorStatus winCursor(XPLMWindowID, int, int, void*) { return xplm_C
 
 
 // Commands, so this can be bound to a key or a hardware button.
-static XPLMCommandRef g_cmdToggle = nullptr, g_cmdCycle = nullptr, g_cmdQuality = nullptr;
 static XPLMCommandRef g_cmdSelfTest = nullptr;
+
+static void requestSelfTest(const char *why)
+{
+    g_stRequested = true;
+    g_stPhase     = TAA_ST_OFF;
+    XPLMSpeakString("Motion vector self test starting");
+    xlog("self-test: requested by %s", why);
+}
 
 static int cmdSelfTest(XPLMCommandRef, XPLMCommandPhase ph, void*)
 {
-    if (ph == xplm_CommandBegin) {
-        g_stRequested = true;
-        g_stPhase     = TAA_ST_OFF;
-        XPLMSpeakString("T A A self test starting");
-        xlog("self-test: requested by command");
-    }
+    if (ph == xplm_CommandBegin) requestSelfTest("command");
     return 0;
 }
-
-static int cmdToggle(XPLMCommandRef, XPLMCommandPhase ph, void*)
-{
-    (void)ph;
-    return 0;
-}
-
-
 
 static void menuHandler(void*, void *item)
 {
-    switch ((intptr_t)item) {
-    }
+    if ((intptr_t)item == 0) requestSelfTest("menu");
 }
 
 static void createMenu()
 {
-    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "TAA / Upscaler", nullptr, 0);
-    g_menu = XPLMCreateMenu("TAA / Upscaler", XPLMFindPluginsMenu(), idx, menuHandler, nullptr);
-    XPLMAppendMenuItem(g_menu, "Settings...",    (void*)0, 0);
-    XPLMAppendMenuItem(g_menu, "Cycle upscaler", (void*)1, 0);
-    XPLMAppendMenuItem(g_menu, "Cycle quality",  (void*)2, 0);
+    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Motion Vectors", nullptr, 0);
+    g_menu = XPLMCreateMenu("Motion Vectors", XPLMFindPluginsMenu(), idx, menuHandler, nullptr);
+    XPLMAppendMenuItem(g_menu, "Run the velocity self-test", (void*)0, 0);
     g_menuItem = idx;
 
     // Say so, because "the menu is not there" and "the menu is there and I did
     // not find it" look identical from the outside and need different answers.
-    xlog("menu: Plugins > TAA / Upscaler > Settings... created (item %d). "
-         "Commands taaimpl/toggle_window, cycle_upscaler, cycle_quality are "
-         "bindable if you would rather have a key.", idx);
+    xlog("menu: Plugins > Motion Vectors created (item %d). The command "
+         "motionvectors/self_test is bindable if you would rather have a key.", idx);
 
-    g_cmdToggle  = XPLMCreateCommand("taaimpl/toggle_window",  "TAA: show/hide settings");
-    XPLMRegisterCommandHandler(g_cmdToggle,  cmdToggle,  1, nullptr);
-
-    g_cmdSelfTest = XPLMCreateCommand("taaimpl/self_test",
-                                      "TAA: run the scripted velocity self-test");
+    g_cmdSelfTest = XPLMCreateCommand("motionvectors/self_test",
+                                      "Motion Vectors: run the scripted velocity self-test");
     XPLMRegisterCommandHandler(g_cmdSelfTest, cmdSelfTest, 1, nullptr);
 
     // Auto-start, so a validation run needs no interaction at all: launch,
@@ -3574,10 +3480,7 @@ static void loadConfig(const std::string &path)
         else if (!strcmp(key, "render_scale"))   g_renderScale  = (float)val;
         else if (!strcmp(key, "jitter_phases"))  g_jitterPhases = (int)val;
         else if (!strcmp(key, "moving_objects")) g_objectsOn    = (val != 0);
-        else if (!strcmp(key, "reactive_discs")) g_reactiveOn   = (val != 0);
         else if (!strcmp(key, "traffic_radius")) g_trafficRadius= (float)val;
-        else if (!strcmp(key, "cockpit_reactive_dist"))     g_cockpitDist     = (float)val;
-        else if (!strcmp(key, "cockpit_reactive_strength")) g_cockpitStrength = (float)val;
         // The upscaler selection, which this file claimed to carry and did not.
         //
         // The default stays Off, deliberately - something that changes what the
@@ -3603,8 +3506,8 @@ static void loadConfig(const std::string &path)
     if (g_lodBias < -3.0f)    g_lodBias = -3.0f;
     if (g_lodBias >  1.0f)    g_lodBias =  1.0f;
 
-    xlog("config: lodBias=%.2f renderScale=%.2f jitterPhases=%d objects=%d reactive=%d",
-         g_lodBias, g_renderScale, g_jitterPhases, g_objectsOn ? 1 : 0, g_reactiveOn ? 1 : 0);
+    xlog("config: lodBias=%.2f renderScale=%.2f jitterPhases=%d objects=%d",
+         g_lodBias, g_renderScale, g_jitterPhases, g_objectsOn ? 1 : 0);
 }
 
 PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
@@ -3678,7 +3581,6 @@ PLUGIN_API void XPluginDisable(void)
     XPLMUnregisterDrawCallback(autoStartDrawCb, xplm_Phase_Window, 0, nullptr);
 
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
-    if (g_cmdToggle)  XPLMUnregisterCommandHandler(g_cmdToggle,  cmdToggle,  1, nullptr);
     unregisterDatarefs();
 
     // Mark the block invalid before tearing it down. The layer may still be
