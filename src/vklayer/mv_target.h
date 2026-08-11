@@ -53,7 +53,15 @@ struct MvTarget {
     void          *readbackPtr = nullptr;
     VkDeviceSize   readbackSize = 0;
     bool           wantDump = false;    // set by the interval; cleared on record
-    bool           dumpPending = false; // copy recorded, data readable next frame
+    // COUNTDOWN, not a flag. The copy is recorded during the frame; the read
+    // happens in QueuePresentKHR - and the present that ENDS the recording
+    // frame arrives before the GPU has necessarily executed the copy. Reading
+    // there returns whatever the buffer held before, which is the PREVIOUS
+    // dump, twenty frames stale. That is not a visible failure: it is a
+    // plausible velocity field belonging to a different camera pose, and it
+    // reads as the vectors being wrong by a wandering factor. Counting two
+    // presents puts a full frame boundary between the copy and the read.
+    int            dumpPending = 0;
 
     // WHAT THE SHADER WAS HANDED FOR *THIS* COPY.
     //
@@ -276,7 +284,7 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                           0, nullptr, 0, nullptr, 1, &b);
 
-    m.dumpPending = true;
+    m.dumpPending = 2;
 }
 
 // Measure it. Deliberately the SAME statistics the depth-derived dump prints,
@@ -285,7 +293,7 @@ static void mvReport(double camMoved)
 {
     MvTarget &m = g_mv;
     if (!m.dumpPending || !m.readbackPtr) return;
-    m.dumpPending = false;
+    if (--m.dumpPending > 0) return;
 
     // Taken from the record, not from now. See dumpReproj.
     const float *reproj       = m.dumpReproj;

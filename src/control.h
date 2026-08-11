@@ -90,17 +90,11 @@ struct TaaControl {
     uint32_t pad1;
 
     int32_t  enabled;
-    int32_t  upscaler;
-    int32_t  quality;
-    int32_t  optFlow;
-    float    sharpness;
     float    lodBias;
-    float    pad2;
 
     int32_t  jitterPhases;
     int32_t  movingObjects;
     float    trafficRadius;
-    float    cockpitStrength;
 
     // X-PLANE'S OWN SUB-NATIVE RENDERING.
     //
