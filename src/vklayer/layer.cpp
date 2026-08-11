@@ -4453,32 +4453,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             g_share->gpuName[sizeof(g_share->gpuName) - 1] = 0;
         }
 
-        g_share->availability[TAA_UPSCALER_OFF] = TAA_AVAIL_OK;
-        g_share->availability[TAA_UPSCALER_TAA] = TAA_AVAIL_OK;
-#ifdef TAA_HAVE_FSR2
-        g_share->availability[TAA_UPSCALER_FSR2] = TAA_AVAIL_OK;
-#else
-        g_share->availability[TAA_UPSCALER_FSR2] = TAA_AVAIL_NO_SUPPORT;
-#endif
-        // Not integrated yet. NO_SUPPORT rather than NO_LIBRARY: the SDKs are
-        // present on disk, so telling someone to install a runtime would send
-        // them after a file they already have.
-        g_share->availability[TAA_UPSCALER_FSR4] = TAA_AVAIL_NO_SUPPORT;
-
-        // DLSS IS INTEGRATED NOW - dlss_sr.h - so this must not claim
-        // otherwise. It used to say NO_SUPPORT here, "not implemented yet",
-        // and that answer arrived long before NGX could give a real one: the
-        // capability query runs on a worker thread precisely so a stalled NGX
-        // cannot hang the sim, so it is seconds behind this point.
-        //
-        // The plugin reads availability to decide whether taa.ini's request is
-        // usable, and it gave up with "asked for upscaler DLSS but it is not
-        // usable: not implemented yet" - refusing a backend that was in the
-        // build, over a line that had simply gone stale.
-        //
-        // NO_LIBRARY means "no answer yet" here and is corrected the moment the
-        // NGX thread reports, one way or the other.
-        g_share->availability[TAA_UPSCALER_DLSS] = TAA_AVAIL_NO_LIBRARY;
 
         MemoryBarrier();
         trace("SHARE: reported attach + availability (gpu=%s)", g_share->gpuName);
@@ -4954,6 +4928,40 @@ TAA_GetDeviceProcAddr(VkDevice device, const char *name);
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
     const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *alloc, VkInstance *out)
 {
+    // ---- ONLY X-PLANE. THIS IS AN IMPLICIT LAYER.
+    //
+    // Shipped through the loader's ImplicitLayers key, this is offered to every
+    // Vulkan application on the machine, not just the sim. Nothing here is
+    // useful to anything else and the shader patching would be actively
+    // unwelcome, so any other process gets a straight pass-through: chain to
+    // the next layer and touch nothing.
+    //
+    // Checked by executable name rather than by a window or a dataref, because
+    // this runs before either exists.
+    {
+        static int forUs = -1;
+        if (forUs < 0) {
+            char exe[MAX_PATH] = {0};
+            GetModuleFileNameA(nullptr, exe, sizeof(exe) - 1);
+            const char *base = strrchr(exe, 0x5C);   // 0x5C is a backslash: written
+            // as a code rather than a char literal so no layer of escaping can eat it
+            base = base ? base + 1 : exe;
+            forUs = (_stricmp(base, "X-Plane.exe") == 0) ? 1 : 0;
+            if (!forUs)
+                trace("not X-Plane (%s) - passing through untouched", base);
+        }
+        if (!forUs) {
+            VkLayerInstanceCreateInfo *lnk = findInstanceLink(ci);
+            if (!lnk || !lnk->u.pLayerInfo) return VK_ERROR_INITIALIZATION_FAILED;
+            PFN_vkGetInstanceProcAddr gipa =
+                lnk->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+            lnk->u.pLayerInfo = lnk->u.pLayerInfo->pNext;
+            PFN_vkCreateInstance nextCI =
+                (PFN_vkCreateInstance)gipa(VK_NULL_HANDLE, "vkCreateInstance");
+            return nextCI ? nextCI(ci, alloc, out) : VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
+
     trace("=== TAA layer CreateInstance ===");
 
     // Read here rather than in armLayerOnce: the instance is created long before

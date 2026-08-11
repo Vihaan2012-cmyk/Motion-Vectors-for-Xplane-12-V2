@@ -1501,73 +1501,11 @@ static int   getReverseZMat(void*)  { return g_share ? g_share->reverseZFromMatr
 // Selecting a backend the hardware or the runtime cannot provide is refused
 // here rather than deferred to a vendor SDK, so the caller finds out
 // immediately and in the log - whether the caller is our window or a script.
-static bool backendUsable(int u, const char **why)
-{
-    if (u < 0 || u >= TAA_UPSCALER_COUNT) { if (why) *why = "out of range"; return false; }
-    if (u == TAA_UPSCALER_OFF || u == TAA_UPSCALER_TAA) return true;
-    if (!g_share || !g_share->layerAttached) { if (why) *why = "Vulkan layer not attached"; return false; }
-    int a = g_share->availability[u];
-    if (a == TAA_AVAIL_OK) return true;
-    if (why) *why = taaAvailabilityText(a);
-    return false;
-}
 
-static void setUpscaler(void*, int v)
-{
-    const char *why = "";
-    if (!backendUsable(v, &why)) {
-        xlog("upscaler %s refused: %s", taaUpscalerName(v), why);
-        return;
-    }
-    if (g_upscaler != v) {
-        g_upscaler = v;
-        xlog("upscaler -> %s", taaUpscalerName(v));
-    }
-}
 
 // Defined further down, next to the other X-Plane private controls. Declared
 // here because the quality setter is what drives it now.
-static void applyXpFsr(int quality, int bypass);
 
-static void setQuality(void*, int v)
-{
-    if (v < 0) v = 0;
-    if (v >= TAA_QUALITY_COUNT) v = TAA_QUALITY_COUNT - 1;
-
-    // TAA has no upscaler, so it only has a native mode. Silently running it at
-    // a quality preset would render at reduced resolution and never upscale -
-    // a blurry image with no explanation.
-    if (g_upscaler == TAA_UPSCALER_TAA && v != TAA_QUALITY_NATIVE) {
-        xlog("quality %s ignored: TAA is native-resolution only", taaQualityName(v));
-        return;
-    }
-    if (g_quality != v) {
-        g_quality = v;
-        xlog("quality -> %s (%.2fx)", taaQualityName(v), taaQualityScale(v));
-
-        // ---- THE QUALITY CONTROL NOW DRIVES THE RENDER SIZE. IT DID NOT BEFORE.
-        //
-        // X-Plane decides what resolution it renders the 3D scene at; the layer
-        // only ever sees the result. So this setting used to be a label - the
-        // panel read "Quality: Balanced (1.70x)" while the layer reported
-        // "render 3840x2160 -> display 3840x2160" and FSR2 upscaled by exactly
-        // nothing.
-        //
-        // The only thing that makes X-Plane draw smaller is its OWN FSR, and
-        // its controls are right here: fsr/enable, fsr/quality, fsr/bypass.
-        // Setting quality makes it render sub-native; setting BYPASS makes it
-        // skip its own upscale pass afterwards. That combination is the whole
-        // takeover - X-Plane draws small and does not upscale, and our FSR2
-        // takes it from there to display resolution.
-        //
-        // Native maps to -1, which turns its FSR off entirely and returns the
-        // sim to full-resolution rendering with our pass running 1:1.
-        //
-        // TAA_XP_FSR still overrides at startup for testing; this is what the
-        // control in the panel does from now on.
-        applyXpFsr(v == TAA_QUALITY_NATIVE ? -1 : (v - 1), 1 /*bypass*/);
-    }
-}
 
 static int getAvail(void*, int *out, int off, int n)
 {
@@ -1584,10 +1522,6 @@ static void registerDatarefs()
 {
     g_myEnabled  = XPLMRegisterDataAccessor("taaimpl/enabled", xplmType_Int, 1,
                      getEnabled, setEnabled, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myUpscaler = XPLMRegisterDataAccessor("taaimpl/upscaler", xplmType_Int, 1,
-                     getUpscaler, setUpscaler, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myQuality  = XPLMRegisterDataAccessor("taaimpl/quality", xplmType_Int, 1,
-                     getQuality, setQuality, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
     g_myOptFlow  = XPLMRegisterDataAccessor("taaimpl/optical_flow", xplmType_Int, 1,
                      getOptFlow, setOptFlow, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
     g_myAttached = XPLMRegisterDataAccessor("taaimpl/layer_attached", xplmType_Int, 0,
@@ -1752,34 +1686,6 @@ static void openControl()
 // All four controls are floats even though three of them are flags - that is
 // how X-Plane's art controls are typed, and writing an int to one silently does
 // nothing.
-static void applyXpFsr(int quality, int bypass)
-{
-    static XPLMDataRef en = nullptr, ql = nullptr, by = nullptr;
-    static bool looked = false;
-    if (!looked) {
-        looked = true;
-        en = taaFind("sim/private/controls/fsr/enable");
-        ql = taaFind("sim/private/controls/fsr/quality");
-        by = taaFind("sim/private/controls/fsr/bypass");
-        if (!en || !ql)
-            xlog("xpfsr: controls absent - this build of X-Plane has no "
-                 "sub-native rendering, so render scale cannot be changed");
-    }
-    if (!en || !ql) return;
-
-    if (quality < 0) {
-        XPLMSetDataf(en, 0.0f);
-        xlog("xpfsr: disabled - rendering at native resolution");
-        return;
-    }
-    if (quality > 4) quality = 4;
-    XPLMSetDataf(ql, (float)quality);
-    XPLMSetDataf(en, 1.0f);
-    if (by) XPLMSetDataf(by, bypass ? 1.0f : 0.0f);
-    xlog("xpfsr: enabled at quality %d, bypass %d - watch the layer log for the "
-         "scene target size to learn what scale that actually is",
-         quality, bypass ? 1 : 0);
-}
 
 // Apply a pending request, if there is one. Called once per flight loop.
 //
@@ -1807,13 +1713,10 @@ static void pumpControl()
 
     uint32_t m = g_ctl->mask;
     if (m & TAA_CTL_ENABLED)   g_enabled   = g_ctl->enabled ? 1 : 0;
-    if (m & TAA_CTL_UPSCALER)  setUpscaler(nullptr, g_ctl->upscaler);
-    if (m & TAA_CTL_QUALITY)   setQuality(nullptr, g_ctl->quality);
     if (m & TAA_CTL_SHARPNESS) g_sharpness = g_ctl->sharpness;
     if (m & TAA_CTL_LOD_BIAS)  g_lodBias   = g_ctl->lodBias;
     if (m & TAA_CTL_COCKPIT)   g_cockpitDist = g_ctl->cockpitReactiveDist;
     if (m & TAA_CTL_OPT_FLOW)  g_opticalFlow = g_ctl->optFlow ? 1 : 0;
-    if (m & TAA_CTL_XPFSR)     applyXpFsr(g_ctl->xpFsrQuality, g_ctl->xpFsrBypass);
     if (m & TAA_CTL_OBJECTS)   g_objectsOn   = (g_ctl->movingObjects != 0);
     if (m & TAA_CTL_REACTIVE)  g_reactiveOn  = (g_ctl->reactiveDiscs != 0);
     if (m & TAA_CTL_TRAFFIC)   g_trafficRadius   = g_ctl->trafficRadius;
@@ -2489,37 +2392,8 @@ static float matrixCallback(float sinceLast, float, int, void *)
         // "disabled - rendering at native resolution" while the scene pass stays
         // 2953x1661. The log said the write happened and the layer said the size
         // had not changed, which is the pair of statements that matters.
-        static bool done = false;
-        if (!done) {
-            done = true;
-            const char *q = getenv("TAA_XP_FSR");
-            if (q) {
-                int bypass = 0;
-                if (const char *b = getenv("TAA_XP_FSR_BYPASS")) bypass = atoi(b);
-                applyXpFsr(atoi(q), bypass);
-            }
-        }
     }
 
-    if (!g_iniApplied && g_iniUpscaler >= 0 &&
-        g_share && g_share->layerAttached) {
-        const char *why = "";
-        if (backendUsable(g_iniUpscaler, &why)) {
-            g_iniApplied = true;
-            if (g_iniQuality >= 0) setQuality(nullptr, g_iniQuality);
-            setUpscaler(nullptr, g_iniUpscaler);
-            xlog("config: taa.ini selected upscaler %s",
-                 taaUpscalerName(g_iniUpscaler));
-        } else if (g_flightFrames == 600) {
-            // Ten seconds in is long enough for every backend to have reported.
-            // Said once, with the reason, rather than staying quiet - a config
-            // file that does nothing and says nothing is worse than one that
-            // refuses out loud.
-            g_iniApplied = true;
-            xlog("config: taa.ini asked for upscaler %s but it is not usable: %s",
-                 taaUpscalerName(g_iniUpscaler), why);
-        }
-    }
 
     // ---- self-test phase machine.
     //
@@ -3750,21 +3624,6 @@ static void drawWindow(XPLMWindowID w, void *)
     // Every backend is listed, including ones that cannot run here, each with
     // the reason. Hiding them would leave "why is there no DLSS option?" with
     // no answer; greying them with a reason answers it in place.
-    for (int u = 0; u < TAA_UPSCALER_COUNT; ++u) {
-        const char *why = "";
-        bool ok = backendUsable(u, &why);
-        bool sel = (g_upscaler == u);
-
-        if (ok)
-            snprintf(buf, sizeof(buf), "   %s %-9s", sel ? "*" : " ", taaUpscalerName(u));
-        else
-            snprintf(buf, sizeof(buf), "   %s %-9s  - %s",
-                     sel ? "*" : " ", taaUpscalerName(u), why);
-
-        XPLMDrawString(ok ? (sel ? green : white) : grey, x, y, buf, nullptr, xplmFont_Basic);
-        g_rows[g_rowCount].y = y; g_rows[g_rowCount].kind = 100 + u; ++g_rowCount;
-        y -= 16;
-    }
     y -= 10;
 
     // Quality only means anything for a real upscaler.
@@ -3818,9 +3677,7 @@ static int handleClick(XPLMWindowID w, int mx, int my, XPLMMouseStatus st, void 
     if (bestKind < 0) return 1;
 
     if (bestKind >= 100) {
-        setUpscaler(nullptr, bestKind - 100);
     } else if (bestKind == 1) {
-        setQuality(nullptr, (g_quality + 1) % TAA_QUALITY_COUNT);
     } else if (bestKind == 2) {
         // Cycle, skipping sources this machine cannot run, so clicking never
         // lands on a dead option.
@@ -3888,29 +3745,12 @@ static int cmdToggle(XPLMCommandRef, XPLMCommandPhase ph, void*)
     return 0;
 }
 
-static int cmdCycle(XPLMCommandRef, XPLMCommandPhase ph, void*)
-{
-    if (ph != xplm_CommandBegin) return 0;
-    // Skip anything unusable so cycling never lands on a dead option.
-    for (int i = 1; i <= TAA_UPSCALER_COUNT; ++i) {
-        int cand = (g_upscaler + i) % TAA_UPSCALER_COUNT;
-        if (backendUsable(cand, nullptr)) { setUpscaler(nullptr, cand); break; }
-    }
-    return 0;
-}
 
-static int cmdQuality(XPLMCommandRef, XPLMCommandPhase ph, void*)
-{
-    if (ph == xplm_CommandBegin) setQuality(nullptr, (g_quality + 1) % TAA_QUALITY_COUNT);
-    return 0;
-}
 
 static void menuHandler(void*, void *item)
 {
     switch ((intptr_t)item) {
         case 0: toggleWindow(); break;
-        case 1: cmdCycle(nullptr, xplm_CommandBegin, nullptr); break;
-        case 2: cmdQuality(nullptr, xplm_CommandBegin, nullptr); break;
     }
 }
 
@@ -3930,11 +3770,7 @@ static void createMenu()
          "bindable if you would rather have a key.", idx);
 
     g_cmdToggle  = XPLMCreateCommand("taaimpl/toggle_window",  "TAA: show/hide settings");
-    g_cmdCycle   = XPLMCreateCommand("taaimpl/cycle_upscaler", "TAA: cycle upscaler");
-    g_cmdQuality = XPLMCreateCommand("taaimpl/cycle_quality",  "TAA: cycle quality preset");
     XPLMRegisterCommandHandler(g_cmdToggle,  cmdToggle,  1, nullptr);
-    XPLMRegisterCommandHandler(g_cmdCycle,   cmdCycle,   1, nullptr);
-    XPLMRegisterCommandHandler(g_cmdQuality, cmdQuality, 1, nullptr);
 
     g_cmdSelfTest = XPLMCreateCommand("taaimpl/self_test",
                                       "TAA: run the scripted velocity self-test");
@@ -4067,8 +3903,6 @@ PLUGIN_API void XPluginDisable(void)
     if (g_window) { XPLMDestroyWindow(g_window); g_window = nullptr; }
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
     if (g_cmdToggle)  XPLMUnregisterCommandHandler(g_cmdToggle,  cmdToggle,  1, nullptr);
-    if (g_cmdCycle)   XPLMUnregisterCommandHandler(g_cmdCycle,   cmdCycle,   1, nullptr);
-    if (g_cmdQuality) XPLMUnregisterCommandHandler(g_cmdQuality, cmdQuality, 1, nullptr);
     unregisterDatarefs();
 
     // Mark the block invalid before tearing it down. The layer may still be
