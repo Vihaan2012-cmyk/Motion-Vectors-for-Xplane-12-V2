@@ -3491,7 +3491,9 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                 std::map<void*, DeviceData>::iterator rdi =
                     g_devices.find(dispatchKey(rci->second));
                 if (rdi != g_devices.end() && g_mv.ready)
-                    mvRecordReadback(rdi->second, cb);
+                    mvRecordReadback(rdi->second, cb, g_velSnap.reproj,
+                                     g_velSnap.selfTestExpectedPx,
+                                     g_velSnap.selfTestPhase);
             }
         }
 
@@ -4783,8 +4785,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // frame would race the submission and produce numbers describing nothing.
 
     if (g_spirvLive && g_mv.ready) {
-        mvReport(snap.camDelta, snap.reproj,
-                 snap.selfTestExpectedPx, snap.selfTestPhase);
+        mvReport(snap.camDelta);
         if (dumpEvery > 0 && (frames % (uint64_t)dumpEvery) == 0)
             g_mv.wantDump = true;
     }

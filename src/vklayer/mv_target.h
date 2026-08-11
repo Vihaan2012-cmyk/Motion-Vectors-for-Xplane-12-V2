@@ -54,6 +54,19 @@ struct MvTarget {
     VkDeviceSize   readbackSize = 0;
     bool           wantDump = false;    // set by the interval; cleared on record
     bool           dumpPending = false; // copy recorded, data readable next frame
+
+    // WHAT THE SHADER WAS HANDED FOR *THIS* COPY.
+    //
+    // The copy is recorded on one frame and read on the next, so comparing it
+    // against the CURRENT snapshot compares a field to a matrix that describes
+    // a different frame. Most of the time the camera is turning steadily and
+    // the two agree; on the frame a self-test phase changes, the camera jumps,
+    // and the field then shows a rigid ~350 px while the snapshot still reads
+    // the steady 13 px - which looked exactly like the vectors being 26x wrong.
+    // Captured at record time, these always describe the frame in the buffer.
+    float          dumpReproj[16] = {0};
+    float          dumpExpectedPx = 0.0f;
+    int            dumpPhase      = 0;
 };
 
 static MvTarget g_mv;
@@ -217,11 +230,16 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
 // a half-written field and produce numbers that look like a broken shader
 // rather than a mistimed read, which is a distinction that has already cost
 // this project several rounds elsewhere.
-static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb)
+static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
+                             const float *reproj, float expectedPx, int phase)
 {
     MvTarget &m = g_mv;
     if (!m.ready || !m.readbackPtr || !m.wantDump) return;
     m.wantDump = false;
+
+    if (reproj) memcpy(m.dumpReproj, reproj, sizeof(m.dumpReproj));
+    m.dumpExpectedPx = expectedPx;
+    m.dumpPhase      = phase;
 
     VkImageMemoryBarrier b;
     memset(&b, 0, sizeof(b));
@@ -263,12 +281,16 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb)
 
 // Measure it. Deliberately the SAME statistics the depth-derived dump prints,
 // so the two fields can be compared line for line rather than by impression.
-static void mvReport(double camMoved, const float *reproj,
-                     float expectedPx, int selfTestPhase)
+static void mvReport(double camMoved)
 {
     MvTarget &m = g_mv;
     if (!m.dumpPending || !m.readbackPtr) return;
     m.dumpPending = false;
+
+    // Taken from the record, not from now. See dumpReproj.
+    const float *reproj       = m.dumpReproj;
+    const float  expectedPx   = m.dumpExpectedPx;
+    const int    selfTestPhase = m.dumpPhase;
 
     const uint16_t *px = (const uint16_t*)m.readbackPtr;
     double sum = 0.0, maxMag = 0.0;
