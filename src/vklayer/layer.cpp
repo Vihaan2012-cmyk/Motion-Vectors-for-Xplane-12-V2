@@ -2223,6 +2223,16 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
 // smeared. Stage 1 only counts passes per frame and records their attachment
 // sizes so the boundary can be identified from data rather than guessed.
 static uint32_t g_passesThisFrame = 0;
+
+// HOW MANY PASSES BIND THE VELOCITY TARGET IN ONE FRAME.
+//
+// isScene is size-plus-depth, nothing more: any full-resolution pass carrying a
+// depth attachment qualifies. X-Plane draws 28 passes a frame, and if more than
+// one of them matches, the second writes ITS camera's motion over the first's -
+// which would explain a field that is sometimes correct, sometimes uniformly
+// wrong, and sometimes a mixture, while the matrix stays constant.
+static uint32_t g_mvBindsThisFrame = 0;
+static uint32_t g_mvBindsMax       = 0;
 static uint32_t g_passSizes[32][2];
 static uint32_t g_passHasDepth[32];
 static uint32_t g_passColorCount[32];
@@ -2802,6 +2812,16 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
     bool hasDepth = info->pDepthAttachment &&
                     info->pDepthAttachment->imageView != VK_NULL_HANDLE;
     bool isScene  = fullViewport && hasDepth && g_mv.ready;
+    if (isScene) {
+        uint32_t n = ++g_mvBindsThisFrame;
+        if (n > g_mvBindsMax) {
+            g_mvBindsMax = n;
+            trace("MV BINDS: %u pass(es) bound the velocity target in one frame "
+                  "- shape %ux%u colour=%u", n,
+                  info->renderArea.extent.width, info->renderArea.extent.height,
+                  info->colorAttachmentCount);
+        }
+    }
 
     // EVERY DISTINCT PASS SHAPE, once each.
     //
@@ -4794,6 +4814,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     g_prevLastDepthPassIdx = g_lastDepthPassIdx;   // predicts where to inject next frame
     g_lastDepthPassIdx     = -1;
     g_passesThisFrame      = 0;
+    g_mvBindsThisFrame     = 0;
 
     g_mvClearedThisFrame.store(false);
     g_depthFreshThisFrame  = false;   // must be re-proven every frame
@@ -6219,6 +6240,37 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
                     src = (const VkPipelineRenderingCreateInfo*)p;
             if (!src || !ci[i].pColorBlendState) continue;
+
+            // ---- FULL-SCREEN PIPELINES MUST NOT WRITE VELOCITY.
+            //
+            // A pipeline with no vertex attributes draws the modern full-screen
+            // triangle from gl_VertexIndex. Its gl_Position is a screen corner,
+            // not a point in the world, so reprojecting it through uReproj
+            // produces a number that means nothing - and because the triangle
+            // covers the frame, it writes that number over EVERY pixel.
+            //
+            // This is what the dumps were showing. Thirteen passes a frame bind
+            // the velocity target (they are all full-resolution with depth,
+            // which is the whole of the isScene test), and a full-screen pass
+            // landing among them replaces a correct field with a screen-uniform
+            // one. It matches the signature exactly: p25 through p95 all within
+            // a few tenths of each other at ~350 px, on a frame whose matrix
+            // predicts 13.15 - and it explains why the same frame could read
+            // correct or uniformly wrong depending on which pass wrote last.
+            //
+            // The blend state below already sets the velocity write mask to 0
+            // for anything left unpatched, so declining here is sufficient: the
+            // attachment stays bound and keeps whatever the geometry wrote.
+            if (!ci[i].pVertexInputState ||
+                ci[i].pVertexInputState->vertexAttributeDescriptionCount == 0) {
+                static uint64_t nFullScreen = 0;
+                if (++nFullScreen % 500 == 1)
+                    trace("MV: declining %llu full-screen pipeline(s) - no vertex "
+                          "attributes, so uReproj has nothing meaningful to "
+                          "reproject and the triangle covers the whole frame",
+                          (unsigned long long)nFullScreen);
+                continue;
+            }
 
             // One extra format, at index colorAttachmentCount - matching the
             // single extra slot the pass hook appends, and matching the
