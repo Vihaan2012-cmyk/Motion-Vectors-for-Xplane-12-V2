@@ -30,7 +30,7 @@
 #include <QDesktopServices>
 #include <QUrl>
 
-static const char *kVersion  = "0.0.02";
+static const char *kVersion  = "0.0.03";
 static const char *kLayer    = "VK_LAYER_mv";
 static const char *kReleases =
     "https://api.github.com/repos/Vihaan2012-cmyk/Motion-Vectors-for-Xplane-12-V2/releases/latest";
@@ -169,7 +169,7 @@ private:
 
         QStringList args;
         if (m_situation->isChecked())
-            args << "--load_smo=Output/situations/Cirrus SR-22 Replay.sit";
+            args << "--load_smo=Output/situations/Cirrus SR-22 SituationV2.sit";
 
         auto *p = new QProcess(this);
         p->setProcessEnvironment(env);

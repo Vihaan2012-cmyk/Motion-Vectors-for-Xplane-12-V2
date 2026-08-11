@@ -800,17 +800,6 @@ static void dumpPagerControls()
 
     // Ask X-Plane to keep its reduced render but skip its own spatial upscale,
     // leaving the reconstruction to ours. See the note in launch-xp.cmd.
-    if (getenv("TAA_XPFSR_BYPASS")) {
-        XPLMDataRef by = taaFind("sim/private/controls/fsr/bypass");
-        if (by && XPLMCanWriteDataRef(by)) {
-            XPLMSetDataf(by, 1.0f);
-            xlog("xpfsr: bypass ON - X-Plane renders small and does NOT upscale; "
-                 "our resolve is expected to do it. Check the layer log's "
-                 "RENDER RESOLUTION line to see what actually happened.");
-        } else {
-            xlog("xpfsr: bypass control %s", by ? "is read-only" : "absent");
-        }
-    }
 
     g_trimOn = (getenv("TAA_VRAM_TRIM") != nullptr);
     xlog("trim: VRAM trim is %s", g_trimOn ? "ON" : "off (set TAA_VRAM_TRIM=1)");

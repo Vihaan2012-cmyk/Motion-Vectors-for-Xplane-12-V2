@@ -34,10 +34,33 @@ set "VK_LOADER_LAYERS_ENABLE=VK_LAYER_mv"
 rem Layer log. Off in normal use - it writes from the render path.
 set "TAA_LAYER_TRACE=1"
 
-rem Straight into the saved situation.
-set "XPARGS=--load_smo=Output/situations/Cirrus SR-22 Replay.sit"
+rem Measure the velocity field every N frames. This is the acceptance gate for
+rem the whole project, so it is on for debugging - but it reads back 31.9 MB at
+rem 4K, which is why it stays off in a release build rather than defaulting on
+rem like the injection does.
+set "TAA_VELOCITY_DUMP=300"
+
+rem Drive the camera through a known yaw and pitch once the flight settles, and
+rem compare the vectors against the pixel displacement that motion must
+rem produce. This is what turns "does it look right" into a number, and it is
+rem the only way to measure without someone flying.
+set "TAA_SELFTEST=1"
+
+rem Load the situation after all. It comes up in replay, which is not ideal -
+rem but replay still renders, and the self-test drives the CAMERA rather than
+rem the aeroplane, so the measurement is unaffected. Without it the sim sits on
+rem the configuration screen and nothing can be measured at all.
+
+rem Measure the velocity field every N frames. This is the acceptance gate for
+rem the project, so it is on for debugging - but it reads back 31.9 MB at 4K,
+rem which is why it stays off in a release build rather than defaulting on the
+rem way the injection does.
+
+rem NO --load_smo. The saved situation was captured from a replay, so loading it
+rem puts the sim straight back into replay rather than a live flight. Start
+rem normally and fly it.
+
 
 echo Layer:     %LAYERDIR%
-echo Situation: %XPARGS%
-start "" /D "%XPROOT%" "%XPROOT%\X-Plane.exe" %XPARGS%
+start "" /D "%XPROOT%" "%XPROOT%\X-Plane.exe"
 endlocal

@@ -72,6 +72,14 @@ static MvTarget g_mv;
 // consumer for, and dropping it halves the bandwidth.
 static const VkFormat kMvFormat = VK_FORMAT_R16G16_SFLOAT;
 
+// DERIVED, never restated. The readback size and the index stride both have to
+// track kMvFormat, and the comment below used to say so while the numbers said
+// otherwise: the format went back to RG16F and these stayed at RGBA16F values.
+// The result measured as exactly 50% zeros and hundreds of pixels of motion on
+// a camera that had not moved - every read landing on the wrong pixel.
+static const uint32_t kMvHalves = 2;                 // R16G16 = two halves
+static const uint32_t kMvBytes  = kMvHalves * 2;     // ...four bytes
+
 static void mvDestroy(DeviceData &dd)
 {
     MvTarget &m = g_mv;
@@ -173,15 +181,12 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
     }
 
 
-    // Host-visible readback buffer, allocated once alongside the image. 8 bytes
-    // per pixel for R16G16B16A16_SFLOAT - 63.8 MB at 3840x2160, which is why
-    // dumps are on an interval rather than every frame.
+    // Host-visible readback buffer, allocated once alongside the image.
     //
-    // This MUST track kMvFormat. It was 4 when the target was RG16F, and a
-    // vkCmdCopyImageToBuffer into a buffer half the size it needs is not a
-    // validation error on every driver - it is a truncated dump that reads as
-    // the bottom half of the screen being empty.
-    m.readbackSize = (VkDeviceSize)w * h * 8;
+    // Sized from kMvBytes rather than a literal, because a copy into a buffer
+    // half the size it needs is not a validation error on every driver - it is
+    // a truncated dump that reads as the bottom half of the screen being empty.
+    m.readbackSize = (VkDeviceSize)w * h * kMvBytes;
     VkBufferCreateInfo bci;
     memset(&bci, 0, sizeof(bci));
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -330,7 +335,7 @@ static void mvReport(double camMoved, const float *reproj)
     // these statistics to more digits than the question needs.
     for (uint32_t y = 0; y < m.h; y += 4) {
         for (uint32_t x = 0; x < m.w; x += 4) {
-            size_t i = ((size_t)y * m.w + x) * 4;   // RGBA16F: 4 halves per pixel
+            size_t i = ((size_t)y * m.w + x) * kMvHalves;
             float vx = velHalfToFloat(px[i]);
             float vy = velHalfToFloat(px[i + 1]);
 

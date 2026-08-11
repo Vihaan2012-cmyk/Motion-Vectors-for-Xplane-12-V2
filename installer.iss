@@ -10,7 +10,7 @@
 ; It is removed again on uninstall.
 
 #define AppName    "Motion Vectors for X-Plane 12"
-#define AppVersion "0.0.02"
+#define AppVersion "0.0.03"
 #define AppPub     "Vihaan2012-cmyk"
 
 [Setup]

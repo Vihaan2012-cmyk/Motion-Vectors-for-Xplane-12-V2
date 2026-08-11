@@ -463,8 +463,27 @@ static void armSpirvInject()
     static bool armed = false;
     if (armed) return;
     armed = true;
-    g_spirvInject = (getenv("TAA_SPIRV_INJECT") != nullptr);
-    g_spirvLive   = (getenv("TAA_SPIRV_LIVE") != nullptr) && g_spirvInject;
+    // ---- ON BY DEFAULT. THIS IS THE PROJECT.
+    //
+    // Both of these were armed only when an environment variable was set, which
+    // the old development launcher did and nothing else does. Measured: the
+    // creation gate reported spirvLive=0 with every other condition satisfied -
+    // depth found, scene image valid, stable for 1768 frames against a
+    // threshold of 120 - so no velocity target was ever built and the project
+    // produced nothing at all when installed.
+    //
+    // This is the same trap as the texture pager holds, in the one place where
+    // it costs everything: behaviour that exists only under the development
+    // launcher looks like working code right up until someone installs it.
+    //
+    // Set either variable to 0 to switch them off; anything else, or absence,
+    // leaves them on.
+    auto envOn = [](const char *name) {
+        const char *v = getenv(name);
+        return !v || atoi(v) != 0;      // absent means ON
+    };
+    g_spirvInject = envOn("TAA_SPIRV_INJECT");
+    g_spirvLive   = envOn("TAA_SPIRV_LIVE") && g_spirvInject;
     if (g_spirvInject)
         trace("SPIRV INJECT: armed - %s",
               g_spirvLive
@@ -2906,7 +2925,6 @@ static std::set<VkShaderModule> g_xpFsrModules;    // modules that ARE X-Plane's
 static std::set<VkPipeline>     g_xpFsrPipelines;  // compute pipelines built from them
 static std::map<void*, bool>    g_cbFsrBound;      // is an FSR pipeline bound on this cb
 static uint64_t g_xpFsrDropped   = 0;
-static bool     g_replaceXpFsr   = false;   // TAA_REPLACE_XPFSR
 
 // Does this SPIR-V belong to X-Plane's FSR?
 //
@@ -3984,8 +4002,6 @@ static void armLayerOnce()
                           "flight starts and is not in that set.",
                           g_pagerAutogenTo);
             }
-            g_replaceXpFsr = (getenv("TAA_REPLACE_XPFSR") != nullptr);
-            if (g_replaceXpFsr)
                 trace("XP FSR: TAA_REPLACE_XPFSR - X-Plane's own upscale "
                       "dispatches will be dropped once its shader modules are "
                       "recognised, and FSR2's display-sized result written in "
@@ -4696,6 +4712,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     //
     // This used to live inside the resolve's setup, so it only happened when an
     // upscaler was being built.
+    // Say WHICH condition is holding it up. Five conditions gate this and a
+    // silent no-op looks identical whichever one fails.
+    if (!g_mv.ready && !g_mv.failed) {
+        static uint64_t n = 0;
+        if ((n++ % 600) == 0)
+            trace("MV GATE: spirvLive=%d depth=%d sceneImg=%p %ux%u stable=%u/120",
+                  velOrInjected ? 1 : 0, stableEnough ? 1 : 0,
+                  (void*)g_sceneColor.image, g_sceneColor.w, g_sceneColor.h,
+                  g_sceneColorStable);
+    }
     if (velOrInjected && stableEnough && !g_mv.ready && !g_mv.failed &&
         g_sceneColor.image != VK_NULL_HANDLE && g_sceneColor.w && g_sceneColor.h &&
         g_sceneColorStable >= 120) {
@@ -4891,6 +4917,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSampler(
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
     VkDevice device, const VkAllocationCallbacks *alloc)
 {
+    // ---- RELEASE THE VELOCITY TARGET.
+    //
+    // mvDestroy had no caller at all, so the target and its readback buffer -
+    // 31.9 MB plus a mapped host allocation at 4K - were leaked every time the
+    // device went away. X-Plane recreates its device on some settings changes,
+    // so this is not only a shutdown concern.
+    //
+    // Before the dispatch table entry is erased, because destroying images
+    // needs the functions it holds.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(device));
+        if (di != g_devices.end() && g_mv.device == device)
+            mvDestroy(di->second);
+    }
+
     PFN_vkDestroyDevice next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -4923,7 +4965,7 @@ static VkLayerDeviceCreateInfo *findDeviceLink(const VkDeviceCreateInfo *ci)
 }
 
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-TAA_GetDeviceProcAddr(VkDevice device, const char *name);
+MV_GetDeviceProcAddr(VkDevice device, const char *name);
 
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
     const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *alloc, VkInstance *out)
@@ -4966,7 +5008,6 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
 
     // Read here rather than in armLayerOnce: the instance is created long before
     // that runs, and the apiVersion decision below cannot wait.
-    static bool g_slWanted = (getenv("TAA_STREAMLINE") != nullptr);
 
     VkLayerInstanceCreateInfo *link = findInstanceLink(ci);
     if (!link || !link->u.pLayerInfo) {
@@ -5016,19 +5057,6 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
           ci->pApplicationInfo ? VK_API_VERSION_MINOR(ci->pApplicationInfo->apiVersion) : 0u,
           ci->pApplicationInfo ? "present" : "absent, so 1.0 by default");
 
-    if (g_slWanted) {
-        if (ci->pApplicationInfo) appInfo = *ci->pApplicationInfo;
-        else trace("INSTANCE: application supplied no VkApplicationInfo, so the "
-                   "instance defaults to API 1.0 - synthesising one");
-        if (appInfo.apiVersion < VK_API_VERSION_1_3) {
-            trace("INSTANCE: raising apiVersion %u.%u -> 1.3 so Streamline can "
-                  "reach vkCreatePrivateDataSlot (core in 1.3)",
-                  VK_API_VERSION_MAJOR(appInfo.apiVersion),
-                  VK_API_VERSION_MINOR(appInfo.apiVersion));
-            appInfo.apiVersion = VK_API_VERSION_1_3;
-            ci2.pApplicationInfo = &appInfo;
-        }
-    }
     std::vector<const char*> instExts;
 
 
@@ -6604,73 +6632,6 @@ static void velImageBarrier(DeviceData &dd, VkCommandBuffer cb, VkImage img,
 static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
     VkCommandBuffer cb, uint32_t gx, uint32_t gy, uint32_t gz)
 {
-    if (g_replaceXpFsr) {
-        bool isFsr = false;
-        {
-            std::lock_guard<std::mutex> g(g_lock);
-            std::map<void*, bool>::iterator it = g_cbFsrBound.find((void*)cb);
-            isFsr = (it != g_cbFsrBound.end() && it->second);
-        }
-        // NEVER DROP WITH NOWHERE TO PUT THE REPLACEMENT.
-        //
-        // The candidate list is not populated until the composite search has
-        // run, so the first frames dropped X-Plane's upscale and wrote nothing
-        // at all - "into 0 display-sized target(s)" in the trace, and a frame
-        // with no upscale in it on screen. If we cannot replace it, let it run.
-        if (isFsr && g_upscaleTargets.empty()) isFsr = false;
-
-        // ONE TARGET, NOT BOTH.
-        //
-        // Writing every display-sized candidate assumed they were interchangeable
-        // halves of a double buffer. They are not necessarily: if one is an input
-        // to later work rather than the final destination, overwriting it corrupts
-        // whatever reads it - which is what the tiled green chevrons were.
-        //
-        // TAA_XPFSR_TARGET picks by index so the right one can be found the same
-        // way the composite was, by bisection rather than by argument.
-        static int targetIdx = getenv("TAA_XPFSR_TARGET")
-                             ? atoi(getenv("TAA_XPFSR_TARGET")) : 0;
-
-        if (isFsr) {
-            ++g_xpFsrDropped;
-            if (g_xpFsrDropped <= 3 || (g_xpFsrDropped % 600) == 0)
-                trace("XP FSR: dropped its upscale dispatch (%llu total, groups "
-                      "%ux%ux%u). FSR2's result is written here instead, into "
-                      "%zu display-sized target(s).",
-                      (unsigned long long)g_xpFsrDropped, gx, gy, gz,
-                      g_upscaleTargets.size());
-
-            // The replacement is NOT written here any more - see
-            // fsr2BlitToTargets, called from the FSR2 dispatch site so the
-            // write shares a command buffer with the work that produces it.
-            // This hook now only removes X-Plane's upscale.
-            // ---- TAA_XPFSR_KEEP: let its dispatch run, and still write ours.
-            //
-            // We match three of the six variants in fsr.xsa, and the two small
-            // ones are about 4 KB - far too small for EASU or RCAS, so they are
-            // copy or passthrough shaders X-Plane uses elsewhere in the frame.
-            // Dropping those does not just skip an upscale, it removes work the
-            // rest of the frame depends on, which is why the scene we then read
-            // was already white on one half and black on the other whether we
-            // sampled FSR2's output or the composite directly.
-            //
-            // Keeping the dispatch costs the upscale we were trying to avoid
-            // and proves whether dropping is what broke the picture. If it is,
-            // the fix is to narrow WHICH dispatch gets dropped rather than to
-            // stop dropping.
-            static const bool keepDispatch = (getenv("TAA_XPFSR_KEEP") != nullptr);
-            if (keepDispatch) {
-                DeviceData *fd = nullptr;
-                {
-                    std::lock_guard<std::mutex> g(g_lock);
-                    std::map<void*, DeviceData>::iterator it = g_devices.begin();
-                    if (it != g_devices.end()) fd = &it->second;
-                }
-                if (fd && fd->cmdDispatch) fd->cmdDispatch(cb, gx, gy, gz);
-            }
-            return;   // ours has been written; the app's ran only if kept
-        }
-    }
     DeviceData *dd = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -7211,10 +7172,9 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         // that enabled the public one would produce exactly this. Streamline
         // omitting it from its own requirements is then deliberate, not an
         // oversight to be corrected.
-        static const bool noLL = (getenv("TAA_SL_NO_LL") != nullptr);
 
         for (size_t k = 0; k < sizeof(kWanted)/sizeof(kWanted[0]); ++k) {
-            if (noLL && (!strcmp(kWanted[k], "VK_NV_low_latency2") ||
+            if (false && (!strcmp(kWanted[k], "VK_NV_low_latency2") ||
                          !strcmp(kWanted[k], "VK_NV_low_latency"))) {
                 trace("DEVICE: TAA_SL_NO_LL - deliberately NOT enabling %s", kWanted[k]);
                 continue;
@@ -7241,7 +7201,7 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
             // kSlDeviceExt carries VK_NV_low_latency2 as well, so filtering
             // only kWanted would leave the extension enabled by this loop and
             // the test would silently measure nothing.
-            if (noLL && (!strcmp(slWanted[k], "VK_NV_low_latency2") ||
+            if (false && (!strcmp(slWanted[k], "VK_NV_low_latency2") ||
                          !strcmp(slWanted[k], "VK_NV_low_latency"))) {
                 trace("DEVICE: TAA_SL_NO_LL - deliberately NOT enabling %s (Streamline list)",
                       slWanted[k]);
@@ -7489,7 +7449,7 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     //                             EXT spelling NO, vkGetInstanceProcAddr yes
     //
     // Instance-level lookups answered because they do not come through us.
-    // Device-level lookups did not, because they do: TAA_GetDeviceProcAddr ends
+    // Device-level lookups did not, because they do: MV_GetDeviceProcAddr ends
     // in a g_devices lookup and returns nullptr for a device that is not in the
     // map yet. Streamline was asking a layer that had not finished admitting the
     // device exists.
@@ -7564,9 +7524,9 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
 #define RETURN_IF(nm, fn) if (!strcmp(name, nm)) return (PFN_vkVoidFunction)(fn);
 
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-TAA_GetDeviceProcAddr(VkDevice device, const char *name)
+MV_GetDeviceProcAddr(VkDevice device, const char *name)
 {
-    RETURN_IF("vkGetDeviceProcAddr",   TAA_GetDeviceProcAddr)
+    RETURN_IF("vkGetDeviceProcAddr",   MV_GetDeviceProcAddr)
     RETURN_IF("vkDestroyDevice",       Layer_DestroyDevice)
     RETURN_IF("vkCreateImage",         Layer_CreateImage)
     RETURN_IF("vkCreateImageView",     Layer_CreateImageView)
@@ -7680,15 +7640,15 @@ static VKAPI_ATTR void VKAPI_CALL TAA_DestroyDebugUtilsMessengerEXT(
 }
 
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-TAA_GetInstanceProcAddr(VkInstance inst, const char *name)
+MV_GetInstanceProcAddr(VkInstance inst, const char *name)
 {
     RETURN_IF("vkCreateDebugUtilsMessengerEXT",  TAA_CreateDebugUtilsMessengerEXT)
     RETURN_IF("vkDestroyDebugUtilsMessengerEXT", TAA_DestroyDebugUtilsMessengerEXT)
-    RETURN_IF("vkGetInstanceProcAddr", TAA_GetInstanceProcAddr)
+    RETURN_IF("vkGetInstanceProcAddr", MV_GetInstanceProcAddr)
     RETURN_IF("vkCreateInstance",      TAA_CreateInstance)
     RETURN_IF("vkDestroyInstance",     TAA_DestroyInstance)
     RETURN_IF("vkCreateDevice",        TAA_CreateDevice)
-    RETURN_IF("vkGetDeviceProcAddr",   TAA_GetDeviceProcAddr)
+    RETURN_IF("vkGetDeviceProcAddr",   MV_GetDeviceProcAddr)
 
     // Both spellings. The KHR alias is what an application targeting Vulkan 1.0
     // with VK_KHR_get_physical_device_properties2 will ask for, and hooking only

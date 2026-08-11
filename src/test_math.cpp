@@ -568,6 +568,86 @@ int main()
         }
     }
 
+    // ---- THE INJECTED SHADER'S OWN ARITHMETIC, ON THE CPU.
+    //
+    // The reprojection matrix is verified above. This goes one step up the
+    // column and reproduces exactly what the patched shaders do:
+    //
+    //   vertex:    prevClip = uReproj * gl_Position     (a varying, per vertex)
+    //   fragment:  mv = curr.xy/curr.w - prev.xy/prev.w (per fragment, in NDC)
+    //
+    // and checks the result against the screen displacement a known camera yaw
+    // must produce. That is the convention the predecessor never settled: every
+    // check there ran through a GPU, a readback and a statistic, and any of the
+    // three could be the liar. Here there is only arithmetic.
+    //
+    // NDC spans 2 units across the screen, so N pixels is 2N/width in NDC. The
+    // sim's own self-test uses the same factor: angle * proj[0] * width * 0.5.
+    printf("\n[injected shader arithmetic]\n");
+    {
+        const float W = 3840.0f, H = 2160.0f;
+        const float fov = 65.0f * 3.14159265f / 180.0f;
+        const float yaw = 0.01f;                 // radians between the frames
+
+        float proj[16], viewPrev[16], viewCurr[16];
+        perspectiveReverseZInfinite(proj, fov, W / H, 0.02f);
+        viewAtYaw(viewPrev, 0.0f, 0.0f, 0.0f, 0.0f);
+        viewAtYaw(viewCurr, 0.0f, 0.0f, 0.0f, yaw);
+
+        float vpPrev[16], vpCurr[16], invCurr[16], reproj[16];
+        taaMul(vpPrev, proj, viewPrev);
+        taaMul(vpCurr, proj, viewCurr);
+        bool inv = taaInverse(invCurr, vpCurr);
+        check(inv, "current view-projection inverts");
+        taaMul(reproj, vpPrev, invCurr);
+
+        // A point straight ahead, far enough that only rotation matters.
+        float world[4] = { 0.0f, 0.0f, -1000.0f, 1.0f };
+        float currClip[4], prevDirect[4], prevViaReproj[4];
+        xform(currClip, vpCurr, world);
+        xform(prevDirect, vpPrev, world);
+        xform(prevViaReproj, reproj, currClip);
+
+        // The vertex route must agree with projecting by the previous matrix
+        // directly. If it does not, no fragment maths can rescue it.
+        float dx = prevViaReproj[0] / prevViaReproj[3] - prevDirect[0] / prevDirect[3];
+        float dy = prevViaReproj[1] / prevViaReproj[3] - prevDirect[1] / prevDirect[3];
+        check(fabsf(dx) < 1e-4f && fabsf(dy) < 1e-4f,
+              "vertex route (uReproj * gl_Position) matches direct projection",
+              fabsf(dx) + fabsf(dy));
+
+        // The fragment shader's subtraction, in NDC.
+        float mvx = currClip[0] / currClip[3] - prevViaReproj[0] / prevViaReproj[3];
+        float mvy = currClip[1] / currClip[3] - prevViaReproj[1] / prevViaReproj[3];
+
+        const float expectedPx = yaw * proj[0] * W * 0.5f;
+        const float measuredPx = mvx * W * 0.5f;
+        printf("    yaw %.4f rad -> expected %.3f px, shader gives %.3f px (ratio %.3f)\n",
+               yaw, expectedPx, measuredPx,
+               expectedPx != 0.0f ? measuredPx / expectedPx : 0.0f);
+        check(fabsf(fabsf(measuredPx / expectedPx) - 1.0f) < 0.02f,
+              "shader vector magnitude matches the yaw that caused it",
+              measuredPx / expectedPx);
+
+        check(fabsf(mvy * H * 0.5f) < 0.5f,
+              "a pure yaw produces no vertical component", mvy * H * 0.5f);
+
+        // Coherence. Whatever the sign convention is, it must be the SAME
+        // across the frame: the predecessor measured a signed mean near zero
+        // against a large absolute mean, which means neighbouring pixels
+        // disagreed with each other.
+        float leftW[4]  = { -200.0f, 0.0f, -1000.0f, 1.0f };
+        float rightW[4] = {  200.0f, 0.0f, -1000.0f, 1.0f };
+        float lc[4], rc[4], lp[4], rp[4];
+        xform(lc, vpCurr, leftW);   xform(lp, reproj, lc);
+        xform(rc, vpCurr, rightW);  xform(rp, reproj, rc);
+        float lmv = lc[0] / lc[3] - lp[0] / lp[3];
+        float rmv = rc[0] / rc[3] - rp[0] / rp[3];
+        printf("    left %.5f   right %.5f   (same sign means a coherent field)\n", lmv, rmv);
+        check(lmv * rmv > 0.0f,
+              "vectors either side of centre point the SAME way", lmv * rmv);
+    }
+
     printf("\n%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
 }
