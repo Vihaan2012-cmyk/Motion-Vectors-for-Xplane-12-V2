@@ -1034,8 +1034,16 @@ static float g_floorValue = 0.0625f;   // what the floor ended up being
 static void patchTextureScaleFloor()
 {
     if (g_floorRaised) return;
+    // ---- DEFAULTS TO 1.0: THE PAGER MAY NEVER CUT A TEXTURE.
+    //
+    // This used to do nothing unless a variable was set, which meant it only
+    // ever ran under the development launcher. Installed, the sim paged
+    // textures down as usual and the code that exists to stop it sat inert.
+    //
+    // 1.0 is the floor because the reachable scales are powers of two - 2, 1,
+    // 0.5, 0.25, 0.125, 0.0625 - so a floor of 1 means full size and no cut.
     const char *env = getenv("TAA_SCALE_FLOOR");
-    if (!env || !env[0]) return;
+    if (!env || !env[0]) env = "1";
 
     // A VALUE, not a switch.
     //
@@ -3628,11 +3636,25 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
     patchTextureBudget();
 
     // Read here so values can be changed without a rebuild.
+    // ---- HELD BY DEFAULT, not only when a launcher sets the variables.
+    //
+    // These were read from the environment alone, so an installed build held
+    // nothing and X-Plane's pager downscaled textures freely - measured:
+    // max_overdrive sat at its default of 16 where the development launcher had
+    // been setting 64. The environment still overrides, for sweeping values.
+    static const float kDefaults[] = {
+        64.0f,      // max_overdrive     - how far the pager may run ahead
+        0.75f,      // size_fudge_factor - shrinks its size estimate
+        0.0f,       // downscale_cooldown - 0 leaves X-Plane's own value alone
+    };
     for (size_t i = 0; i < sizeof(g_held)/sizeof(g_held[0]); ++i) {
         const char *v = getenv(g_held[i].env);
-        if (!v) continue;
-        g_held[i].want = (float)atof(v);
-        xlog("hold: armed %s = %g", g_held[i].path, g_held[i].want);
+        float want = v ? (float)atof(v)
+                       : (i < sizeof(kDefaults)/sizeof(kDefaults[0]) ? kDefaults[i] : 0.0f);
+        if (want == 0.0f) continue;
+        g_held[i].want = want;
+        xlog("hold: armed %s = %g%s", g_held[i].path, g_held[i].want,
+             v ? " (from environment)" : " (default)");
     }
     return 1;
 }
