@@ -39,27 +39,46 @@ WelcomeLabel2=This installs motion vectors for X-Plane 12.%n%nStart the sim from
 Source: "build\MotionVectors.xpl";        DestDir: "{app}\Resources\plugins\MotionVectors\64"; DestName: "win.xpl"; Flags: ignoreversion
 Source: "build\vklayer\VkLayer_mv.dll";   DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
 Source: "build\vklayer\VkLayer_mv.json";  DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
+; The Qt launcher and its runtime. recursesubdirs picks up the platform,
+; imageformat and tls plugin folders windeployqt produced - Qt will not start
+; without platforms\qwindows.dll, and a missing plugin folder fails at run time
+; rather than at install time, which is the worst place to find out.
+Source: "build\qtlauncher\*"; DestDir: "{app}\MotionVectors\launcher"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Kept as a fallback: no dependencies, works if the Qt runtime is ever broken.
+; The Qt launcher and its runtime. recursesubdirs picks up the platform,
+; imageformat and tls plugin folders windeployqt produced - Qt will not start
+; without platforms\qwindows.dll, and a missing plugin folder fails at run time
+; rather than at install time, which is the worse place to find out.
+; Kept as a fallback: no dependencies, works even if the Qt runtime is broken.
 Source: "build\MotionVectorsLauncher.exe"; DestDir: "{app}\MotionVectors";                    Flags: ignoreversion
-Source: "lua\MotionVectors.lua";           DestDir: "{app}\Resources\plugins\FlyWithLua\Scripts"; Flags: ignoreversion onlyifdestfileexists
+Source: "lua\MotionVectors.lua";           DestDir: "{app}\Resources\plugins\FlyWithLua\Scripts"; Flags: ignoreversion; Check: FlyWithLuaPresent
 Source: "README.md";                      DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
 
 [Icons]
 ; The sim must be started through this. It sets VK_LAYER_PATH and
 ; VK_LOADER_LAYERS_ENABLE for that one process, which is what makes the layer
 ; EXPLICIT - loaded only here, never in any other Vulkan application.
-Name: "{autoprograms}\X-Plane 12 with Motion Vectors"; Filename: "{app}\MotionVectors\MotionVectorsLauncher.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\X-Plane 12 with Motion Vectors";  Filename: "{app}\MotionVectors\MotionVectorsLauncher.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\X-Plane 12 with Motion Vectors"; Filename: "{app}\MotionVectors\launcher\MotionVectors.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\X-Plane 12 with Motion Vectors";  Filename: "{app}\MotionVectors\launcher\MotionVectors.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 
 [Run]
-Filename: "{app}\MotionVectors\MotionVectorsLauncher.exe"; Description: "Start X-Plane 12 with motion vectors now"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\MotionVectors\launcher\MotionVectors.exe"; Description: "Start X-Plane 12 with motion vectors now"; Flags: nowait postinstall skipifsilent
 
 [Code]
 // Guess X-Plane's location so the common case needs no typing, and verify
 // whatever is chosen actually is an X-Plane folder rather than failing later
 // with files copied somewhere harmless.
+// The Lua panel is optional: it needs FlyWithLua, which many installs do not
+// have. Copying a script into a folder that does not exist would fail the
+// install for a component nothing else depends on.
+function FlyWithLuaPresent: Boolean;
+begin
+  Result := DirExists(WizardDirValue + '\Resources\plugins\FlyWithLua\Scripts');
+end;
+
 function DefaultXPlaneDir(Param: String): String;
 var
   Candidates: array[0..3] of String;
