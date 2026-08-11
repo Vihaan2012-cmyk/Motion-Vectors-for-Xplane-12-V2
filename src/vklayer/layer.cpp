@@ -151,17 +151,12 @@ struct Snapshot {
     float    camBodyDrift, camGap;
     int32_t  selfTestPhase;
     float    selfTestExpectedPx;
-    int32_t  upscaler;        // TaaUpscaler, chosen in the sim
-    float    sharpness;       // 0..1, the panel's slider - drives FSR2's RCAS
     int32_t  reverseZ, historyReset, resetReason;
     int32_t  viewportW, viewportH;
     float    nearClip, farClip;
     float    fovDeg;
 
-    // Milliseconds, not seconds. FSR2 paces its history decay off this, so
-    // handing it seconds would make it behave as though a thousandth of the
-    // time had elapsed and hold history roughly sixty times too long - which
-    // would look like heavy ghosting rather than like a units mistake.
+    // Milliseconds, not seconds.
     float    frameTimeMs;
     double   simTime;
     float    jitterX, jitterY;
@@ -189,8 +184,6 @@ static bool snapshot(Snapshot *o)
         o->camGap          = g_share->camGap;
         o->selfTestPhase      = g_share->selfTestPhase;
         o->selfTestExpectedPx = g_share->selfTestExpectedPx;
-        o->upscaler      = g_share->upscaler;
-        o->sharpness     = g_share->sharpness;
         o->reverseZ      = g_share->reverseZ;
         o->historyReset  = g_share->historyReset;
         o->resetReason   = g_share->resetReason;
@@ -2634,21 +2627,9 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetViewport(
     //
     // On its own it makes the image worse: it shifts the sample grid every
     // frame and, with nothing accumulating the result, high-contrast edges
-    // crawl. Tying it to the selected upscaler means switching to Off in the
-    // menu restores the untouched image in one frame rather than leaving a
-    // shimmering one behind.
-    // DLSS IS A CONSUMER TOO. It is a temporal upscaler with a history buffer
-    // and it is handed the jitter it must compensate for, exactly as FSR2 is -
-    // so leaving it out meant selecting DLSS silently turned the jitter off,
-    // which the trace reported as "upscaler=Off" on the JITTER line while the
-    // gate one screen away said "upscaler=DLSS(4)".
-    bool consumer = (g_velSnap.upscaler == TAA_UPSCALER_TAA)
-                 || (g_velSnap.upscaler == TAA_UPSCALER_FSR2)
-                 || (g_velSnap.upscaler == TAA_UPSCALER_DLSS);
 
     bool scene = false;
-    if (g_jitterViewport && g_jitterArmed && consumer &&
-        vp && count > 0) {
+    if (g_jitterViewport && g_jitterArmed && vp && count > 0) {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<VkCommandBuffer, bool>::iterator it = g_cbInScenePass.find(cb);
         scene = (it != g_cbInScenePass.end() && it->second);
@@ -4781,34 +4762,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // accumulate. Counting it is how that gets noticed.
     //
     // But zero is only a FAULT when something was asking to be jittered. With
-    // the upscaler set to Off there is no consumer, the gate in
-    // Layer_CmdSetViewport correctly declines, and zero is the right answer.
-    //
-    // The old warning did not make that distinction and reported a fault every
-    // time, in every session where the menu was left on Off - which is most of
-    // them. Combined with the resolve counter that logged whether or not it
-    // recorded anything, the pair described a sim that was jittering nothing
-    // while resolving 116401 times, and I spent a round chasing the hook rather
-    // than reading the gate. A diagnostic that cries wolf is worse than none.
-    if (g_jitterArmed && (frames % 600) == 0) {
-        const char *selName = (snap.upscaler == TAA_UPSCALER_TAA)  ? "TAA"
-                            : (snap.upscaler == TAA_UPSCALER_FSR2) ? "FSR2"
-                            : "Off";
+    // Jitter is phase two and its amplitude is zero, so this reports the
+    // count and the phase and claims nothing else.
+    if (g_jitterArmed && (frames % 600) == 0)
         trace("JITTER: %llu draws offset so far, current=(%.3f %.3f) px "
-              "phase %d/%d, upscaler=%s", (unsigned long long)g_jitterApplied,
-              snap.jitterX, snap.jitterY, snap.jitterIndex, snap.jitterPhases,
-              selName);
-        if (g_jitterApplied == 0) {
-            if (snap.upscaler != TAA_UPSCALER_TAA && snap.upscaler != TAA_UPSCALER_FSR2)
-                trace("JITTER: idle - upscaler is %s, so there is no consumer and "
-                      "nothing SHOULD be jittered. Select TAA or FSR2 in the sim "
-                      "to arm it. This is not a fault.", selName);
-            else
-                trace("JITTER: WARNING %s is selected but nothing has been "
-                      "jittered - the hook is not firing inside a scene pass.",
-                      selName);
-        }
-    }
+              "phase %d/%d", (unsigned long long)g_jitterApplied,
+              snap.jitterX, snap.jitterY, snap.jitterIndex, snap.jitterPhases);
 
     // ---- did the resolve actually run this frame?
     //
@@ -6674,7 +6633,18 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // Gated on bodyReprojValid, which the plugin clears whenever the camera is
     // NOT rigid with the airframe - an external view, or a head that has moved.
     // Using the body frame then would be as wrong as the world frame is now.
-    bool useBody = inCockpit && g_velSnap.bodyReprojValid && !useIdentity;
+    // TAA_MV_NO_BODY forces the world matrix everywhere.
+    //
+    // The body-frame path rests on a premise the SELF-TEST deliberately breaks:
+    // that the camera is rigid with the airframe. The test rotates the camera
+    // INSIDE the cockpit, so while it runs the panel is not stationary relative
+    // to the eye and a body-frame reprojection is the wrong answer for it - by
+    // most of a screen. The measured field is bimodal, clustering near the
+    // correct value and near twenty-odd times it, which is what a frame split
+    // between two populations does to a median. This switch decides whether the
+    // cockpit is that second population.
+    static const bool noBody = (getenv("TAA_MV_NO_BODY") != nullptr);
+    bool useBody = inCockpit && g_velSnap.bodyReprojValid && !useIdentity && !noBody;
 
     float block[20];
     memcpy(block, useIdentity ? kIdentity
@@ -6700,14 +6670,6 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // Gated twice. Only inside a scene pass, and only on pipelines that draw
     // from vertex buffers - everything else gets zero, which is the point of
     // pushing this per draw instead of setting a viewport once.
-    // DLSS IS A CONSUMER TOO. It is a temporal upscaler with a history buffer
-    // and it is handed the jitter it must compensate for, exactly as FSR2 is -
-    // so leaving it out meant selecting DLSS silently turned the jitter off,
-    // which the trace reported as "upscaler=Off" on the JITTER line while the
-    // gate one screen away said "upscaler=DLSS(4)".
-    bool consumer = (g_velSnap.upscaler == TAA_UPSCALER_TAA)
-                 || (g_velSnap.upscaler == TAA_UPSCALER_FSR2)
-                 || (g_velSnap.upscaler == TAA_UPSCALER_DLSS);
 
     // Which of the four conditions is failing, counted rather than guessed.
     // "0 draws offset" says the result; it does not say which gate closed, and
@@ -6719,12 +6681,12 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     if (inScene && isGeometry) ++nBoth;
     if ((nBind % 200000) == 0)
         trace("JITTER GATE: %llu binds, inScene=%llu isGeometry=%llu both=%llu, "
-              "armed=%d consumer=%d jitterOff=%d",
+              "armed=%d",
               (unsigned long long)nBind, (unsigned long long)nScene,
               (unsigned long long)nGeom, (unsigned long long)nBoth,
-              g_jitterArmed ? 1 : 0, consumer ? 1 : 0, 0);
+              g_jitterArmed ? 1 : 0);
 
-    if (g_jitterArmed && consumer && inScene && isGeometry) {
+    if (g_jitterArmed && inScene && isGeometry) {
         // The RENDER resolution, not the window. Converting a pixel offset to
         // NDC against the display size would scale the jitter by 0.769 when
         // X-Plane's FSR is on - a wrong jitter rather than none, which is

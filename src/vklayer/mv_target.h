@@ -446,27 +446,50 @@ static void mvReport(double camMoved, const float *reproj,
         // one - and when they do, "the vectors are wrong" and "the vectors are
         // right and the yardstick is wrong" look identical from one number.
         //
-        // A point at infinity down the centre ray is clip (0,0,0,1) under a
-        // reverse-Z infinite projection, so reproj * that is simply the
-        // matrix's fourth column - and the shader's own subtraction against a
-        // centre NDC of zero is then -prevNDC * 0.5. Column-major, as the
-        // shader consumes it.
-        double predX = 0.0, predY = 0.0;
-        if (reproj && reproj[15] != 0.0f) {
-            predX = fabs(0.5 * (double)reproj[12] / (double)reproj[15]) * m.w;
-            predY = fabs(0.5 * (double)reproj[13] / (double)reproj[15]) * m.h;
+        // Down the centre ray, at BOTH ends of the depth range.
+        //
+        // Clip is w * (ndcX, ndcY, ndcZ, 1), and reproj is linear, so the w
+        // cancels in the perspective divide: the centre ray at a given depth is
+        // just (0, 0, ndcZ, 1). Column-major, as the shader consumes it, so
+        // that product is column 3 plus ndcZ times column 2. The shader's own
+        // subtraction against a centre NDC of zero is then -prevNDC * 0.5.
+        //
+        // Both ends, rather than picking one, because WHICH end is "infinity"
+        // depends on the depth convention - and this projection is not
+        // reverse-Z, so a first version that assumed z=0 was sampling the NEAR
+        // plane and reading translation parallax instead of rotation.
+        //
+        // Reporting both is the better instrument anyway: under a pure rotation
+        // the reprojection is depth-INDEPENDENT, so the two must agree. When
+        // they diverge, the camera translated, and no single expected
+        // displacement fits the frame.
+        auto predictAt = [&](double ndcZ, double *px, double *py) {
+            const double x = (double)reproj[12] + ndcZ * (double)reproj[8];
+            const double y = (double)reproj[13] + ndcZ * (double)reproj[9];
+            const double w = (double)reproj[15] + ndcZ * (double)reproj[11];
+            if (fabs(w) < 1e-12) { *px = *py = 0.0; return; }
+            *px = fabs(0.5 * x / w) * m.w;
+            *py = fabs(0.5 * y / w) * m.h;
+        };
+        double nearX = 0.0, nearY = 0.0, farX = 0.0, farY = 0.0;
+        if (reproj) {
+            predictAt(0.0, &nearX, &nearY);
+            predictAt(1.0, &farX,  &farY);
         }
-        const double predPx = vertical ? predY : predX;
+        const double predNear = vertical ? nearY : nearX;
+        const double predFar  = vertical ? farY  : farX;
 
         if (settle > 0) { --settle; }
         else {
             trace("MV RATIO: phase=%d %s  measured=%.3f px  expected=%.3f px  "
-                  "ratio=%.3f%s  | matrix predicts %.3f px (field/matrix %.3f)"
-                  "  [magnitude %.3f]",
+                  "ratio=%.3f%s  | matrix predicts near=%.3f far=%.3f px "
+                  "(field/far %.3f, near/far %.3f)  [magnitude %.3f]",
                   selfTestPhase, vertical ? "pitch" : "yaw  ",
                   axisPx, expectedPx, ratio,
                   (ratio > 0.95 && ratio < 1.05) ? "   <- CORRECT" : "",
-                  predPx, predPx > 1e-6 ? axisPx / predPx : 0.0,
+                  predNear, predFar,
+                  predFar > 1e-6 ? axisPx / predFar : 0.0,
+                  predFar > 1e-6 ? predNear / predFar : 0.0,
                   centre);
         }
     }
