@@ -2232,6 +2232,13 @@ static uint32_t g_passesThisFrame = 0;
 // which would explain a field that is sometimes correct, sometimes uniformly
 // wrong, and sometimes a mixture, while the matrix stays constant.
 static uint32_t g_mvBindsThisFrame = 0;
+// Which qualifying pass is currently open, counted from 0 in submission order,
+// and how many patched GEOMETRY pipelines get bound inside each. The world pass
+// is the one that draws the world; that is a thing to measure, not to guess at
+// from attachment counts. -1 means no qualifying pass is open.
+static int      g_mvPassOrdinal = -1;
+static uint64_t g_mvPassDraws[16] = {0};
+static uint32_t g_mvQualifyThisFrame = 0;
 static uint32_t g_mvBindsMax       = 0;
 static uint32_t g_passSizes[32][2];
 static uint32_t g_passHasDepth[32];
@@ -2812,6 +2819,43 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
     bool hasDepth = info->pDepthAttachment &&
                     info->pDepthAttachment->imageView != VK_NULL_HANDLE;
     bool isScene  = fullViewport && hasDepth && g_mv.ready;
+
+    // ---- ONLY THE FIRST QUALIFYING PASS.
+    //
+    // isScene is size-plus-depth, and THIRTEEN passes a frame satisfy it. They
+    // are not all the 3D world: X-Plane composites panel and instrument content
+    // at full resolution with depth too, and geometry drawn from a vertex
+    // buffer in screen space reprojects to nonsense exactly as a full-screen
+    // triangle does. Because the attachment is LOAD, whichever of the thirteen
+    // draws last owns the pixel - which is why the same configuration produced
+    // p05/far of 1.001 on one dump and 21x on the next.
+    //
+    // The arithmetic rules out parallax as the explanation: a median of 813 px
+    // would need geometry 1.5 cm from the eye, and the matrix's own near-plane
+    // figure implies a translation of about 4 mm, which puts the panel at ~17
+    // px. Nothing in the cockpit can move that far.
+    //
+    // The main scene pass is the FIRST to qualify - the world is drawn before
+    // anything is composited over it. Set TAA_MV_ALL_PASSES to go back to
+    // binding all thirteen and watch the field come apart again.
+    // WHICH of the thirteen is the world pass has to be measured, not guessed.
+    // Binding only the first gave three dumps of exact zeros - the first to
+    // qualify writes nothing, so it is a prepass. TAA_MV_PASS pins a specific
+    // index once the census below says which one draws the world.
+    static const long onlyPass = getenv("TAA_MV_PASS")
+                               ? atol(getenv("TAA_MV_PASS")) : -1;
+
+    // The ordinal counts every QUALIFYING pass, whether or not it ends up
+    // bound - otherwise pinning to one pass would renumber the very thing being
+    // pinned, and index 3 would mean something different on the run that
+    // selected it than on the run that measured it.
+    if (isScene) {
+        g_mvPassOrdinal = (int)g_mvQualifyThisFrame++;
+        if (onlyPass >= 0 && g_mvPassOrdinal != (int)onlyPass) isScene = false;
+    } else {
+        g_mvPassOrdinal = -1;
+    }
+
     if (isScene) {
         uint32_t n = ++g_mvBindsThisFrame;
         if (n > g_mvBindsMax) {
@@ -4814,7 +4858,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     g_prevLastDepthPassIdx = g_lastDepthPassIdx;   // predicts where to inject next frame
     g_lastDepthPassIdx     = -1;
     g_passesThisFrame      = 0;
+    if ((frames % 600) == 0) {
+        char line[512]; int off = 0;
+        for (int i = 0; i < 16 && off < 460; ++i)
+            if (g_mvPassDraws[i])
+                off += snprintf(line + off, sizeof(line) - off, " [%d]=%llu", i,
+                                (unsigned long long)g_mvPassDraws[i]);
+        if (off) trace("MV PASS CENSUS: geometry binds per qualifying pass -%s", line);
+    }
+
     g_mvBindsThisFrame     = 0;
+    g_mvQualifyThisFrame   = 0;
+    g_mvPassOrdinal        = -1;
 
     g_mvClearedThisFrame.store(false);
     g_depthFreshThisFrame  = false;   // must be re-proven every frame
@@ -6698,6 +6753,12 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // cockpit is that second population.
     static const bool noBody = (getenv("TAA_MV_NO_BODY") != nullptr);
     bool useBody = inCockpit && g_velSnap.bodyReprojValid && !useIdentity && !noBody;
+
+    // PER-PASS CENSUS. Which qualifying pass actually draws the world is a
+    // measurement; attachment counts and submission order have both already
+    // been guessed at and both were wrong.
+    if (g_mvPassOrdinal >= 0 && g_mvPassOrdinal < 16 && isGeometry)
+        ++g_mvPassDraws[g_mvPassOrdinal];
 
     float block[20];
     memcpy(block, useIdentity ? kIdentity
