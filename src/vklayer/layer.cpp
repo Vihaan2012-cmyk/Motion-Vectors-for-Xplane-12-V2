@@ -2842,8 +2842,22 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
     // Binding only the first gave three dumps of exact zeros - the first to
     // qualify writes nothing, so it is a prepass. TAA_MV_PASS pins a specific
     // index once the census below says which one draws the world.
+    // PASS 1, MEASURED. The census settles which of the thirteen draws the
+    // world, and it is not close:
+    //
+    //   geometry binds per qualifying pass - [0]=108 [1]=57132 [2]=540
+    //     [3]=540 [4]=216 [6]=432 [7]=540 [8]=108 [9]=216 [11]=540
+    //
+    // Pass 1 carries two orders of magnitude more geometry than any other. Pass
+    // 0 is a prepass with 108 binds - pinning to it produced dumps of exact
+    // zeros, which is how that guess was caught.
+    //
+    // DEFAULTED, not env-gated. An env-only switch is what left the SPIR-V
+    // injection dead for a whole session in this project: the code was right
+    // and nothing set the variable. TAA_MV_PASS overrides, and -1 restores
+    // binding every qualifying pass so the census can be re-run.
     static const long onlyPass = getenv("TAA_MV_PASS")
-                               ? atol(getenv("TAA_MV_PASS")) : -1;
+                               ? atol(getenv("TAA_MV_PASS")) : 1;
 
     // The ordinal counts every QUALIFYING pass, whether or not it ends up
     // bound - otherwise pinning to one pass would renumber the very thing being
