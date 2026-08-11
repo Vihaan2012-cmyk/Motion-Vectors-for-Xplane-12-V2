@@ -4834,7 +4834,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // frame would race the submission and produce numbers describing nothing.
 
     if (g_spirvLive && g_mv.ready) {
-        mvReport(snap.camDelta, snap.reproj);
+        mvReport(snap.camDelta, snap.reproj,
+                 snap.selfTestExpectedPx, snap.selfTestPhase);
         if (dumpEvery > 0 && (frames % (uint64_t)dumpEvery) == 0)
             g_mv.wantDump = true;
     }

@@ -275,7 +275,8 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb)
 
 // Measure it. Deliberately the SAME statistics the depth-derived dump prints,
 // so the two fields can be compared line for line rather than by impression.
-static void mvReport(double camMoved, const float *reproj)
+static void mvReport(double camMoved, const float *reproj,
+                     float expectedPx, int selfTestPhase)
 {
     MvTarget &m = g_mv;
     if (!m.dumpPending || !m.readbackPtr) return;
@@ -416,6 +417,49 @@ static void mvReport(double camMoved, const float *reproj)
           med * m.w, (sum / (double)n) * m.w, p95 * m.w, maxMag * m.w,
           100.0 * (double)zero / (double)n,
           (unsigned long long)nan, camMoved);
+
+    // ---- THE ACCEPTANCE GATE.
+    //
+    // The self test yaws and pitches the camera by a known amount and publishes
+    // the pixel displacement that motion must produce. Comparing the measured
+    // field against it turns "does this look right" into a number, which is the
+    // whole basis on which this project calls the vectors correct.
+    //
+    // A ratio of 1 is the target. Sign is not meaningful here: the vectors point
+    // backwards by convention - from a pixel to where it was - while the
+    // expectation is a magnitude.
+    if (selfTestPhase != 0 && expectedPx > 0.01) {
+        // ---- COMPARE THE MATCHING AXIS, NOT THE MAGNITUDE.
+        //
+        // `centre` above is sqrt(vx^2 + vy^2). The expectation for a yaw is a
+        // purely HORIZONTAL displacement, and a magnitude can only ever be
+        // greater than or equal to |vx| - so any vertical content inflates the
+        // ratio and it can never read below 1. That alone would explain a
+        // stable reading of about 1.25.
+        //
+        // Yaw phases (3, 4) are horizontal; pitch (5) is vertical.
+        const double cxPx = fabs(cSx / (double)(cN ? cN : 1)) * m.w;
+        const double cyPx = fabs(cSy / (double)(cN ? cN : 1)) * m.h;
+        const bool   vertical = (selfTestPhase == 5);
+        const double axisPx = vertical ? cyPx : cxPx;
+        const double ratio  = axisPx / (double)expectedPx;
+
+        // Frames straight after a phase change are a camera JUMP, not the
+        // steady motion being measured - they read tens of times too large and
+        // say nothing about the convention.
+        static int lastPhase = -1;
+        static int settle    = 0;
+        if (selfTestPhase != lastPhase) { lastPhase = selfTestPhase; settle = 3; }
+        if (settle > 0) { --settle; }
+        else {
+            trace("MV RATIO: phase=%d %s  measured=%.3f px  expected=%.3f px  "
+                  "ratio=%.3f%s  [magnitude %.3f]",
+                  selfTestPhase, vertical ? "pitch" : "yaw  ",
+                  axisPx, expectedPx, ratio,
+                  (ratio > 0.95 && ratio < 1.05) ? "   <- CORRECT" : "",
+                  centre);
+        }
+    }
 
     // REACTIVE MASK COVERAGE, in pixels.
     //

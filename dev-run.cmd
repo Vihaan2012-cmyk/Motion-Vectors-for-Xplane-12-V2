@@ -38,7 +38,7 @@ rem Measure the velocity field every N frames. This is the acceptance gate for
 rem the whole project, so it is on for debugging - but it reads back 31.9 MB at
 rem 4K, which is why it stays off in a release build rather than defaulting on
 rem like the injection does.
-set "TAA_VELOCITY_DUMP=300"
+set "TAA_VELOCITY_DUMP=20"
 
 rem Drive the camera through a known yaw and pitch once the flight settles, and
 rem compare the vectors against the pixel displacement that motion must

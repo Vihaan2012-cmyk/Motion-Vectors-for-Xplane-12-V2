@@ -30,7 +30,7 @@
 #include <QDesktopServices>
 #include <QUrl>
 
-static const char *kVersion  = "0.0.03";
+static const char *kVersion  = "0.0.04";
 static const char *kLayer    = "VK_LAYER_mv";
 static const char *kReleases =
     "https://api.github.com/repos/Vihaan2012-cmyk/Motion-Vectors-for-Xplane-12-V2/releases/latest";
