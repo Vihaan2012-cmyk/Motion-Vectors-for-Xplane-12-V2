@@ -75,6 +75,12 @@ struct MvTarget {
     float          dumpReproj[16] = {0};
     float          dumpExpectedPx = 0.0f;
     int            dumpPhase      = 0;
+    // Which SHARE frame that matrix came from, and which one is current when it
+    // is read. `far` has been constant at 13.150 px in every line ever printed,
+    // including frames whose field is a uniform 378 px - a matrix that never
+    // varies while the field does means the two still are not the same frame.
+    // Printing both ids says so outright instead of leaving it to be inferred.
+    uint64_t       dumpShareFrame = 0;
 };
 
 static MvTarget g_mv;
@@ -239,7 +245,8 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
 // rather than a mistimed read, which is a distinction that has already cost
 // this project several rounds elsewhere.
 static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
-                             const float *reproj, float expectedPx, int phase)
+                             const float *reproj, float expectedPx, int phase,
+                             uint64_t shareFrame)
 {
     MvTarget &m = g_mv;
     if (!m.ready || !m.readbackPtr || !m.wantDump) return;
@@ -248,6 +255,7 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
     if (reproj) memcpy(m.dumpReproj, reproj, sizeof(m.dumpReproj));
     m.dumpExpectedPx = expectedPx;
     m.dumpPhase      = phase;
+    m.dumpShareFrame = shareFrame;
 
     VkImageMemoryBarrier b;
     memset(&b, 0, sizeof(b));
@@ -289,7 +297,7 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
 
 // Measure it. Deliberately the SAME statistics the depth-derived dump prints,
 // so the two fields can be compared line for line rather than by impression.
-static void mvReport(double camMoved)
+static void mvReport(double camMoved, uint64_t nowShareFrame)
 {
     MvTarget &m = g_mv;
     if (!m.dumpPending || !m.readbackPtr) return;
@@ -542,11 +550,13 @@ static void mvReport(double camMoved)
             const double farRatio = predFar > 1e-6 ? p05 / predFar : 0.0;
             trace("MV RATIO: phase=%d %s  p05=%.3f p25=%.3f med=%.3f p75=%.3f "
                   "p95=%.3f px | matrix far=%.3f px  ->  p05/far=%.3f%s "
-                  "(expected=%.3f, near=%.3f)",
+                  "(expected=%.3f, near=%.3f, frame %llu recorded / %llu now)",
                   selfTestPhase, vertical ? "pitch" : "yaw  ",
                   p05, p25, axisPx, p75, p95, predFar, farRatio,
                   (farRatio > 0.95 && farRatio < 1.05) ? "  <- CORRECT" : "",
-                  expectedPx, predNear);
+                  expectedPx, predNear,
+                  (unsigned long long)m.dumpShareFrame,
+                  (unsigned long long)nowShareFrame);
             (void)ratio; (void)centre;
         }
     }

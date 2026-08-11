@@ -3493,7 +3493,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                 if (rdi != g_devices.end() && g_mv.ready)
                     mvRecordReadback(rdi->second, cb, g_velSnap.reproj,
                                      g_velSnap.selfTestExpectedPx,
-                                     g_velSnap.selfTestPhase);
+                                     g_velSnap.selfTestPhase, g_velSnap.frame);
             }
         }
 
@@ -4785,7 +4785,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // frame would race the submission and produce numbers describing nothing.
 
     if (g_spirvLive && g_mv.ready) {
-        mvReport(snap.camDelta);
+        mvReport(snap.camDelta, snap.frame);
         if (dumpEvery > 0 && (frames % (uint64_t)dumpEvery) == 0)
             g_mv.wantDump = true;
     }
