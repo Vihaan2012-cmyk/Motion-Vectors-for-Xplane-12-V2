@@ -185,6 +185,7 @@ static float    g_stLastPitch  = 0.0f;
 static bool     g_stLastPitchValid = false;
 static float    g_stAppliedPitch   = 0.0f;
 static int      g_stWatchdog       = 0;
+static bool     g_stPausedBySelfTest = false;
 static float    g_stBaseX = 0, g_stBaseY = 0, g_stBaseZ = 0;
 static float    g_stBaseHdg = 0, g_stBasePitch = 0;
 
@@ -2270,6 +2271,34 @@ static float matrixCallback(float sinceLast, float, int, void *)
 
             XPLMControlCamera(xplm_ControlCameraUntilViewChanges,
                               taaSelfTestCamera, nullptr);
+
+            // ---- FREEZE THE AEROPLANE FOR THE DURATION.
+            //
+            // The yaw and pitch phases are supposed to be PURE ROTATION about
+            // the eye, and the whole expectation rests on that: with no
+            // translation a camera rotation moves every depth by the same
+            // amount, so one predicted displacement fits the entire frame.
+            //
+            // A live flight does not hold still. Parked with the engine
+            // running, the aeroplane creeps, and the camera creeps with it -
+            // the matrix reports it plainly, near-plane displacement running to
+            // hundreds of pixels while infinity stays at 13. The measured field
+            // then spreads smoothly from below the prediction to fifteen times
+            // it, which is REAL parallax and not a defect, but it means no
+            // single number describes the frame and the gate cannot pass.
+            //
+            // Pausing costs nothing here: the self-test drives the camera, not
+            // the aeroplane, so a frozen sim still renders every frame the
+            // measurement needs.
+            if (XPLMCommandRef pause = XPLMFindCommand("sim/operation/pause_toggle")) {
+                XPLMDataRef paused = XPLMFindDataRef("sim/time/paused");
+                if (!paused || XPLMGetDatai(paused) == 0) {
+                    XPLMCommandOnce(pause);
+                    g_stPausedBySelfTest = true;
+                    xlog("self-test: paused the sim so the camera is the only "
+                         "thing moving");
+                }
+            }
             xlog("self-test: taking the camera from (%.1f %.1f %.1f) hdg=%.1f. "
                  "Phases: SETTLE, HOLD, YAW, TRANSLATE, HEADMOVE - %d frames each.",
                  p.x, p.y, p.z, p.heading, kStPhaseFrames);
@@ -2285,6 +2314,12 @@ static float matrixCallback(float sinceLast, float, int, void *)
             if (g_stPhase == TAA_ST_DONE) {
                 xlog("self-test: complete - camera released.");
                 XPLMDontControlCamera();
+                if (g_stPausedBySelfTest) {
+                    if (XPLMCommandRef pause = XPLMFindCommand("sim/operation/pause_toggle"))
+                        XPLMCommandOnce(pause);
+                    g_stPausedBySelfTest = false;
+                    xlog("self-test: unpaused");
+                }
                 g_stActive   = false;
                 g_stHaveBase = false;
             } else {

@@ -81,6 +81,7 @@ struct MvTarget {
     // varies while the field does means the two still are not the same frame.
     // Printing both ids says so outright instead of leaving it to be inferred.
     uint64_t       dumpShareFrame = 0;
+    float          dumpNearClip   = 0.0f;
 };
 
 static MvTarget g_mv;
@@ -246,7 +247,7 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
 // this project several rounds elsewhere.
 static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
                              const float *reproj, float expectedPx, int phase,
-                             uint64_t shareFrame)
+                             uint64_t shareFrame, float nearClip)
 {
     MvTarget &m = g_mv;
     if (!m.ready || !m.readbackPtr || !m.wantDump) return;
@@ -256,6 +257,7 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
     m.dumpExpectedPx = expectedPx;
     m.dumpPhase      = phase;
     m.dumpShareFrame = shareFrame;
+    m.dumpNearClip   = nearClip;
 
     VkImageMemoryBarrier b;
     memset(&b, 0, sizeof(b));
@@ -533,10 +535,25 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             *px = fabs(0.5 * x / w) * m.w;
             *py = fabs(0.5 * y / w) * m.h;
         };
+        // AT ONE METRE, NOT AT THE NEAR PLANE.
+        //
+        // The near plane here is 1.6 CM. A point there moves hundreds of pixels
+        // for a camera wobble of well under a millimetre, so comparing it
+        // against infinity flags translation that nothing visible cares about -
+        // and the first version of this test duly rejected almost every frame
+        // as "camera translated" while the sim was PAUSED.
+        //
+        // One metre is the real question: does something at arm.s length - the
+        // instrument panel - move like the terrain does? If those two agree,
+        // the frame is a pure rotation as far as anything being drawn is
+        // concerned. With an infinite far plane the depth mapping is
+        // ndcZ = 1 - near/d, so a metre is 1 - nearClip.
+        const double oneMetreZ = m.dumpNearClip > 0.0f
+                               ? 1.0 - (double)m.dumpNearClip : 0.98;
         double nearX = 0.0, nearY = 0.0, farX = 0.0, farY = 0.0;
         if (reproj) {
-            predictAt(0.0, &nearX, &nearY);
-            predictAt(1.0, &farX,  &farY);
+            predictAt(oneMetreZ, &nearX, &nearY);
+            predictAt(1.0,       &farX,  &farY);
         }
         const double predNear = vertical ? nearY : nearX;
         const double predFar  = vertical ? farY  : farX;
@@ -548,12 +565,31 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             // geometry in it, and that is what the matrix's far prediction
             // describes.
             const double farRatio = predFar > 1e-6 ? p05 / predFar : 0.0;
+
+            // A VERDICT ONLY WHEN THE MATRIX SAYS PURE ROTATION.
+            //
+            // The expectation is depth-independent only if the camera did not
+            // translate; then one number describes the whole frame and p05 must
+            // equal it. Once the camera translates, near geometry genuinely
+            // moves further than far geometry, the field spreads smoothly from
+            // below the prediction to many times it, and NO single number is
+            // right - so reporting a ratio there is reporting noise with three
+            // decimal places on it.
+            //
+            // near and far are the same rotation evaluated at the two ends of
+            // the depth range, so their agreement IS the purity test, and it
+            // comes from the matrix the shader was handed rather than from an
+            // assumption about what the aeroplane was doing.
+            const double purity = predFar > 1e-6 ? predNear / predFar : 0.0;
+            const bool   pure   = purity > 0.95 && purity < 1.05;
             trace("MV RATIO: phase=%d %s  p05=%.3f p25=%.3f med=%.3f p75=%.3f "
                   "p95=%.3f px | matrix far=%.3f px  ->  p05/far=%.3f%s "
-                  "(expected=%.3f, near=%.3f, frame %llu recorded / %llu now)",
+                  "(expected=%.3f, at1m=%.3f, frame %llu recorded / %llu now)",
                   selfTestPhase, vertical ? "pitch" : "yaw  ",
                   p05, p25, axisPx, p75, p95, predFar, farRatio,
-                  (farRatio > 0.95 && farRatio < 1.05) ? "  <- CORRECT" : "",
+                  !pure ? "  (camera translated - no single expectation)"
+                        : (farRatio > 0.95 && farRatio < 1.05) ? "  <- CORRECT"
+                        : "  <- WRONG",
                   expectedPx, predNear,
                   (unsigned long long)m.dumpShareFrame,
                   (unsigned long long)nowShareFrame);

@@ -3571,7 +3571,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                 if (rdi != g_devices.end() && g_mv.ready)
                     mvRecordReadback(rdi->second, cb, g_velSnap.reproj,
                                      g_velSnap.selfTestExpectedPx,
-                                     g_velSnap.selfTestPhase, g_velSnap.frame);
+                                     g_velSnap.selfTestPhase, g_velSnap.frame,
+                                     g_velSnap.nearClip);
             }
         }
 
