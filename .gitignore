@@ -1,0 +1,7 @@
+build/
+*.dll
+*.xpl
+*.o
+*.obj
+dist/
+*.bmp
