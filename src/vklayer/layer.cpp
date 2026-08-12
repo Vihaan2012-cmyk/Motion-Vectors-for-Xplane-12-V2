@@ -4778,7 +4778,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 // one step apart and far is being extracted wrongly. If it
                 // agrees with far, the plugin's formula is wrong. It is the same
                 // trace identity: tr(R_curr^T R_prev) = 1 + 2cos(a).
-                if ((frames % 600) == 0 && g_mv.w) {
+                // Phases 3, 4 and 5 are YAW, YAW-LEFT and PITCH - the only
+                // ones with a rotation to measure. Firing every 600 frames
+                // instead landed almost every sample outside them: four
+                // consecutive MV ANGLE lines read "trace says 0.000 px" while
+                // the disagreement they exist to resolve happens only while the
+                // camera is turning. Matched to the dump cadence so each line
+                // pairs with a verdict line.
+                const int stPhase = fresh.selfTestPhase;
+                // EVERY phase, not just the rotating ones. The epipolar
+                // probe says the reprojection carries almost no translation -
+                // the line it traces from one metre to infinity is 0.00 px
+                // through the hold phases and 0.2 to 3 px through the rotations,
+                // while the aircraft is flying at cruise. If that is real then
+                // near-field geometry cannot reproject correctly no matter how
+                // good the rotation is, which is exactly the shape of the
+                // residual: median 0.000 px, p95 15 to 330 px.
+                //
+                // dC is printed in metres so the question stops being an
+                // inference. Either the camera delta is genuinely tiny - which
+                // would mean the plugin's world matrices are expressed in a
+                // frame that travels with the aircraft - or it is being lost
+                // between the recovery and the matrix.
+                const bool rotating = (stPhase >= 3 && stPhase <= 5);
+                if (stPhase >= 1 && (frames % 20) == 0 && g_mv.w) {
                     double tr = 0.0;
                     for (int c = 0; c < 3; ++c)
                         for (int rr = 0; rr < 3; ++rr)
@@ -4788,7 +4811,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                     if (ca < -1.0) ca = -1.0;
                     const double ang = acos(ca);
                     const double angPx = ang * (double)fresh.proj[0] * (double)g_mv.w * 0.5;
-                    double fx = (double)r[12], fw = (double)r[15];
+                    // THE POINT AT INFINITY IS COLUMN 2, NOT COLUMN 3.
+                    //
+                    // This read r[12]/r[15] - column 3 - which is the image of
+                    // the point (0,0,0,1): the camera's own origin. Through a
+                    // view-space matrix whose w row is -1/near = -61.9 that is
+                    // a division by something near zero, and it duly reported
+                    // 4113, 3869 and 20349 px against a trace angle of 0.7 px.
+                    // Numbers like that read as a broken reprojection; they
+                    // were a broken probe.
+                    //
+                    // A point at infinity along the centre ray is (0,0,+-1,0),
+                    // so its image is +-column 2 and the sign cancels in the
+                    // magnitude.
+                    double fx = (double)r[8], fw = (double)r[11];
                     const double farPx = fabs(fw) < 1e-12 ? 0.0
                                        : fabs(0.5 * fx / fw) * g_mv.w;
                     // THE DEPTH CONVENTION, TAKEN FROM THE PROJECTION.
@@ -4799,6 +4835,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                     // all of which have now been guessed at and got wrong.
                     const double m10 = fresh.proj[10], m11 = fresh.proj[11];
                     const double zInf = (fabs(m11) > 1e-12) ? m10 / m11 : 0.0;
+                    const double dcLen = sqrt(dx*dx + dy*dy + dz*dz);
+                    const double tcam = sqrt((double)relRot[12]*relRot[12]
+                                           + (double)relRot[13]*relRot[13]
+                                           + (double)relRot[14]*relRot[14]);
+                    trace("MV DELTA: phase=%d camera moved %.4f m between these "
+                          "two frames; the same delta in previous-camera axes is "
+                          "%.4f m (these must agree - a rotation preserves "
+                          "length - and a value near zero while the aircraft is "
+                          "flying means the world matrices are not in a fixed "
+                          "frame)", stPhase, dcLen, tcam);
                     trace("MV ANGLE: same two matrices - trace says %.3f px, "
                           "reprojection says %.3f px, plugin says %.3f px | "
                           "proj[10]=%.5f proj[11]=%.5f proj[14]=%.5f -> "
@@ -4811,10 +4857,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 // Both, once in a while, so the difference is a measurement
                 // rather than a claim. Column 3 plus column 2 is the centre ray
                 // at infinity; half of it, in pixels, is the displacement.
-                if ((frames % 600) == 0 && g_mv.w) {
+                if (rotating && (frames % 20) == 0 && g_mv.w) {
+                    // Column 2 alone. col3 + col2 is the image of (0,0,1,1) -
+                    // a point one metre along the centre ray - not a point at
+                    // infinity, and at one metre the translation term still
+                    // dominates. Same correction as MV ANGLE above.
                     auto farPx = [&](const float *m) {
-                        double x = (double)m[12] + (double)m[8];
-                        double w = (double)m[15] + (double)m[11];
+                        double x = (double)m[8];
+                        double w = (double)m[11];
                         return fabs(w) < 1e-12 ? 0.0 : fabs(0.5 * x / w) * g_mv.w;
                     };
                     trace("MV REPROJ: layer-paired %.3f px vs plugin-paired %.3f px "

@@ -385,6 +385,55 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     double cSx = 0.0, cSy = 0.0;
     std::vector<float> cAxX, cAxY;
 
+    // ---- THE DEPTH-FREE CONSISTENCY TEST.
+    //
+    // Every verdict above compares the field against a prediction made at an
+    // ASSUMED depth - one metre, or infinity. That only decides anything while
+    // the camera is purely rotating, because only then does depth stop
+    // mattering. The aircraft is flying throughout this test, so from phase 4
+    // onward the matrix carries real translation (near swings 9.06 to 15.43 px
+    // while far stays pinned at 13.150), the centre pixel sits at some finite
+    // depth nobody knows, and a disagreement with either endpoint proves
+    // nothing at all. Phases 4 to 7 could not have passed as written.
+    //
+    // This needs no depth. Each pixel has two measured components and one
+    // unknown distance, so the distance is solved from x and then used to
+    // PREDICT y. If the field is right, the predicted y lands on the measured y
+    // for every pixel at once; if it is wrong, no single distance satisfies
+    // both and the residual blows up. It works under translation, rotation and
+    // both together, which is what the later phases actually contain.
+    //
+    // Writing P = (u*d/sx, v*d/sy, -d, 1) for the view-space point behind pixel
+    // (u, v) at distance d, each clip component is linear in d:
+    //
+    //     clip.k = d * (M[0][k]*u/sx + M[1][k]*v/sy - M[2][k]) + M[3][k]
+    //
+    // so x/w = Xp is one linear equation in d, and y follows.
+    //
+    // Four sign conventions are evaluated rather than one. The image-space Y
+    // flip has already been guessed at and got wrong once, and a flipped Y is
+    // invisible in every magnitude statistic on this page. Printing all four
+    // lets the log name the convention instead of me assuming it.
+    const float *RJ = m.dumpReproj;
+    const double sxP = (m.dumpProj[0] != 0.0f) ? (double)m.dumpProj[0] : 1.0;
+    const double syP = (m.dumpProj[5] != 0.0f) ? (double)m.dumpProj[5] : 1.0;
+    std::vector<float> resid[4];
+    std::vector<float> solvedD;
+    // WHERE the bad pixels are, not just how many.
+    //
+    // The residual tail can mean two completely different things and the
+    // numbers alone cannot tell them apart. If it is spread over the whole
+    // frame, the reprojection is wrong. If it is clustered, it is geometry that
+    // does not move with the camera - the propeller disc, control surfaces,
+    // instrument needles - which no camera-only reprojection can predict and
+    // which a TAA resolve is expected to reject by colour clamping instead.
+    //
+    // A centroid and a spread settle it in one line. Accumulated for the first
+    // sign convention; the four agree closely enough that the choice does not
+    // move the answer.
+    double badSx = 0.0, badSy = 0.0, badSxx = 0.0, badSyy = 0.0;
+    uint64_t badN = 0, liveN = 0;
+
 
     // Strided. A full 8.3 M pixel scan per dump costs more than it tells us -
     // every 4th pixel in each direction is 500k samples, which settles any of
@@ -405,6 +454,109 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             if (mag > 0.0) {
                 axX.push_back(fabsf(vx));
                 axY.push_back(fabsf(vy));
+
+                // ---- EPIPOLAR RESIDUAL, not a solved depth.
+                //
+                // The first version of this solved d from the x channel and
+                // predicted y from it. That is ill-posed exactly where it
+                // matters: under a pure rotation the image of a ray does not
+                // depend on d at all, the numerator M[12] - Xp*M[15] goes to
+                // zero with the translation, and d comes out 0/0. It duly
+                // rejected 518400 samples of 518400 on the rotation frames and
+                // solved 0.7 m on the rest.
+                //
+                // What is always well posed is the CURVE. As d sweeps 0 to
+                // infinity the previous position of this pixel traces the image
+                // of a ray, which is a straight line - the epipolar line. So
+                // the question is not "what depth" but "does the measured
+                // previous position lie on the line at all", and that is a
+                // perpendicular distance. Under translation the line is long
+                // and the test is sharp; under pure rotation it collapses to a
+                // single point and the test degrades gracefully into the
+                // fixed-depth comparison, which is the right behaviour rather
+                // than a division by zero.
+                //
+                // Two points fix the line: d -> infinity, where the constant
+                // column drops out, and d = 1 m.
+                const double u    = 2.0 * ((double)x + 0.5) / (double)m.w - 1.0;
+                const double vTop = 1.0 - 2.0 * ((double)y + 0.5) / (double)m.h;
+                const double hw = 0.5 * (double)m.w, hh = 0.5 * (double)m.h;
+                (void)sxP; (void)syP;
+                for (int c = 0; c < 4; ++c) {
+                    const double v   = (c & 1) ? -vTop : vTop;
+                    const double dyN = (c & 2) ?  2.0 * (double)vy
+                                               : -2.0 * (double)vy;
+                    // THE MATRIX TAKES CLIP, NOT VIEW.
+                    //
+                    // viewToPrevClip = prevProj * relRot * clipToView, and that
+                    // trailing clipToView is what converts clip to view - so
+                    // the matrix expects exactly what the shader hands it,
+                    // (x_clip, y_clip, w_clip, 1). Building a view-space point
+                    // here divided by the projection scales a second time and
+                    // negated z on top, and the residual came out 500 to 2600 px
+                    // with no sign convention winning - the signature of a
+                    // structurally wrong probe rather than a wrong field.
+                    //
+                    // For the pixel at NDC (u, v) at clip depth d, x_clip = u*d
+                    // and y_clip = v*d, so every clip component is d*A + M[3][k]
+                    // with A = M[0][k]*u + M[1][k]*v + M[2][k].
+                    //
+                    // Checked against the identity case: with no camera motion
+                    // M reduces to columns (1,0,0,0), (0,1,0,0), (0,0,1,1),
+                    // (0,0,m14,0), giving Ax = u, Aw = 1 and x/w = u. No
+                    // motion, which is the only answer that can be right.
+                    const double Ax = RJ[0]*u + RJ[4]*v + RJ[8];
+                    const double Ay = RJ[1]*u + RJ[5]*v + RJ[9];
+                    const double Aw = RJ[3]*u + RJ[7]*v + RJ[11];
+                    if (fabs(Aw) < 1e-12) continue;
+                    const double ex = (Ax / Aw) * hw, ey = (Ay / Aw) * hh;
+                    const double w1 = Aw + (double)RJ[15];
+                    if (fabs(w1) < 1e-12) continue;
+                    const double fx = ((Ax + (double)RJ[12]) / w1) * hw;
+                    const double fy = ((Ay + (double)RJ[13]) / w1) * hh;
+                    const double mx = (u + 2.0 * (double)vx) * hw;
+                    const double my = (v + dyN) * hh;
+                    double lx = fx - ex, ly = fy - ey;
+                    const double len = sqrt(lx*lx + ly*ly);
+                    double r;
+                    if (len < 1e-4) {
+                        // Pure rotation: the line is a point.
+                        r = sqrt((mx-ex)*(mx-ex) + (my-ey)*(my-ey));
+                    } else {
+                        lx /= len; ly /= len;
+                        r = fabs((mx - ex) * ly - (my - ey) * lx);
+                    }
+                    resid[c].push_back((float)r);
+                    // ---- CONVENTION 2 IS v+,dy+, AND IT IS THE RIGHT ONE.
+                    //
+                    // Measured, on every phase of a full self-test run:
+                    //
+                    //   phase 7  v+,dy-=34.792 v-,dy-=30.831 v+,dy+=0.003 v-,dy+=7.183
+                    //   phase 7  v+,dy-=19.360 v-,dy-=22.297 v+,dy+=0.002 v-,dy+=4.328
+                    //   phase 0  v+,dy-=0.711  v-,dy-=0.057  v+,dy+=0.005 v-,dy+=0.748
+                    //   phase 0  v+,dy-=1.897  v-,dy-=0.044  v+,dy+=0.008 v-,dy+=1.922
+                    //
+                    // v+,dy+ wins every line by two to four orders of
+                    // magnitude, and it wins hardest on phase 7 where the
+                    // epipolar line is 27 px long and the test has the most to
+                    // discriminate with. The shader therefore writes velocity
+                    // with Y already in the NDC-up sense and needs no flip.
+                    //
+                    // The tail statistics were being accumulated on convention
+                    // 0 - v+,dy-, one of the wrong ones - which is why they
+                    // reported 95% of moving pixels missing by more than a
+                    // pixel while the median for the correct convention was
+                    // 0.003 px. They read the wrong column, not a broken field.
+                    if (c == 2) {
+                        solvedD.push_back((float)len);
+                        ++liveN;
+                        if (r > 1.0) {
+                            ++badN;
+                            badSx += (double)x; badSy += (double)y;
+                            badSxx += (double)x * x; badSyy += (double)y * y;
+                        }
+                    }
+                }
             }
             if (mag == 0.0) ++zero;
             if (mag > maxMag) maxMag = mag;
@@ -427,6 +579,67 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
         }
     }
     if (!n) return;
+
+    {
+        auto med = [](std::vector<float> &v) -> double {
+            if (v.empty()) return -1.0;
+            size_t k = v.size() / 2;
+            std::nth_element(v.begin(), v.begin() + k, v.end());
+            return (double)v[k];
+        };
+        static const char *kConv[4] = { "v+,dy-", "v-,dy-", "v+,dy+", "v-,dy+" };
+        double best = 1e30; int bestC = -1;
+        double mr[4];
+        for (int c = 0; c < 4; ++c) {
+            mr[c] = med(resid[c]);
+            if (mr[c] >= 0.0 && mr[c] < best) { best = mr[c]; bestC = c; }
+        }
+        const double medD = med(solvedD);
+        // p95 as well as the median, and the PHASE on the line.
+        //
+        // Pairing this against the verdict line by position in the log does not
+        // work - the two do not fire on the same set of frames - and reading a
+        // translation phase as a rotation one has already cost an analysis
+        // cycle once on this project. The line carries its own phase now.
+        //
+        // The median alone would hide the case that matters most: a field that
+        // is right almost everywhere and wrong on the near-field geometry is
+        // exactly what a consumer ghosts on.
+        std::vector<float> &rb = resid[bestC >= 0 ? bestC : 0];
+        double r95 = -1.0;
+        if (!rb.empty()) {
+            size_t k95 = (size_t)(rb.size() * 0.95);
+            if (k95 >= rb.size()) k95 = rb.size() - 1;
+            std::nth_element(rb.begin(), rb.begin() + k95, rb.end());
+            r95 = (double)rb[k95];
+        }
+        trace("MV EPI: phase=%d | distance from the measured previous position "
+              "to the epipolar line, median per sign convention: %s=%.3f "
+              "%s=%.3f %s=%.3f %s=%.3f px | best=%s p95=%.3f px | median line "
+              "length=%.2f px over %llu of %llu samples (a short line means the "
+              "frame is nearly a pure rotation, where depth cannot be recovered "
+              "and the residual reduces to the fixed-depth comparison)",
+              m.dumpPhase,
+              kConv[0], mr[0], kConv[1], mr[1], kConv[2], mr[2], kConv[3], mr[3],
+              bestC >= 0 ? kConv[bestC] : "none", r95, medD,
+              (unsigned long long)solvedD.size(), (unsigned long long)n);
+        if (badN) {
+            const double bx = badSx / (double)badN, by = badSy / (double)badN;
+            double vxx = badSxx / (double)badN - bx * bx;
+            double vyy = badSyy / (double)badN - by * by;
+            if (vxx < 0.0) vxx = 0.0;
+            if (vyy < 0.0) vyy = 0.0;
+            trace("MV TAIL: %llu of %llu moving pixels miss the epipolar line by "
+                  "more than 1 px (%.2f%%), centred at (%.0f, %.0f) of %ux%u "
+                  "with a spread of %.0f x %.0f px - clustered low and central "
+                  "is the propeller and the panel, which are not rigid with the "
+                  "camera and cannot be reprojected from it; spread over the "
+                  "whole frame would mean the matrix is wrong",
+                  (unsigned long long)badN, (unsigned long long)liveN,
+                  100.0 * (double)badN / (double)(liveN ? liveN : 1),
+                  bx, by, m.w, m.h, sqrt(vxx), sqrt(vyy));
+        }
+    }
 
     // Reported in PIXELS. The shader writes UV, but a UV number is unreadable
     // without knowing the resolution, and every prediction worth checking - the
@@ -666,10 +879,44 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
         // the reprojection is depth-INDEPENDENT, so the two must agree. When
         // they diverge, the camera translated, and no single expected
         // displacement fits the frame.
-        auto predictAt = [&](double ndcZ, double *px, double *py) {
-            const double x = (double)reproj[12] + ndcZ * (double)reproj[8];
-            const double y = (double)reproj[13] + ndcZ * (double)reproj[9];
-            const double w = (double)reproj[15] + ndcZ * (double)reproj[11];
+        // ---- THE MATRIX IS VIEW-SPACE. FEED IT A VIEW-SPACE POINT.
+        //
+        // This took a CLIP-space depth and built col3 + ndcZ*col2, the image of
+        // (0, 0, ndcZ, 1). That was right while the reprojection went clip to
+        // clip. It has been wrong since the matrix became view-to-prev-clip,
+        // and it is the whole of the far=9.5..17.3 scatter that the last two
+        // rounds were spent chasing: the matrix never moved. MV ANGLE, reading
+        // the same matrix correctly, gives 13.150 px on every line while the
+        // trace angle and the plugin independently give 13.13-13.18.
+        //
+        // The shader hands the matrix (x_clip, y_clip, w_clip, 1) and clipToView
+        // turns that into (x_view, y_view, z_view, 1) - it divides x and y by
+        // the projection scales and sets clipToView[10] = -1, so z_view =
+        // -w_clip, and w_clip is positive for anything in front of the eye.
+        // Forward is therefore -z, and a point d metres down the centre ray is
+        // (0, 0, -d, 1).
+        //
+        // At infinity the constant column drops out under the division, leaving
+        // column 2 alone - which is exactly the correction just made to the
+        // MV ANGLE probe, for exactly the same reason.
+        auto predictAtDistance = [&](double d, double *px, double *py) {
+            double x, y, w;
+            if (d <= 0.0) {                       // d <= 0 means "at infinity"
+                x = (double)reproj[8];
+                y = (double)reproj[9];
+                w = (double)reproj[11];
+            } else {
+                // +d, not -d. Same mistake as the epipolar probe had: the
+                // matrix consumes (x_clip, y_clip, w_clip, 1) and w_clip is
+                // positive in front of the eye, so the centre ray at distance d
+                // is (0, 0, d, 1). Negating it put the sample behind the
+                // camera, which is why near disagreed with far by up to 40%
+                // while far - taken from column 2 alone, and so immune to the
+                // sign - was steady and correct at 13.150 px.
+                x = (double)reproj[12] + d * (double)reproj[8];
+                y = (double)reproj[13] + d * (double)reproj[9];
+                w = (double)reproj[15] + d * (double)reproj[11];
+            }
             if (fabs(w) < 1e-12) { *px = *py = 0.0; return; }
             *px = fabs(0.5 * x / w) * m.w;
             *py = fabs(0.5 * y / w) * m.h;
@@ -732,8 +979,13 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
         const double oneMetreZ = haveProj ? (m10 / m11 - m14 / m11) : 0.98;
         double nearX = 0.0, nearY = 0.0, farX = 0.0, farY = 0.0;
         if (reproj) {
-            predictAt(oneMetreZ, &nearX, &nearY);
-            predictAt(infinityZ, &farX,  &farY);
+            // One metre and infinity, both as DISTANCES now. The two clip
+            // depths above are kept because the depth convention they encode is
+            // still printed elsewhere, but they are no longer what the
+            // predictor consumes.
+            (void)oneMetreZ; (void)infinityZ;
+            predictAtDistance(1.0, &nearX, &nearY);
+            predictAtDistance(-1.0, &farX,  &farY);
         }
         const double predNear = vertical ? nearY : nearX;
         const double predFar  = vertical ? farY  : farX;
@@ -758,7 +1010,39 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             std::vector<float> &cAxis = vertical ? cAxY : cAxX;
             const double centrePx = quantile(cAxis, 0.5)
                                   * (vertical ? (double)m.h : (double)m.w);
-            const double farRatio = predFar > 1e-6 ? centrePx / predFar : 0.0;
+            // ---- REVERTED: judged against predFar again, and here is why.
+            //
+            // I switched this to the plugin's angle one run ago on the strength
+            // of four consecutive yaw frames where the field and the plugin
+            // agreed to better than 1% while predFar wandered. A fuller sample
+            // says that reading was wrong, and the evidence is a correlation:
+            //
+            //     centre   far
+            //      5.760  10.062
+            //      7.766   7.062
+            //     12.780  13.004
+            //     17.996  14.770
+            //     21.835  15.856
+            //
+            // centre and far rise and fall together; the plugin sits flat at
+            // 13.15 through both the yaw and the pitch phase. Two numbers that
+            // track each other are measuring one thing, and the flat one is
+            // measuring another - so those four agreeing yaw frames were a
+            // coincidence of the commanded rate matching the realised one, not
+            // corroboration.
+            //
+            // The two describe different frame PAIRS. The plugin's angle comes
+            // from world against prevWorld, consecutive FLIGHT LOOP samples
+            // (plugin.cpp, selfTestExpectedPx). The layer's reprojection is
+            // built across consecutive PRESENTS. Neither is wrong; they answer
+            // different questions, and the one that governs whether the field
+            // is correct is the present-paired one, because that is the pair
+            // the shader reprojected between.
+            //
+            // So predFar is the judge. The plugin's figure stays in the log as
+            // an independent witness, and its disagreement here is information
+            // about loop-to-present pacing rather than a defect in the field.
+            const double farRatio  = predFar > 1e-6 ? centrePx / predFar : 0.0;
 
             // ---- WHAT EACH PHASE PREDICTS. Magnitude at the centre is not a
             // test on its own: a field with the right size and the wrong sign is
