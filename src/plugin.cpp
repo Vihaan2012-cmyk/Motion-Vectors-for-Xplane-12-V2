@@ -1433,6 +1433,7 @@ static int   getViewportW(void*)    { return g_share ? g_share->viewportW : 0; }
 static int   getViewportH(void*)    { return g_share ? g_share->viewportH : 0; }
 static int   getJitterPhases(void*) { return g_share ? g_share->jitterPhases : 0; }
 static int   getObjectCount(void*)  { return g_share ? g_share->objectCount : 0; }
+static float getRenderScale(void*)  { return g_share ? g_share->renderScale : 1.0f; }
 
 // ---- THE QUALITY FIGURES.
 //
@@ -1531,6 +1532,14 @@ static void registerDatarefs()
     g_myObjCount  = XPLMRegisterDataAccessor("taaimpl/moving_objects", xplmType_Int, 0,
                       getObjectCount, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
+
+    // render_scale was DOCUMENTED at the top of this file and never registered.
+    // The panel read it, FlyWithLua reported a missing name through its own
+    // error path rather than through Lua, and it quarantined the script and
+    // took the whole Lua engine down with it - every other script the user had
+    // loaded, for one name in a comment that was never code.
+    XPLMRegisterDataAccessor("taaimpl/render_scale", xplmType_Float, 0,
+        nullptr, nullptr, getRenderScale, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
 
     XPLMRegisterDataAccessor("taaimpl/mv_residual_px", xplmType_Float, 0,
         nullptr, nullptr, getMvResidual, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);

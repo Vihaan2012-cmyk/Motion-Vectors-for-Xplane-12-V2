@@ -28,8 +28,24 @@ end
   exactly this reason.
 --------------------------------------------------------------------------- ]]
 local have = {}
+
+-- ---- ASK WHETHER IT EXISTS BEFORE BINDING IT.
+--
+-- pcall is NOT enough. FlyWithLua's dataref() reports a missing name through
+-- its own error path, above Lua, so the failure is not something pcall can
+-- catch - it quarantines the whole script and takes the Lua engine with it.
+-- That is exactly what happened: taaimpl/render_scale is documented in the
+-- plugin and never actually registered, and one missing name killed every
+-- script the user had loaded.
+--
+-- XPLMFindDataRef just returns nil for a name that does not exist, which is the
+-- question actually being asked here. pcall stays as a second line for the
+-- binding itself.
 local function try_dataref(name, kind)
     local var = name:gsub("/", "_"):gsub("^taaimpl_", "MV_")
+    if XPLMFindDataRef == nil then have[name] = false return false end
+    local ref = XPLMFindDataRef(name)
+    if ref == nil or ref == 0 then have[name] = false return false end
     local ok = pcall(dataref, var, name, kind)
     have[name] = ok
     return ok
