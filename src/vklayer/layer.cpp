@@ -4835,12 +4835,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                     const double tcam = sqrt((double)relRot[12]*relRot[12]
                                            + (double)relRot[13]*relRot[13]
                                            + (double)relRot[14]*relRot[14]);
+                    // COMPONENTS, not just lengths.
+                    //
+                    // The flow in phase 6 sits 46 to 54 degrees off the epipolar
+                    // line it must lie along, while phase 7 - the same geometry
+                    // with 58x less translation - is exact to 0.001 degrees. A
+                    // wrong axis would be a CONSTANT angle. This one grows
+                    // through the phase, so something is accumulating, and the
+                    // lengths agreeing tells us nothing about direction: a
+                    // rotation preserves length, so |t| = |dC| holds for every
+                    // wrong rotation as well as the right one.
                     trace("MV DELTA: phase=%d camera moved %.4f m between these "
                           "two frames; the same delta in previous-camera axes is "
-                          "%.4f m (these must agree - a rotation preserves "
-                          "length - and a value near zero while the aircraft is "
-                          "flying means the world matrices are not in a fixed "
-                          "frame)", stPhase, dcLen, tcam);
+                          "%.4f m | dC=(%+.4f, %+.4f, %+.4f) t=(%+.4f, %+.4f, "
+                          "%+.4f) | cam=(%.2f, %.2f, %.2f)",
+                          stPhase, dcLen, tcam, dx, dy, dz,
+                          (double)relRot[12], (double)relRot[13], (double)relRot[14],
+                          ccx, ccy, ccz);
                     trace("MV ANGLE: same two matrices - trace says %.3f px, "
                           "reprojection says %.3f px, plugin says %.3f px | "
                           "proj[10]=%.5f proj[11]=%.5f proj[14]=%.5f -> "

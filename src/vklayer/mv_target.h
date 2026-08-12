@@ -466,6 +466,11 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // rotation is wrong" from "the translation is wrong" without any new
     // machinery in the render path.
     std::vector<float> residShort, residLong;
+    // The ANGLE between the measured flow and the epipolar line it should lie
+    // along. A wrong translation axis turns the line; a wrong sign or scale
+    // slides the point along it and leaves the angle at zero. The perpendicular
+    // residual cannot tell those apart, and this can.
+    std::vector<float> flowAngle;
 
 
     // Strided. A full 8.3 M pixel scan per dump costs more than it tells us -
@@ -563,6 +568,19 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                     if (c == 2) {
                         if (len < 1.0) residShort.push_back((float)r);
                         else           residLong.push_back((float)r);
+                        if (len >= 4.0) {
+                            const double fxm = mx - u * hw, fym = my - v * hh;
+                            const double fl = sqrt(fxm*fxm + fym*fym);
+                            if (fl > 1.0) {
+                                // lx,ly is the unit epipolar direction; the
+                                // measured flow should be parallel to it.
+                                double d = (fxm * lx + fym * ly) / fl;
+                                if (d >  1.0) d =  1.0;
+                                if (d < -1.0) d = -1.0;
+                                double ang = acos(fabs(d)) * 57.29577951308232;
+                                flowAngle.push_back((float)ang);
+                            }
+                        }
                     }
                     // ---- CONVENTION 2 IS v+,dy+, AND IT IS THE RIGHT ONE.
                     //
@@ -668,6 +686,21 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                 std::nth_element(v.begin(), v.begin() + k, v.end());
                 return (double)v[k];
             };
+            {
+                double amed = -1.0;
+                if (!flowAngle.empty()) {
+                    size_t k = flowAngle.size() / 2;
+                    std::nth_element(flowAngle.begin(), flowAngle.begin() + k, flowAngle.end());
+                    amed = (double)flowAngle[k];
+                }
+                trace("MV FLOWDIR: phase=%d | median angle between the measured "
+                      "flow and the epipolar line it must lie along = %.3f deg "
+                      "over %llu pixels - near zero means the direction is right "
+                      "and any error is along the line (a sign or a scale); a "
+                      "consistent non-zero angle means the translation AXIS is "
+                      "wrong", m.dumpPhase, amed,
+                      (unsigned long long)flowAngle.size());
+            }
             trace("MV SPLIT: phase=%d | pixels whose reprojection barely depends "
                   "on depth (epipolar line under 1 px): median %.3f px over %llu "
                   "| pixels that depend on it strongly: median %.3f px over %llu "

@@ -2432,6 +2432,24 @@ static float matrixCallback(float sinceLast, float, int, void *)
                    ox - lastOwnX, oy - lastOwnY, oz - lastOwnZ,
                    sqrt((ox-lastOwnX)*(ox-lastOwnX) + (oy-lastOwnY)*(oy-lastOwnY)
                       + (oz-lastOwnZ)*(oz-lastOwnZ)), oy);
+        // WHY it is not moving, not just that it is not.
+        //
+        // A stationary aircraft at a constant 337.69 m reads the same whether
+        // the sim is paused, the engine is idle with the brakes on, or a freeze
+        // is in force - and those need completely different fixes. The whole
+        // acceptance suite has been running in this state, so every number it
+        // produced covers rotation and near-zero translation only.
+        if (haveOwn && (every % 20) == 0) {
+            static XPLMDataRef drGS  = taaFind("sim/flightmodel/position/groundspeed");
+            static XPLMDataRef drThr = taaFind("sim/cockpit2/engine/actuators/throttle_ratio_all");
+            static XPLMDataRef drPbk = taaFind("sim/flightmodel/controls/parkbrake");
+            xlog("MV STATE: paused=%d groundspeed=%.2f m/s throttle=%.2f "
+                 "parkbrake=%.2f - a frozen world tests no translation at all",
+                 g_drPaused ? XPLMGetDatai(g_drPaused) : -1,
+                 drGS  ? (double)XPLMGetDataf(drGS)  : -1.0,
+                 drThr ? (double)XPLMGetDataf(drThr) : -1.0,
+                 drPbk ? (double)XPLMGetDataf(drPbk) : -1.0);
+        }
         lastOwnX = ox; lastOwnY = oy; lastOwnZ = oz; haveOwn = true;
     }
 
