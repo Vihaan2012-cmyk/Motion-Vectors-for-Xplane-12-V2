@@ -491,6 +491,29 @@ struct TaaShare {
     // Device-local heap only - host-visible system memory is not what runs out.
     // Megabytes rather than bytes: a uint32 of bytes overflows at 4 GB, which is
     // half this card.
+    // ---- MOTION VECTOR QUALITY, WRITTEN BY THE LAYER.
+    //
+    // The one number that says whether this project works, published where a
+    // user can see it instead of living in a trace file. It is the median
+    // distance between where the field says a pixel was and where the geometry
+    // says it could have been - the depth-free epipolar residual - measured
+    // over every sampled pixel of a dumped frame.
+    //
+    // Sub-pixel is correct. The verified suite runs 0.000 to 0.004 px across
+    // rotation, pitch, translation and head movement. A panel showing 12 px is
+    // showing a broken build, and that is worth being able to see without
+    // reading a log.
+    //
+    // Scaled by 1000 and carried as an integer: the shared block is written by
+    // one process and read by another, and a float that is half-written reads
+    // as a denormal or a NaN rather than as a stale number. Milli-pixels are
+    // finer than the measurement and cannot tear into nonsense.
+    uint32_t mvResidualMilliPx;    // median epipolar residual, px * 1000
+    uint32_t mvResidualP95MilliPx; // 95th percentile, px * 1000
+    uint32_t mvResidualSamples;    // pixels behind those two figures
+    uint32_t mvVelocityMB;         // the velocity target itself
+    uint32_t mvPipelinesPatched;   // geometry pipelines carrying the injection
+    uint32_t mvPipelinesRejected;  // ...and how many the driver refused
     uint32_t vramTotalMB;     // physical size of the device-local heap
     uint32_t vramBudgetMB;    // what the driver says this process may use
     uint32_t vramUsageMB;     // what this process currently has allocated

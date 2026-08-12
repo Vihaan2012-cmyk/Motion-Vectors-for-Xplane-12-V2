@@ -788,6 +788,22 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                   (unsigned long long)residShort.size(), med2(residLong),
                   (unsigned long long)residLong.size());
         }
+        // ---- PUBLISH THE RESIDUAL FOR THE PANEL.
+        //
+        // The one number that says whether this project works, put where a user
+        // can read it rather than left in a trace file. Milli-pixels as an
+        // integer, because the shared block is written by one process and read
+        // by another and a half-written float reads as a denormal rather than
+        // as a stale number.
+        if (g_share && g_share->magic == TAA_MAGIC && bestC >= 0 && mr[bestC] >= 0.0) {
+            double mp = mr[bestC] * 1000.0;
+            if (mp < 0.0) mp = 0.0;
+            if (mp > 4.0e9) mp = 4.0e9;
+            g_share->mvResidualMilliPx = (uint32_t)mp;
+            g_share->mvResidualSamples = (uint32_t)resid[bestC].size();
+            g_share->mvVelocityMB =
+                (uint32_t)(((uint64_t)m.w * m.h * kMvBytes) / (1024u * 1024u));
+        }
         std::vector<float> &rb = resid[bestC >= 0 ? bestC : 0];
         double r95 = -1.0;
         if (!rb.empty()) {
@@ -795,6 +811,12 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             if (k95 >= rb.size()) k95 = rb.size() - 1;
             std::nth_element(rb.begin(), rb.begin() + k95, rb.end());
             r95 = (double)rb[k95];
+            if (g_share && g_share->magic == TAA_MAGIC) {
+                double p = r95 * 1000.0;
+                if (p < 0.0) p = 0.0;
+                if (p > 4.0e9) p = 4.0e9;
+                g_share->mvResidualP95MilliPx = (uint32_t)p;
+            }
         }
         trace("MV EPI: phase=%d | distance from the measured previous position "
               "to the epipolar line, median per sign convention: %s=%.3f "

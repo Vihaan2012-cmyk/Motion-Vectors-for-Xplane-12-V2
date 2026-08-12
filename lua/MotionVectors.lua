@@ -1,11 +1,14 @@
 --[[----------------------------------------------------------------------------
-  Motion Vectors - status panel
+  MOTION VECTORS - status panel
 
   A front end for the MotionVectors plugin, which derives per-pixel motion
-  vectors for X-Plane 12. There is nothing to choose here: the project produces
-  vectors and this reports on them. Every widget reads a dataref; the few that
-  write are tuning values the plugin clamps itself, so this never holds state of
-  its own and cannot drift from what the plugin believes.
+  vectors for X-Plane 12.
+
+  There is almost nothing to choose here, and that is deliberate. The project
+  produces a velocity field; this reports on it. Every value on screen reads a
+  dataref, and the one control that writes is a tuning value the plugin clamps
+  itself - so this panel holds no state of its own and cannot drift from what
+  the plugin believes.
 
   Requires FlyWithLua NG+ (ImGui).
 ------------------------------------------------------------------------------]]
@@ -15,11 +18,15 @@ if not SUPPORTS_FLOATING_WINDOWS then
     return
 end
 
--- Wrapped in pcall so the panel survives the plugin being absent. A script that
--- throws on load takes the whole thing down, and then the message the user
--- actually needs - "the plugin is not installed" - is buried under a traceback
--- about a nil dataref. The predecessor's panel ended up quarantined by
--- FlyWithLua for exactly this reason.
+--[[ ---------------------------------------------------------------------------
+  Datarefs.
+
+  Wrapped in pcall so the panel survives the plugin being absent. A script that
+  throws on load takes the whole thing down, and the message the user actually
+  needs - "the plugin is not installed" - ends up buried under a traceback about
+  a nil dataref. The predecessor's panel was quarantined by FlyWithLua for
+  exactly this reason.
+--------------------------------------------------------------------------- ]]
 local have = {}
 local function try_dataref(name, kind)
     local var = name:gsub("/", "_"):gsub("^taaimpl_", "MV_")
@@ -28,20 +35,24 @@ local function try_dataref(name, kind)
     return ok
 end
 
-try_dataref("taaimpl/enabled",        "writable")
-try_dataref("taaimpl/layer_attached", "readonly")
-try_dataref("taaimpl/render_scale",   "readonly")
-try_dataref("taaimpl/viewport_w",     "readonly")
-try_dataref("taaimpl/viewport_h",     "readonly")
-try_dataref("taaimpl/jitter_phases",  "readonly")
-try_dataref("taaimpl/moving_objects", "readonly")
-try_dataref("taaimpl/reverse_z",      "readonly")
-try_dataref("taaimpl/lod_bias",       "writable")
-try_dataref("taaimpl/vram_used_mb",   "readonly")
-try_dataref("taaimpl/vram_budget_mb", "readonly")
-try_dataref("taaimpl/vram_total_mb",  "readonly")
-
-local wnd = nil
+try_dataref("taaimpl/enabled",            "writable")
+try_dataref("taaimpl/layer_attached",     "readonly")
+try_dataref("taaimpl/render_scale",       "readonly")
+try_dataref("taaimpl/viewport_w",         "readonly")
+try_dataref("taaimpl/viewport_h",         "readonly")
+try_dataref("taaimpl/jitter_phases",      "readonly")
+try_dataref("taaimpl/moving_objects",     "readonly")
+try_dataref("taaimpl/reverse_z",          "readonly")
+try_dataref("taaimpl/lod_bias",           "writable")
+try_dataref("taaimpl/vram_used_mb",       "readonly")
+try_dataref("taaimpl/vram_budget_mb",     "readonly")
+try_dataref("taaimpl/vram_total_mb",      "readonly")
+try_dataref("taaimpl/mv_residual_px",     "readonly")
+try_dataref("taaimpl/mv_residual_p95_px", "readonly")
+try_dataref("taaimpl/mv_samples",         "readonly")
+try_dataref("taaimpl/velocity_mb",        "readonly")
+try_dataref("taaimpl/pipelines_patched",  "readonly")
+try_dataref("taaimpl/pipelines_rejected", "readonly")
 
 local function get(name, default)
     if not have[name] then return default end
@@ -51,48 +62,148 @@ local function get(name, default)
     return v
 end
 
-local function build(w, x, y)
-    local attached = get("taaimpl/layer_attached", 0)
+--[[ ---------------------------------------------------------------------------
+  Colour.
 
-    if attached ~= 1 then
-        imgui.TextUnformatted("Vulkan layer NOT attached")
+  Amber for headings, cyan-grey for labels, white for values, and green/red used
+  ONLY where something is genuinely good or genuinely wrong. Colour that means
+  nothing is worse than no colour: if every panel is half green, green stops
+  being a signal, and the one number that matters here - the residual - loses
+  the only visual weight it has.
+--------------------------------------------------------------------------- ]]
+local AMBER  = 0xFF3BA7FF   -- ImGui takes ABGR
+local LABEL  = 0xFFB0793B
+local VALUE  = 0xFFE8E8E8
+local GOOD   = 0xFF5BD65B
+local BAD    = 0xFF4B4BFF
+local DIM    = 0xFF707070
+
+local function text(col, s)
+    imgui.PushStyleColor(imgui.constant.Col.Text, col)
+    imgui.TextUnformatted(s)
+    imgui.PopStyleColor()
+end
+
+local function same(x) imgui.SameLine(x) end
+
+-- A label/value row on one line, with the value at a fixed column so a column
+-- of them lines up regardless of label length.
+local function row(label, value, col, indent)
+    text(LABEL, string.format("  %s", label))
+    same(indent or 190)
+    text(col or VALUE, value)
+end
+
+local function heading(s)
+    imgui.TextUnformatted("")
+    text(AMBER, s)
+    imgui.Separator()
+end
+
+--[[ ---------------------------------------------------------------------------
+  The verdict.
+
+  The residual is the depth-free epipolar distance: how far the field says a
+  pixel was from where the geometry says it could have been. It is the one
+  number that decides whether this project works, so it gets the top of the
+  panel and it gets the only strong colour.
+
+  The thresholds come from the verified suite, which runs 0.000 to 0.004 px
+  across rotation, pitch, translation and head movement. A tenth of a pixel is
+  already an order of magnitude worse than anything measured, so that is where
+  "good" ends. Above a pixel the field is not usable by a consumer at all.
+--------------------------------------------------------------------------- ]]
+local function verdict(res)
+    if res < 0.0    then return DIM,  "NO MEASUREMENT YET" end
+    if res <= 0.10  then return GOOD, "SUB-PIXEL - VERIFIED" end
+    if res <= 1.00  then return AMBER, "DEGRADED" end
+    return BAD, "BROKEN"
+end
+
+local function build(w, x, y)
+    if get("taaimpl/layer_attached", 0) ~= 1 then
+        text(BAD, "VULKAN LAYER NOT ATTACHED")
+        imgui.Separator()
         imgui.TextUnformatted("")
         -- Say what to do about it, not just that it happened. The layer is
-        -- explicit: it loads only when the loader is told to load it, which the
+        -- explicit: it loads only when the loader is told to, which the
         -- launcher does and a plain Steam start does not.
-        imgui.TextUnformatted("Start X-Plane from the Motion Vectors shortcut.")
-        imgui.TextUnformatted("The layer is enabled for that process only, so")
-        imgui.TextUnformatted("no other Vulkan application loads it.")
+        text(VALUE, "Start X-Plane from the Motion Vectors launcher.")
+        imgui.TextUnformatted("")
+        text(DIM, "The layer is enabled for that process only, so no")
+        text(DIM, "other Vulkan application ever loads it.")
         return
     end
 
-    imgui.TextUnformatted("Vulkan layer attached")
+    local res     = get("taaimpl/mv_residual_px", -1.0)
+    local p95     = get("taaimpl/mv_residual_p95_px", -1.0)
+    local samples = get("taaimpl/mv_samples", 0)
+    local vcol, vtext = verdict(res)
+
+    text(AMBER, "MOTION VECTOR ACCURACY")
+    imgui.Separator()
     imgui.TextUnformatted("")
 
-    local vw = get("taaimpl/viewport_w", 0)
-    local vh = get("taaimpl/viewport_h", 0)
-    local scale = get("taaimpl/render_scale", 1.0)
-    imgui.TextUnformatted(string.format("Render      %dx%d  (%.2fx)", vw, vh, scale))
-    imgui.TextUnformatted(string.format("Depth       %s",
-        get("taaimpl/reverse_z", 0) == 1 and "reverse-Z" or "standard"))
-    imgui.TextUnformatted(string.format("Jitter      %d phases (off until the vectors measure 1)",
-        get("taaimpl/jitter_phases", 0)))
-    imgui.TextUnformatted(string.format("Moving objs %d", get("taaimpl/moving_objects", 0)))
+    -- The headline figure, large-ish and alone. Everything else on this panel
+    -- is context for it.
+    text(LABEL, "  MEDIAN RESIDUAL")
+    same(190)
+    if res < 0.0 then
+        text(DIM, "waiting for a sampled frame")
+    else
+        text(vcol, string.format("%.3f px", res))
+        same(300)
+        text(vcol, vtext)
+    end
+
+    if res >= 0.0 then
+        row("95TH PERCENTILE", string.format("%.3f px", p95))
+        row("SAMPLES", string.format("%d px/frame", samples), DIM)
+    end
 
     imgui.TextUnformatted("")
-    imgui.TextUnformatted(string.format("VRAM        %d / %d MB  of %d",
+    text(DIM, "  Distance between where the field says a pixel was and")
+    text(DIM, "  where the geometry says it could have been. Needs no")
+    text(DIM, "  depth, so it is valid under rotation and translation.")
+
+    heading("INJECTION")
+    local patched  = get("taaimpl/pipelines_patched", 0)
+    local rejected = get("taaimpl/pipelines_rejected", 0)
+    row("PIPELINES CARRYING VELOCITY", string.format("%d", patched))
+    -- Rejections are the failure that hides. 14,835 of them once left the field
+    -- a function of screen position that passed every test being run at the
+    -- time, so this is red the moment it is not zero.
+    row("REJECTED BY THE DRIVER", string.format("%d", rejected),
+        rejected == 0 and GOOD or BAD)
+    if rejected > 0 then
+        text(BAD, "  Rejected pipelines are holes in the field.")
+    end
+
+    heading("RENDER")
+    row("RESOLUTION", string.format("%d x %d", get("taaimpl/viewport_w", 0),
+                                                get("taaimpl/viewport_h", 0)))
+    row("SCALE", string.format("%.2f x", get("taaimpl/render_scale", 1.0)))
+    row("DEPTH", get("taaimpl/reverse_z", 0) == 1 and "reverse-Z" or "standard")
+    row("JITTER", string.format("%d phases", get("taaimpl/jitter_phases", 0)))
+    row("MOVING OBJECTS", string.format("%d", get("taaimpl/moving_objects", 0)))
+
+    heading("MEMORY")
+    local used, budget, total =
         get("taaimpl/vram_used_mb", 0),
         get("taaimpl/vram_budget_mb", 0),
-        get("taaimpl/vram_total_mb", 0)))
+        get("taaimpl/vram_total_mb", 0)
+    row("VELOCITY TARGET", string.format("%d MB", get("taaimpl/velocity_mb", 0)))
+    row("PROCESS VRAM", string.format("%d MB", used))
+    row("DRIVER BUDGET", string.format("%d / %d MB", budget, total), DIM)
 
-    imgui.TextUnformatted("")
+    heading("TUNING")
     local changed, v = imgui.SliderFloat("LOD bias", get("taaimpl/lod_bias", 0.0),
                                          -2.0, 0.0, "%.2f")
     if changed and have["taaimpl/lod_bias"] then MV_lod_bias = v end
-
-    imgui.TextUnformatted("")
-    imgui.TextUnformatted("Everything here is a dataref under taaimpl/.")
+    text(DIM, "  Everything on this panel is a dataref under taaimpl/.")
 end
+
+local wnd = nil
 
 local function open()
     if wnd then
@@ -100,7 +211,7 @@ local function open()
         wnd = nil
         return
     end
-    wnd = float_wnd_create(420, 260, 1, true)
+    wnd = float_wnd_create(560, 620, 1, true)
     float_wnd_set_title(wnd, "Motion Vectors")
     float_wnd_set_imgui_builder(wnd, "build")
     float_wnd_set_onclose(wnd, "onclose")

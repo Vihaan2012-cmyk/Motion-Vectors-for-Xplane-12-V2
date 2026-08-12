@@ -6462,6 +6462,11 @@ static thread_local PendingPush g_tlPush = { VK_NULL_HANDLE, VK_NULL_HANDLE, {0}
 // this draw is jittered. See the note where it is written.
 static std::map<VkPipeline, bool> g_pipelineIsGeometry;
 static uint64_t g_pipeGeometry = 0, g_pipeFullscreen = 0;
+// Pipelines the driver refused with the injection and which fell back to
+// X-Plane's original. Every one is a hole in the velocity field, and 14,835 of
+// them is what the Location 31 fault looked like from the outside - so this is
+// the single number that says whether that class of failure has returned.
+static uint64_t g_pipeRejected = 0;
 
 // ---- DRAW-WEIGHTED MOTION VECTOR COVERAGE.
 //
@@ -7139,6 +7144,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
 
             r1 = g_nextCreateGfxPipelines(device, cache, 1, &ci[i], alloc, &out[i]);
             ++fellBack;
+            ++g_pipeRejected;
             if (fellBack <= 4) {
                 const VkPipelineRenderingCreateInfo *src = nullptr;
                 for (const VkBaseInStructure *pn = (const VkBaseInStructure*)ci[i].pNext;
@@ -7734,7 +7740,17 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     memcpy(g_tlPush.block, block, sizeof(g_tlPush.block));
     g_tlPush.valid  = true;
 
-    if (++g_pushCount <= 3 || (g_pushCount % 100000) == 0)
+    // ---- BRACES. THE SECOND TRACE WAS NOT INSIDE THE IF.
+    //
+    // Both lines were meant to fire on the first three pushes and then every
+    // hundred thousandth. Only the first did. The second ran on EVERY push, and
+    // the last acceptance run left a 3.4 GB trace containing 19,099,210 copies
+    // of it - a formatted write per draw, per frame, on the render path.
+    //
+    // The indentation said what was intended and the compiler did something
+    // else, which is the same shape as every other unbraced body that has cost
+    // this project time.
+    if (++g_pushCount <= 3 || (g_pushCount % 100000) == 0) {
         trace("SPIRV INJECT: draw-time re-pushes %llu", (unsigned long long)g_drawRepushes);
         trace("SPIRV INJECT: pushed uReproj + jitter (%llu times), body-frame "
               "%llu, bodyValid=%d cockpitPass=%d | jitter now (%.5f %.5f) ndc, "
@@ -7745,6 +7761,17 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
               block[16], block[17],
               (unsigned long long)g_pipeGeometry,
               (unsigned long long)g_pipeFullscreen);
+    }
+
+    // ---- PUBLISH THE QUALITY FIGURES WHERE A USER CAN SEE THEM.
+    //
+    // These live in the shared block so the plugin can turn them into datarefs
+    // and the panel can show them. Cheap: two integer stores against a counter
+    // that already exists.
+    if (g_share && g_share->magic == TAA_MAGIC) {
+        g_share->mvPipelinesPatched  = (uint32_t)g_pipeGeometry;
+        g_share->mvPipelinesRejected = (uint32_t)g_pipeRejected;
+    }
 }
 
 // ------------------------------------------------------- VRAM overcommit

@@ -1434,6 +1434,42 @@ static int   getViewportH(void*)    { return g_share ? g_share->viewportH : 0; }
 static int   getJitterPhases(void*) { return g_share ? g_share->jitterPhases : 0; }
 static int   getObjectCount(void*)  { return g_share ? g_share->objectCount : 0; }
 
+// ---- THE QUALITY FIGURES.
+//
+// The residual travels as milli-pixels because the shared block is written by
+// the layer and read here, and a torn float reads as a denormal rather than as
+// a stale number. It comes back out as a float because "0.002 px" is what a
+// person reads, not "2".
+static float getMvResidual(void*)
+    { return g_share ? (float)g_share->mvResidualMilliPx * 0.001f : -1.0f; }
+static float getMvResidualP95(void*)
+    { return g_share ? (float)g_share->mvResidualP95MilliPx * 0.001f : -1.0f; }
+static int   getMvSamples(void*)
+    { return g_share ? (int)g_share->mvResidualSamples : 0; }
+static int   getMvVelocityMB(void*)
+    { return g_share ? (int)g_share->mvVelocityMB : 0; }
+static int   getMvPatched(void*)
+    { return g_share ? (int)g_share->mvPipelinesPatched : 0; }
+static int   getMvRejected(void*)
+    { return g_share ? (int)g_share->mvPipelinesRejected : 0; }
+
+// The build's own version, so a bug report names a build. MV_VERSION comes from
+// the VERSION file by way of build.ps1; the fallback is deliberately not a
+// plausible number.
+#ifndef MV_VERSION
+#define MV_VERSION "0.0.0-unversioned"
+#endif
+static int getVersionString(void *, void *out, int off, int max)
+{
+    static const char *v = MV_VERSION;
+    const int len = (int)strlen(v);
+    if (!out) return len;
+    if (off >= len) return 0;
+    int n = len - off; if (n > max) n = max;
+    memcpy(out, v + off, (size_t)n);
+    return n;
+}
+
 // TWO reverse-Z answers, exposed separately ON PURPOSE.
 //
 // share.h already says why they exist: the convention is "independently derived
@@ -1496,7 +1532,24 @@ static void registerDatarefs()
                       getObjectCount, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
 
-    xlog("registered %d datarefs under taaimpl/ (usable from FlyWithLua or any script)", 15);
+    XPLMRegisterDataAccessor("taaimpl/mv_residual_px", xplmType_Float, 0,
+        nullptr, nullptr, getMvResidual, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/mv_residual_p95_px", xplmType_Float, 0,
+        nullptr, nullptr, getMvResidualP95, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/mv_samples", xplmType_Int, 0,
+        getMvSamples, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/velocity_mb", xplmType_Int, 0,
+        getMvVelocityMB, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/pipelines_patched", xplmType_Int, 0,
+        getMvPatched, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/pipelines_rejected", xplmType_Int, 0,
+        getMvRejected, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/version", xplmType_Data, 0,
+        nullptr, nullptr, nullptr, nullptr, 0,0,0,0,0,0,
+        getVersionString, nullptr, nullptr, nullptr);
+
+    xlog("registered %d datarefs under taaimpl/ (usable from FlyWithLua or any "
+         "script); build %s", 22, MV_VERSION);
 }
 
 static void unregisterDatarefs()
