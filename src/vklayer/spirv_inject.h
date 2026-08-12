@@ -1019,7 +1019,26 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     body.push_back(head(OpVectorShuffle, 7)); body.push_back(idV2); body.push_back(idPxy); body.push_back(idLp); body.push_back(idLp); body.push_back(0); body.push_back(1);
     body.push_back(head(OpFDiv, 5)); body.push_back(idV2); body.push_back(idCn); body.push_back(idCxy); body.push_back(idCwv);
     body.push_back(head(OpFDiv, 5)); body.push_back(idV2); body.push_back(idPn); body.push_back(idPxy); body.push_back(idPwv);
-    body.push_back(head(OpFSub, 5)); body.push_back(idV2); body.push_back(idDiff); body.push_back(idCn); body.push_back(idPn);
+    // ---- prev - curr, NOT curr - prev.
+    //
+    // This subtracted the other way round for the whole life of the project,
+    // and no test could see it: every statistic on the field was a magnitude,
+    // and a negated vector has exactly the right magnitude. The direct
+    // calibration finally named it, on the steady frames of a scripted yaw:
+    //
+    //     field=(-13.249, -0.041)  matrix=(+13.150, -0.000)  ratio=-1.008
+    //     field=(-13.219, +0.038)  matrix=(+13.150, -0.000)  ratio=-1.005
+    //     field=(-13.247, -0.042)  matrix=(+13.150, -0.000)  ratio=-1.007
+    //
+    // A clean -1, three frames running.
+    //
+    // Every consumer this field exists for - FSR2, DLSS, a TAA resolve - wants
+    // the vector that carries the current pixel back to where it was, so the
+    // history is sampled at uv + velocity. That is prev - curr. Written the
+    // other way it does not fail or warn; it reprojects exactly twice as far in
+    // exactly the wrong direction, which reads as heavy ghosting and gets
+    // chased as a tuning problem.
+    body.push_back(head(OpFSub, 5)); body.push_back(idV2); body.push_back(idDiff); body.push_back(idPn); body.push_back(idCn);
     body.push_back(head(OpVectorTimesScalar, 5)); body.push_back(idV2); body.push_back(idScaled); body.push_back(idDiff); body.push_back(idConstHalf);
     body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idScaled); body.push_back(0);
     uint32_t idMx = bound++;

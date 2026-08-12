@@ -623,6 +623,36 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
               kConv[0], mr[0], kConv[1], mr[1], kConv[2], mr[2], kConv[3], mr[3],
               bestC >= 0 ? kConv[bestC] : "none", r95, medD,
               (unsigned long long)solvedD.size(), (unsigned long long)n);
+        // ---- MEASURED AGAINST PREDICTED, SIGNED, AT THE CENTRE.
+        //
+        // The epipolar residual is exact in free flight - 0.001 to 0.017 px
+        // over 400,000 samples with real translation in the matrix - and 8 to
+        // 27 px through the scripted rotation phases. Every structural
+        // explanation offered for that gap has now been ruled out by
+        // measurement: the loop-to-present census reads exactly one 3000, more
+        // than one 0; MV PUSH RACE reads 1 distinct matrix per frame; and the
+        // dump takes g_lastPushed, the matrix the draws actually used.
+        //
+        // So stop inferring. Two vectors, signed, in pixels, side by side: what
+        // the field says the centre moved, and what the matrix says it should
+        // have. A sign difference, a factor, or a swapped axis is then readable
+        // straight off the line instead of being deduced from a scalar
+        // residual that collapses all three into one number.
+        {
+            const double hw = 0.5 * (double)m.w, hh = 0.5 * (double)m.h;
+            const double Ax = (double)RJ[8], Ay = (double)RJ[9], Aw = (double)RJ[11];
+            double pdx = 0.0, pdy = 0.0;
+            if (fabs(Aw) > 1e-12) { pdx = (Ax / Aw) * hw; pdy = (Ay / Aw) * hh; }
+            const double mdx = cN ? (cSx / (double)cN) * 2.0 * hw : 0.0;
+            const double mdy = cN ? (cSy / (double)cN) * 2.0 * hh : 0.0;
+            trace("MV CALIB: phase=%d | field says the centre moved (%+.3f, "
+                  "%+.3f) px | matrix at infinity says (%+.3f, %+.3f) px | "
+                  "ratio (%.3f, %.3f) - a clean 2 or -1 names a scale or a sign, "
+                  "a swap names the axes, anything else is neither",
+                  m.dumpPhase, mdx, mdy, pdx, pdy,
+                  fabs(pdx) > 1e-6 ? mdx / pdx : 0.0,
+                  fabs(pdy) > 1e-6 ? mdy / pdy : 0.0);
+        }
         if (badN) {
             const double bx = badSx / (double)badN, by = badSy / (double)badN;
             double vxx = badSxx / (double)badN - bx * bx;
