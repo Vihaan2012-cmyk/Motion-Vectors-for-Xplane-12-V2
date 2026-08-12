@@ -944,10 +944,6 @@ static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "mv_target.h"
 #include "spirv_inject.h"
 
-// Set once, from the environment, next to the header that declares it.
-static const bool g_mvRawInit = (g_mvRawMode = spvinj::debugRaw());
-static const bool g_mvDebugDepthInit = (g_mvDebugDepth = spvinj::debugDepthMode() =
-                                        (getenv("TAA_MV_DEBUG_DEPTH") != nullptr));
 
 // FSR2 is optional at BUILD time as well as run time. Its static library takes
 // several minutes to produce, so requiring it in order to compile the layer
@@ -7541,48 +7537,58 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     if (g_mvPassOrdinal >= 0 && g_mvPassOrdinal < 16 && isGeometry)
         ++g_mvPassDraws[g_mvPassOrdinal];
 
-    // ---- TAA_MV_TESTYAW: push a SYNTHETIC clip-to-clip rotation of a known
-    // size, in degrees, and depend on nothing X-Plane produces.
+    // TAA_MV_TESTYAW is gone. It pushed a synthetic clip-to-clip rotation to
+    // separate "the matrix is wrong" from "the shader is wrong", and both of
+    // those are now answered by the epipolar residual - 0.000 to 0.003 px per
+    // frame against the real matrix. It also had its own sx inverted, so it
+    // would have mislabelled the very fault it existed to find.
     //
-    // The contradiction to settle: TAA_MV_IDENTITY proves the field is built
-    // from the pushed matrix (100% zeros), yet under motion the field measures
-    // about 44x what that matrix implies per pixel. One of those is false and
-    // no comparison against X-Plane's own matrices can say which, because both
-    // sides of that comparison come from the same suspect source.
-    //
-    // A hand-built matrix has no such problem. For a yaw of angle a about the
-    // eye, the clip-to-clip reprojection is P * R * P^-1, and for the standard
-    // perspective form that is exactly:
-    //
-    //     [ cos a        0   -sin a / sx        0 ]
-    //     [ 0            1    0                 0 ]
-    //     [ sx * sin a   0    cos a             0 ]   (rows, column-major below)
-    //     [ 0            0    0                 1 ]
-    //
-    // where sx = proj[0]. A distant point at screen centre must then move
-    // exactly a * proj[0] * width * 0.5 pixels. If the field reports that, the
-    // shader and the whole write path are correct and the fault is in how the
-    // real matrix is built. If it reports 44x that, the fault is in the shader
-    // or the units, and every matrix here is innocent.
-    static const double testYawDeg = getenv("TAA_MV_TESTYAW")
-                                   ? atof(getenv("TAA_MV_TESTYAW")) : 0.0;
-    float kTestYaw[16];
-    if (testYawDeg != 0.0) {
-        const double a  = testYawDeg * 3.14159265358979 / 180.0;
-        const double sx = (g_velSnap.proj[0] != 0.0f) ? g_velSnap.proj[0] : 1.0;
-        memset(kTestYaw, 0, sizeof(kTestYaw));
-        kTestYaw[0]  = (float)cos(a);
-        kTestYaw[2]  = (float)(sx * sin(a));
-        kTestYaw[5]  = 1.0f;
-        kTestYaw[8]  = (float)(-sin(a) / sx);
-        kTestYaw[10] = (float)cos(a);
-        kTestYaw[15] = 1.0f;
-    }
-
+    // Removed rather than defaulted off: it REPLACED the pushed matrix, so a
+    // stray environment variable would have made every motion vector describe
+    // a rotation the camera never performed, and no magnitude test would have
+    // noticed.
     float block[20];
-    if (testYawDeg != 0.0) memcpy(block, kTestYaw, 64); else
-    memcpy(block, useIdentity ? kIdentity
-                 : (useBody ? g_velSnap.bodyReproj : g_velSnap.reproj), 64);
+    // ---- THE BODY MATRIX IS STILL CLIP-TO-CLIP. CONVERT IT.
+    //
+    // When the main reprojection moved to view space the shader changed what it
+    // feeds the matrix: it now builds (pos.x, pos.y, pos.w, 1) and the matrix
+    // absorbs 1/sx, 1/sy and the -1. bodyReproj was not converted with it. It
+    // is still (prevProj * prevWorldRel * Bp) * (proj * worldRel * Bc)^-1, a
+    // clip-to-clip matrix, and it was being handed a vector in the other
+    // convention.
+    //
+    // That is the band across the bottom of the screen: a full-width region
+    // with vx exactly zero and vy growing linearly from the horizon, present
+    // while the aircraft is frozen - local_x/y/z move 0.0000 m per frame at a
+    // constant 337.69 m. Its ratio prevNDC.y / currNDC.y measured 0.6549, dead
+    // constant over 28,536 pixels and seven consecutive frames. A constant
+    // scale, on one axis, over one coherent group of draws - which is what
+    // feeding one convention's vector to the other convention's matrix does.
+    // Cockpit geometry sits below the horizon, so only the lower half showed
+    // it; the sky above writes no velocity at all.
+    //
+    // The conversion is exact. With m10 = m11 = -1 the projection gives
+    // z_clip = w_clip + m14, so the vector the shader passes expands to full
+    // clip space through
+    //
+    //     K: (x, y, w, 1) -> (x, y, w + m14, w)
+    //
+    // and pushing bodyReproj * K puts the body path back on the same footing.
+    // K's columns are (1,0,0,0), (0,1,0,0), (0,0,1,1), (0,0,m14,0) - the same
+    // matrix that proj * clipToView reduces to, which is the cross-check that
+    // the two paths now agree.
+    if (useBody) {
+        float K[16];
+        memset(K, 0, sizeof(K));
+        K[0] = 1.0f; K[5] = 1.0f;
+        K[10] = 1.0f; K[11] = 1.0f;
+        K[14] = g_velSnap.proj[14];
+        float bodyView[16];
+        taaMul(bodyView, g_velSnap.bodyReproj, K);
+        memcpy(block, bodyView, 64);
+    } else
+    memcpy(block, useIdentity ? kIdentity : g_velSnap.reproj, 64);
+    if (useIdentity) memcpy(block, kIdentity, 64);
     if (useBody) ++g_bodyReprojPushes;
     block[16] = block[17] = block[18] = block[19] = 0.0f;
 
@@ -8186,16 +8192,48 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     memset(&wantFeatures, 0, sizeof(wantFeatures));
     if (ci->pEnabledFeatures) wantFeatures = *ci->pEnabledFeatures;
 
+    // ---- RESOLVED FROM THE APPLICATION'S INSTANCE, NOT FROM A NULL ONE.
+    //
+    // This passed nullptr as the instance. vkGetInstanceProcAddr accepts a null
+    // instance for exactly four global-level entry points -
+    // vkEnumerateInstanceVersion, vkEnumerateInstanceExtensionProperties,
+    // vkEnumerateInstanceLayerProperties and vkCreateInstance - and
+    // vkGetPhysicalDeviceFeatures is not among them. So it returned NULL, the
+    // whole query was skipped, haveIndependentBlend stayed false, and the
+    // feature was never requested.
+    //
+    // That reading was then quoted as evidence the device did not support
+    // independentBlend, which is the feature the velocity attachment needs and
+    // the one named in the comment above as the cause of 14,835 rejected
+    // pipelines. A query that never ran is not a negative result.
+    //
+    // The instance map is keyed by dispatch pointer and a physical device
+    // shares its instance's dispatch key, so phys finds its own instance. Same
+    // discipline as the memory-properties getter above: resolve physical-device
+    // functions from the instance the physical device actually belongs to, or
+    // the loader looks the handle up in the wrong list.
     bool haveIndependentBlend = false;
     {
-        PFN_vkGetPhysicalDeviceFeatures getFeatures =
-            (PFN_vkGetPhysicalDeviceFeatures)nextGIPA(nullptr, "vkGetPhysicalDeviceFeatures");
+        PFN_vkGetInstanceProcAddr gipa = nextGIPA;
+        VkInstance owner = VK_NULL_HANDLE;
+        std::map<void*, InstanceData>::iterator ii = g_instances.find(dispatchKey(phys));
+        if (ii != g_instances.end()) { gipa = ii->second.gipa; owner = ii->second.instance; }
+        else if (g_firstInstance != VK_NULL_HANDLE) { owner = g_firstInstance; }
+
+        PFN_vkGetPhysicalDeviceFeatures getFeatures = owner != VK_NULL_HANDLE
+            ? (PFN_vkGetPhysicalDeviceFeatures)gipa(owner, "vkGetPhysicalDeviceFeatures")
+            : nullptr;
         if (getFeatures) {
             VkPhysicalDeviceFeatures supported;
             memset(&supported, 0, sizeof(supported));
             getFeatures(phys, &supported);
             haveIndependentBlend = (supported.independentBlend == VK_TRUE);
         }
+        trace("SPIRV INJECT: independentBlend query - instance %s, getter %s, "
+              "supported=%d (a null instance here returned no getter at all and "
+              "the answer was read as unsupported)",
+              owner != VK_NULL_HANDLE ? "found" : "NOT FOUND",
+              getFeatures ? "resolved" : "NULL", haveIndependentBlend ? 1 : 0);
     }
 
     // Only touch pEnabledFeatures when X-Plane used that form. When it passes

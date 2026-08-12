@@ -185,27 +185,17 @@ inline uint32_t choosePushOffset(uint32_t maxPushConstantsSize)
 // Set at device creation from maxVertexOutputComponents / 4 (components, not
 // locations - four per vec4). The Vulkan minimum of 64 components gives 16
 // locations, so the fallback below stays inside what every device guarantees.
-// TAA_MV_DEBUG_DEPTH: write the fragment.s NDC DEPTH into .y instead of the
-// vertical velocity.
+// The diagnostic probes that lived here - TAA_MV_RAW, TAA_MV_DEBUG_DEPTH and
+// TAA_MV_PROBE_CONST - are gone. They existed to answer whether the prevClip
+// varying linked at all and whether uReproj arrived, and both questions are
+// settled: the epipolar residual is 0.000 to 0.003 px per frame, which no
+// shader with a dead varying or a zero matrix can produce.
 //
-// Depth is the one quantity in this whole chain that has never been measured.
-// The field disagrees with the matrix by factors that do NOT scale with the
-// commanded rotation - cutting the rate fivefold left them where they were - so
-// what remains is a component that depends on depth and on a camera drift that
-// is also rate-independent. At 1.5 mm of drift, 350 px means geometry 1.3 cm
-// from the eye. Either something really is that close, or the depth reaching
-// this shader is not the depth of the surface being drawn. This says which.
-// TAA_MV_RAW: read at CALL time, not from a global written by a static
-// initialiser. The previous form was false when vertex modules were patched and
-// true when fragment ones were, so the vertex probe silently never compiled in -
-// and its apparent zeros were trusted for six turns.
-inline bool debugRaw()
-{
-    static int v = -1;
-    if (v < 0) v = getenv("TAA_MV_RAW") ? 1 : 0;
-    return v != 0;
-}
-inline bool &debugDepthMode() { static bool v = false; return v; }
+// They are removed rather than left switched off. Each one REPLACED the real
+// velocity write with something else, so a stray environment variable in a
+// user's launcher would silently turn the field into a debug pattern, and the
+// field would still pass every magnitude test. That is the same failure shape
+// as the sign error these probes were built to chase.
 inline uint32_t &currClipLocation() { static uint32_t v = 14; return v; }
 inline uint32_t &prevClipLocation() { static uint32_t v = 15; return v; }
 
@@ -692,38 +682,6 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // prevClip.w into .y in this mode, so .y becomes m33: 1.0 if the matrix
     // arrived, 0.0 if the load returned zeros and every motion vector this
     // shader has ever written was a difference against nothing.
-    if (debugDepthMode()) {
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(bound); body.push_back(idLoadedMat); body.push_back(0);
-        uint32_t idDbgC0 = bound++;
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(bound); body.push_back(idLoadedMat); body.push_back(3);
-        uint32_t idDbgC3 = bound++;
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idDbgC0); body.push_back(0);
-        uint32_t idDbgM00 = bound++;
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idDbgC3); body.push_back(3);
-        uint32_t idDbgM33 = bound++;
-        // ---- TAA_MV_PROBE_CONST: write a LITERAL 1.0 instead of the matrix.
-        //
-        // "m33 reads zero" has been the basis of six turns of reasoning and the
-        // probe behind it has never itself been checked. If a constant 1.0 also
-        // arrives as zero, the fault is in this probe or in the prevClip
-        // varying - NOT in the matrix - and everything concluded from that
-        // reading is void.
-        //
-        // The .w component is what the fragment forwards, so the constant goes
-        // The .w component is what the fragment forwards, so gl_Position.w goes
-// there - a value ALREADY PROVEN to arrive through this exact varying,
-// since currClip.w reads 0.24 m to 8.3 km correctly. If it arrives via
-// prevClip too, the varying and the probe are sound and the matrix is
-// genuinely zero. If it does not, the prevClip path is broken and every
-// zero read from it means nothing about the matrix at all.
-        uint32_t idDbgOut = bound++;
-        if (getenv("TAA_MV_PROBE_CONST")) {
-            body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idDbgOut); body.push_back(idDbgM00); body.push_back(idPosW); body.push_back(idDbgM00); body.push_back(idPosW);
-        } else {
-            body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idDbgOut); body.push_back(idDbgM00); body.push_back(idDbgM33); body.push_back(idDbgM00); body.push_back(idDbgM33);
-        }
-        body.push_back(head(OpStore, 3)); body.push_back(idOutPrev); body.push_back(idDbgOut);
-    } else
     body.push_back(head(OpStore, 3)); body.push_back(idOutPrev); body.push_back(idPrevSel);
     // currClip goes out in the same space the matrix works in, so the fragment's
     // subtraction is between two comparable vectors. Both raw, or both flipped -
@@ -1045,58 +1003,6 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idScaled); body.push_back(1);
     uint32_t idMy = bound++;
 
-    if (debugDepthMode()) {
-        // ---- RAW currClip.w INTO .y. NO CONVENTION INVOLVED.
-        //
-        // The previous version of this wrote z_ndc = z/w, and its output
-        // contradicts the projection matrix: it measured small values for
-        // distant geometry, implying z_ndc = near/d, while proj[10]/proj[11]
-        // says z_ndc = 1 - near/d which tends to 1. Both cannot be true.
-        //
-        // w is the view depth in metres and needs no interpretation, so it
-        // settles which measurement to distrust. Mountains should read
-        // thousands and the instrument panel a fraction of a metre. If instead
-        // it reads centimetres, the w reaching the fragment is wrong - and
-        // since the fragment shader divides by exactly this w to form the
-        // motion vector, that would explain a field the size of a near-plane
-        // displacement.
-        // .x keeps the velocity, .y carries this fragment's own w. With both
-        // in the same pixel the CPU can reconstruct exactly what the matrix
-        // implies FOR THAT PIXEL - its screen position and its depth - and
-        // compare against the velocity actually written. No centre region, no
-        // assumed depth, no percentile standing in for a value.
-        // ---- WRITE prevClip.w INTO .y.
-        //
-        // The fragment shader has NO push constant - it never sees uReproj at
-        // all. It receives prevClip as a varying that the VERTEX shader is
-        // supposed to fill with uReproj * gl_Position. So the question is
-        // whether that varying arrives carrying a reprojected position.
-        //
-        // A synthetic 0.25 degree yaw was pushed and stashed, the dump read
-        // 5.337 px out of it, and the field came back at 0.002 px - no motion
-        // from a matrix demanding 5.3 px. If prevClip.w comes back equal to
-        // currClip.w, the vertex shader wrote the position through unchanged
-        // and the reprojection never happened. If it comes back zero, the
-        // varying is not linking at all and every velocity ever written was a
-        // difference against nothing.
-        //
-        // It also retires the identity test, which proved nothing: a shader
-        // that ignores uReproj writes zero whether identity or a rotation is
-        // pushed, and that zero was read all night as proof it worked.
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idLp); body.push_back(3);
-        idMy = bound++;
-    }
-    if (debugRaw()) {
-        // .x = prev.w, .y = curr.w. Two numbers that MUST be equal for any
-        // rigid camera motion - the same point is the same distance in front of
-        // the eye either frame. No convention enters: not y-up versus y-down,
-        // not the depth range, not a scale. Their ratio is exactly the factor
-        // the fragment divides by when it forms the motion vector.
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idLp); body.push_back(0);
-        idMx = bound++;
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idLp); body.push_back(1);
-        idMy = bound++;
-    }
     // (velocity.x, velocity.y, 0, 0). A colour attachment output is a
     // vec4; the target is two channels, so the last two are shape, not
     // information, and the format discards them.

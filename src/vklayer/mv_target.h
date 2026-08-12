@@ -90,8 +90,6 @@ struct MvTarget {
 static MvTarget g_mv;
 // Set by the layer once spirv_inject.h has been included. mv_target.h is
 // included first, so it cannot ask the injector directly.
-static bool g_mvDebugDepth = false;
-static bool g_mvRawMode    = false;
 static const int g_dumpDelay = getenv("TAA_MV_DUMP_DELAY")
                              ? atoi(getenv("TAA_MV_DUMP_DELAY")) : 8;
 // .xy velocity in UV units. Two channels is all a velocity buffer carries -
@@ -433,6 +431,26 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // move the answer.
     double badSx = 0.0, badSy = 0.0, badSxx = 0.0, badSyy = 0.0;
     uint64_t badN = 0, liveN = 0;
+    // A bounding box and a handful of actual values. The centroid and spread
+    // say a cluster exists; they cannot say WHAT it is. A box plus three
+    // samples of the real velocity in pixels distinguishes the candidates -
+    // a spinning propeller reads as large opposed vectors, a mis-transformed
+    // object reads as one coherent shift, and uninitialised memory reads as
+    // neither.
+    uint32_t bx0 = 0xffffffffu, by0 = 0xffffffffu, bx1 = 0, by1 = 0;
+    struct BadSample { uint32_t x, y; float vx, vy; };
+    BadSample bsamp[3]; uint32_t nsamp = 0;
+    std::vector<float> badMag;
+    // prevNDC.y / currNDC.y over the cluster.
+    //
+    // The band has vx exactly zero at x = 700, 996 and 3808 and vy growing
+    // linearly with y from the horizon, while the aircraft is frozen -
+    // local_x/y/z move 0.0000 m per frame and the altitude holds at 337.69 m.
+    // So this is not unmodelled camera motion; it is a Y-only scale error, and
+    // a scale error has a NUMBER. Two hand-worked samples gave 1.59 and 1.56,
+    // which is close to proj[0] = 1.57 and not far off sy/sx = 1.778 - too
+    // close to call from two points. A median over the whole cluster names it.
+    std::vector<float> badKy;
 
 
     // Strided. A full 8.3 M pixel scan per dump costs more than it tells us -
@@ -554,6 +572,25 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                             ++badN;
                             badSx += (double)x; badSy += (double)y;
                             badSxx += (double)x * x; badSyy += (double)y * y;
+                            if (x < bx0) bx0 = x;
+                            if (x > bx1) bx1 = x;
+                            if (y < by0) by0 = y;
+                            if (y > by1) by1 = y;
+                            badMag.push_back((float)(mag * (double)m.w));
+                            if (fabs(v) > 0.05) {   // away from the horizon,
+                                                    // where the ratio is noise
+                                const double prevY = v + dyN;
+                                badKy.push_back((float)(prevY / v));
+                            }
+                            // Spread the samples through the cluster rather
+                            // than taking the first three, which would all land
+                            // on its top edge.
+                            if (nsamp < 3 && (badN % 4093) == 1) {
+                                bsamp[nsamp].x = x; bsamp[nsamp].y = y;
+                                bsamp[nsamp].vx = vx * (float)m.w;
+                                bsamp[nsamp].vy = vy * (float)m.h;
+                                ++nsamp;
+                            }
                         }
                     }
                 }
@@ -668,6 +705,34 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                   (unsigned long long)badN, (unsigned long long)liveN,
                   100.0 * (double)badN / (double)(liveN ? liveN : 1),
                   bx, by, m.w, m.h, sqrt(vxx), sqrt(vyy));
+            double bmed = -1.0;
+            if (!badMag.empty()) {
+                size_t kk = badMag.size() / 2;
+                std::nth_element(badMag.begin(), badMag.begin() + kk, badMag.end());
+                bmed = (double)badMag[kk];
+            }
+            double kmed = -1.0;
+            if (!badKy.empty()) {
+                size_t kk = badKy.size() / 2;
+                std::nth_element(badKy.begin(), badKy.begin() + kk, badKy.end());
+                kmed = (double)badKy[kk];
+            }
+            trace("MV TAIL KY: prevNDC.y / currNDC.y over the cluster = %.4f "
+                  "(median of %llu) | proj[0]=%.4f proj[5]=%.4f sy/sx=%.4f - a "
+                  "match against one of those names the factor outright",
+                  kmed, (unsigned long long)badKy.size(),
+                  (double)m.dumpProj[0], (double)m.dumpProj[5],
+                  m.dumpProj[0] != 0.0f ? (double)m.dumpProj[5] / m.dumpProj[0] : 0.0);
+            trace("MV TAIL BOX: x %u..%u, y %u..%u | median |v| in the cluster "
+                  "%.2f px | samples (%u,%u)=(%+.2f,%+.2f) (%u,%u)=(%+.2f,%+.2f) "
+                  "(%u,%u)=(%+.2f,%+.2f) px",
+                  bx0, bx1, by0, by1, bmed,
+                  nsamp > 0 ? bsamp[0].x : 0u, nsamp > 0 ? bsamp[0].y : 0u,
+                  nsamp > 0 ? bsamp[0].vx : 0.f, nsamp > 0 ? bsamp[0].vy : 0.f,
+                  nsamp > 1 ? bsamp[1].x : 0u, nsamp > 1 ? bsamp[1].y : 0u,
+                  nsamp > 1 ? bsamp[1].vx : 0.f, nsamp > 1 ? bsamp[1].vy : 0.f,
+                  nsamp > 2 ? bsamp[2].x : 0u, nsamp > 2 ? bsamp[2].y : 0u,
+                  nsamp > 2 ? bsamp[2].vx : 0.f, nsamp > 2 ? bsamp[2].vy : 0.f);
         }
     }
 
@@ -744,60 +809,6 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // formed. If they do not, the field is not f(matrix, depth) and the
     // identity test - which showed 100% zeros - was answering a narrower
     // question than it appeared to.
-    if (g_mvDebugDepth && m.dumpProj[11] != 0.0f) {
-        const double m10 = m.dumpProj[10], m11 = m.dumpProj[11], m14 = m.dumpProj[14];
-        // A MEAN OF RATIOS IS THE WRONG STATISTIC HERE, and the first version
-        // of this used one: predVx goes to near zero wherever the matrix
-        // predicts almost no motion, and dividing by 0.004 px produces
-        // thousands without meaning anything. The first run duly reported a
-        // mean of 954 and a worst of 20384, which says only that some
-        // denominators were small.
-        //
-        // The median is immune to that, and the absolute pixel error says
-        // whether any disagreement actually matters.
-        std::vector<float> ratios;
-        double sumAbsErr = 0.0;
-        uint64_t nCmp = 0;
-        for (uint32_t y = 0; y < m.h; y += 64) {
-            for (uint32_t x = 0; x < m.w; x += 64) {
-                const size_t i = ((size_t)y * m.w + x) * kMvHalves;
-                const double vx = velHalfToFloat(px[i]);
-                const double w  = velHalfToFloat(px[i + 1]);
-                if (!(w > 0.05) || vx != vx) continue;      // no geometry here
-
-                // Screen position -> NDC. The viewport is Y-flipped, but only
-                // x is being compared so that does not enter.
-                const double ndcX = ((double)x + 0.5) / (double)m.w * 2.0 - 1.0;
-                const double ndcY = ((double)y + 0.5) / (double)m.h * 2.0 - 1.0;
-                const double ndcZ = m10 / m11 - m14 / (m11 * w);
-
-                // clip = w * (ndc, 1), then prev = reproj * clip.
-                const double cx4 = ndcX * w, cy4 = ndcY * w, cz4 = ndcZ * w;
-                const double pxv = reproj[0]*cx4 + reproj[4]*cy4 + reproj[8]*cz4  + reproj[12]*w;
-                const double pwv = reproj[3]*cx4 + reproj[7]*cy4 + reproj[11]*cz4 + reproj[15]*w;
-                if (fabs(pwv) < 1e-9) continue;
-
-                const double predVx = (ndcX - pxv / pwv) * 0.5;
-                sumAbsErr += fabs(vx - predVx) * (double)m.w;
-                ++nCmp;
-                // Only pixels the matrix says should MOVE can carry a ratio.
-                if (fabs(predVx) * (double)m.w > 1.0)
-                    ratios.push_back((float)(vx / predVx));
-            }
-        }
-        if (nCmp) {
-            double medRatio = 0.0;
-            if (!ratios.empty()) {
-                std::nth_element(ratios.begin(), ratios.begin() + ratios.size()/2, ratios.end());
-                medRatio = ratios[ratios.size()/2];
-            }
-            trace("MV PERPIXEL: %llu pixels, %llu movers - median "
-                  "measured/predicted %.4f, mean |error| %.3f px "
-                  "(1.0 and 0.0 mean the shader applied the pushed matrix)",
-                  (unsigned long long)nCmp, (unsigned long long)ratios.size(),
-                  medRatio, sumAbsErr / (double)nCmp);
-        }
-    }
 
     // ---- RAW MODE REPORTS BOTH CHANNELS, EXPLICITLY.
     //
@@ -806,18 +817,6 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // where .x is prev.w and .y is curr.w. Reading pitch rows as prev.w cost a
     // full analysis cycle. These two must be EQUAL for any rigid camera motion,
     // so they are printed side by side with nothing deciding which is which.
-    if (g_mvRawMode && !axX.empty() && !axY.empty()) {
-        auto q = [](std::vector<float> &v, double f) -> double {
-            size_t k = (size_t)(f * (double)(v.size() - 1));
-            std::nth_element(v.begin(), v.begin() + k, v.end());
-            return v[k];
-        };
-        trace("MV RAW: prev.w  p05=%.3f med=%.3f p95=%.3f m   |   "
-              "curr.w  p05=%.3f med=%.3f p95=%.3f m   (they must match)",
-              q(axX, 0.05), q(axX, 0.50), q(axX, 0.95),
-              q(axY, 0.05), q(axY, 0.50), q(axY, 0.95));
-    }
-
     // Gated on the PHASE alone, not on the plugin's expectedPx.
     //
     // The plugin only fills expectedPx for the rotation phases - it is zero for

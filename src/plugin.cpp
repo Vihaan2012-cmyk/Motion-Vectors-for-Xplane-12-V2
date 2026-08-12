@@ -2404,6 +2404,37 @@ static float matrixCallback(float sinceLast, float, int, void *)
             s->selfTestExpectedPx = a * s->proj[0] * (float)s->viewportW * 0.5f;
     }
 
+    // ---- IS THE AIRCRAFT ACTUALLY MOVING?
+    //
+    // The velocity field carries a full-width band across the bottom of the
+    // screen with vx exactly zero at x = 700, 996 and 3808 and vy growing
+    // linearly with y from zero at the horizon. Purely vertical flow whose
+    // magnitude goes as 1/depth is what a camera translating VERTICALLY
+    // produces; forward translation would be radial and would show vx at those
+    // x positions, and it shows none. Meanwhile dC, differenced from the world
+    // matrices, reads 0.0000 m.
+    //
+    // Exactly one of those is wrong, and the aircraft's own local_y settles it
+    // without any matrix in the way. If local_y is moving while dC is zero, the
+    // world matrices are in a frame that travels with the aircraft and the
+    // reprojection is missing a real translation.
+    {
+        static double lastOwnY = 0.0, lastOwnX = 0.0, lastOwnZ = 0.0;
+        static bool   haveOwn = false;
+        const double oy = g_drOwnY ? XPLMGetDatad(g_drOwnY) : 0.0;
+        const double ox = g_drOwnX ? XPLMGetDatad(g_drOwnX) : 0.0;
+        const double oz = g_drOwnZ ? XPLMGetDatad(g_drOwnZ) : 0.0;
+        static int every = 0;
+        if (haveOwn && (++every % 20) == 0)
+            xlog("MV OWN: aircraft moved (%+.4f, %+.4f, %+.4f) m this frame, "
+                   "%.4f m total, altitude %.2f m - compare against the camera "
+                   "delta the layer prints",
+                   ox - lastOwnX, oy - lastOwnY, oz - lastOwnZ,
+                   sqrt((ox-lastOwnX)*(ox-lastOwnX) + (oy-lastOwnY)*(oy-lastOwnY)
+                      + (oz-lastOwnZ)*(oz-lastOwnZ)), oy);
+        lastOwnX = ox; lastOwnY = oy; lastOwnZ = oz; haveOwn = true;
+    }
+
     deriveDepthRange(s);
 
     // The matrix wins any disagreement with the art control: it is what the GPU
