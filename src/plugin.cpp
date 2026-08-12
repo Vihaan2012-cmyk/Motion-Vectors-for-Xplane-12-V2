@@ -170,6 +170,10 @@ enum {
     TAA_ST_PITCH,
     TAA_ST_TRANSLATE,
     TAA_ST_HEADMOVE,
+    // The only phase that moves the AEROPLANE. Everything above drives the
+    // camera while the aircraft sits parked with the brake on, so the whole
+    // suite verified rotation and a camera slide and nothing else.
+    TAA_ST_FLY,
     TAA_ST_DONE
 };
 
@@ -1887,6 +1891,15 @@ static int taaSelfTestCamera(XPLMCameraPosition_t *pos, int losingControl, void 
         break;
     }
 
+    case TAA_ST_FLY:
+        // ---- THE CAMERA IS LEFT ALONE HERE, ON PURPOSE.
+        //
+        // It rides the aircraft, so the reprojection is exercised through the
+        // same path a user's frames take rather than through a synthetic
+        // override - and any error the override was masking has nowhere to
+        // hide. Returning 0 hands the camera back to X-Plane for this phase.
+        return 0;
+
     case TAA_ST_HEADMOVE:
         // Sideways shuffle in the seat: small, and crucially motion of the
         // camera RELATIVE to the airframe, which is the only case where the
@@ -1908,6 +1921,7 @@ static const char *taaSelfTestName(int p)
     case TAA_ST_PITCH:     return "PITCH";
     case TAA_ST_TRANSLATE: return "TRANSLATE";
     case TAA_ST_HEADMOVE:  return "HEADMOVE";
+    case TAA_ST_FLY:       return "FLY";
     case TAA_ST_DONE:      return "DONE";
     }
     return "OFF";
@@ -2417,6 +2431,13 @@ static float matrixCallback(float sinceLast, float, int, void *)
             ++g_stPhase;
             if (g_stPhase == TAA_ST_DONE) {
                 xlog("self-test: complete - camera released.");
+                // The FLY phase is the last one, so completion is where its
+                // controls have to be put back. Doing it only on a phase change
+                // would leave the throttle open forever.
+                if (XPLMDataRef d = XPLMFindDataRef("sim/flightmodel/controls/parkbrake"))
+                    XPLMSetDataf(d, 1.0f);
+                if (XPLMDataRef d = XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all"))
+                    XPLMSetDataf(d, 0.0f);
                 XPLMDontControlCamera();
                 for (int i = 0; i < 2; ++i) {
                     if (!g_stShakeSaved[i]) continue;
@@ -2429,7 +2450,43 @@ static float matrixCallback(float sinceLast, float, int, void *)
                 g_stActive   = false;
                 g_stHaveBase = false;
             } else {
-                xlog("self-test: phase %s", taaSelfTestName(g_stPhase));
+                // ---- DRIVE THE AEROPLANE FOR THE FLY PHASE.
+                //
+                // Release the parking brake and open the throttle, then put
+                // both back exactly as they were. The suite has run its whole
+                // life against paused=0, groundspeed=0.00, throttle=0.00,
+                // parkbrake=1.00 - so every "verified" figure covered rotation
+                // and a camera slide, and real flight, which translates metres
+                // per frame, was never tested at all.
+                //
+                // Restoring is not politeness. Leaving a user's brake off and
+                // the throttle open after a diagnostic is how a sim ends up
+                // rolling into something while nobody is looking.
+                static float savedBrake = -1.0f, savedThrottle = -1.0f;
+                XPLMDataRef drBrake = XPLMFindDataRef("sim/flightmodel/controls/parkbrake");
+                XPLMDataRef drThr   = XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all");
+                if (g_stPhase == TAA_ST_FLY) {
+                    if (drBrake && savedBrake < 0.0f) {
+                        savedBrake = XPLMGetDataf(drBrake);
+                        XPLMSetDataf(drBrake, 0.0f);
+                    }
+                    if (drThr && savedThrottle < 0.0f) {
+                        savedThrottle = XPLMGetDataf(drThr);
+                        XPLMSetDataf(drThr, 1.0f);
+                    }
+                    xlog("self-test: phase FLY - brake released, throttle open. "
+                         "This is the only phase in which the AIRCRAFT moves.");
+                } else {
+                    if (drBrake && savedBrake >= 0.0f) {
+                        XPLMSetDataf(drBrake, savedBrake);
+                        savedBrake = -1.0f;
+                    }
+                    if (drThr && savedThrottle >= 0.0f) {
+                        XPLMSetDataf(drThr, savedThrottle);
+                        savedThrottle = -1.0f;
+                    }
+                    xlog("self-test: phase %s", taaSelfTestName(g_stPhase));
+                }
             }
         }
     }
