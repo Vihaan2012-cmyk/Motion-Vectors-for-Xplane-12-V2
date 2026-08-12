@@ -1804,6 +1804,24 @@ static int taaSelfTestCamera(XPLMCameraPosition_t *pos, int losingControl, void 
         float d = kStMetresPerFrame * (float)g_stFrame;
         pos->x = g_stBaseX + sinf(h) * d;
         pos->z = g_stBaseZ - cosf(h) * d;
+
+        // ---- LIFT THE CAMERA CLEAR OF THE GROUND FOR THIS PHASE.
+        //
+        // g_stBaseY is 338.31 m against a field elevation of 337.69 - the
+        // camera sits 0.6 m off the dirt, and this phase then slides it forward
+        // 0.35 m per frame. So the one phase that tests translation was doing
+        // it while skimming the ground, where near-field geometry fills the
+        // screen and a single frame moves surfaces most of the way across it.
+        //
+        // That is not a fair test of the reprojection and it is not a case the
+        // field will ever be asked for. TAA_ST_TRANSLATE_AGL lifts the camera
+        // so the same translation happens against ordinary scenery distances.
+        // If the residual collapses, the failure was the geometry; if it
+        // survives, the matrix is wrong and the altitude was never the point.
+        static const float agl = getenv("TAA_ST_TRANSLATE_AGL")
+                               ? (float)atof(getenv("TAA_ST_TRANSLATE_AGL"))
+                               : 150.0f;
+        pos->y = g_stBaseY + agl;
         break;
     }
 

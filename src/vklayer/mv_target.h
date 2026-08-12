@@ -471,6 +471,21 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // slides the point along it and leaves the angle at zero. The perpendicular
     // residual cannot tell those apart, and this can.
     std::vector<float> flowAngle;
+    // ---- WHERE THE FIELD PUTS THE FOCUS OF EXPANSION.
+    //
+    // Under pure forward translation every flow vector points along a line
+    // through one point, the focus of expansion. The field is radial - centre
+    // 0.105 px, growing to 85 px at the edges - but 46 to 54 degrees off the
+    // epipolar line the matrix predicts, so it is radial about a DIFFERENT
+    // point. Finding that point says which.
+    //
+    // Each pixel gives one constraint: the FOE lies on the line through the
+    // pixel along its flow direction, so with n the unit normal to that flow,
+    // n . (foe - p) = 0. Accumulating n n^T and n (n . p) over the frame and
+    // solving the 2x2 system is the least-squares intersection of every flow
+    // line at once - no threshold, no picking pixels.
+    double foeA00 = 0.0, foeA01 = 0.0, foeA11 = 0.0, foeB0 = 0.0, foeB1 = 0.0;
+    uint64_t foeN = 0;
 
 
     // Strided. A full 8.3 M pixel scan per dump costs more than it tells us -
@@ -571,6 +586,15 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                         if (len >= 4.0) {
                             const double fxm = mx - u * hw, fym = my - v * hh;
                             const double fl = sqrt(fxm*fxm + fym*fym);
+                            if (fl > 1.0) {
+                                const double nx = -fym / fl, ny = fxm / fl;
+                                const double pu = u * hw, pv = v * hh;
+                                const double d0 = nx * pu + ny * pv;
+                                foeA00 += nx * nx; foeA01 += nx * ny;
+                                foeA11 += ny * ny;
+                                foeB0  += nx * d0; foeB1  += ny * d0;
+                                ++foeN;
+                            }
                             if (fl > 1.0) {
                                 // lx,ly is the unit epipolar direction; the
                                 // measured flow should be parallel to it.
@@ -687,6 +711,60 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                 return (double)v[k];
             };
             {
+                // hw/hh are scoped to the sampling loop; the report needs its
+                // own copy.
+                const double hw = 0.5 * (double)m.w, hh = 0.5 * (double)m.h;
+                const double det = foeA00 * foeA11 - foeA01 * foeA01;
+                double fx = 0.0, fy = 0.0;
+                bool haveFoe = fabs(det) > 1e-9 && foeN > 100;
+                if (haveFoe) {
+                    fx = ( foeA11 * foeB0 - foeA01 * foeB1) / det;
+                    fy = (-foeA01 * foeB0 + foeA00 * foeB1) / det;
+                }
+                // The matrix's own epipole is the image of the CURRENT camera
+                // centre, which is column 3 - the same column that, read as if
+                // it were a point at infinity, produced the 4113 px nonsense
+                // earlier. Here it is the right column for the right reason.
+                double mfx = 0.0, mfy = 0.0;
+                const bool haveM = fabs((double)RJ[15]) > 1e-12;
+                if (haveM) {
+                    mfx = ((double)RJ[12] / (double)RJ[15]) * hw;
+                    mfy = ((double)RJ[13] / (double)RJ[15]) * hh;
+                }
+                // ---- IS THE Y ESTIMATE EVEN DETERMINED?
+                //
+                // The difference is almost entirely in Y - 266 to 1261 px and
+                // growing - while X agrees to about 20. That is exactly what an
+                // ILL-CONDITIONED fit looks like, and this one has reason to be:
+                // flow lines constrain the FOE only ACROSS their direction, so a
+                // frame whose flow is mostly vertical - looking down at ground
+                // while moving forward - pins X and leaves Y nearly free.
+                //
+                // A(2x2) is symmetric positive semi-definite, so its eigenvalues
+                // are real and the ratio of the smaller to the larger says how
+                // much of the answer is measurement and how much is noise. Below
+                // about 0.01 the weak axis is not determined and the number on
+                // it must not be read as a result. Printing it beside the
+                // difference is the difference between a finding and another
+                // published retraction.
+                const double tr2 = foeA00 + foeA11;
+                const double disc = sqrt(fabs(tr2 * tr2 - 4.0 * det));
+                const double ev1 = 0.5 * (tr2 + disc), ev2 = 0.5 * (tr2 - disc);
+                const double cond = fabs(ev1) > 1e-12 ? fabs(ev2) / fabs(ev1) : 0.0;
+                trace("MV FOE FIT: phase=%d | eigenvalue ratio %.5f - below "
+                      "about 0.01 the weak axis of this fit is not determined "
+                      "and the offset along it is noise, not a measurement",
+                      m.dumpPhase, cond);
+                trace("MV FOE: phase=%d | the field expands about (%+.1f, %+.1f) "
+                      "px from centre over %llu flow lines | the matrix puts the "
+                      "camera centre at (%+.1f, %+.1f) | difference (%+.1f, "
+                      "%+.1f) px - drift names an accumulating position error, a "
+                      "fixed offset names the starting pose",
+                      m.dumpPhase, haveFoe ? fx : 0.0, haveFoe ? fy : 0.0,
+                      (unsigned long long)foeN, haveM ? mfx : 0.0,
+                      haveM ? mfy : 0.0,
+                      (haveFoe && haveM) ? fx - mfx : 0.0,
+                      (haveFoe && haveM) ? fy - mfy : 0.0);
                 double amed = -1.0;
                 if (!flowAngle.empty()) {
                     size_t k = flowAngle.size() / 2;
