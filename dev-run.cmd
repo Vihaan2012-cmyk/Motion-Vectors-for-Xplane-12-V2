@@ -50,6 +50,12 @@ rem produce. This is what turns "does it look right" into a number, and it is
 rem the only way to measure without someone flying.
 set "TAA_SELFTEST=1"
 
+rem Experiment switches are passed THROUGH this script, not set in it. setlocal
+rem scopes what is set here, but variables already in the environment survive -
+rem so TAA_MV_IDENTITY and friends set by the caller reach X-Plane. The layer
+rem prints what it actually received on its first present; check that line
+rem before believing any run made through one of them.
+
 rem Load the situation after all. It comes up in replay, which is not ideal -
 rem but replay still renders, and the self-test drives the CAMERA rather than
 rem the aeroplane, so the measurement is unaffected. Without it the sim sits on

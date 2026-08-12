@@ -4462,6 +4462,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // Same shape of bug as the arming block - per-frame state written inside a
     // subsystem that turned out to be optional. Published here instead, where
     // it cannot be gated on anything.
+    // EVERY SWITCH, ONCE, AS THE LAYER SEES IT.
+    //
+    // An experiment run through a switch that never arrived is worse than no
+    // experiment: TAA_MV_IDENTITY was set for a whole run and the output came
+    // back byte-identical to the run without it, which reads as "identity makes
+    // no difference" rather than as "the variable never reached the process".
+    // The self-test is deterministic - paused sim, scripted camera - so
+    // identical output is exactly what an ineffective switch produces.
+    {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            trace("MV SWITCHES: identity=%d pass=%ld noBody=%d pluginReproj=%d",
+                  getenv("TAA_MV_IDENTITY") ? 1 : 0,
+                  getenv("TAA_MV_PASS") ? atol(getenv("TAA_MV_PASS")) : 1L,
+                  getenv("TAA_MV_NO_BODY") ? 1 : 0,
+                  g_usePluginReproj ? 1 : 0);
+        }
+    }
+
     if (g_share && g_share->magic == TAA_MAGIC) {
         Snapshot fresh;
         if (snapshot(&fresh)) {
