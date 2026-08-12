@@ -4984,10 +4984,38 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // But zero is only a FAULT when something was asking to be jittered. With
     // Jitter is phase two and its amplitude is zero, so this reports the
     // count and the phase and claims nothing else.
-    if (g_jitterArmed && (frames % 600) == 0)
+    // Distinct phases seen since the last report, because a sample every 600
+    // frames against an 8-phase sequence lands on the SAME index every time -
+    // 600 is divisible by 8 - and reads as a jitter frozen at phase 2/8 when it
+    // is advancing perfectly. Aliasing the instrument against the thing being
+    // measured; counting distinct values cannot alias.
+    {
+        static uint32_t seenMask = 0;
+        if (snap.jitterIndex >= 0 && snap.jitterIndex < 32)
+            seenMask |= (1u << snap.jitterIndex);
+        if (g_jitterArmed && (frames % 601) == 0) {
+            int distinct = 0;
+            for (int i = 0; i < 32; ++i) if (seenMask & (1u << i)) ++distinct;
+            trace("JITTER SEQUENCE: %d distinct phases seen of %d expected",
+                  distinct, snap.jitterPhases);
+            seenMask = 0;
+        }
+    }
+
+    if (g_jitterArmed && (frames % 600) == 0) {
+        // Pixels, not NDC. The push is in clip units and reads as a meaningless
+        // fraction; what matters is whether the offset is the sub-pixel value
+        // the sequence asked for, so it is reported in the units it was
+        // specified in.
         trace("JITTER: %llu draws offset so far, current=(%.3f %.3f) px "
-              "phase %d/%d", (unsigned long long)g_jitterApplied,
-              snap.jitterX, snap.jitterY, snap.jitterIndex, snap.jitterPhases);
+              "phase %d/%d, amplitude %.2f",
+              (unsigned long long)g_jitterApplied,
+              snap.jitterX, snap.jitterY, snap.jitterIndex, snap.jitterPhases,
+              getenv("TAA_JITTER_SCALE") ? atof(getenv("TAA_JITTER_SCALE")) : 0.0);
+        if (g_jitterApplied == 0)
+            trace("JITTER: nothing offset - armed=%d but no draw met "
+                  "inScene && isGeometry", g_jitterArmed ? 1 : 0);
+    }
 
     // ---- did the resolve actually run this frame?
     //
@@ -6973,7 +7001,23 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             // sign and amplitude bugs from the calibration. The injection path
             // stays so it can be switched on once the vectors read a ratio of
             // one, but it contributes nothing until then.
-            const float jitterScale = 0.0f;
+            // ---- AMPLITUDE. Phase two starts here.
+            //
+            // Held at zero while the vectors were being calibrated, so the
+            // field was measured against an unjittered render and a whole class
+            // of sign and amplitude bugs could not contaminate it. The vectors
+            // now pass acceptance 30 of 32, so the reason for holding it is
+            // gone.
+            //
+            // TAA_JITTER_SCALE sets it. 1.0 is a full Halton(2,3) offset of
+            // +-0.5 px; the plugin already centres the sequence on the pixel.
+            // The default stays 0 because jitter with NOTHING CONSUMING IT is
+            // strictly worse than none - it shifts the sample grid every frame
+            // and, with no accumulation, high-contrast edges crawl. It is armed
+            // for measurement, not for use, until a resolve exists to cancel it.
+            static const float jitterScale = getenv("TAA_JITTER_SCALE")
+                                           ? (float)atof(getenv("TAA_JITTER_SCALE"))
+                                           : 0.0f;
             block[16] =  2.0f * g_velSnap.jitterX * jitterScale / w;
             block[17] = ySign * 2.0f * g_velSnap.jitterY * jitterScale / h;
             if (block[16] != 0.0f || block[17] != 0.0f) ++g_jitterApplied;

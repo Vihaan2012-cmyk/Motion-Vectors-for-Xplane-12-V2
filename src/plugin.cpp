@@ -187,6 +187,7 @@ static float    g_stAppliedPitch   = 0.0f;
 static int      g_stWatchdog       = 0;
 static bool     g_stPausedBySelfTest = false;
 static int      g_stShakeSaved[2] = {0, 0};
+static float    g_stBrakeSaved = 0.0f;
 static float    g_stBaseX = 0, g_stBaseY = 0, g_stBaseZ = 0;
 static float    g_stBaseHdg = 0, g_stBasePitch = 0;
 
@@ -2315,6 +2316,22 @@ static float matrixCallback(float sinceLast, float, int, void *)
             // supposedly pure rotation read as "camera translated" on most
             // frames, and it is why the matrices came back with terms forty
             // times larger than a 0.25 degree step can explain.
+            // ---- HOLD THE AEROPLANE ON THE BRAKES.
+            //
+            // Pausing stops the physics but the run still ends unpaused, and a
+            // parked Cirrus with the engine running creeps. That creep is not
+            // cosmetic: the camera creeps with it, and 2 mm a frame is 431 px of
+            // reprojection at a 1.6 cm near plane and about 7 px at one metre -
+            // the same size as the 13 px rotation being measured. It is what
+            // made a scripted, paused, supposedly pure rotation keep reading as
+            // "camera translated".
+            if (XPLMDataRef pb = XPLMFindDataRef("sim/cockpit2/controls/parking_brake_ratio")) {
+                g_stBrakeSaved = XPLMGetDataf(pb);
+                XPLMSetDataf(pb, 1.0f);
+                xlog("self-test: parking brake set (was %.2f) so the aeroplane "
+                     "cannot creep under the camera", g_stBrakeSaved);
+            }
+
             for (int i = 0; i < 2; ++i) {
                 const char *name = i ? "sim/graphics/view/handheld_external_cam"
                                      : "sim/graphics/view/gloaded_internal_cam";
@@ -2362,6 +2379,8 @@ static float matrixCallback(float sinceLast, float, int, void *)
             if (g_stPhase == TAA_ST_DONE) {
                 xlog("self-test: complete - camera released.");
                 XPLMDontControlCamera();
+                if (XPLMDataRef pb = XPLMFindDataRef("sim/cockpit2/controls/parking_brake_ratio"))
+                    XPLMSetDataf(pb, g_stBrakeSaved);
                 for (int i = 0; i < 2; ++i) {
                     if (!g_stShakeSaved[i]) continue;
                     const char *name = i ? "sim/graphics/view/handheld_external_cam"
