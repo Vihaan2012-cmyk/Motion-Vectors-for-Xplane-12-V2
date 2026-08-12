@@ -10,7 +10,13 @@
 ; It is removed again on uninstall.
 
 #define AppName    "Motion Vectors for X-Plane 12"
-#define AppVersion "0.0.08"
+; Passed in by build.ps1 as /DAppVersion=..., which reads the VERSION file.
+; The literal here is only a fallback for building by hand, and it is
+; deliberately not a plausible version - a stale number that LOOKS right is
+; worse than one that cannot be mistaken for a real build.
+#ifndef AppVersion
+  #define AppVersion "0.0.0-handbuilt"
+#endif
 #define AppPub     "Vihaan2012-cmyk"
 
 [Setup]
@@ -42,13 +48,8 @@ Source: "build\vklayer\VkLayer_mv.json";  DestDir: "{app}\MotionVectors";       
 ; The Qt launcher and its runtime. recursesubdirs picks up the platform,
 ; imageformat and tls plugin folders windeployqt produced - Qt will not start
 ; without platforms\qwindows.dll, and a missing plugin folder fails at run time
-; rather than at install time, which is the worst place to find out.
-Source: "build\qtlauncher\*"; DestDir: "{app}\MotionVectors\launcher"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Kept as a fallback: no dependencies, works if the Qt runtime is ever broken.
-; The Qt launcher and its runtime. recursesubdirs picks up the platform,
-; imageformat and tls plugin folders windeployqt produced - Qt will not start
-; without platforms\qwindows.dll, and a missing plugin folder fails at run time
 ; rather than at install time, which is the worse place to find out.
+Source: "build\qtlauncher\*"; DestDir: "{app}\MotionVectors\launcher"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Kept as a fallback: no dependencies, works even if the Qt runtime is broken.
 Source: "build\MotionVectorsLauncher.exe"; DestDir: "{app}\MotionVectors";                    Flags: ignoreversion
 Source: "lua\MotionVectors.lua";           DestDir: "{app}\Resources\plugins\FlyWithLua\Scripts"; Flags: ignoreversion; Check: FlyWithLuaPresent

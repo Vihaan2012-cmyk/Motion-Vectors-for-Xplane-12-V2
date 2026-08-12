@@ -1,3 +1,5 @@
+param([switch]$Installer)
+
 # Build: XPLM plugin + Vulkan layer.
 #
 # No upscaler feature flags. The predecessor gated FSR2/FSR3/DLSS/Streamline
@@ -6,6 +8,20 @@
 
 $ErrorActionPreference = "Stop"
 $root  = $PSScriptRoot
+
+# ---- ONE SOURCE OF TRUTH FOR THE VERSION.
+#
+# It used to live in installer.iss alone, so the installer said 0.0.08 while
+# the tag said 0.0.11 and the plugin said nothing at all. A version that
+# disagrees with itself across three files is how a user ends up reporting a
+# bug against a build nobody can identify.
+#
+# VERSION is the file. Everything else reads it: the compiler takes it as a
+# define, the installer takes it on the command line, and the Lua panel reads
+# it back out of the plugin over a dataref.
+$mvVersion = (Get-Content (Join-Path $root "VERSION") -Raw).Trim()
+Write-Host "Motion Vectors $mvVersion"
+
 $src   = Join-Path $root "src"
 $out   = Join-Path $root "build"
 $vksdk = (Get-ChildItem "C:\VulkanSDK\*" -Directory | Sort-Object Name | Select-Object -Last 1).FullName
@@ -15,7 +31,7 @@ New-Item -ItemType Directory -Force (Join-Path $out "vklayer") | Out-Null
 
 Write-Host "Building plugin..."
 & g++ -shared -o "$out\MotionVectors.xpl" "$src\plugin.cpp" `
-  -I"$root\SDK\CHeaders\XPLM" -DIBM=1 -m64 -O2 -std=c++17 `
+  -I"$root\SDK\CHeaders\XPLM" -DIBM=1 "-DMV_VERSION=\`"$mvVersion\`"" -m64 -O2 -std=c++17 `
   -static -static-libgcc -static-libstdc++ `
   -L"$root\SDK\Libraries\Win" -lXPLM_64
 if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
@@ -35,10 +51,58 @@ Write-Host "Building launcher..."
   -m64 -O2 -std=c++17 -mwindows -static -static-libgcc -static-libstdc++
 if ($LASTEXITCODE -ne 0) { throw "launcher build failed" }
 
+
+# ---- THE Qt LAUNCHER.
+#
+# This was never built by this script. src\qtlauncher\main.cpp existed, the
+# installer shipped build\qtlauncher\* unconditionally, and nothing in
+# between regenerated it - so every installer since that folder was first
+# populated by hand has carried a STALE launcher, built from a source nobody
+# had compiled in the meantime. It is exactly the failure the VERSION file was
+# just introduced to prevent, one directory over.
+#
+# windeployqt is what makes the output runnable: Qt will not start without
+# platforms\qwindows.dll, and a missing plugin folder fails at run time on the
+# user's machine rather than here.
+$qtRoot = "C:\Qt\6.8.3\mingw_64"
+if (Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) {
+    Write-Host "Building Qt launcher..."
+    $qtOut = Join-Path $out "qtlauncher"
+    # Cleared first. windeployqt only ADDS files, so a runtime left behind by a
+    # previous Qt version would be shipped alongside the current one.
+    if (Test-Path $qtOut) { Remove-Item -Recurse -Force $qtOut }
+    New-Item -ItemType Directory -Force $qtOut | Out-Null
+    & g++ -o (Join-Path $qtOut "MotionVectors.exe") "$src\qtlauncher\main.cpp" `
+      "-I$qtRoot\include" "-I$qtRoot\include\QtCore" "-I$qtRoot\include\QtGui" `
+      "-I$qtRoot\include\QtWidgets" "-I$qtRoot\include\QtNetwork" `
+      -m64 -O2 -std=c++17 -mwindows "-DMV_VERSION=\`"$mvVersion\`"" `
+      "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network -lQt6Network
+    if ($LASTEXITCODE -ne 0) { throw "Qt launcher build failed" }
+    & (Join-Path $qtRoot "bin\windeployqt.exe") --release --no-translations `
+      (Join-Path $qtOut "MotionVectors.exe") | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+} else {
+    Write-Host "Qt not found at $qtRoot - skipping the Qt launcher" -ForegroundColor Yellow
+}
+
 Write-Host "Installing..."
 $xp  = Split-Path $root -Parent
 $dst = Join-Path $xp "Resources\plugins\MotionVectors\64"
 New-Item -ItemType Directory -Force $dst | Out-Null
 Copy-Item "$out\MotionVectors.xpl" (Join-Path $dst "win.xpl") -Force
+
+
+# ---- THE INSTALLER, BUILT FROM THE SAME TREE AS THE BINARIES.
+#
+# On request only: it takes several seconds and most iterations do not need
+# one. Every release does.
+if ($Installer) {
+    $iscc = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
+    if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
+    Write-Host "Building installer..."
+    & $iscc "/DAppVersion=$mvVersion" (Join-Path $root "installer.iss") | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
+    Write-Host "  dist\MotionVectors-$mvVersion-setup.exe" -ForegroundColor Green
+}
 
 Write-Host "Done." -ForegroundColor Green
