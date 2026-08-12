@@ -508,6 +508,21 @@ struct TaaShare {
     // one process and read by another, and a float that is half-written reads
     // as a denormal or a NaN rather than as a stale number. Milli-pixels are
     // finer than the measurement and cannot tear into nonsense.
+    // ---- TAA, CONTROLLED BY THE PLUGIN.
+    //
+    // The resolve was behind an environment variable, which means it could only
+    // be turned on by editing a launcher script - fine while it was being
+    // proved out, useless to anyone else. These are written by the plugin and
+    // read by the layer every frame, so the panel's switch takes effect on the
+    // next frame with no restart.
+    //
+    // taaBlendMilli is the current frame's weight scaled by 1000, an integer for
+    // the same reason the residual is: the block is written by one process and
+    // read by another, and a torn float reads as a denormal rather than as a
+    // stale number.
+    int32_t  taaEnabledWanted;     // 1 = run the resolve
+    uint32_t taaBlendMilli;        // current-frame weight * 1000, 10..1000
+    uint32_t taaDispatches;        // layer -> plugin: proof it is actually running
     uint32_t mvResidualMilliPx;    // median epipolar residual, px * 1000
     uint32_t mvResidualP95MilliPx; // 95th percentile, px * 1000
     uint32_t mvResidualSamples;    // pixels behind those two figures

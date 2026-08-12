@@ -69,6 +69,9 @@ try_dataref("taaimpl/mv_samples",         "readonly")
 try_dataref("taaimpl/velocity_mb",        "readonly")
 try_dataref("taaimpl/pipelines_patched",  "readonly")
 try_dataref("taaimpl/pipelines_rejected", "readonly")
+try_dataref("taaimpl/taa_enabled",        "writable")
+try_dataref("taaimpl/taa_blend",          "writable")
+try_dataref("taaimpl/taa_dispatches",     "readonly")
 
 local function get(name, default)
     if not have[name] then return default end
@@ -181,6 +184,48 @@ local function build(w, x, y)
     text(DIM, "  Distance between where the field says a pixel was and")
     text(DIM, "  where the geometry says it could have been. Needs no")
     text(DIM, "  depth, so it is valid under rotation and translation.")
+
+    --[[ -----------------------------------------------------------------------
+      TAA.
+
+      Placed directly under the residual, because the residual is the thing that
+      makes this safe to switch on. A temporal resolve reprojects the previous
+      frame through the velocity field; if the field is wrong the result is
+      smeared, and the number immediately above says whether it is.
+
+      The dispatch count is shown for one reason: a resolve that silently never
+      runs looks exactly like a resolve that runs and does nothing. That already
+      happened once - a descriptor pool ran dry after eight frames and the pass
+      quietly stopped - so "enabled" is not evidence and the counter is.
+    ------------------------------------------------------------------------ ]]
+    heading("TEMPORAL ANTI-ALIASING")
+    local taaOn   = get("taaimpl/taa_enabled", 0)
+    local dispatch = get("taaimpl/taa_dispatches", 0)
+
+    if have["taaimpl/taa_enabled"] then
+        local changed, v = imgui.Checkbox("Enable TAA", taaOn == 1)
+        if changed then MV_taa_enabled = v and 1 or 0 end
+    end
+
+    if taaOn == 1 then
+        -- Running, or merely switched on? Those are different claims.
+        if dispatch > 0 then
+            row("RESOLVE", string.format("%d frames", dispatch), GOOD)
+        else
+            row("RESOLVE", "SWITCHED ON, NOT RUNNING", BAD)
+        end
+        if have["taaimpl/taa_blend"] then
+            local ch, b = imgui.SliderFloat("Current frame weight",
+                                            get("taaimpl/taa_blend", 0.1),
+                                            0.01, 1.0, "%.2f")
+            if ch then MV_taa_blend = b end
+        end
+        text(DIM, "  Lower keeps more history: smoother, but slower to")
+        text(DIM, "  respond. 0.10 converges in about ten frames.")
+    else
+        text(DIM, "  Off. The velocity field is produced either way -")
+        text(DIM, "  this is the first thing that consumes it.")
+    end
 
     heading("INJECTION")
     local patched  = get("taaimpl/pipelines_patched", 0)

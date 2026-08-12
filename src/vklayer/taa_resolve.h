@@ -94,24 +94,32 @@ struct TaaResolvePush {
 // whether the reprojection is right. Too high and TAA does nothing visible; too
 // low and every error in the velocity field is held on screen for half a
 // second, which is actually useful while proving this out.
+// Read LIVE from the shared block, not latched into a static. The panel's
+// slider has to take effect on the next frame, and a value cached on first use
+// would mean the sim had to be restarted to change it - which is exactly the
+// friction that kept this behind an environment variable.
 static float taaBlendWeight()
 {
-    static float v = -1.0f;
-    if (v < 0.0f) {
-        v = 0.1f;
-        if (const char *e = getenv("TAA_BLEND")) {
-            float f = (float)atof(e);
-            if (f > 0.0f && f <= 1.0f) v = f;
-        }
+    if (g_share && g_share->magic == TAA_MAGIC && g_share->taaBlendMilli) {
+        float v = (float)g_share->taaBlendMilli * 0.001f;
+        if (v > 0.0f && v <= 1.0f) return v;
     }
-    return v;
+    if (const char *e = getenv("TAA_BLEND")) {
+        float f = (float)atof(e);
+        if (f > 0.0f && f <= 1.0f) return f;
+    }
+    return 0.1f;
 }
 
+// The environment variable still forces it on, because a switch that can only
+// be reached through a running plugin is no use when the plugin is what is
+// being debugged. Otherwise the plugin decides.
 static bool taaEnabled()
 {
-    static int v = -1;
-    if (v < 0) v = getenv("TAA_RESOLVE") ? 1 : 0;
-    return v != 0;
+    static int forced = -1;
+    if (forced < 0) forced = getenv("TAA_RESOLVE") ? 1 : 0;
+    if (forced) return true;
+    return g_share && g_share->magic == TAA_MAGIC && g_share->taaEnabledWanted != 0;
 }
 
 static void taaDestroy(DeviceData &dd)
@@ -527,7 +535,10 @@ static bool taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
     t.historyValid = true;
-    if (++t.dispatches <= 3 || (t.dispatches % 600) == 0)
+    ++t.dispatches;
+    if (g_share && g_share->magic == TAA_MAGIC)
+        g_share->taaDispatches = (uint32_t)t.dispatches;
+    if (t.dispatches <= 3 || (t.dispatches % 600) == 0)
         trace("TAA: resolve dispatched %llu times (%ux%u, blend %.2f, reset=%d)",
               (unsigned long long)t.dispatches, t.w, t.h, pc.blend,
               pc.reset > 0.5f ? 1 : 0);
