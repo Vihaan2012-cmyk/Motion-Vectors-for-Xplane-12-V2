@@ -1,0 +1,83 @@
+#version 450
+
+// TAA resolve.
+//
+// Reads the current frame, reprojects the history through the velocity field
+// this project spent its whole life verifying, and blends the two. One
+// dispatch, one output, no temporal state beyond the history image itself.
+//
+// The velocity convention is prev - curr, in UV. That is the whole reason the
+// history is sampled at uv + velocity and not uv - velocity, and getting it
+// backwards does not fail - it reprojects twice as far in the wrong direction
+// and reads as heavy ghosting. It was backwards in this project for its entire
+// life until a direct calibration caught it, so it is stated here rather than
+// left to be inferred from a sign.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uCurrent;
+layout(set = 0, binding = 1) uniform sampler2D uHistory;
+layout(set = 0, binding = 2) uniform sampler2D uVelocity;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D uOutput;
+
+layout(push_constant) uniform Params {
+    vec2  invSize;      // 1 / render target size
+    float blend;        // weight of the CURRENT frame, 0..1
+    float reset;        // 1 = ignore history entirely this frame
+} pc;
+
+// Neighbourhood clamping.
+//
+// The history is a different frame, so anything newly revealed - a disocclusion,
+// a surface coming round an edge - has no correct history to fetch and will
+// return something from the wrong surface. Clamping the history into the colour
+// range of the current pixel's 3x3 neighbourhood is what stops that becoming a
+// smear, and it is what makes TAA tolerable without per-pixel rejection logic.
+//
+// An AABB in RGB is the cheap version and it is what this uses. It is not the
+// tightest possible bound - a variance-clipped box is tighter - but a wrong
+// tight bound flickers, and a loose bound only ghosts slightly. Start loose.
+void neighbourhood(ivec2 p, out vec3 lo, out vec3 hi)
+{
+    lo = vec3( 1e9);
+    hi = vec3(-1e9);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec3 c = texelFetch(uCurrent, p + ivec2(dx, dy), 0).rgb;
+            lo = min(lo, c);
+            hi = max(hi, c);
+        }
+    }
+}
+
+void main()
+{
+    ivec2 size = textureSize(uCurrent, 0);
+    ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) return;
+
+    vec2 uv  = (vec2(p) + 0.5) * pc.invSize;
+    vec3 cur = texelFetch(uCurrent, p, 0).rgb;
+
+    // prev - curr, so the history sits at uv + velocity.
+    vec2 vel   = texture(uVelocity, uv).xy;
+    vec2 hisUv = uv + vel;
+
+    // Off-screen history is not history. A sample outside the frame wraps or
+    // clamps to an edge texel, and an edge texel repeated over a whole border
+    // is the classic TAA smear down the side of the screen.
+    bool valid = pc.reset < 0.5
+              && hisUv.x >= 0.0 && hisUv.x <= 1.0
+              && hisUv.y >= 0.0 && hisUv.y <= 1.0;
+
+    vec3 outColour = cur;
+    if (valid) {
+        vec3 his = texture(uHistory, hisUv).rgb;
+        vec3 lo, hi;
+        neighbourhood(p, lo, hi);
+        his = clamp(his, lo, hi);
+        outColour = mix(his, cur, pc.blend);
+    }
+
+    imageStore(uOutput, p, vec4(outColour, 1.0));
+}

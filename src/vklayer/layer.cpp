@@ -943,6 +943,7 @@ static VkImageLayout g_sceneDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "mv_target.h"
 #include "spirv_inject.h"
+#include "taa_resolve.h"
 
 
 // FSR2 is optional at BUILD time as well as run time. Its static library takes
@@ -3599,6 +3600,42 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                                      g_velSnap.selfTestExpectedPx,
                                      g_velSnap.selfTestPhase, g_velSnap.frame,
                                      g_velSnap.nearClip, g_velSnap.proj);
+
+                // ---- THE RESOLVE, AT THE SAME BOUNDARY.
+                //
+                // Recorded here for the same reason the readback is: this point
+                // is after every scene pass by construction. Running earlier
+                // would resolve a half-drawn frame, which reads as a broken
+                // history rather than as a mistimed pass - a distinction that
+                // has cost this project several rounds elsewhere.
+                //
+                // Off unless TAA_RESOLVE is set. The velocity field is the
+                // product; this is its first consumer and it changes what the
+                // user sees, so it does not turn itself on.
+                if (rdi != g_devices.end() && g_mv.ready && taaEnabled()
+                    && g_sceneColor.image && g_sceneColor.w && g_sceneColor.h) {
+                    DeviceData &rdd = rdi->second;
+                    if (taaInit(rdd, rdd.phys, g_sceneColor.w, g_sceneColor.h)) {
+                        VkImageView sv = taaSceneView(rdd, g_sceneColor.image,
+                                                      g_sceneColor.format);
+                        // historyReset is the plugin's statement that the camera
+                        // cut - a view change, a teleport - and that no history
+                        // from before it describes this frame.
+                        if (!taaRecordResolve(rdd, cb, g_sceneColor.image, sv,
+                                              g_mv.view,
+                                              g_velSnap.historyReset != 0)) {
+                            static bool said = false;
+                            if (!said) {
+                                said = true;
+                                trace("TAA: the resolve did NOT record - scene "
+                                      "view %p, velocity view %p. A pass that "
+                                      "silently does not run looks exactly like "
+                                      "one that runs and does nothing.",
+                                      (void*)sv, (void*)g_mv.view);
+                            }
+                        }
+                    }
+                }
             }
         }
 
