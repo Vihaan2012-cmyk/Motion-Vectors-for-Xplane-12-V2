@@ -48,6 +48,7 @@ rem Drive the camera through a known yaw and pitch once the flight settles, and
 rem compare the vectors against the pixel displacement that motion must
 rem produce. This is what turns "does it look right" into a number, and it is
 rem the only way to measure without someone flying.
+set "TAA_RESOLVE=1"
 set "TAA_SELFTEST=1"
 
 rem Experiment switches are passed THROUGH this script, not set in it. setlocal

@@ -55,6 +55,20 @@ struct TaaResolve {
     VkImageView     currentView = VK_NULL_HANDLE;   // view onto the scene colour
     VkImageView     velocityView = VK_NULL_HANDLE;
 
+    // ---- A RING OF SETS, ALLOCATED ONCE.
+    //
+    // The first version allocated a set per dispatch and never freed one. The
+    // pool held eight, so the resolve ran for exactly eight frames and then
+    // stopped - and it stopped SILENTLY, because a failed allocation is a
+    // return code and not a crash. The three "dispatched" lines in the log
+    // followed by nothing were the only evidence.
+    //
+    // Eight sets, cycled by dispatch index. The GPU is at most two or three
+    // frames behind one dispatch per frame, so a set is long finished before it
+    // comes round again.
+    enum { kSets = 8 };
+    VkDescriptorSet sets[kSets] = { VK_NULL_HANDLE };
+
     uint32_t        w = 0, h = 0;
     VkFormat        format = VK_FORMAT_UNDEFINED;
     bool            ready = false;
@@ -333,6 +347,20 @@ static bool taaInit(DeviceData &dd, VkPhysicalDevice phys, uint32_t w, uint32_t 
         return false;
     }
 
+    VkDescriptorSetLayout layouts[TaaResolve::kSets];
+    for (int i = 0; i < TaaResolve::kSets; ++i) layouts[i] = t.setLayout;
+    VkDescriptorSetAllocateInfo dsai;
+    memset(&dsai, 0, sizeof(dsai));
+    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool     = t.pool;
+    dsai.descriptorSetCount = TaaResolve::kSets;
+    dsai.pSetLayouts        = layouts;
+    if (dd.allocateDescriptorSets(dd.device, &dsai, t.sets) != VK_SUCCESS) {
+        trace("TAA: could not allocate the descriptor ring");
+        taaDestroy(dd);
+        return false;
+    }
+
     t.ready = true;
     t.historyValid = false;
     trace("TAA: resolve ready %ux%u RGBA16F, history pair %.1f MB total, "
@@ -382,14 +410,8 @@ static bool taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     TaaResolve &t = g_taa;
     if (!t.ready || !sceneView || !velocityView) return false;
 
-    VkDescriptorSetAllocateInfo dsai;
-    memset(&dsai, 0, sizeof(dsai));
-    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool     = t.pool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts        = &t.setLayout;
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    if (dd.allocateDescriptorSets(dd.device, &dsai, &set) != VK_SUCCESS) return false;
+    VkDescriptorSet set = t.sets[t.dispatches % TaaResolve::kSets];
+    if (!set) return false;
 
     VkDescriptorImageInfo ii[4];
     memset(ii, 0, sizeof(ii));
