@@ -478,7 +478,17 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // A ratio of 1 is the target. Sign is not meaningful here: the vectors point
     // backwards by convention - from a pixel to where it was - while the
     // expectation is a magnitude.
-    if (selfTestPhase != 0 && expectedPx > 0.01) {
+    // Gated on the PHASE alone, not on the plugin's expectedPx.
+    //
+    // The plugin only fills expectedPx for the rotation phases - it is zero for
+    // HOLD, TRANSLATE and HEADMOVE - so gating on it silently discarded every
+    // sample from the three phases that test the things rotation cannot: that a
+    // still camera produces a still field, and that translation produces
+    // PARALLAX rather than a uniform shift. Those are the samples that prove
+    // the field is depth-aware, and none of them were ever being printed.
+    //
+    // Nothing here needs expectedPx any more; the matrix is the yardstick.
+    if (selfTestPhase != 0) {
         // ---- COMPARE THE MATCHING AXIS, NOT THE MAGNITUDE.
         //
         // `centre` above is sqrt(vx^2 + vy^2). The expectation for a yaw is a
@@ -510,7 +520,7 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
         // frame must agree with the matrix's own far prediction. If the low
         // quantile matches, the field is right and the spread is parallax; if
         // even the low quantile is a multiple of it, the field is wrong.
-        const bool   vertical = (selfTestPhase == 5);
+        const bool   vertical = (selfTestPhase == 5);   // ST_PITCH
         const double axisPx = vertical ? cyPx : cxPx;
         std::vector<float> &axis = vertical ? axY : axX;
         const double scale = vertical ? (double)m.h : (double)m.w;
@@ -628,6 +638,40 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                                   * (vertical ? (double)m.h : (double)m.w);
             const double farRatio = predFar > 1e-6 ? centrePx / predFar : 0.0;
 
+            // ---- WHAT EACH PHASE PREDICTS. Magnitude at the centre is not a
+            // test on its own: a field with the right size and the wrong sign is
+            // useless to every consumer of it, and rotation phases cannot
+            // exercise depth at all.
+            //
+            //   1 HOLD       camera still            -> the field must be ZERO
+            //   2 YAW  3 YAWL 4 PITCH  rotation      -> centre == centre-ray
+            //                                           prediction, and the SAME
+            //                                           at every depth
+            //   5 TRANSLATE  camera slides sideways  -> infinity must NOT move.
+            //                                           Parallax only, so far
+            //                                           goes to zero while near
+            //                                           geometry moves a lot
+            //
+            // TRANSLATE is the one that proves the vectors are depth-aware
+            // rather than a global offset that happens to fit a rotation.
+            // The phase numbers come from the plugin's enum, which starts at
+            // TAA_ST_OFF = 0. Naming them here rather than writing the integers
+            // is not decoration: the first version of this switch had them off
+            // by one and applied the TRANSLATION rule to the PITCH phase, so
+            // every pitch row was failed for "moving infinity" while its ratio
+            // read 1.002.
+            enum { ST_OFF = 0, ST_SETTLE, ST_HOLD, ST_YAW, ST_YAWL,
+                   ST_PITCH, ST_TRANSLATE, ST_HEADMOVE };
+
+            // SIGN COHERENCE. Under any rigid camera motion over static scenery
+            // the centre pixels all move the same way, so the SIGNED mean and
+            // the median MAGNITUDE must agree. If they diverge, neighbouring
+            // pixels disagree with each other - which is the defect the
+            // predecessor spent weeks on and never measured properly.
+            const double signedPx = (vertical ? fabs(cSy / (double)(cN ? cN : 1)) * m.h
+                                              : fabs(cSx / (double)(cN ? cN : 1)) * m.w);
+            const double coherence = centrePx > 1e-6 ? signedPx / centrePx : 1.0;
+
             // A VERDICT ONLY WHEN THE MATRIX SAYS PURE ROTATION.
             //
             // The expectation is depth-independent only if the camera did not
@@ -644,17 +688,51 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             // assumption about what the aeroplane was doing.
             const double purity = predFar > 1e-6 ? predNear / predFar : 0.0;
             const bool   pure   = purity > 0.95 && purity < 1.05;
+            const char *verdict = "";
+            switch (selfTestPhase) {
+            case ST_SETTLE:
+            case ST_HOLD:
+                verdict = (centrePx < 0.05) ? "  <- CORRECT (still)"
+                                            : "  <- WRONG (should be zero)";
+                break;
+            case ST_TRANSLATE: {
+                // The camera translates FORWARD here - measured, cam z goes
+                // -33869.9 to -33864.1 while x goes -237.6 to -235.2 at
+                // 0.348 m per frame.
+                //
+                // Forward motion makes the centre of the screen the FOCUS OF
+                // EXPANSION: the one point that does not move, at any depth.
+                // The matrix says so plainly, far=8.090 against near=8.084,
+                // both near zero - so a ratio against the centre-ray prediction
+                // is degenerate and cannot judge this phase. The first version
+                // of this test did exactly that and failed a phase the vectors
+                // were passing.
+                //
+                // The real signature of radial flow is a large magnitude with a
+                // signed mean near zero, because pixels either side of centre
+                // move in OPPOSITE directions. That is what coherence measures,
+                // and it reads 0.02 to 0.09 here against 1.00 for every
+                // rotation - so it is the assertion.
+                const bool radial = coherence < 0.30 && centrePx > 1.0;
+                verdict = radial ? "  <- CORRECT (radial parallax from forward motion)"
+                                 : "  <- WRONG (forward translation should be radial)";
+                break;
+            }
+            default:   // ST_YAW, ST_YAWL, ST_PITCH, ST_HEADMOVE
+                verdict = (farRatio > 0.95 && farRatio < 1.05) ? "  <- CORRECT"
+                                                               : "  <- WRONG";
+            }
+
             trace("MV RATIO: phase=%d %s  centre=%.3f | p05=%.3f p25=%.3f med=%.3f p75=%.3f "
-                  "p95=%.3f px | matrix far=%.3f px  ->  p05/far=%.3f%s "
-                  "(expected=%.3f, at1m=%.3f, frame %llu recorded / %llu now)",
+                  "p95=%.3f px | far=%.3f near=%.3f  ->  ratio=%.3f%s "
+                  "coherence=%.2f (frame %llu recorded / %llu now)",
                   selfTestPhase, vertical ? "pitch" : "yaw  ",
-                  centrePx, p05, p25, axisPx, p75, p95, predFar, farRatio,
-                  !pure ? "  (camera translated - no single expectation)"
-                        : (farRatio > 0.95 && farRatio < 1.05) ? "  <- CORRECT"
-                        : "  <- WRONG",
-                  expectedPx, predNear,
+                  centrePx, p05, p25, axisPx, p75, p95, predFar, predNear, farRatio,
+                  verdict,
+                  coherence,
                   (unsigned long long)m.dumpShareFrame,
                   (unsigned long long)nowShareFrame);
+            (void)pure; (void)expectedPx;
             // THE MATRIX ITSELF, on the frames that fail.
             //
             // Every derived number has now been checked and every one of them
