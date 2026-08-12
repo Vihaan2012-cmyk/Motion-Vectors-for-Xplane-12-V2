@@ -41,10 +41,9 @@ twice as far in the wrong direction, which reads as ghosting.
 
 **2. The body matrix was never converted to view space.** When the main
 reprojection moved to view space, the shader changed what it feeds the matrix.
-`bodyReproj`, the cockpit path, stayed clip-to-clip. Measured with the aircraft
-frozen at 0.0000 m per frame: a full-width band below the horizon, `vx` exactly
-zero at x = 700, 996 and 3808, and `prevNDC.y / currNDC.y = 0.6549` dead
-constant over 28,536 pixels and seven consecutive frames.
+`bodyReproj`, the cockpit path, stayed clip-to-clip. This is a real latent bug
+and it is fixed — but see the correction below: it was **not** the cause of the
+band, and the band is still present.
 
 **3. The `independentBlend` query never ran.** It passed a NULL instance to
 `vkGetInstanceProcAddr`, which the spec allows for four global entry points that
@@ -62,6 +61,27 @@ a launcher would have turned the field into a debug pattern — and it would sti
 have passed every magnitude test. `TAA_MV_DUMP_SPIRV` is kept; it only writes
 files and cannot alter what is rendered.
 
+## Correction to this release's first published text
+
+This page originally claimed the body-matrix fix removed a fixed 28,866-pixel
+cluster below the horizon. **That claim was wrong and is withdrawn.**
+
+The layer's own counters say the body path is never taken:
+
+    body-frame 0, bodyValid=0, cockpitPass=-1
+
+so the conversion cannot have changed any pixel. The run in which the band
+disappeared was a different flight state, and I attributed it to the change I
+had just made. A later run reproduces the band unchanged — 28,593 pixels at
+(562, 1659), prevNDC.y / currNDC.y = 0.6554.
+
+The measurement itself stands and is repeatable: a coherent group of draws whose
+Y reprojection is off by a constant factor of about 0.655, with X exact. Since
+one matrix is pushed per frame (`MV PUSH RACE: 1`), the likeliest remaining
+explanation is that those draws are rasterised with a projection of their own —
+`proj[5]` around 4.26 against the main 2.79 — which our reprojection, built from
+the main projection, does not describe. That is a hypothesis, not a result.
+
 ## Known, not fixed
 
 - The TRANSLATE phase reports 80–196 px on some frames while others on the same
@@ -69,7 +89,12 @@ files and cannot alter what is rendered.
   error.
 - A p95 tail persists in the hold phases where the median is 0.000. Under a
   frozen sim nearly every pixel is exactly zero and excluded from the statistic,
-  so this is a small set of genuinely moving pixels. Not yet identified.
+  so this is a small set of genuinely moving pixels. This is the band described
+  in the correction above; it is measured, repeatable, and unexplained.
+- The TRANSLATE phase's failures do not correlate with the camera delta: dC is
+  steady at 0.3477-0.3535 m and the epipolar line at 299-302 px across every
+  frame, while the median residual swings between 0.002 and 241 px. The
+  frame-pairing explanation is ruled out.
 
 ## This supersedes 0.0.08
 
