@@ -4027,15 +4027,18 @@ static void armLayerOnce()
             dumpEvery = 0;
             if (const char *d = getenv("TAA_VELOCITY_DUMP")) dumpEvery = atoi(d);
 
-            // Jitter is OFF unless asked for, and will later be gated on a
-            // resolve being present.
+            // ---- "WILL LATER BE GATED ON A RESOLVE BEING PRESENT." IT IS NOW.
             //
-            // On its own it makes the image worse, not better: it shifts
-            // the sample grid every frame and nothing accumulates the
-            // result, so high-contrast edges crawl. It is only useful to
-            // whatever consumes it. Shipping it enabled ahead of the
-            // resolve would look like a regression, and would be one.
-            g_jitterArmed = (getenv("TAA_JITTER") != nullptr);
+            // On its own jitter makes the image worse: it shifts the sample
+            // grid every frame with nothing accumulating the result, so
+            // high-contrast edges crawl. With the resolve accumulating, that
+            // same shifted grid is the entire mechanism by which temporal
+            // anti-aliasing gets samples a single frame never had.
+            //
+            // So the two are tied. TAA_JITTER still forces it on for
+            // measurement, but the resolve is what arms it in normal use, and
+            // neither can be left on without the other by accident.
+            g_jitterArmed = (getenv("TAA_JITTER") != nullptr) || taaEnabled();
             g_jitterViewport = (getenv("TAA_JITTER_VIEWPORT") != nullptr);
             if (const char *nf = getenv("TAA_NEARFIELD_M")) {
                 g_nearFieldM = (float)atof(nf);
@@ -7712,9 +7715,20 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             // strictly worse than none - it shifts the sample grid every frame
             // and, with no accumulation, high-contrast edges crawl. It is armed
             // for measurement, not for use, until a resolve exists to cancel it.
+            // ---- THE CONDITION THIS COMMENT NAMES IS NOW MET.
+            //
+            // "It is armed for measurement, not for use, until a resolve exists
+            // to cancel it." A resolve exists. So the default follows the
+            // resolve rather than staying at zero: jitter with nothing
+            // consuming it is strictly worse than none, and jitter WITH a
+            // consumer is the entire mechanism by which temporal
+            // anti-aliasing gets samples the single frame did not have.
+            //
+            // Still overridable, and still zero when the resolve is off - the
+            // two are tied together because either alone is a downgrade.
             static const float jitterScale = getenv("TAA_JITTER_SCALE")
                                            ? (float)atof(getenv("TAA_JITTER_SCALE"))
-                                           : 0.0f;
+                                           : (taaEnabled() ? 1.0f : 0.0f);
             block[16] =  2.0f * g_velSnap.jitterX * jitterScale / w;
             block[17] = ySign * 2.0f * g_velSnap.jitterY * jitterScale / h;
             if (block[16] != 0.0f || block[17] != 0.0f) ++g_jitterApplied;
