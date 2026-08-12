@@ -451,6 +451,21 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // which is close to proj[0] = 1.57 and not far off sy/sx = 1.778 - too
     // close to call from two points. A median over the whole cluster names it.
     std::vector<float> badKy;
+    // The residual split by how much TRANSLATION each pixel depends on.
+    //
+    // The centre-versus-matrix line cannot test a translation phase: with no
+    // rotation the matrix predicts zero motion at infinity by construction, and
+    // it duly prints (-0.000, -0.000) on every phase 7 frame. So the epipolar
+    // residual is the only instrument there, and it needs to say WHERE it fails.
+    //
+    // Each pixel's epipolar line length is exactly how far its predicted
+    // previous position moves between one metre and infinity - that is, how
+    // much its reprojection depends on depth, and so on the translation term.
+    // Distant geometry has a short line and needs only the rotation; near
+    // geometry has a long one. Splitting the residual on it separates "the
+    // rotation is wrong" from "the translation is wrong" without any new
+    // machinery in the render path.
+    std::vector<float> residShort, residLong;
 
 
     // Strided. A full 8.3 M pixel scan per dump costs more than it tells us -
@@ -545,6 +560,10 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                         r = fabs((mx - ex) * ly - (my - ey) * lx);
                     }
                     resid[c].push_back((float)r);
+                    if (c == 2) {
+                        if (len < 1.0) residShort.push_back((float)r);
+                        else           residLong.push_back((float)r);
+                    }
                     // ---- CONVENTION 2 IS v+,dy+, AND IT IS THE RIGHT ONE.
                     //
                     // Measured, on every phase of a full self-test run:
@@ -642,6 +661,22 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
         // The median alone would hide the case that matters most: a field that
         // is right almost everywhere and wrong on the near-field geometry is
         // exactly what a consumer ghosts on.
+        {
+            auto med2 = [](std::vector<float> &v) -> double {
+                if (v.empty()) return -1.0;
+                size_t k = v.size() / 2;
+                std::nth_element(v.begin(), v.begin() + k, v.end());
+                return (double)v[k];
+            };
+            trace("MV SPLIT: phase=%d | pixels whose reprojection barely depends "
+                  "on depth (epipolar line under 1 px): median %.3f px over %llu "
+                  "| pixels that depend on it strongly: median %.3f px over %llu "
+                  "- the first tests the rotation alone, the second tests the "
+                  "translation term as well",
+                  m.dumpPhase, med2(residShort),
+                  (unsigned long long)residShort.size(), med2(residLong),
+                  (unsigned long long)residLong.size());
+        }
         std::vector<float> &rb = resid[bestC >= 0 ? bestC : 0];
         double r95 = -1.0;
         if (!rb.empty()) {
