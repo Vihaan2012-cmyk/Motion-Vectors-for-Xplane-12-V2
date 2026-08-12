@@ -4629,6 +4629,50 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             worldRel[12] = worldRel[13] = worldRel[14] = 0.0f;
             taaMul(currVPrel, fresh.proj, worldRel);
 
+            // ---- THE PROJECTION IS INVERTED IN CLOSED FORM, NOT NUMERICALLY.
+            //
+            // reproj = P_prev * W_rel * P_curr^-1. Taking that last inverse with
+            // a general 4x4 cofactor expansion in float32 is what broke the
+            // vectors: this projection has an INFINITE far plane and a 1.6 cm
+            // near plane, so the matrix spans an enormous dynamic range and is
+            // severely ill conditioned. The rotation part survives - which is
+            // why the field always had the right SHAPE - while the w row
+            // degenerates.
+            //
+            // Measured consequence: prevClip.w arrived at the fragment shader as
+            // ZERO, and the shader divides by it. mv = curr.xy/curr.w -
+            // prev.xy/prev.w then explodes by however close to zero w landed,
+            // which is exactly the 3x to 21x seen, varying per frame, while
+            // staying uniform and coherent because the rotation itself was fine.
+            //
+            // A perspective matrix inverts exactly, in four terms. For the form
+            // X-Plane uses - proj[0], proj[5] the x and y scales, proj[10] = -1,
+            // proj[11] = -1, proj[14] = -near:
+            //
+            //     x_view = x_clip / proj[0]
+            //     y_view = y_clip / proj[5]
+            //     z_view = -w_clip
+            //     w_view = (z_clip - proj[10] * (-w_clip)) / proj[14]
+            //
+            // Every term is a reciprocal of a well-scaled number. Nothing
+            // cancels, nothing is conditioned on the far plane.
+            float invProj[16];
+            {
+                const float sx = fresh.proj[0]  != 0.0f ? fresh.proj[0]  : 1.0f;
+                const float sy = fresh.proj[5]  != 0.0f ? fresh.proj[5]  : 1.0f;
+                const float m10 = fresh.proj[10], m11 = fresh.proj[11], m14 = fresh.proj[14];
+                memset(invProj, 0, sizeof(invProj));
+                invProj[0]  = 1.0f / sx;                       // x_view from x_clip
+                invProj[5]  = 1.0f / sy;                       // y_view from y_clip
+                invProj[11] = (m14 != 0.0f) ? 1.0f / m14 : 0.0f;   // w_view from z_clip
+                invProj[14] = (m11 != 0.0f) ? 1.0f / m11 : 0.0f;   // z_view from w_clip
+                invProj[15] = (m14 != 0.0f) ? -m10 / (m11 * m14) : 0.0f;
+            }
+
+            // W_rel = W_prev * W_curr^-1 for two RIGID matrices, which is also
+            // closed form: [R_prev * R_curr^T | R_prev * (C_curr - C_prev)].
+            // The rotation transpose is exact and the translation is the
+            // millimetre-scale delta already differenced in double below.
             if (adjacent && taaInverse(invCurr, currVPrel)) {
                 // The camera positions are recovered from each rigid matrix in
                 // DOUBLE and differenced there, so the millimetre that survives
@@ -4650,7 +4694,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                                                  + (double)prevWorldSaved[4 + i] * dy
                                                  + (double)prevWorldSaved[8 + i] * dz);
                 taaMul(prevVPrel, prevProjSaved, prevWorldRel);
-                taaMul(r, prevVPrel, invCurr);
+
+                // reproj = (P_prev * W_prev_rel) * (W_curr_rel^-1 * P_curr^-1).
+                // W_curr_rel is [R_curr | 0], so its inverse is [R_curr^T | 0] -
+                // exact, no division at all.
+                float invWorldRel[16];
+                memset(invWorldRel, 0, sizeof(invWorldRel));
+                for (int c = 0; c < 3; ++c)
+                    for (int rr = 0; rr < 3; ++rr)
+                        invWorldRel[c*4 + rr] = worldRel[rr*4 + c];   // transpose
+                invWorldRel[15] = 1.0f;
+
+                float invCurrExact[16];
+                taaMul(invCurrExact, invWorldRel, invProj);
+
+                static const bool useNumeric = (getenv("TAA_MV_NUMERIC_INV") != nullptr);
+                taaMul(r, prevVPrel, useNumeric ? invCurr : invCurrExact);
 
                 // ---- THE ANGLE, FROM THE SAME TWO MATRICES.
                 //
@@ -6273,8 +6332,18 @@ static std::map<VkPipeline, VkPipelineLayout> g_pipelineLayoutOf;
 //
 // Pushing again immediately before each draw closes that window: nothing can be
 // bound between the push and the draw that consumes it.
-struct PendingPush { VkPipelineLayout layout; float block[20]; bool valid; };
-static std::map<VkCommandBuffer, PendingPush> g_cbPendingPush;
+struct PendingPush { VkCommandBuffer cb; VkPipelineLayout layout; float block[20]; bool valid; };
+
+// THREAD-LOCAL, NOT A MAP UNDER A MUTEX.
+//
+// The first version of this kept a std::map keyed by command buffer and took
+// the global lock on every draw. X-Plane records on several threads, so every
+// draw on every thread serialised on one mutex and the sim ran at 9 fps.
+//
+// A recording thread has exactly one command buffer open and one pipeline last
+// bound, so the state is naturally per-thread. No sharing, no lock, no map
+// lookup - a pointer compare and a memcpy.
+static thread_local PendingPush g_tlPush = { VK_NULL_HANDLE, VK_NULL_HANDLE, {0}, false };
 
 // Does this pipeline draw geometry from vertex buffers, and how many of each
 // kind exist. Filled at pipeline creation; read at bind time to decide whether
@@ -7116,22 +7185,26 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
 // Kept behind TAA_MV_REPUSH because the mechanism is worth being able to retest,
 // but never on by default. A diagnostic that halves the frame rate is a
 // diagnostic that changes what it measures.
+// ---- RE-PUSH BEFORE EVERY DRAW. ON BY DEFAULT NOW.
+//
+// The field is a uniform rigid rotation of the right shape but 8 to 21 times
+// the magnitude the recorded matrix encodes, and the factor varies per frame.
+// A uniform field IS a rotation, so the shader is applying SOME matrix - just
+// not the one that was current when the draw ran. Pushing at bind time leaves a
+// window: anything that re-records or replays between the bind and the draw
+// consumes whatever was last written into that command buffer.
+//
+// Writing it immediately before each draw closes the window by construction.
+// TAA_MV_NO_REPUSH turns it off to compare.
 static void mvRepushBeforeDraw(VkCommandBuffer cb)
 {
-    static const bool on = (getenv("TAA_MV_REPUSH") != nullptr);
-    if (!on) return;
-    if (!g_nextCmdPushConstants) return;
-    PendingPush pp;
-    {
-        std::lock_guard<std::mutex> g(g_lock);
-        std::map<VkCommandBuffer, PendingPush>::iterator it = g_cbPendingPush.find(cb);
-        if (it == g_cbPendingPush.end() || !it->second.valid) return;
-        pp = it->second;
-    }
+    static const bool off = (getenv("TAA_MV_NO_REPUSH") != nullptr);
+    if (off || !g_nextCmdPushConstants) return;
+    if (!g_tlPush.valid || g_tlPush.cb != cb) return;
     g_inOurPush = true;
-    g_nextCmdPushConstants(cb, pp.layout, VK_SHADER_STAGE_VERTEX_BIT,
+    g_nextCmdPushConstants(cb, g_tlPush.layout, VK_SHADER_STAGE_VERTEX_BIT,
                            spvinj::pushConstantOffset(),
-                           spvinj::kPushConstantBytes, pp.block);
+                           spvinj::kPushConstantBytes, g_tlPush.block);
     g_inOurPush = false;
     ++g_drawRepushes;
 }
@@ -7534,13 +7607,10 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
                            spvinj::kPushConstantBytes,
                            block);
     g_inOurPush = false;
-    {
-        std::lock_guard<std::mutex> g(g_lock);
-        PendingPush &pp = g_cbPendingPush[cb];
-        pp.layout = layout;
-        memcpy(pp.block, block, sizeof(pp.block));
-        pp.valid = true;
-    }
+    g_tlPush.cb     = cb;
+    g_tlPush.layout = layout;
+    memcpy(g_tlPush.block, block, sizeof(g_tlPush.block));
+    g_tlPush.valid  = true;
 
     if (++g_pushCount <= 3 || (g_pushCount % 100000) == 0)
         trace("SPIRV INJECT: draw-time re-pushes %llu", (unsigned long long)g_drawRepushes);

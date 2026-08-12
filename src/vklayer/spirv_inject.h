@@ -195,6 +195,16 @@ inline uint32_t choosePushOffset(uint32_t maxPushConstantsSize)
 // is also rate-independent. At 1.5 mm of drift, 350 px means geometry 1.3 cm
 // from the eye. Either something really is that close, or the depth reaching
 // this shader is not the depth of the surface being drawn. This says which.
+// TAA_MV_RAW: read at CALL time, not from a global written by a static
+// initialiser. The previous form was false when vertex modules were patched and
+// true when fragment ones were, so the vertex probe silently never compiled in -
+// and its apparent zeros were trusted for six turns.
+inline bool debugRaw()
+{
+    static int v = -1;
+    if (v < 0) v = getenv("TAA_MV_RAW") ? 1 : 0;
+    return v != 0;
+}
 inline bool &debugDepthMode() { static bool v = false; return v; }
 inline uint32_t &currClipLocation() { static uint32_t v = 14; return v; }
 inline uint32_t &prevClipLocation() { static uint32_t v = 15; return v; }
@@ -574,7 +584,30 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 
     body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrPCMat4); body.push_back(idChainPC); body.push_back(idPCVar); body.push_back(idConst0);
     body.push_back(head(OpLoad, 4));        body.push_back(idMat4);      body.push_back(idLoadedMat); body.push_back(idChainPC);
-    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idLoadedMat); body.push_back(idFlipped);
+    // ---- THE MATRIX IS APPLIED TO THE RAW CLIP POSITION, NOT THE FLIPPED ONE.
+    //
+    // uReproj is built from X-Plane's world and projection matrices, which are
+    // y-UP clip space. Feeding it a y-NEGATED vector mixes -y into every row,
+    // the w row included, so prevClip.w comes out wrong wherever |y| is large -
+    // and the fragment then divides by it.
+    //
+    // Measured, in metres, over the same frames:
+    //
+    //     prev.w   p05 0.017   med 0.383   p95 2210
+    //     curr.w   p05 0.24    med 0.351   p95 8336
+    //
+    // The medians agree; the tails do not. prev.w reaches the 1.6 cm near plane
+    // where curr.w never goes below 0.24 m, and those near-zero pixels are what
+    // inflate the motion vectors by the 3x to 21x that varied with how many of
+    // them were in frame.
+    //
+    // The flip was inherited from the depth-derived shader, which built its NDC
+    // from PIXEL COORDINATES and so was genuinely y-down. That shader is gone.
+    // A matrix in y-up clip space must be applied to a y-up clip position.
+    //
+    // TAA_MV_FLIP restores the old behaviour for comparison.
+    static const bool flipForMatrix = (getenv("TAA_MV_FLIP") != nullptr);
+    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idLoadedMat); body.push_back(flipForMatrix ? idFlipped : storedValue);
 
     // ---- NEAR FIELD: THE COCKPIT'S CORRECT MOTION VECTOR IS ZERO.
     //
@@ -655,7 +688,10 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         body.push_back(head(OpStore, 3)); body.push_back(idOutPrev); body.push_back(idDbgOut);
     } else
     body.push_back(head(OpStore, 3)); body.push_back(idOutPrev); body.push_back(idPrevSel);
-    body.push_back(head(OpStore, 3)); body.push_back(idOutCurr); body.push_back(idFlipped);
+    // currClip goes out in the same space the matrix works in, so the fragment's
+    // subtraction is between two comparable vectors. Both raw, or both flipped -
+    // never one of each.
+    body.push_back(head(OpStore, 3)); body.push_back(idOutCurr); body.push_back(flipForMatrix ? idFlipped : storedValue);
 
     // ---- SUB-PIXEL JITTER, in clip space.
     //
@@ -992,6 +1028,17 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
         // that ignores uReproj writes zero whether identity or a rotation is
         // pushed, and that zero was read all night as proof it worked.
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idLp); body.push_back(3);
+        idMy = bound++;
+    }
+    if (debugRaw()) {
+        // .x = prev.w, .y = curr.w. Two numbers that MUST be equal for any
+        // rigid camera motion - the same point is the same distance in front of
+        // the eye either frame. No convention enters: not y-up versus y-down,
+        // not the depth range, not a scale. Their ratio is exactly the factor
+        // the fragment divides by when it forms the motion vector.
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idLp); body.push_back(0);
+        idMx = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idLp); body.push_back(1);
         idMy = bound++;
     }
     // (velocity.x, velocity.y, 0, 0). A colour attachment output is a
