@@ -185,7 +185,6 @@ static float    g_stLastPitch  = 0.0f;
 static bool     g_stLastPitchValid = false;
 static float    g_stAppliedPitch   = 0.0f;
 static int      g_stWatchdog       = 0;
-static bool     g_stPausedBySelfTest = false;
 static int      g_stShakeSaved[2] = {0, 0};
 static float    g_stBrakeSaved = 0.0f;
 static float    g_stBaseX = 0, g_stBaseY = 0, g_stBaseZ = 0;
@@ -2284,53 +2283,22 @@ static float matrixCallback(float sinceLast, float, int, void *)
             XPLMControlCamera(xplm_ControlCameraUntilViewChanges,
                               taaSelfTestCamera, nullptr);
 
-            // ---- FREEZE THE AEROPLANE FOR THE DURATION.
+            // NOT PAUSED, AND NOT BRAKED.
             //
-            // The yaw and pitch phases are supposed to be PURE ROTATION about
-            // the eye, and the whole expectation rests on that: with no
-            // translation a camera rotation moves every depth by the same
-            // amount, so one predicted displacement fits the entire frame.
+            // Both were added to stop the aeroplane creeping under the camera,
+            // on a diagnosis that was wrong twice: the parking brake was
+            // already 1.00, and the "2 to 4 mm a frame of drift" turned out to
+            // be float32 quantising a camera position recovered from a matrix
+            // 33,870 m from the origin. That is fixed at the source now, so
+            // neither is doing anything except sitting on the user's sim.
             //
-            // A live flight does not hold still. Parked with the engine
-            // running, the aeroplane creeps, and the camera creeps with it -
-            // the matrix reports it plainly, near-plane displacement running to
-            // hundreds of pixels while infinity stays at 13. The measured field
-            // then spreads smoothly from below the prediction to fifteen times
-            // it, which is REAL parallax and not a defect, but it means no
-            // single number describes the frame and the gate cannot pass.
-            //
-            // Pausing costs nothing here: the self-test drives the camera, not
-            // the aeroplane, so a frozen sim still renders every frame the
-            // measurement needs.
-            // ---- TURN OFF THE G-LOADED CAMERA.
-            //
-            // X-Plane shakes the internal view deliberately - a g-loaded camera
-            // for cockpit views, and a hand-held one outside. It is a VIEW
-            // effect, so pausing the aeroplane does not stop it, and it moves
-            // the eye by a couple of millimetres a frame.
-            //
-            // Two millimetres sounds like nothing and is not. The near plane
-            // here is 1.6 cm, so the reprojection carries a term of 431 px at
-            // that depth; at one metre it is 6.9 px against the 13.15 px the
-            // rotation itself produces. That is what made a scripted, paused,
-            // supposedly pure rotation read as "camera translated" on most
-            // frames, and it is why the matrices came back with terms forty
-            // times larger than a 0.25 degree step can explain.
-            // ---- HOLD THE AEROPLANE ON THE BRAKES.
-            //
-            // Pausing stops the physics but the run still ends unpaused, and a
-            // parked Cirrus with the engine running creeps. That creep is not
-            // cosmetic: the camera creeps with it, and 2 mm a frame is 431 px of
-            // reprojection at a 1.6 cm near plane and about 7 px at one metre -
-            // the same size as the 13 px rotation being measured. It is what
-            // made a scripted, paused, supposedly pure rotation keep reading as
-            // "camera translated".
-            if (XPLMDataRef pb = XPLMFindDataRef("sim/cockpit2/controls/parking_brake_ratio")) {
-                g_stBrakeSaved = XPLMGetDataf(pb);
-                XPLMSetDataf(pb, 1.0f);
-                xlog("self-test: parking brake set (was %.2f) so the aeroplane "
-                     "cannot creep under the camera", g_stBrakeSaved);
-            }
+            // Pausing is also actively suspect. This test drives the camera
+            // through a CAMERA CALLBACK, which runs per rendered frame whether
+            // or not the sim is paused, while the plugin reads world_matrix in
+            // the FLIGHT LOOP. If a pause changes the rate or the timing of
+            // those view-matrix updates, the field shows the real motion of the
+            // scripted camera while the matrix describes something else - which
+            // is the disagreement being chased.
 
             for (int i = 0; i < 2; ++i) {
                 const char *name = i ? "sim/graphics/view/handheld_external_cam"
@@ -2348,15 +2316,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
                 }
             }
 
-            if (XPLMCommandRef pause = XPLMFindCommand("sim/operation/pause_toggle")) {
-                XPLMDataRef paused = XPLMFindDataRef("sim/time/paused");
-                if (!paused || XPLMGetDatai(paused) == 0) {
-                    XPLMCommandOnce(pause);
-                    g_stPausedBySelfTest = true;
-                    xlog("self-test: paused the sim so the camera is the only "
-                         "thing moving");
-                }
-            }
             xlog("self-test: taking the camera from (%.1f %.1f %.1f) hdg=%.1f. "
                  "Phases: SETTLE, HOLD, YAW, TRANSLATE, HEADMOVE - %d frames each.",
                  p.x, p.y, p.z, p.heading, kStPhaseFrames);
@@ -2379,8 +2338,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
             if (g_stPhase == TAA_ST_DONE) {
                 xlog("self-test: complete - camera released.");
                 XPLMDontControlCamera();
-                if (XPLMDataRef pb = XPLMFindDataRef("sim/cockpit2/controls/parking_brake_ratio"))
-                    XPLMSetDataf(pb, g_stBrakeSaved);
                 for (int i = 0; i < 2; ++i) {
                     if (!g_stShakeSaved[i]) continue;
                     const char *name = i ? "sim/graphics/view/handheld_external_cam"
@@ -2388,12 +2345,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
                     if (XPLMDataRef d = XPLMFindDataRef(name))
                         XPLMSetDatai(d, g_stShakeSaved[i]);
                     g_stShakeSaved[i] = 0;
-                }
-                if (g_stPausedBySelfTest) {
-                    if (XPLMCommandRef pause = XPLMFindCommand("sim/operation/pause_toggle"))
-                        XPLMCommandOnce(pause);
-                    g_stPausedBySelfTest = false;
-                    xlog("self-test: unpaused");
                 }
                 g_stActive   = false;
                 g_stHaveBase = false;
@@ -2476,15 +2427,47 @@ static float matrixCallback(float sinceLast, float, int, void *)
     //    translation, scaled by distance from the origin: a 1.7 degree pan
     //    produced 1500 m of apparent movement and tripped the teleport detector
     //    205 times in one short flight.
+    // ---- RECOVERED IN DOUBLE, AND WITHOUT A GENERAL INVERSE.
+    //
+    // The world matrix is RIGID, so its inverse is exactly [R^T | -R^T t] and
+    // no 4x4 cofactor expansion is needed. That matters because of what the
+    // numbers are: the translation here is about 33,870 m, and float32 carries
+    // roughly seven significant digits, so a position recovered in float lands
+    // on a grid about 3.4 mm wide.
+    //
+    // That was showing up as "the camera drifts 2 to 4 mm a frame with the sim
+    // paused and the brakes on" - and it was never camera motion, it was the
+    // recovery quantising. It did not stay a cosmetic reading either: Tc below
+    // is built from this position, so the noise went into worldRel and from
+    // there into the REPROJECTION MATRIX the shader is pushed. Three millimetres
+    // is about 430 px at a 1.6 cm near plane and about 9 px at one metre, which
+    // is the same size as the rotation being measured - and it is exactly the
+    // at1m-versus-far disagreement that had been failing frames.
+    //
+    // Double gives about fifteen digits, so 33,870 m resolves to tens of
+    // nanometres and the noise is gone rather than reduced.
+    const double t0 = (double)s->world[12];
+    const double t1 = (double)s->world[13];
+    const double t2 = (double)s->world[14];
+    const double cx = -((double)s->world[0]  * t0 + (double)s->world[1]  * t1 + (double)s->world[2]  * t2);
+    const double cy = -((double)s->world[4]  * t0 + (double)s->world[5]  * t1 + (double)s->world[6]  * t2);
+    const double cz = -((double)s->world[8]  * t0 + (double)s->world[9]  * t1 + (double)s->world[10] * t2);
+
+    // The DELTA is differenced in double as well. Two positions 33 km from the
+    // origin differing by a millimetre cannot be subtracted in float at all -
+    // the difference is entirely below the last bit of either operand.
+    static double prevCx = 0.0, prevCy = 0.0, prevCz = 0.0;
+    static bool   havePrevCam = false;
+    const double ddx = cx - prevCx, ddy = cy - prevCy, ddz = cz - prevCz;
+    s->camDelta = havePrevCam
+                ? (float)sqrt(ddx*ddx + ddy*ddy + ddz*ddz) : 0.0f;
+    prevCx = cx; prevCy = cy; prevCz = cz;
+    havePrevCam = true;
+
+    s->camX = (float)cx;
+    s->camY = (float)cy;
+    s->camZ = (float)cz;
     float px = s->camX, py = s->camY, pz = s->camZ;
-    float invWorld[16];
-    if (taaInverse(invWorld, s->world)) {
-        s->camX = invWorld[12];
-        s->camY = invWorld[13];
-        s->camZ = invWorld[14];
-    }
-    float dx = s->camX - px, dy = s->camY - py, dz = s->camZ - pz;
-    s->camDelta = sqrtf(dx*dx + dy*dy + dz*dz);
     if (justEntered) { px = s->camX; py = s->camY; pz = s->camZ; s->camDelta = 0.0f; }
 
     // ---- reprojection matrix: clip(now) -> clip(prev), collapsed CPU-side.
@@ -2542,14 +2525,45 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // deliberate: modelview appears to be exactly the rotation, but "appears
     // to be" is what produced the last two bugs. This construction is exact
     // from a matrix we have already validated semantically.
-    float Tc[16];
-    memset(Tc, 0, sizeof(Tc));
-    Tc[0] = Tc[5] = Tc[10] = Tc[15] = 1.0f;
-    Tc[12] = s->camX; Tc[13] = s->camY; Tc[14] = s->camZ;
-
+    // ---- CAMERA-RELATIVE, WITHOUT EVER FORMING THE CAMERA POSITION.
+    //
+    // The old form built Tc = translate(camX, camY, camZ) and multiplied both
+    // view matrices by it. That is correct algebra and numerically hopeless
+    // here: camX is a float about 33,870 m from the origin, so it lands on a
+    // 3.4 mm grid, and the product then cancels two huge numbers to leave a
+    // small one. Storing the position through the float share block quantised
+    // it a second time. The residue went straight into the reprojection the
+    // shader is pushed - about 430 px at a 1.6 cm near plane - and is what made
+    // at1m disagree with far on frames where the camera had not moved.
+    //
+    // Both products have closed forms for a RIGID matrix, so neither needs the
+    // position at all:
+    //
+    //     world * Tc      = [R_curr | 0]                 - it cancels exactly
+    //     prevWorld * Tc  = [R_prev | R_prev * (C_curr - C_prev)]
+    //
+    // Only the camera DELTA survives, it is millimetres, and a millimetre in
+    // float is exact to a picometre. The subtraction that produces it is done
+    // in double, from the two rigid inverses, so the cancellation happens once
+    // at full precision instead of repeatedly at seven digits.
     float worldRel[16], prevWorldRel[16];
-    taaMul(worldRel,     s->world,     Tc);
-    taaMul(prevWorldRel, s->prevWorld, Tc);
+    memcpy(worldRel, s->world, sizeof(worldRel));
+    worldRel[12] = worldRel[13] = worldRel[14] = 0.0f;
+
+    const double pt0 = (double)s->prevWorld[12];
+    const double pt1 = (double)s->prevWorld[13];
+    const double pt2 = (double)s->prevWorld[14];
+    const double pcx = -((double)s->prevWorld[0] * pt0 + (double)s->prevWorld[1] * pt1 + (double)s->prevWorld[2]  * pt2);
+    const double pcy = -((double)s->prevWorld[4] * pt0 + (double)s->prevWorld[5] * pt1 + (double)s->prevWorld[6]  * pt2);
+    const double pcz = -((double)s->prevWorld[8] * pt0 + (double)s->prevWorld[9] * pt1 + (double)s->prevWorld[10] * pt2);
+
+    const double dCx = cx - pcx, dCy = cy - pcy, dCz = cz - pcz;
+
+    memcpy(prevWorldRel, s->prevWorld, sizeof(prevWorldRel));
+    for (int i = 0; i < 3; ++i)
+        prevWorldRel[12 + i] = (float)((double)s->prevWorld[0 + i] * dCx
+                                     + (double)s->prevWorld[4 + i] * dCy
+                                     + (double)s->prevWorld[8 + i] * dCz);
 
     float currVPrel[16], prevVPrel[16], invCurrVPrel[16];
     taaMul(currVPrel, s->proj,     worldRel);

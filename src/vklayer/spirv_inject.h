@@ -120,10 +120,26 @@ inline uint32_t &pushConstantOffset() { static uint32_t v = 64; return v; }
 // in the log rather than a surprise.
 inline uint32_t choosePushOffset(uint32_t maxPushConstantsSize)
 {
-    uint32_t sz = maxPushConstantsSize;
-    if (sz < kPushConstantBytes) sz = kPushConstantBytes;
-    // 16-byte aligned, as a mat4 member requires.
-    pushConstantOffset() = ((sz - kPushConstantBytes) / 16) * 16;
+    // ---- TAA_MV_PCOFFSET overrides. Default is now 0.
+    //
+    // This used to sit at the TOP of the range - 176 of 256 - reasoning that
+    // writers allocate upward from 0 so the far end is least contended. That
+    // reasoning does not apply here, because X-Plane declares NO push constant
+    // ranges at all on these layouts: measured, logged, one range on the layout
+    // and it is ours. The whole space is free and offset 0 is the plainest
+    // address there is.
+    //
+    // It matters because at 176 the matrix arrives at the vertex shader as
+    // ZEROS, with everything else verified: spirv-val clean, one push constant
+    // block, the entry point listing it, the layout carrying the range, and
+    // 4.3 million re-pushes issued immediately before draws. The offset is the
+    // last input to that read which has never been varied.
+    if (const char *e = getenv("TAA_MV_PCOFFSET")) {
+        pushConstantOffset() = (uint32_t)(atoi(e) / 16) * 16;
+        return pushConstantOffset();
+    }
+    (void)maxPushConstantsSize;
+    pushConstantOffset() = 0;
     return pushConstantOffset();
 }
 
@@ -267,8 +283,30 @@ inline void chooseLocations(uint32_t vertexComponents, uint32_t fragmentComponen
                    ? vertexComponents : fragmentComponents;
     uint32_t locs = comps / 4;
     if (locs < 4) locs = 4;               // absurdly small device; stay in range
-    prevClipLocation() = locs - 1;
-    currClipLocation() = locs - 2;
+
+    // ---- HEADROOM BELOW THE CEILING, and why.
+    //
+    // This used the top two slots: 31 and 30 of 32. Location 30 delivers
+    // correctly and Location 31 delivers ZERO - proven by sending
+    // gl_Position.w, a value known to survive location 30, through 31 and
+    // reading back 0.000 on every pixel.
+    //
+    // The component limit is not the whole story of what a stage can carry.
+    // Built-ins consume output components too - this vertex shader's entry
+    // point lists v_clip_distances alongside gl_Position - so the last slot the
+    // arithmetic allows is not necessarily a slot that links. The failure is
+    // silent: the pipeline builds, the module validates, and the varying simply
+    // reads zero.
+    //
+    // TAA_MV_LOC pins the pair for testing; the default now leaves two slots of
+    // headroom rather than sitting on the ceiling.
+    uint32_t top = locs - 2;
+    if (const char *e = getenv("TAA_MV_LOC")) {
+        uint32_t v = (uint32_t)atoi(e);
+        if (v >= 2 && v < locs) top = v;
+    }
+    prevClipLocation() = top;
+    currClipLocation() = top - 1;
 }
 
 struct Ins { uint16_t op, len; size_t at; };
@@ -573,6 +611,49 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     body.push_back(head(OpFOrdLessThan, 5)); body.push_back(idBool); body.push_back(idNFcmp); body.push_back(idPosW); body.push_back(idNFdist);
     body.push_back(head(OpSelect, 6)); body.push_back(idV4); body.push_back(idPrevSel); body.push_back(idNFcmp); body.push_back(idFlipped); body.push_back(idPrevClip);
 
+    // ---- DEBUG: REPORT THE MATRIX THE VERTEX SHADER ACTUALLY LOADED.
+    //
+    // prevClip arrives at the fragment shader as ZERO while currClip arrives
+    // correct, and prevClip is the only one that passes through the loaded
+    // push-constant matrix. prevClip = 0 is exactly what a matrix of zeros
+    // produces, so the question is whether the load returns anything at all.
+    //
+    // This replaces prevClip with (m00, m33, 0, 1). The fragment already writes
+    // prevClip.w into .y in this mode, so .y becomes m33: 1.0 if the matrix
+    // arrived, 0.0 if the load returned zeros and every motion vector this
+    // shader has ever written was a difference against nothing.
+    if (debugDepthMode()) {
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(bound); body.push_back(idLoadedMat); body.push_back(0);
+        uint32_t idDbgC0 = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(bound); body.push_back(idLoadedMat); body.push_back(3);
+        uint32_t idDbgC3 = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idDbgC0); body.push_back(0);
+        uint32_t idDbgM00 = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idDbgC3); body.push_back(3);
+        uint32_t idDbgM33 = bound++;
+        // ---- TAA_MV_PROBE_CONST: write a LITERAL 1.0 instead of the matrix.
+        //
+        // "m33 reads zero" has been the basis of six turns of reasoning and the
+        // probe behind it has never itself been checked. If a constant 1.0 also
+        // arrives as zero, the fault is in this probe or in the prevClip
+        // varying - NOT in the matrix - and everything concluded from that
+        // reading is void.
+        //
+        // The .w component is what the fragment forwards, so the constant goes
+        // The .w component is what the fragment forwards, so gl_Position.w goes
+// there - a value ALREADY PROVEN to arrive through this exact varying,
+// since currClip.w reads 0.24 m to 8.3 km correctly. If it arrives via
+// prevClip too, the varying and the probe are sound and the matrix is
+// genuinely zero. If it does not, the prevClip path is broken and every
+// zero read from it means nothing about the matrix at all.
+        uint32_t idDbgOut = bound++;
+        if (getenv("TAA_MV_PROBE_CONST")) {
+            body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idDbgOut); body.push_back(idDbgM00); body.push_back(idPosW); body.push_back(idDbgM00); body.push_back(idPosW);
+        } else {
+            body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idDbgOut); body.push_back(idDbgM00); body.push_back(idDbgM33); body.push_back(idDbgM00); body.push_back(idDbgM33);
+        }
+        body.push_back(head(OpStore, 3)); body.push_back(idOutPrev); body.push_back(idDbgOut);
+    } else
     body.push_back(head(OpStore, 3)); body.push_back(idOutPrev); body.push_back(idPrevSel);
     body.push_back(head(OpStore, 3)); body.push_back(idOutCurr); body.push_back(idFlipped);
 
@@ -873,10 +954,44 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     uint32_t idMy = bound++;
 
     if (debugDepthMode()) {
-        // z_ndc = currClip.z / currClip.w, straight into .y.
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idLc); body.push_back(2);
-        uint32_t idCz = bound++;
-        body.push_back(head(OpFDiv, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idCz); body.push_back(idCw);
+        // ---- RAW currClip.w INTO .y. NO CONVENTION INVOLVED.
+        //
+        // The previous version of this wrote z_ndc = z/w, and its output
+        // contradicts the projection matrix: it measured small values for
+        // distant geometry, implying z_ndc = near/d, while proj[10]/proj[11]
+        // says z_ndc = 1 - near/d which tends to 1. Both cannot be true.
+        //
+        // w is the view depth in metres and needs no interpretation, so it
+        // settles which measurement to distrust. Mountains should read
+        // thousands and the instrument panel a fraction of a metre. If instead
+        // it reads centimetres, the w reaching the fragment is wrong - and
+        // since the fragment shader divides by exactly this w to form the
+        // motion vector, that would explain a field the size of a near-plane
+        // displacement.
+        // .x keeps the velocity, .y carries this fragment's own w. With both
+        // in the same pixel the CPU can reconstruct exactly what the matrix
+        // implies FOR THAT PIXEL - its screen position and its depth - and
+        // compare against the velocity actually written. No centre region, no
+        // assumed depth, no percentile standing in for a value.
+        // ---- WRITE prevClip.w INTO .y.
+        //
+        // The fragment shader has NO push constant - it never sees uReproj at
+        // all. It receives prevClip as a varying that the VERTEX shader is
+        // supposed to fill with uReproj * gl_Position. So the question is
+        // whether that varying arrives carrying a reprojected position.
+        //
+        // A synthetic 0.25 degree yaw was pushed and stashed, the dump read
+        // 5.337 px out of it, and the field came back at 0.002 px - no motion
+        // from a matrix demanding 5.3 px. If prevClip.w comes back equal to
+        // currClip.w, the vertex shader wrote the position through unchanged
+        // and the reprojection never happened. If it comes back zero, the
+        // varying is not linking at all and every velocity ever written was a
+        // difference against nothing.
+        //
+        // It also retires the identity test, which proved nothing: a shader
+        // that ignores uReproj writes zero whether identity or a rotation is
+        // pushed, and that zero was read all night as proof it worked.
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idLp); body.push_back(3);
         idMy = bound++;
     }
     // (velocity.x, velocity.y, 0, 0). A colour attachment output is a

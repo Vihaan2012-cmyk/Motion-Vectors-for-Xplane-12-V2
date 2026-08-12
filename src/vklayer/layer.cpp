@@ -73,15 +73,16 @@ static void trace(const char *fmt, ...)
     }
 
     std::lock_guard<std::mutex> g(g_traceLock);
-    FILE *f = fopen(path.c_str(), "a");
+    static FILE *f = nullptr;
+    if (!f) f = fopen(path.c_str(), "a");
     if (!f) return;
     va_list ap;
     va_start(ap, fmt);
     vfprintf(f, fmt, ap);
     va_end(ap);
     fputc('\n', f);
-    fclose(f);   // flushed every line: the process may exit without unwinding, and
-                 // a buffered trace of the last frame would be lost.
+    fflush(f);   // flushed, not closed: durability without an open and close
+                 // per line, which cost 63 MB of file I/O and most of the fps.
 }
 
 // ------------------------------------------------------- shared memory
@@ -944,7 +945,7 @@ static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "spirv_inject.h"
 
 // Set once, from the environment, next to the header that declares it.
-static const bool g_mvDebugDepthInit = (spvinj::debugDepthMode() =
+static const bool g_mvDebugDepthInit = (g_mvDebugDepth = spvinj::debugDepthMode() =
                                         (getenv("TAA_MV_DEBUG_DEPTH") != nullptr));
 
 // FSR2 is optional at BUILD time as well as run time. Its static library takes
@@ -3600,7 +3601,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                     mvRecordReadback(rdi->second, cb, g_lastPushed,
                                      g_velSnap.selfTestExpectedPx,
                                      g_velSnap.selfTestPhase, g_velSnap.frame,
-                                     g_velSnap.nearClip);
+                                     g_velSnap.nearClip, g_velSnap.proj);
             }
         }
 
@@ -4479,6 +4480,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // Same shape of bug as the arming block - per-frame state written inside a
     // subsystem that turned out to be optional. Published here instead, where
     // it cannot be gated on anything.
+    // ---- FLIGHT LOOPS PER PRESENT.
+    //
+    // This is the whole of item 2. The plugin's expectedPx is the angle between
+    // world and prevWorld, which are consecutive FLIGHT LOOP samples. The
+    // layer's reprojection is built across consecutive PRESENTS. If the two
+    // rates are equal the pair is the same and both describe one rendered
+    // frame; if the flight loop runs more often, the plugin describes a
+    // fraction of what the renderer drew and reports 13.15 px on a frame whose
+    // reprojection legitimately encodes 842.
+    //
+    // Neither number is wrong in that case - they answer different questions -
+    // and the SHADER must use the present-paired one, which it now does. This
+    // says which case is actually occurring instead of leaving it inferred.
+    if (g_share && g_share->magic == TAA_MAGIC) {
+        static uint64_t lastShareFrame = 0;
+        static uint64_t nOne = 0, nMore = 0, nZero = 0, maxGap = 0;
+        const uint64_t f = g_share->frame;
+        if (lastShareFrame) {
+            const uint64_t gap = f - lastShareFrame;
+            if (gap == 1) ++nOne; else if (gap == 0) ++nZero; else ++nMore;
+            if (gap > maxGap) maxGap = gap;
+            if (((nOne + nMore + nZero) % 600) == 0)
+                trace("MV RATE: flight loops per present - exactly one %llu, "
+                      "more than one %llu, none %llu, worst gap %llu",
+                      (unsigned long long)nOne, (unsigned long long)nMore,
+                      (unsigned long long)nZero, (unsigned long long)maxGap);
+        }
+        lastShareFrame = f;
+    }
+
     // EVERY SWITCH, ONCE, AS THE LAYER SEES IT.
     //
     // An experiment run through a switch that never arrived is worse than no
@@ -4554,23 +4585,113 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                           fresh.proj[14], fresh.prevProj[14]);
             }
 
-            static float prevWorldSaved[16], prevProjSaved[16];
+            // ---- THE SAVED FRAME MUST BE THE IMMEDIATELY PRECEDING ONE.
+            //
+            // snapshot() can fail: a torn read that does not settle in four
+            // attempts, or a share block not yet valid. The save below sits
+            // inside that success branch, so a failure left prevWorldSaved
+            // holding an OLDER frame and the next success built a reprojection
+            // spanning several frames instead of one.
+            //
+            // That is what the cross-check exposed. The plugin reported 13.13 px
+            // on every line - correct, the camera is driven at a constant
+            // 0.25 deg/frame - while this matrix read up to 742 px, and the
+            // FIELD matched the matrix because the shader faithfully rendered
+            // whatever it was handed. A motion vector spanning five frames is
+            // wrong for a consumer that reprojects one.
+            //
+            // The share frame number travels with the saved matrix now, and the
+            // reprojection is only built when the gap is exactly one. Anything
+            // else falls back to the plugin's own pairing, which is correct by
+            // construction because the plugin rolls prev into curr every
+            // flight loop unconditionally.
+            static float    prevWorldSaved[16], prevProjSaved[16];
+            static uint64_t prevSavedFrame = 0;
             static bool  havePrevFrame = false;
+            const bool   adjacent = havePrevFrame
+                                 && fresh.frame == prevSavedFrame + 1;
 
-            float Tc[16];
-            memset(Tc, 0, sizeof(Tc));
-            Tc[0] = Tc[5] = Tc[10] = Tc[15] = 1.0f;
-            Tc[12] = fresh.camX; Tc[13] = fresh.camY; Tc[14] = fresh.camZ;
-
+            // Same closed form the plugin uses, and for the same reason: this
+            // built Tc from fresh.camX, a float about 33,870 m from the origin,
+            // then cancelled two huge products to leave a small one. Seven
+            // significant digits at that distance is a 3.4 mm grid, and the
+            // residue lands in the matrix the shader is pushed.
+            //
+            // Fixing only the plugin left this copy intact, which is why `far`
+            // kept disagreeing with the plugin's estimate after that fix - the
+            // two were computing the same quantity by different arithmetic, and
+            // this one is the arithmetic that loses.
+            //
+            //     world * Tc     = [R | 0]                      exactly
+            //     prevWorld * Tc = [R_prev | R_prev * (C - C_prev)]
             float worldRel[16], currVPrel[16], invCurr[16];
-            taaMul(worldRel, fresh.world, Tc);
+            memcpy(worldRel, fresh.world, sizeof(worldRel));
+            worldRel[12] = worldRel[13] = worldRel[14] = 0.0f;
             taaMul(currVPrel, fresh.proj, worldRel);
 
-            if (havePrevFrame && taaInverse(invCurr, currVPrel)) {
+            if (adjacent && taaInverse(invCurr, currVPrel)) {
+                // The camera positions are recovered from each rigid matrix in
+                // DOUBLE and differenced there, so the millimetre that survives
+                // is exact rather than the remains of a cancellation.
                 float prevWorldRel[16], prevVPrel[16], r[16];
-                taaMul(prevWorldRel, prevWorldSaved, Tc);
+                const double ct0 = fresh.world[12], ct1 = fresh.world[13], ct2 = fresh.world[14];
+                const double pt0 = prevWorldSaved[12], pt1 = prevWorldSaved[13], pt2 = prevWorldSaved[14];
+                const double ccx = -((double)fresh.world[0] * ct0 + (double)fresh.world[1] * ct1 + (double)fresh.world[2]  * ct2);
+                const double ccy = -((double)fresh.world[4] * ct0 + (double)fresh.world[5] * ct1 + (double)fresh.world[6]  * ct2);
+                const double ccz = -((double)fresh.world[8] * ct0 + (double)fresh.world[9] * ct1 + (double)fresh.world[10] * ct2);
+                const double ppx = -((double)prevWorldSaved[0] * pt0 + (double)prevWorldSaved[1] * pt1 + (double)prevWorldSaved[2]  * pt2);
+                const double ppy = -((double)prevWorldSaved[4] * pt0 + (double)prevWorldSaved[5] * pt1 + (double)prevWorldSaved[6]  * pt2);
+                const double ppz = -((double)prevWorldSaved[8] * pt0 + (double)prevWorldSaved[9] * pt1 + (double)prevWorldSaved[10] * pt2);
+                const double dx = ccx - ppx, dy = ccy - ppy, dz = ccz - ppz;
+
+                memcpy(prevWorldRel, prevWorldSaved, sizeof(prevWorldRel));
+                for (int i = 0; i < 3; ++i)
+                    prevWorldRel[12 + i] = (float)((double)prevWorldSaved[0 + i] * dx
+                                                 + (double)prevWorldSaved[4 + i] * dy
+                                                 + (double)prevWorldSaved[8 + i] * dz);
                 taaMul(prevVPrel, prevProjSaved, prevWorldRel);
                 taaMul(r, prevVPrel, invCurr);
+
+                // ---- THE ANGLE, FROM THE SAME TWO MATRICES.
+                //
+                // far and the plugin's estimate disagree while both claim to
+                // describe the pair (world(N-1), world(N)). Exactly one of three
+                // things is wrong: the matrices are not that pair, the plugin's
+                // trace formula, or the extraction of far from the reprojection.
+                //
+                // Computing the angle HERE, from fresh.world and prevWorldSaved,
+                // separates them. If it agrees with the plugin, the matrices are
+                // one step apart and far is being extracted wrongly. If it
+                // agrees with far, the plugin's formula is wrong. It is the same
+                // trace identity: tr(R_curr^T R_prev) = 1 + 2cos(a).
+                if ((frames % 600) == 0 && g_mv.w) {
+                    double tr = 0.0;
+                    for (int c = 0; c < 3; ++c)
+                        for (int rr = 0; rr < 3; ++rr)
+                            tr += (double)fresh.world[c*4+rr] * (double)prevWorldSaved[c*4+rr];
+                    double ca = (tr - 1.0) * 0.5;
+                    if (ca >  1.0) ca =  1.0;
+                    if (ca < -1.0) ca = -1.0;
+                    const double ang = acos(ca);
+                    const double angPx = ang * (double)fresh.proj[0] * (double)g_mv.w * 0.5;
+                    double fx = (double)r[12], fw = (double)r[15];
+                    const double farPx = fabs(fw) < 1e-12 ? 0.0
+                                       : fabs(0.5 * fx / fw) * g_mv.w;
+                    // THE DEPTH CONVENTION, TAKEN FROM THE PROJECTION.
+                    //
+                    // As d -> infinity, z_clip/w_clip -> proj[10]/proj[11].
+                    // That is exact and needs no assumption about reverse-Z,
+                    // GL-versus-Vulkan ranges, or the sign of view-space z -
+                    // all of which have now been guessed at and got wrong.
+                    const double m10 = fresh.proj[10], m11 = fresh.proj[11];
+                    const double zInf = (fabs(m11) > 1e-12) ? m10 / m11 : 0.0;
+                    trace("MV ANGLE: same two matrices - trace says %.3f px, "
+                          "reprojection says %.3f px, plugin says %.3f px | "
+                          "proj[10]=%.5f proj[11]=%.5f proj[14]=%.5f -> "
+                          "infinity is ndcZ=%.5f",
+                          angPx, farPx, (double)fresh.selfTestExpectedPx,
+                          m10, m11, (double)fresh.proj[14], zInf);
+                }
                 if (!g_usePluginReproj) memcpy(g_velSnap.reproj, r, sizeof(r));
 
                 // Both, once in a while, so the difference is a measurement
@@ -4591,7 +4712,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
 
             memcpy(prevWorldSaved, fresh.world, sizeof(prevWorldSaved));
             memcpy(prevProjSaved,  fresh.proj,  sizeof(prevProjSaved));
+            prevSavedFrame = fresh.frame;
             havePrevFrame = true;
+
+            // Counted, because "the pairing is fine" is exactly the kind of
+            // thing that has been assumed here before and was not.
+            {
+                static uint64_t nAdj = 0, nGap = 0;
+                if (adjacent) ++nAdj; else ++nGap;
+                if (((nAdj + nGap) % 600) == 0)
+                    trace("MV PAIRING: adjacent %llu, non-adjacent %llu - "
+                          "non-adjacent frames fall back to the plugin's matrix",
+                          (unsigned long long)nAdj, (unsigned long long)nGap);
+            }
         }
     }
 
@@ -6041,6 +6174,41 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreatePipelineLayout(
         ci->pPushConstantRanges,
         ci->pPushConstantRanges + ci->pushConstantRangeCount);
 
+    // ---- WHAT X-PLANE ALREADY DECLARES, AND WHETHER WE COLLIDE WITH IT.
+    //
+    // The matrix loads as ZERO in the vertex shader - m33 reads 0.000, so
+    // prevClip is 0 and every motion vector produced has been currNDC * 0.5, a
+    // difference against nothing. The offset is not the problem: 176 is chosen
+    // before the first shader is patched and both the declaration and the push
+    // use it.
+    //
+    // What has never been looked at is the ranges X-Plane itself declares. If
+    // one of them already covers our bytes FOR THE VERTEX STAGE, the layout is
+    // invalid by overlap; if X-Plane pushes a range spanning them, its own
+    // writes land on our matrix. Either way the shader reads something nobody
+    // intended, and zero is the commonest something.
+    {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            for (uint32_t i = 0; i < ci->pushConstantRangeCount; ++i) {
+                const VkPushConstantRange &e = ci->pPushConstantRanges[i];
+                const bool overlaps =
+                    (e.offset < spvinj::pushConstantOffset() + spvinj::kPushConstantBytes) &&
+                    (spvinj::pushConstantOffset() < e.offset + e.size);
+                trace("SPIRV INJECT: X-Plane push range %u/%u - stages 0x%x, "
+                      "offset %u, size %u (ours is vertex, %u..%u)%s",
+                      i + 1, ci->pushConstantRangeCount, e.stageFlags,
+                      e.offset, e.size, spvinj::pushConstantOffset(),
+                      spvinj::pushConstantOffset() + spvinj::kPushConstantBytes,
+                      overlaps ? "  *** OVERLAPS OURS ***" : "");
+            }
+            if (ci->pushConstantRangeCount == 0)
+                trace("SPIRV INJECT: X-Plane declares NO push constant ranges "
+                      "on this layout - ours is the only one");
+        }
+    }
+
     VkPushConstantRange ours;
     ours.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     ours.offset     = spvinj::pushConstantOffset();
@@ -6088,6 +6256,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreatePipelineLayout(
 // takes a VkPipeline and returns its layout - the association exists only in
 // the create info, which is gone by the time the draw happens.
 static std::map<VkPipeline, VkPipelineLayout> g_pipelineLayoutOf;
+
+// ---- WHAT TO PUSH, PER COMMAND BUFFER, PUSHED AGAIN AT DRAW TIME.
+//
+// The matrix loads as ZERO in the vertex shader while everything upstream
+// checks out: spirv-val passes, the block is declared at offset 176 with the
+// entry point listing it, the layout carries our range, X-Plane declares none
+// of its own, no layout is skipped, and 2.2 million pushes happen.
+//
+// The one mechanism left is Vulkan's own: push constant values become UNDEFINED
+// when a pipeline layout that is not push-constant-compatible is bound. We push
+// at vkCmdBindPipeline, and X-Plane then binds descriptor sets and other state
+// before the draw. Any of those with a different layout discards our write, and
+// discards it silently - no error, no validation message, just zeros at the
+// shader.
+//
+// Pushing again immediately before each draw closes that window: nothing can be
+// bound between the push and the draw that consumes it.
+struct PendingPush { VkPipelineLayout layout; float block[20]; bool valid; };
+static std::map<VkCommandBuffer, PendingPush> g_cbPendingPush;
 
 // Does this pipeline draw geometry from vertex buffers, and how many of each
 // kind exist. Filled at pipeline creation; read at bind time to decide whether
@@ -6283,6 +6470,34 @@ static void mvPickLocationsOnce()
     }
 }
 
+// TAA_MV_DUMP_SPIRV writes the first patched vertex modules to disk.
+//
+// Every link has now been checked by reasoning and each looked correct: the
+// offset is chosen before the first patch, the layout carries our range and
+// X-Plane declares none of its own, the push uses that layout, and the entry
+// point lists the push constant variable for SPIR-V 1.4 and later. The matrix
+// still loads as zero, so the reasoning is wrong somewhere and the bytes are
+// the only thing left that can say where.
+static void mvMaybeDumpSpirv(const std::vector<uint32_t> &code, const char *what)
+{
+    static const char *dir = getenv("TAA_MV_DUMP_SPIRV");
+    if (!dir) return;
+    // A counter PER KIND. One shared counter meant the two vertex dumps used the
+    // whole budget and the fragment module - the one that has never been
+    // inspected, and the side the dead varying is read on - was never written.
+    static int nVert = 0, nFrag = 0;
+    const bool isVert = (what[0] == 'v');
+    int &n = isVert ? nVert : nFrag;
+    if (n >= 2) return;
+    char path[512];
+    snprintf(path, sizeof(path), "%s\mv_%s_%d.spv", dir, what, n++);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(code.data(), 4, code.size(), f);
+    fclose(f);
+    trace("SPIRV INJECT: wrote patched %s module to %s", what, path);
+}
+
 static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
 {
     mvPickLocationsOnce();
@@ -6306,6 +6521,7 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
     VkShaderModule out = VK_NULL_HANDLE;
     spvinj::Result ir = spvinj::inject(src.data(), src.size() * 4, patched, &loc);
     mvNoteInjectReason(ir);
+    if (ir == spvinj::INJ_OK) mvMaybeDumpSpirv(patched, "vert");
     if (ir == spvinj::INJ_OK) {
         VkShaderModuleCreateInfo smci;
         memset(&smci, 0, sizeof(smci));
@@ -6360,6 +6576,11 @@ static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
     std::vector<uint32_t> patched;
     spvinj::Result fr = spvinj::injectFragment(src.data(), src.size() * 4, patched,
                                                attachmentIndex);
+    // The VERTEX module's Location decorations were verified from a dump - 30
+    // and 31, both stored. The FRAGMENT module's INPUT locations never were,
+    // and a mismatch there would deliver zeros through a varying that looks
+    // perfectly correct on the writing side.
+    if (fr == spvinj::INJ_OK) mvMaybeDumpSpirv(patched, "frag");
     if (fr != spvinj::INJ_OK) {
         std::lock_guard<std::mutex> g(g_lock);
         g_fragVariant[key] = VK_NULL_HANDLE;   // remember the refusal too
@@ -6642,6 +6863,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     mvLogInjectReasons();
                 }
             }
+            // ---- HOW MANY PIPELINES ACTUALLY GET BOTH STAGES PATCHED.
+            //
+            // currClip has been the control for every conclusion tonight: it
+            // arrives correctly, so the varying mechanism was assumed sound and
+            // prevClip's zero was blamed on the matrix. That control is only
+            // valid if the VERTEX module is really substituted. If it is not,
+            // Location 30 is carrying some pre-existing X-Plane varying whose .w
+            // merely looks like plausible depth, Location 31 carries nothing,
+            // and the whole reading is an illusion.
+            //
+            // A pipeline needs BOTH stages patched or it gets neither, so this
+            // counts the outcome per pipeline instead of per module.
+            {
+                static uint64_t nBoth = 0, nVertOnly = 0, nFragOnly = 0, nNeither = 0;
+                if (fragPatched && vertPatched)      ++nBoth;
+                else if (vertPatched)                ++nVertOnly;
+                else if (fragPatched)                ++nFragOnly;
+                else                                 ++nNeither;
+                const uint64_t tot = nBoth + nVertOnly + nFragOnly + nNeither;
+                if (tot == 500 || (tot % 5000) == 0)
+                    trace("SPIRV INJECT: pipelines by patch outcome - both %llu, "
+                          "vertex only %llu, fragment only %llu, neither %llu "
+                          "(of %llu)",
+                          (unsigned long long)nBoth, (unsigned long long)nVertOnly,
+                          (unsigned long long)nFragOnly, (unsigned long long)nNeither,
+                          (unsigned long long)tot);
+            }
+
             if (fragPatched && vertPatched) {
                 ci2[i].pStages = stages[i].data();
             } else {
@@ -6685,9 +6934,51 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
     // cannot extend is a hole in the velocity buffer; a pipeline that fails to
     // create is a dead sim.
     if (r != VK_SUCCESS && !ci2.empty()) {
-        trace("SPIRV INJECT: extended pipeline creation REJECTED (%d) - "
-              "retrying with the application's originals", (int)r);
-        r = g_nextCreateGfxPipelines(device, cache, count, ci, alloc, out);
+        // ---- RETRY ONE AT A TIME, NOT THE WHOLE BATCH.
+        //
+        // vkCreateGraphicsPipelines takes an ARRAY. One bad pipeline makes the
+        // whole call fail, and dropping back to the originals for the entire
+        // batch threw away every good pipeline alongside it. Measured: 14,835
+        // rejections out of ~16,000 pipelines, all VK_ERROR_UNKNOWN, and the
+        // survivors were too few to write a velocity field - which is why
+        // prevClip read zero and why that zero was blamed on the push constant,
+        // the offset, the varying location and the matrix in turn.
+        //
+        // Rebuilding individually keeps every pipeline the driver will accept
+        // and falls back only for the ones it will not. It also names them: the
+        // attachment count of a pipeline that fails alone is the evidence for
+        // what the driver objects to.
+        uint32_t okExtended = 0, fellBack = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            out[i] = VK_NULL_HANDLE;
+
+            const VkGraphicsPipelineCreateInfo *one = ci2.empty() ? &ci[i] : &ci2[i];
+            VkResult r1 = g_nextCreateGfxPipelines(device, cache, 1, one, alloc, &out[i]);
+            if (r1 == VK_SUCCESS) { ++okExtended; continue; }
+
+            r1 = g_nextCreateGfxPipelines(device, cache, 1, &ci[i], alloc, &out[i]);
+            ++fellBack;
+            if (fellBack <= 4) {
+                const VkPipelineRenderingCreateInfo *src = nullptr;
+                for (const VkBaseInStructure *pn = (const VkBaseInStructure*)ci[i].pNext;
+                     pn; pn = pn->pNext)
+                    if (pn->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
+                        src = (const VkPipelineRenderingCreateInfo*)pn;
+                trace("SPIRV INJECT: pipeline %u of %u refused extended (%d) - "
+                      "colour attachments %u, stages %u", i, count, (int)r1,
+                      src ? src->colorAttachmentCount : 0u, ci[i].stageCount);
+            }
+            if (r1 != VK_SUCCESS) r = r1;
+        }
+        if (r != VK_SUCCESS && fellBack == 0) r = VK_SUCCESS;
+        else if (fellBack) {
+            static uint64_t nBatches = 0;
+            if (++nBatches <= 8 || (nBatches % 200) == 0)
+                trace("SPIRV INJECT: batch of %u - %u extended, %u fell back "
+                      "(a whole batch used to be discarded for one failure)",
+                      count, okExtended, fellBack);
+            r = VK_SUCCESS;
+        }
     }
 
     // Remember each pipeline's layout. vkCmdBindPipeline names only the
@@ -6749,6 +7040,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
 // exactly rather than one recovered from a quantised depth value.
 static PFN_vkCmdBindPipeline  g_nextCmdBindPipeline = nullptr;
 static PFN_vkCmdPushConstants g_nextCmdPushConstants = nullptr;
+static thread_local bool g_inOurPush = false;
+static uint64_t g_foreignPushes = 0;
+static uint32_t g_foreignLo = 0xFFFFFFFFu, g_foreignHi = 0;
+static PFN_vkCmdDraw            g_nextCmdDraw           = nullptr;
+static PFN_vkCmdDrawIndexed     g_nextCmdDrawIndexed    = nullptr;
+static PFN_vkCmdDrawIndirect            g_nextCmdDrawIndirect            = nullptr;
+static PFN_vkCmdDrawIndexedIndirect     g_nextCmdDrawIndexedIndirect     = nullptr;
+static PFN_vkCmdDrawIndirectCount       g_nextCmdDrawIndirectCount       = nullptr;
+static PFN_vkCmdDrawIndexedIndirectCount g_nextCmdDrawIndexedIndirectCount = nullptr;
+static uint64_t                 g_drawRepushes          = 0;
 
 // A colour image layout transition. Small, explicit, and local: the blit that
 // replaces X-Plane's upscale needs both its source and destination in transfer
@@ -6798,6 +7099,125 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
         if (it != g_devices.end()) dd = &it->second;
     }
     if (dd && dd->cmdDispatch) dd->cmdDispatch(cb, gx, gy, gz);
+}
+
+// Re-push immediately before the draw. Cheap - a push constant write is a few
+// dwords into the command stream - and it is the only point at which nothing
+// can intervene between the value and its use.
+// ---- OFF BY DEFAULT. IT COST 9 FPS.
+//
+// This re-pushed the matrix before every draw to test whether an incompatible
+// layout bind was invalidating it. The test ran - 4.3 million re-pushes - and
+// the answer was no, the matrix still arrived as zeros. So the experiment is
+// finished, and what remained was a GLOBAL MUTEX taken on every draw call while
+// X-Plane records command buffers on several threads. Every draw on every
+// thread serialising on one lock took the sim to 9 fps.
+//
+// Kept behind TAA_MV_REPUSH because the mechanism is worth being able to retest,
+// but never on by default. A diagnostic that halves the frame rate is a
+// diagnostic that changes what it measures.
+static void mvRepushBeforeDraw(VkCommandBuffer cb)
+{
+    static const bool on = (getenv("TAA_MV_REPUSH") != nullptr);
+    if (!on) return;
+    if (!g_nextCmdPushConstants) return;
+    PendingPush pp;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, PendingPush>::iterator it = g_cbPendingPush.find(cb);
+        if (it == g_cbPendingPush.end() || !it->second.valid) return;
+        pp = it->second;
+    }
+    g_inOurPush = true;
+    g_nextCmdPushConstants(cb, pp.layout, VK_SHADER_STAGE_VERTEX_BIT,
+                           spvinj::pushConstantOffset(),
+                           spvinj::kPushConstantBytes, pp.block);
+    g_inOurPush = false;
+    ++g_drawRepushes;
+}
+
+// X-PLANE DRAWS INDIRECTLY. Measured: 20243 pushes at bind time against 9
+// re-pushes at draw time, so vkCmdDraw and vkCmdDrawIndexed are almost never
+// called and hooking only those tested nothing at all.
+// ---- IS ANYTHING ELSE WRITING PUSH CONSTANTS?
+//
+// The matrix arrives as zeros with everything else verified: the SPIR-V loads
+// and multiplies correctly, the block is declared at the offset we push to, the
+// layout carries our range, and we push immediately before every draw - 4.3
+// million times. The remaining possibility is that someone else writes over it
+// between our push and the shader's read.
+//
+// X-Plane declares no push constant ranges on the layouts we have inspected, so
+// in principle it never pushes. "In principle" is what has been wrong all night,
+// so this counts and reports every call that is not ours, with its range.
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdPushConstants(
+    VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages,
+    uint32_t offset, uint32_t size, const void *values)
+{
+    // Counting is cheap but this hook is on X-Plane's own hot path, and its
+    // question is already answered: zero foreign pushes, nothing overwrites the
+    // matrix. Opt-in from here.
+    static const bool watch = (getenv("TAA_MV_WATCH_PUSH") != nullptr);
+    if (watch && !g_inOurPush) {
+        uint64_t n = ++g_foreignPushes;
+        if (offset < g_foreignLo) g_foreignLo = offset;
+        if (offset + size > g_foreignHi) g_foreignHi = offset + size;
+        const bool hitsUs =
+            (offset < spvinj::pushConstantOffset() + spvinj::kPushConstantBytes) &&
+            (spvinj::pushConstantOffset() < offset + size);
+        if (n <= 4 || (n % 200000) == 0)
+            trace("PUSH FOREIGN: call %llu - stages 0x%x, offset %u, size %u "
+                  "(ours %u..%u)%s", (unsigned long long)n, stages, offset, size,
+                  spvinj::pushConstantOffset(),
+                  spvinj::pushConstantOffset() + spvinj::kPushConstantBytes,
+                  hitsUs ? "  *** OVERWRITES OUR MATRIX ***" : "");
+    }
+    g_nextCmdPushConstants(cb, layout, stages, offset, size, values);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdDrawIndirect(
+    VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, uint32_t cnt, uint32_t stride)
+{
+    mvRepushBeforeDraw(cb);
+    g_nextCmdDrawIndirect(cb, buf, off, cnt, stride);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdDrawIndexedIndirect(
+    VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, uint32_t cnt, uint32_t stride)
+{
+    mvRepushBeforeDraw(cb);
+    g_nextCmdDrawIndexedIndirect(cb, buf, off, cnt, stride);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdDrawIndirectCount(
+    VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
+    VkBuffer cntBuf, VkDeviceSize cntOff, uint32_t maxCnt, uint32_t stride)
+{
+    mvRepushBeforeDraw(cb);
+    g_nextCmdDrawIndirectCount(cb, buf, off, cntBuf, cntOff, maxCnt, stride);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdDrawIndexedIndirectCount(
+    VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
+    VkBuffer cntBuf, VkDeviceSize cntOff, uint32_t maxCnt, uint32_t stride)
+{
+    mvRepushBeforeDraw(cb);
+    g_nextCmdDrawIndexedIndirectCount(cb, buf, off, cntBuf, cntOff, maxCnt, stride);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdDraw(
+    VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi)
+{
+    mvRepushBeforeDraw(cb);
+    g_nextCmdDraw(cb, vc, ic, fv, fi);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdDrawIndexed(
+    VkCommandBuffer cb, uint32_t ic, uint32_t inst, uint32_t fi, int32_t vo, uint32_t firstInst)
+{
+    mvRepushBeforeDraw(cb);
+    g_nextCmdDrawIndexed(cb, ic, inst, fi, vo, firstInst);
 }
 
 static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
@@ -6943,7 +7363,46 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     if (g_mvPassOrdinal >= 0 && g_mvPassOrdinal < 16 && isGeometry)
         ++g_mvPassDraws[g_mvPassOrdinal];
 
+    // ---- TAA_MV_TESTYAW: push a SYNTHETIC clip-to-clip rotation of a known
+    // size, in degrees, and depend on nothing X-Plane produces.
+    //
+    // The contradiction to settle: TAA_MV_IDENTITY proves the field is built
+    // from the pushed matrix (100% zeros), yet under motion the field measures
+    // about 44x what that matrix implies per pixel. One of those is false and
+    // no comparison against X-Plane's own matrices can say which, because both
+    // sides of that comparison come from the same suspect source.
+    //
+    // A hand-built matrix has no such problem. For a yaw of angle a about the
+    // eye, the clip-to-clip reprojection is P * R * P^-1, and for the standard
+    // perspective form that is exactly:
+    //
+    //     [ cos a        0   -sin a / sx        0 ]
+    //     [ 0            1    0                 0 ]
+    //     [ sx * sin a   0    cos a             0 ]   (rows, column-major below)
+    //     [ 0            0    0                 1 ]
+    //
+    // where sx = proj[0]. A distant point at screen centre must then move
+    // exactly a * proj[0] * width * 0.5 pixels. If the field reports that, the
+    // shader and the whole write path are correct and the fault is in how the
+    // real matrix is built. If it reports 44x that, the fault is in the shader
+    // or the units, and every matrix here is innocent.
+    static const double testYawDeg = getenv("TAA_MV_TESTYAW")
+                                   ? atof(getenv("TAA_MV_TESTYAW")) : 0.0;
+    float kTestYaw[16];
+    if (testYawDeg != 0.0) {
+        const double a  = testYawDeg * 3.14159265358979 / 180.0;
+        const double sx = (g_velSnap.proj[0] != 0.0f) ? g_velSnap.proj[0] : 1.0;
+        memset(kTestYaw, 0, sizeof(kTestYaw));
+        kTestYaw[0]  = (float)cos(a);
+        kTestYaw[2]  = (float)(sx * sin(a));
+        kTestYaw[5]  = 1.0f;
+        kTestYaw[8]  = (float)(-sin(a) / sx);
+        kTestYaw[10] = (float)cos(a);
+        kTestYaw[15] = 1.0f;
+    }
+
     float block[20];
+    if (testYawDeg != 0.0) memcpy(block, kTestYaw, 64); else
     memcpy(block, useIdentity ? kIdentity
                  : (useBody ? g_velSnap.bodyReproj : g_velSnap.reproj), 64);
     if (useBody) ++g_bodyReprojPushes;
@@ -7069,12 +7528,22 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         }
     }
 
+    g_inOurPush = true;
     g_nextCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT,
                            spvinj::pushConstantOffset(),
                            spvinj::kPushConstantBytes,
                            block);
+    g_inOurPush = false;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        PendingPush &pp = g_cbPendingPush[cb];
+        pp.layout = layout;
+        memcpy(pp.block, block, sizeof(pp.block));
+        pp.valid = true;
+    }
 
     if (++g_pushCount <= 3 || (g_pushCount % 100000) == 0)
+        trace("SPIRV INJECT: draw-time re-pushes %llu", (unsigned long long)g_drawRepushes);
         trace("SPIRV INJECT: pushed uReproj + jitter (%llu times), body-frame "
               "%llu, bodyValid=%d cockpitPass=%d | jitter now (%.5f %.5f) ndc, "
               "pipelines: %llu geometry / %llu full-screen",
@@ -7516,6 +7985,65 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         VkDeviceCreateInfo fgCi;
     }
 
+    // ---- independentBlend. THIS IS WHY 14,835 PIPELINES WERE REJECTED.
+    //
+    // We append one colour blend attachment for the velocity target, and it is
+    // deliberately unlike X-Plane's own: blendEnable FALSE and a write mask of
+    // R|G, because a velocity is replaced rather than blended and the target
+    // has two channels. The spec permits that only with independentBlend:
+    //
+    //   "If the independentBlend feature is not enabled, all elements of
+    //    pAttachments must be identical."
+    //
+    // The layer never asked for it. X-Plane does not enable it, and 74% of its
+    // pipelines blend - so almost every extended pipeline was invalid and the
+    // driver refused it as VK_ERROR_UNKNOWN, which is not a validation message
+    // and says nothing about what was wrong. The batch then fell back to the
+    // application's originals, leaving pipelines with no varyings and no
+    // velocity output. That is the whole reason prevClip read zero, and why
+    // the push constant, the offset, the varying location and the matrix were
+    // all suspected in turn while every one of them was innocent.
+    //
+    // Enabled only if the driver reports it, and only added to a features
+    // struct we own, so X-Plane's request is never altered in a way that could
+    // stop the sim starting.
+    VkPhysicalDeviceFeatures wantFeatures;
+    memset(&wantFeatures, 0, sizeof(wantFeatures));
+    if (ci->pEnabledFeatures) wantFeatures = *ci->pEnabledFeatures;
+
+    bool haveIndependentBlend = false;
+    {
+        PFN_vkGetPhysicalDeviceFeatures getFeatures =
+            (PFN_vkGetPhysicalDeviceFeatures)nextGIPA(nullptr, "vkGetPhysicalDeviceFeatures");
+        if (getFeatures) {
+            VkPhysicalDeviceFeatures supported;
+            memset(&supported, 0, sizeof(supported));
+            getFeatures(phys, &supported);
+            haveIndependentBlend = (supported.independentBlend == VK_TRUE);
+        }
+    }
+
+    // Only touch pEnabledFeatures when X-Plane used that form. When it passes
+    // features through pNext instead, the chain is edited there.
+    bool patchedFeatures = false;
+    if (haveIndependentBlend && !wantFeatures.independentBlend) {
+        wantFeatures.independentBlend = VK_TRUE;
+        if (ci->pEnabledFeatures) { ci2.pEnabledFeatures = &wantFeatures; patchedFeatures = true; }
+        else {
+            for (VkBaseOutStructure *pn = (VkBaseOutStructure*)ci2.pNext; pn; pn = pn->pNext)
+                if (pn->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+                    VkPhysicalDeviceFeatures2 *f2 = (VkPhysicalDeviceFeatures2*)pn;
+                    f2->features.independentBlend = VK_TRUE;
+                    patchedFeatures = true;
+                    break;
+                }
+        }
+    }
+    trace("SPIRV INJECT: independentBlend supported=%d, enabled by us=%d - without "
+          "it every appended blend state must match X-Plane's exactly, and ours "
+          "deliberately does not",
+          haveIndependentBlend ? 1 : 0, patchedFeatures ? 1 : 0);
+
     VkResult r = nextCreate(phys, &ci2, alloc, out);
 
     // If the modified create fails, fall back to X-Plane's original request.
@@ -7561,7 +8089,21 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     GD(createShaderModule, CreateShaderModule);          GD(createPipelineLayout, CreatePipelineLayout);
     GD(createComputePipelines, CreateComputePipelines);
     GD(createCommandPool, CreateCommandPool);           GD(allocateCommandBuffers, AllocateCommandBuffers);
-    GD(beginCommandBuffer, BeginCommandBuffer);          GD(endCommandBuffer, EndCommandBuffer);
+    GD(beginCommandBuffer, BeginCommandBuffer);
+    // Resolved into plain globals, not DeviceData: the re-push happens on a
+    // command buffer whose device is not looked up on that path.
+    if (!g_nextCmdDraw)
+        g_nextCmdDraw = (PFN_vkCmdDraw)nextGDPA(*out, "vkCmdDraw");
+    if (!g_nextCmdDrawIndexed)
+        g_nextCmdDrawIndexed = (PFN_vkCmdDrawIndexed)nextGDPA(*out, "vkCmdDrawIndexed");
+    if (!g_nextCmdDrawIndirect)
+        g_nextCmdDrawIndirect = (PFN_vkCmdDrawIndirect)nextGDPA(*out, "vkCmdDrawIndirect");
+    if (!g_nextCmdDrawIndexedIndirect)
+        g_nextCmdDrawIndexedIndirect = (PFN_vkCmdDrawIndexedIndirect)nextGDPA(*out, "vkCmdDrawIndexedIndirect");
+    if (!g_nextCmdDrawIndirectCount)
+        g_nextCmdDrawIndirectCount = (PFN_vkCmdDrawIndirectCount)nextGDPA(*out, "vkCmdDrawIndirectCount");
+    if (!g_nextCmdDrawIndexedIndirectCount)
+        g_nextCmdDrawIndexedIndirectCount = (PFN_vkCmdDrawIndexedIndirectCount)nextGDPA(*out, "vkCmdDrawIndexedIndirectCount");          GD(endCommandBuffer, EndCommandBuffer);
     GD(cmdBindPipeline, CmdBindPipeline);             GD(cmdBindDescriptorSets, CmdBindDescriptorSets);
     GD(cmdPushConstants, CmdPushConstants);            GD(cmdDispatch, CmdDispatch);
     GD(cmdPipelineBarrier, CmdPipelineBarrier);          GD(cmdCopyImageToBuffer, CmdCopyImageToBuffer);
@@ -7774,6 +8316,13 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkCmdDispatch",          TAA_CmdDispatch)
     RETURN_IF("vkCreatePipelineLayout", TAA_CreatePipelineLayout)
     RETURN_IF("vkCmdBindPipeline",     TAA_CmdBindPipeline)
+    RETURN_IF("vkCmdDraw",             TAA_CmdDraw)
+    RETURN_IF("vkCmdDrawIndexed",      TAA_CmdDrawIndexed)
+    RETURN_IF("vkCmdPushConstants",    TAA_CmdPushConstants)
+    RETURN_IF("vkCmdDrawIndirect",            TAA_CmdDrawIndirect)
+    RETURN_IF("vkCmdDrawIndexedIndirect",     TAA_CmdDrawIndexedIndirect)
+    RETURN_IF("vkCmdDrawIndirectCount",       TAA_CmdDrawIndirectCount)
+    RETURN_IF("vkCmdDrawIndexedIndirectCount", TAA_CmdDrawIndexedIndirectCount)
     RETURN_IF("vkCreateGraphicsPipelines", TAA_CreateGraphicsPipelines)
 
     PFN_vkGetDeviceProcAddr next = nullptr;

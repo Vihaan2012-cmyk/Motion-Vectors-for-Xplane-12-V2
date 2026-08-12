@@ -83,9 +83,14 @@ struct MvTarget {
     // Printing both ids says so outright instead of leaving it to be inferred.
     uint64_t       dumpShareFrame = 0;
     float          dumpNearClip   = 0.0f;
+    // The projection, so the depth convention can be READ rather than assumed.
+    float          dumpProj[16] = {0};
 };
 
 static MvTarget g_mv;
+// Set by the layer once spirv_inject.h has been included. mv_target.h is
+// included first, so it cannot ask the injector directly.
+static bool g_mvDebugDepth = false;
 static const int g_dumpDelay = getenv("TAA_MV_DUMP_DELAY")
                              ? atoi(getenv("TAA_MV_DUMP_DELAY")) : 8;
 // .xy velocity in UV units. Two channels is all a velocity buffer carries -
@@ -250,7 +255,8 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
 // this project several rounds elsewhere.
 static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
                              const float *reproj, float expectedPx, int phase,
-                             uint64_t shareFrame, float nearClip)
+                             uint64_t shareFrame, float nearClip,
+                             const float *proj)
 {
     MvTarget &m = g_mv;
     if (!m.ready || !m.readbackPtr || !m.wantDump) return;
@@ -261,6 +267,7 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
     m.dumpPhase      = phase;
     m.dumpShareFrame = shareFrame;
     m.dumpNearClip   = nearClip;
+    if (proj) memcpy(m.dumpProj, proj, sizeof(m.dumpProj));
 
     VkImageMemoryBarrier b;
     memset(&b, 0, sizeof(b));
@@ -478,6 +485,76 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // A ratio of 1 is the target. Sign is not meaningful here: the vectors point
     // backwards by convention - from a pixel to where it was - while the
     // expectation is a magnitude.
+    // ---- PER-PIXEL VERIFICATION, when .y carries w instead of velocity.y.
+    //
+    // Every comparison so far has held a REGION statistic against a CENTRE-RAY
+    // prediction at an ASSUMED depth, and each of those three has been wrong at
+    // least once. This holds neither: for each sampled pixel it takes the
+    // pixel's own screen position and its own w, forms the clip position the
+    // vertex shader must have produced, pushes it through the very matrix that
+    // was pushed, and compares the result against the velocity that pixel
+    // actually contains.
+    //
+    // If these agree, the shader is faithfully applying the matrix and any
+    // remaining disagreement is in how the CPU-side prediction was being
+    // formed. If they do not, the field is not f(matrix, depth) and the
+    // identity test - which showed 100% zeros - was answering a narrower
+    // question than it appeared to.
+    if (g_mvDebugDepth && m.dumpProj[11] != 0.0f) {
+        const double m10 = m.dumpProj[10], m11 = m.dumpProj[11], m14 = m.dumpProj[14];
+        // A MEAN OF RATIOS IS THE WRONG STATISTIC HERE, and the first version
+        // of this used one: predVx goes to near zero wherever the matrix
+        // predicts almost no motion, and dividing by 0.004 px produces
+        // thousands without meaning anything. The first run duly reported a
+        // mean of 954 and a worst of 20384, which says only that some
+        // denominators were small.
+        //
+        // The median is immune to that, and the absolute pixel error says
+        // whether any disagreement actually matters.
+        std::vector<float> ratios;
+        double sumAbsErr = 0.0;
+        uint64_t nCmp = 0;
+        for (uint32_t y = 0; y < m.h; y += 64) {
+            for (uint32_t x = 0; x < m.w; x += 64) {
+                const size_t i = ((size_t)y * m.w + x) * kMvHalves;
+                const double vx = velHalfToFloat(px[i]);
+                const double w  = velHalfToFloat(px[i + 1]);
+                if (!(w > 0.05) || vx != vx) continue;      // no geometry here
+
+                // Screen position -> NDC. The viewport is Y-flipped, but only
+                // x is being compared so that does not enter.
+                const double ndcX = ((double)x + 0.5) / (double)m.w * 2.0 - 1.0;
+                const double ndcY = ((double)y + 0.5) / (double)m.h * 2.0 - 1.0;
+                const double ndcZ = m10 / m11 - m14 / (m11 * w);
+
+                // clip = w * (ndc, 1), then prev = reproj * clip.
+                const double cx4 = ndcX * w, cy4 = ndcY * w, cz4 = ndcZ * w;
+                const double pxv = reproj[0]*cx4 + reproj[4]*cy4 + reproj[8]*cz4  + reproj[12]*w;
+                const double pwv = reproj[3]*cx4 + reproj[7]*cy4 + reproj[11]*cz4 + reproj[15]*w;
+                if (fabs(pwv) < 1e-9) continue;
+
+                const double predVx = (ndcX - pxv / pwv) * 0.5;
+                sumAbsErr += fabs(vx - predVx) * (double)m.w;
+                ++nCmp;
+                // Only pixels the matrix says should MOVE can carry a ratio.
+                if (fabs(predVx) * (double)m.w > 1.0)
+                    ratios.push_back((float)(vx / predVx));
+            }
+        }
+        if (nCmp) {
+            double medRatio = 0.0;
+            if (!ratios.empty()) {
+                std::nth_element(ratios.begin(), ratios.begin() + ratios.size()/2, ratios.end());
+                medRatio = ratios[ratios.size()/2];
+            }
+            trace("MV PERPIXEL: %llu pixels, %llu movers - median "
+                  "measured/predicted %.4f, mean |error| %.3f px "
+                  "(1.0 and 0.0 mean the shader applied the pushed matrix)",
+                  (unsigned long long)nCmp, (unsigned long long)ratios.size(),
+                  medRatio, sumAbsErr / (double)nCmp);
+        }
+    }
+
     // Gated on the PHASE alone, not on the plugin's expectedPx.
     //
     // The plugin only fills expectedPx for the rotation phases - it is zero for
@@ -529,20 +606,26 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
         const double p75 = quantile(axis, 0.75) * scale;
         const double p95 = quantile(axis, 0.95) * scale;
 
-        const double ratio  = axisPx / (double)expectedPx;
-
         // Frames straight after a phase change are a camera JUMP, not the
         // steady motion being measured - they read tens of times too large and
         // say nothing about the convention.
         static int lastPhase = -1;
         static int settle    = 0;
         if (selfTestPhase != lastPhase) { lastPhase = selfTestPhase; settle = 3; }
-        // WHAT THE MATRIX ITSELF PREDICTS, so the column can be split.
+        // WHAT THE MATRIX ITSELF PREDICTS.
         //
-        // `expectedPx` comes from the PLUGIN: it is the angle between the two
-        // view matrices, turned into pixels. `reproj` is what the SHADER was
-        // actually handed. They can disagree - the cockpit pass is pushed a
-        // body-frame matrix while this comparison is against the world-frame
+        // THE PLUGIN'S expectedPx IS NOT USED AND IS NOT PRINTED. It is the
+        // angle between two view matrices sampled in the FLIGHT LOOP, turned
+        // into pixels, and it disagrees with the matrix the shader was actually
+        // handed - reading 13.15 px on frames where the reprojection encodes
+        // 842. One of the two is describing a different pair of frames, and
+        // until that is understood a number that looks authoritative and is
+        // wrong is worse in a log than no number at all.
+        //
+        // `reproj` is what the SHADER was handed, so it is the yardstick. The
+        // rest of this comment records why a second one existed: the cockpit
+        // pass is pushed a body-frame matrix while this comparison is against
+        // the world-frame
         // one - and when they do, "the vectors are wrong" and "the vectors are
         // right and the yardstick is wrong" look identical from one number.
         //
@@ -605,9 +688,28 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
         //
         // The plugin publishes reverseZ=0, so that flag is wrong too, and
         // nothing here trusts it.
-        const double infinityZ = 0.0;
-        const double oneMetreZ = m.dumpNearClip > 0.0f
-                               ? (double)m.dumpNearClip / 1.0 : 0.016;
+        // ---- THE DEPTH CONVENTION, READ FROM THE PROJECTION.
+        //
+        // For a point at view depth d (forward negative, as X-Plane has it):
+        //
+        //     z_ndc(d) = m10/m11 - m14/(m11 * d)
+        //
+        // so infinity is m10/m11 and everything else follows. Measured here:
+        // m10 = m11 = -1 and m14 = -0.01615, giving infinity at ndcZ = 1 and
+        // the near plane at 0.
+        //
+        // THIS HAS NOW BEEN ASSUMED TWICE AND WRONG TWICE. First as
+        // non-reverse-Z, then "corrected" to reverse-Z on the strength of a
+        // depth histogram, which put infinity at 0 and had `far` sampling the
+        // 1.6 cm near plane. The passing numbers survived only because
+        // translation was negligible in those frames, so both ends gave the
+        // rotation and the wrong end happened to agree. That is luck, not
+        // correctness, and it is why this is derived rather than believed.
+        const double m10 = m.dumpProj[10], m11 = m.dumpProj[11];
+        const double m14 = m.dumpProj[14];
+        const bool   haveProj  = fabs(m11) > 1e-12;
+        const double infinityZ = haveProj ? m10 / m11 : 1.0;
+        const double oneMetreZ = haveProj ? (m10 / m11 - m14 / m11) : 0.98;
         double nearX = 0.0, nearY = 0.0, farX = 0.0, farY = 0.0;
         if (reproj) {
             predictAt(oneMetreZ, &nearX, &nearY);
@@ -743,14 +845,19 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
 
             trace("MV RATIO: phase=%d %s  centre=%.3f | p05=%.3f p25=%.3f med=%.3f p75=%.3f "
                   "p95=%.3f px | far=%.3f near=%.3f  ->  ratio=%.3f%s "
-                  "coherence=%.2f (frame %llu recorded / %llu now)",
+                  "coherence=%.2f plugin=%.3f (frame %llu recorded / %llu now)",
                   selfTestPhase, vertical ? "pitch" : "yaw  ",
                   centrePx, p05, p25, axisPx, p75, p95, predFar, predNear, farRatio,
                   verdict,
-                  coherence,
+                  coherence, expectedPx,
                   (unsigned long long)m.dumpShareFrame,
                   (unsigned long long)nowShareFrame);
-            (void)pure; (void)expectedPx;
+            // `plugin` is the plugin's own angle-based estimate, printed as a
+            // CROSS-CHECK and never used for a verdict. The rates are measured
+            // at exactly 1:1 - 3000 presents, 3000 flight loops, worst gap 1 -
+            // so it and the matrix describe the SAME interval and any
+            // disagreement between them is arithmetic, not sampling.
+            (void)pure;
             // THE MATRIX ITSELF, on the frames that fail.
             //
             // Every derived number has now been checked and every one of them
@@ -760,7 +867,16 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             // paraphrasing. A reprojection for a small rotation about Y is
             // near-identity with a small [8] and [2]; anything else here is the
             // answer.
-            if (farRatio > 3.0 || farRatio < 0.5) {
+            // During SETTLE and HOLD the camera is still, so the reprojection
+            // must be the IDENTITY to within noise. That is the one frame where
+            // the correct matrix is known a priori, which makes it the only
+            // place the construction can be checked without trusting any other
+            // measurement. If it is not identity here, nothing downstream can
+            // be right - and the per-pixel test reporting 4.9 to 7.4 px of
+            // error on exactly these frames, where the field is measurably
+            // zero, says one of the two is wrong.
+            if (selfTestPhase == ST_SETTLE || selfTestPhase == ST_HOLD ||
+                farRatio > 3.0 || farRatio < 0.5) {
                 trace("  matrix: [%.5f %.5f %.5f %.5f][%.5f %.5f %.5f %.5f]"
                       "[%.5f %.5f %.5f %.5f][%.5f %.5f %.5f %.5f]",
                       reproj[0], reproj[1], reproj[2], reproj[3],
@@ -768,7 +884,7 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                       reproj[8], reproj[9], reproj[10], reproj[11],
                       reproj[12], reproj[13], reproj[14], reproj[15]);
             }
-            (void)ratio; (void)centre;
+            (void)centre;
         }
     }
 
