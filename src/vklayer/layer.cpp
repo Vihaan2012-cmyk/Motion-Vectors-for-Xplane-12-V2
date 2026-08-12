@@ -151,7 +151,7 @@ struct Snapshot {
     // pairing. Kept separate rather than pre-multiplied: the origin shift has
     // to happen before the projection, or the 52 km of world translation is
     // cancelled after it has been scaled and four significant digits go with it.
-    float    world[16], proj[16];
+    float    world[16], proj[16], prevProj[16];
     float    bodyReproj[16];
     int32_t  bodyReprojValid;
     float    camBodyDrift, camGap;
@@ -186,6 +186,7 @@ static bool snapshot(Snapshot *o)
         memcpy(o->prevViewProj,    g_share->prevViewProj,    sizeof(o->prevViewProj));
         memcpy(o->world,           g_share->world,           sizeof(o->world));
         memcpy(o->proj,            g_share->proj,            sizeof(o->proj));
+        memcpy(o->prevProj,        g_share->prevProj,        sizeof(o->prevProj));
         memcpy(o->bodyReproj,      g_share->bodyReproj,      sizeof(o->bodyReproj));
         o->bodyReprojValid = g_share->bodyReprojValid;
         o->camBodyDrift    = g_share->camBodyDrift;
@@ -941,6 +942,10 @@ static VkImageLayout g_sceneDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "mv_target.h"
 #include "spirv_inject.h"
+
+// Set once, from the environment, next to the header that declares it.
+static const bool g_mvDebugDepthInit = (spvinj::debugDepthMode() =
+                                        (getenv("TAA_MV_DEBUG_DEPTH") != nullptr));
 
 // FSR2 is optional at BUILD time as well as run time. Its static library takes
 // several minutes to produce, so requiring it in order to compile the layer
@@ -2250,6 +2255,18 @@ static uint32_t g_mvBindsThisFrame = 0;
 static int      g_mvPassOrdinal = -1;
 static uint64_t g_mvPassDraws[16] = {0};
 static uint32_t g_mvQualifyThisFrame = 0;
+// THE MATRIX ACTUALLY PUSHED, kept so the dump can compare against it.
+//
+// The dump had been comparing the field against g_velSnap.reproj - the WORLD
+// matrix - while the push may hand a draw g_velSnap.bodyReproj instead. In a
+// cockpit view the body-frame matrix goes to most of the screen, so the field
+// and the yardstick describe different transforms over most of the frame, and
+// p05 flips between them depending on which covers more pixels. Comparing
+// against what was really pushed removes the last place the two can disagree
+// without either being wrong.
+static float g_lastPushed[16];
+static uint32_t g_pushDistinctThisFrame = 0;
+static uint32_t g_pushDistinctMax       = 0;
 static uint32_t g_mvBindsMax       = 0;
 static uint32_t g_passSizes[32][2];
 static uint32_t g_passHasDepth[32];
@@ -3580,7 +3597,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                 std::map<void*, DeviceData>::iterator rdi =
                     g_devices.find(dispatchKey(rci->second));
                 if (rdi != g_devices.end() && g_mv.ready)
-                    mvRecordReadback(rdi->second, cb, g_velSnap.reproj,
+                    mvRecordReadback(rdi->second, cb, g_lastPushed,
                                      g_velSnap.selfTestExpectedPx,
                                      g_velSnap.selfTestPhase, g_velSnap.frame,
                                      g_velSnap.nearClip);
@@ -4511,6 +4528,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             // first, projection after - because doing it the other way cancels
             // 52 km of world translation only after it has been scaled by the
             // projection, which measured a 10-18% residual when it was tried.
+            // DOES THE PROJECTION CHANGE BETWEEN FRAMES?
+            //
+            // The failing matrices carry terms of +-0.17 where a 0.25 degree
+            // rotation should give 0.004, arranged so they cancel at ndcZ=1 and
+            // not elsewhere - 1.12097 against 0.12097, 0.87902 against -0.12098.
+            // That is a depth REMAPPING of about 12%%, which is what appears in
+            // prevProj * R * proj^-1 when the two projections differ. It is not
+            // camera motion, and the field carries it because it is genuinely
+            // part of the reprojection.
+            //
+            // If this fires, the vectors are right and the yardstick - one
+            // predicted displacement along the centre ray - is what cannot
+            // describe the frame.
+            {
+                static uint64_t nDiff = 0, nSame = 0;
+                bool same = memcmp(fresh.proj, fresh.prevProj, 64) == 0;
+                if (same) ++nSame; else ++nDiff;
+                if (((nDiff + nSame) % 600) == 0)
+                    trace("MV PROJ: prevProj differs from proj on %llu of %llu "
+                          "frames - near=%.4f, [10]=%.5f vs %.5f, [14]=%.5f vs %.5f",
+                          (unsigned long long)nDiff,
+                          (unsigned long long)(nDiff + nSame), fresh.nearClip,
+                          fresh.proj[10], fresh.prevProj[10],
+                          fresh.proj[14], fresh.prevProj[14]);
+            }
+
             static float prevWorldSaved[16], prevProjSaved[16];
             static bool  havePrevFrame = false;
 
@@ -4676,7 +4719,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     bool have = snapshot(&snap);
 
     if ((frames % 120) == 0) {
-        trace("FRAME %llu  shareframe=%llu valid=%d  cam=(%.1f %.1f %.1f) moved=%.2fm "
+        trace("FRAME %llu  shareframe=%llu valid=%d  cam=(%.3f %.3f %.3f) moved=%.5fm "
               "revZ=%d near=%.4f objs=%d reset=%d passes=%u depth=%s",
               (unsigned long long)frames, (unsigned long long)snap.frame,
               have ? 1 : 0, snap.camX, snap.camY, snap.camZ, snap.camDelta,
@@ -4980,6 +5023,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
 
     g_mvBindsThisFrame     = 0;
     g_mvQualifyThisFrame   = 0;
+    g_pushDistinctThisFrame = 0;
     g_mvPassOrdinal        = -1;
 
     g_mvClearedThisFrame.store(false);
@@ -6953,6 +6997,33 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // gl_Position.w is positive for anything in front of the camera.
     if (g_velSnap.bodyReprojValid && g_nearFieldM > 0.0f)
         block[18] = g_nearFieldM;
+
+    // ---- HOW MANY DIFFERENT MATRICES ONE FRAME PUSHES.
+    //
+    // The identity test proved the field is built from the pushed matrix for
+    // 100%% of pixels, and the stashed matrix always encodes exactly one
+    // self-test step - yet some frames measure twenty-six. The remaining way
+    // both can be true is that the matrix CHANGED DURING THE FRAME, so the
+    // draws and the stash saw different ones.
+    //
+    // g_velSnap is rewritten in QueuePresentKHR while X-Plane records command
+    // buffers on several threads, so a recording thread can straddle a present
+    // and pick up the next frame's matrix. Counting distinct pushes per frame
+    // says whether that actually happens rather than assuming it does.
+    {
+        static bool  haveLast = false;
+        if (!haveLast || memcmp(g_lastPushed, block, 64) != 0) {
+            memcpy(g_lastPushed, block, 64);
+            haveLast = true;
+            uint32_t n = ++g_pushDistinctThisFrame;
+            if (n > g_pushDistinctMax) {
+                g_pushDistinctMax = n;
+                trace("MV PUSH RACE: %u distinct matrices pushed within one frame "
+                      "- more than 1 means the draws in a frame did not all see "
+                      "the same camera", n);
+            }
+        }
+    }
 
     g_nextCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT,
                            spvinj::pushConstantOffset(),

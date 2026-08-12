@@ -169,6 +169,17 @@ inline uint32_t choosePushOffset(uint32_t maxPushConstantsSize)
 // Set at device creation from maxVertexOutputComponents / 4 (components, not
 // locations - four per vec4). The Vulkan minimum of 64 components gives 16
 // locations, so the fallback below stays inside what every device guarantees.
+// TAA_MV_DEBUG_DEPTH: write the fragment.s NDC DEPTH into .y instead of the
+// vertical velocity.
+//
+// Depth is the one quantity in this whole chain that has never been measured.
+// The field disagrees with the matrix by factors that do NOT scale with the
+// commanded rotation - cutting the rate fivefold left them where they were - so
+// what remains is a component that depends on depth and on a camera drift that
+// is also rate-independent. At 1.5 mm of drift, 350 px means geometry 1.3 cm
+// from the eye. Either something really is that close, or the depth reaching
+// this shader is not the depth of the surface being drawn. This says which.
+inline bool &debugDepthMode() { static bool v = false; return v; }
 inline uint32_t &currClipLocation() { static uint32_t v = 14; return v; }
 inline uint32_t &prevClipLocation() { static uint32_t v = 15; return v; }
 
@@ -860,6 +871,14 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     uint32_t idMx = bound++;
     body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idScaled); body.push_back(1);
     uint32_t idMy = bound++;
+
+    if (debugDepthMode()) {
+        // z_ndc = currClip.z / currClip.w, straight into .y.
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idLc); body.push_back(2);
+        uint32_t idCz = bound++;
+        body.push_back(head(OpFDiv, 5)); body.push_back(idFloat); body.push_back(bound); body.push_back(idCz); body.push_back(idCw);
+        idMy = bound++;
+    }
     // (velocity.x, velocity.y, 0, 0). A colour attachment output is a
     // vec4; the target is two channels, so the last two are shape, not
     // information, and the format discards them.

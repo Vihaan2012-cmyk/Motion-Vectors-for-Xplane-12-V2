@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <vector>
 
@@ -85,6 +86,8 @@ struct MvTarget {
 };
 
 static MvTarget g_mv;
+static const int g_dumpDelay = getenv("TAA_MV_DUMP_DELAY")
+                             ? atoi(getenv("TAA_MV_DUMP_DELAY")) : 8;
 // .xy velocity in UV units. Two channels is all a velocity buffer carries -
 static const VkFormat kMvFormat = VK_FORMAT_R16G16_SFLOAT;
 
@@ -294,7 +297,19 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                           0, nullptr, 0, nullptr, 1, &b);
 
-    m.dumpPending = 2;
+    // EIGHT presents, not two.
+    //
+    // Two was chosen to put one frame boundary between the copy and the read.
+    // At 4K with 28 passes the GPU runs further behind than that, and a copy
+    // that has not executed leaves the PREVIOUS dump in the buffer - twenty
+    // frames of camera rotation earlier, which is a rigid field several times
+    // the size of the current one. That is exactly the shape of the surviving
+    // failures: uniform across the frame, at a multiple of the prediction, on
+    // frames whose matrix is correct.
+    //
+    // TAA_MV_DUMP_DELAY overrides, so the number can be measured rather than
+    // guessed: if the failures thin out as it rises, latency was the cause.
+    m.dumpPending = g_dumpDelay;
 }
 
 // Measure it. Deliberately the SAME statistics the depth-derived dump prints,
@@ -360,6 +375,7 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // matching signs mean the conventions agree, opposite signs on Y alone name
     // the flip outright.
     double cSx = 0.0, cSy = 0.0;
+    std::vector<float> cAxX, cAxY;
 
 
     // Strided. A full 8.3 M pixel scan per dump costs more than it tells us -
@@ -388,6 +404,16 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             mags.push_back((float)mag);
             if (x >= cx0 && x < cx1 && y >= cy0 && y < cy1) {
                 cSum += mag; cSx += vx; cSy += vy; ++cN;
+                // Magnitudes as well as the signed sums. The signed mean is
+                // what tells sign conventions apart, but it is the wrong thing
+                // to hold against a predicted displacement: a minority of
+                // pixels moving the other way - a prop disc, an animated panel
+                // element - drags it toward zero, and the verdict then reads
+                // systematically LOW while never reading high. That is exactly
+                // the residue left after the depth convention was fixed:
+                // 0.70, 0.84, 0.85, 0.88, 0.90, and nothing above 1.01.
+                cAxX.push_back(fabsf(vx));
+                cAxY.push_back(fabsf(vy));
             }
             ++n;
         }
@@ -548,12 +574,34 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
         // the frame is a pure rotation as far as anything being drawn is
         // concerned. With an infinite far plane the depth mapping is
         // ndcZ = 1 - near/d, so a metre is 1 - nearClip.
+        // ---- THE DEPTH CONVENTION IS REVERSE-Z. MEASURED, NOT ASSUMED.
+        //
+        // Writing currClip.z/currClip.w into the field and reading its
+        // distribution settles it. The fragments come back at
+        //
+        //     z_ndc = 0.0000009, 0.0223, 0.0262, 0.0433
+        //
+        // all clustered near ZERO. Under z_ndc = 1 - near/d that would put the
+        // whole scene 1.6 cm from the eye. Under z_ndc = near/d it reads as
+        // 17 km, 0.72 m, 0.62 m and 0.37 m - mountains, then the instrument
+        // panel. That is the scene, so infinity is ndcZ = 0 and the near plane
+        // is ndcZ = 1.
+        //
+        // Which means this predictor had it backwards from the day it was
+        // written: "far" was being evaluated at the NEAR plane. The evidence was
+        // already in the log - a pitch frame measured 190-197 px while
+        // predictAt(0) said 195.4 - and it was read as a failure of the vectors
+        // instead of as the convention being inverted.
+        //
+        // The plugin publishes reverseZ=0, so that flag is wrong too, and
+        // nothing here trusts it.
+        const double infinityZ = 0.0;
         const double oneMetreZ = m.dumpNearClip > 0.0f
-                               ? 1.0 - (double)m.dumpNearClip : 0.98;
+                               ? (double)m.dumpNearClip / 1.0 : 0.016;
         double nearX = 0.0, nearY = 0.0, farX = 0.0, farY = 0.0;
         if (reproj) {
             predictAt(oneMetreZ, &nearX, &nearY);
-            predictAt(1.0,       &farX,  &farY);
+            predictAt(infinityZ, &farX,  &farY);
         }
         const double predNear = vertical ? nearY : nearX;
         const double predFar  = vertical ? farY  : farX;
@@ -564,7 +612,21 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             // least-moving twentieth of the frame, which is the most distant
             // geometry in it, and that is what the matrix's far prediction
             // describes.
-            const double farRatio = predFar > 1e-6 ? p05 / predFar : 0.0;
+            // COMPARE THE CENTRE AGAINST THE CENTRE-RAY PREDICTION.
+            //
+            // predFar is the displacement along the CENTRE ray. Over a 65 degree
+            // field a rigid rotation does not move every pixel by that amount -
+            // displacement grows off-axis - so a whole-frame quantile was never
+            // the right thing to hold against it. p05 was chosen when the far
+            // end was believed to be a lower bound; with the depth convention
+            // corrected it is not.
+            //
+            // The centre region is what predFar describes, so that is what it
+            // is compared with.
+            std::vector<float> &cAxis = vertical ? cAxY : cAxX;
+            const double centrePx = quantile(cAxis, 0.5)
+                                  * (vertical ? (double)m.h : (double)m.w);
+            const double farRatio = predFar > 1e-6 ? centrePx / predFar : 0.0;
 
             // A VERDICT ONLY WHEN THE MATRIX SAYS PURE ROTATION.
             //
@@ -582,17 +644,34 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
             // assumption about what the aeroplane was doing.
             const double purity = predFar > 1e-6 ? predNear / predFar : 0.0;
             const bool   pure   = purity > 0.95 && purity < 1.05;
-            trace("MV RATIO: phase=%d %s  p05=%.3f p25=%.3f med=%.3f p75=%.3f "
+            trace("MV RATIO: phase=%d %s  centre=%.3f | p05=%.3f p25=%.3f med=%.3f p75=%.3f "
                   "p95=%.3f px | matrix far=%.3f px  ->  p05/far=%.3f%s "
                   "(expected=%.3f, at1m=%.3f, frame %llu recorded / %llu now)",
                   selfTestPhase, vertical ? "pitch" : "yaw  ",
-                  p05, p25, axisPx, p75, p95, predFar, farRatio,
+                  centrePx, p05, p25, axisPx, p75, p95, predFar, farRatio,
                   !pure ? "  (camera translated - no single expectation)"
                         : (farRatio > 0.95 && farRatio < 1.05) ? "  <- CORRECT"
                         : "  <- WRONG",
                   expectedPx, predNear,
                   (unsigned long long)m.dumpShareFrame,
                   (unsigned long long)nowShareFrame);
+            // THE MATRIX ITSELF, on the frames that fail.
+            //
+            // Every derived number has now been checked and every one of them
+            // says the same thing: one step. The field says twenty-six. One of
+            // those two readings is of something other than what it claims, and
+            // the sixteen floats are the only place left that cannot be
+            // paraphrasing. A reprojection for a small rotation about Y is
+            // near-identity with a small [8] and [2]; anything else here is the
+            // answer.
+            if (farRatio > 3.0 || farRatio < 0.5) {
+                trace("  matrix: [%.5f %.5f %.5f %.5f][%.5f %.5f %.5f %.5f]"
+                      "[%.5f %.5f %.5f %.5f][%.5f %.5f %.5f %.5f]",
+                      reproj[0], reproj[1], reproj[2], reproj[3],
+                      reproj[4], reproj[5], reproj[6], reproj[7],
+                      reproj[8], reproj[9], reproj[10], reproj[11],
+                      reproj[12], reproj[13], reproj[14], reproj[15]);
+            }
             (void)ratio; (void)centre;
         }
     }

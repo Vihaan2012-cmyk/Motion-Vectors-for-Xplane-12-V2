@@ -186,13 +186,24 @@ static bool     g_stLastPitchValid = false;
 static float    g_stAppliedPitch   = 0.0f;
 static int      g_stWatchdog       = 0;
 static bool     g_stPausedBySelfTest = false;
+static int      g_stShakeSaved[2] = {0, 0};
 static float    g_stBaseX = 0, g_stBaseY = 0, g_stBaseZ = 0;
 static float    g_stBaseHdg = 0, g_stBasePitch = 0;
 
 // Degrees of yaw per frame during TAA_ST_YAW, and metres per frame during
 // TAA_ST_TRANSLATE. Small enough to stay well inside one screen of motion so
 // nothing clips against the frame edge and skews the statistics.
-static const float kStYawPerFrame   = 0.25f;
+// TAA_ST_RATE scales the commanded rotation.
+//
+// A scaling test is the one thing that says whether the surviving uniform
+// fields are a ROTATION at all. Everything else about them is consistent with a
+// rigid rotation of several steps - but the flight loop and the renderer are
+// 1:1 (shareframe advances 120 per 120 presents), the matrix describes one
+// step, and the shader provably builds the field from that matrix. If the
+// uniform fields scale with this, they are rotations and something is
+// multiplying them; if they do not, they are not our rotation at all.
+static float kStYawPerFrame = getenv("TAA_ST_RATE")
+                            ? (float)atof(getenv("TAA_ST_RATE")) : 0.25f;
 static const float kStMetresPerFrame = 0.35f;
 static const int   kStPhaseFrames   = 150;
 
@@ -2290,6 +2301,36 @@ static float matrixCallback(float sinceLast, float, int, void *)
             // Pausing costs nothing here: the self-test drives the camera, not
             // the aeroplane, so a frozen sim still renders every frame the
             // measurement needs.
+            // ---- TURN OFF THE G-LOADED CAMERA.
+            //
+            // X-Plane shakes the internal view deliberately - a g-loaded camera
+            // for cockpit views, and a hand-held one outside. It is a VIEW
+            // effect, so pausing the aeroplane does not stop it, and it moves
+            // the eye by a couple of millimetres a frame.
+            //
+            // Two millimetres sounds like nothing and is not. The near plane
+            // here is 1.6 cm, so the reprojection carries a term of 431 px at
+            // that depth; at one metre it is 6.9 px against the 13.15 px the
+            // rotation itself produces. That is what made a scripted, paused,
+            // supposedly pure rotation read as "camera translated" on most
+            // frames, and it is why the matrices came back with terms forty
+            // times larger than a 0.25 degree step can explain.
+            for (int i = 0; i < 2; ++i) {
+                const char *name = i ? "sim/graphics/view/handheld_external_cam"
+                                     : "sim/graphics/view/gloaded_internal_cam";
+                if (XPLMDataRef d = XPLMFindDataRef(name)) {
+                    g_stShakeSaved[i] = XPLMGetDatai(d);
+                    if (g_stShakeSaved[i]) {
+                        XPLMSetDatai(d, 0);
+                        xlog("self-test: disabled %s (was %d) - it moves the eye "
+                             "a couple of mm a frame, which is 431 px at a 1.6 cm "
+                             "near plane", name, g_stShakeSaved[i]);
+                    }
+                } else {
+                    g_stShakeSaved[i] = 0;
+                }
+            }
+
             if (XPLMCommandRef pause = XPLMFindCommand("sim/operation/pause_toggle")) {
                 XPLMDataRef paused = XPLMFindDataRef("sim/time/paused");
                 if (!paused || XPLMGetDatai(paused) == 0) {
@@ -2303,6 +2344,13 @@ static float matrixCallback(float sinceLast, float, int, void *)
                  "Phases: SETTLE, HOLD, YAW, TRANSLATE, HEADMOVE - %d frames each.",
                  p.x, p.y, p.z, p.heading, kStPhaseFrames);
             xlog("self-test: do not touch the controls; changing view ends it.");
+            // Say the rate OUT LOUD. A run made through a switch that never
+            // arrived returns numbers identical to a run without it, and the
+            // self-test is deterministic enough that identical output is
+            // exactly what an ineffective switch looks like. This has now cost
+            // two runs.
+            xlog("self-test: rate %.4f deg/frame, %d frames per phase",
+                 kStYawPerFrame, kStPhaseFrames);
         }
     }
 
@@ -2314,6 +2362,14 @@ static float matrixCallback(float sinceLast, float, int, void *)
             if (g_stPhase == TAA_ST_DONE) {
                 xlog("self-test: complete - camera released.");
                 XPLMDontControlCamera();
+                for (int i = 0; i < 2; ++i) {
+                    if (!g_stShakeSaved[i]) continue;
+                    const char *name = i ? "sim/graphics/view/handheld_external_cam"
+                                         : "sim/graphics/view/gloaded_internal_cam";
+                    if (XPLMDataRef d = XPLMFindDataRef(name))
+                        XPLMSetDatai(d, g_stShakeSaved[i]);
+                    g_stShakeSaved[i] = 0;
+                }
                 if (g_stPausedBySelfTest) {
                     if (XPLMCommandRef pause = XPLMFindCommand("sim/operation/pause_toggle"))
                         XPLMCommandOnce(pause);
