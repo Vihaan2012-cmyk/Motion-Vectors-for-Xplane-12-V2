@@ -91,6 +91,7 @@ static MvTarget g_mv;
 // Set by the layer once spirv_inject.h has been included. mv_target.h is
 // included first, so it cannot ask the injector directly.
 static bool g_mvDebugDepth = false;
+static bool g_mvRawMode    = false;
 static const int g_dumpDelay = getenv("TAA_MV_DUMP_DELAY")
                              ? atoi(getenv("TAA_MV_DUMP_DELAY")) : 8;
 // .xy velocity in UV units. Two channels is all a velocity buffer carries -
@@ -553,6 +554,25 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                   (unsigned long long)nCmp, (unsigned long long)ratios.size(),
                   medRatio, sumAbsErr / (double)nCmp);
         }
+    }
+
+    // ---- RAW MODE REPORTS BOTH CHANNELS, EXPLICITLY.
+    //
+    // The verdict line picks its axis from the phase - axY for pitch, axX
+    // otherwise - which is right for a velocity but wrong for the raw probe,
+    // where .x is prev.w and .y is curr.w. Reading pitch rows as prev.w cost a
+    // full analysis cycle. These two must be EQUAL for any rigid camera motion,
+    // so they are printed side by side with nothing deciding which is which.
+    if (g_mvRawMode && !axX.empty() && !axY.empty()) {
+        auto q = [](std::vector<float> &v, double f) -> double {
+            size_t k = (size_t)(f * (double)(v.size() - 1));
+            std::nth_element(v.begin(), v.begin() + k, v.end());
+            return v[k];
+        };
+        trace("MV RAW: prev.w  p05=%.3f med=%.3f p95=%.3f m   |   "
+              "curr.w  p05=%.3f med=%.3f p95=%.3f m   (they must match)",
+              q(axX, 0.05), q(axX, 0.50), q(axX, 0.95),
+              q(axY, 0.05), q(axY, 0.50), q(axY, 0.95));
     }
 
     // Gated on the PHASE alone, not on the plugin's expectedPx.

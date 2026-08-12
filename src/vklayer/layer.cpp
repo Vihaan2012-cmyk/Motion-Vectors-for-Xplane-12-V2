@@ -945,6 +945,7 @@ static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "spirv_inject.h"
 
 // Set once, from the environment, next to the header that declares it.
+static const bool g_mvRawInit = (g_mvRawMode = spvinj::debugRaw());
 static const bool g_mvDebugDepthInit = (g_mvDebugDepth = spvinj::debugDepthMode() =
                                         (getenv("TAA_MV_DEBUG_DEPTH") != nullptr));
 
@@ -4708,8 +4709,62 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 float invCurrExact[16];
                 taaMul(invCurrExact, invWorldRel, invProj);
 
-                static const bool useNumeric = (getenv("TAA_MV_NUMERIC_INV") != nullptr);
-                taaMul(r, prevVPrel, useNumeric ? invCurr : invCurrExact);
+                // ---- THE MATRIX THE SHADER GETS IS VIEW-TO-CLIP, NOT CLIP-TO-CLIP.
+                //
+                // A clip-to-clip reprojection cannot be applied in float32 with
+                // this projection. Its w row comes out at +-1/near = +-61.9, and
+                // the shader then evaluates 61.9 * (w_clip - z_clip) - two
+                // nearly equal large numbers subtracted. At 8 km that needs six
+                // significant digits and float32 has seven; at sky distances it
+                // has none, prev.w collapses to noise, and the divide by it
+                // inflated the vectors by the measured 3x to 21x.
+                //
+                // With m10 = m11 = -1 the projection gives z_clip = w_clip +
+                // m14, so z_clip carries NO information beyond w_clip - depth is
+                // entirely in w. View space therefore rebuilds with no
+                // subtraction at all:
+                //
+                //     view = (x_clip/sx, y_clip/sy, -w_clip, 1)
+                //
+                // The shader builds (pos.x, pos.y, pos.w, 1) and this matrix
+                // absorbs 1/sx, 1/sy and the -1. Nothing cancels anywhere.
+                //
+                //     M = P_prev * [R_prev*R_curr^T | R_prev*dC] * diag(1/sx, 1/sy, -1, 1)
+                //
+                // Every factor is exact: a transpose for the rotation, the
+                // millimetre-scale camera delta already differenced in double,
+                // and three reciprocals of well-scaled numbers.
+                float relRot[16];
+                memset(relRot, 0, sizeof(relRot));
+                for (int c = 0; c < 3; ++c)
+                    for (int rr = 0; rr < 3; ++rr) {
+                        double s = 0.0;
+                        for (int k = 0; k < 3; ++k)
+                            s += (double)prevWorldSaved[k*4 + rr] * (double)fresh.world[k*4 + c];
+                        relRot[c*4 + rr] = (float)s;      // R_prev * R_curr^T
+                    }
+                for (int i = 0; i < 3; ++i)
+                    relRot[12 + i] = prevWorldRel[12 + i];   // R_prev * dC
+                relRot[15] = 1.0f;
+
+                float clipToView[16];
+                memset(clipToView, 0, sizeof(clipToView));
+                clipToView[0]  = (fresh.proj[0] != 0.0f) ? 1.0f / fresh.proj[0] : 1.0f;
+                clipToView[5]  = (fresh.proj[5] != 0.0f) ? 1.0f / fresh.proj[5] : 1.0f;
+                clipToView[10] = -1.0f;   // view z from the w the shader passes in slot 2
+                clipToView[15] = 1.0f;
+
+                float viewToPrevClip[16], m2[16];
+                taaMul(m2, relRot, clipToView);
+                taaMul(viewToPrevClip, prevProjSaved, m2);
+
+                static const bool useClipToClip = (getenv("TAA_MV_CLIP2CLIP") != nullptr);
+                if (useClipToClip) {
+                    static const bool useNumeric = (getenv("TAA_MV_NUMERIC_INV") != nullptr);
+                    taaMul(r, prevVPrel, useNumeric ? invCurr : invCurrExact);
+                } else {
+                    memcpy(r, viewToPrevClip, sizeof(r));
+                }
 
                 // ---- THE ANGLE, FROM THE SAME TWO MATRICES.
                 //

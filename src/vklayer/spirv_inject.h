@@ -510,6 +510,19 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // comparison and a select rather than a second matrix.
     uint32_t newBool = 0;
     if (!idBool) { newBool = bound++; idBool = newBool; }
+
+    // A float 1.0, for the view vector's w. It is a literal so that nothing can
+    // cancel: the clip-to-clip form this replaces recovered w as a difference
+    // and lost all precision on distant geometry.
+    uint32_t idConstOneV = 0, newOneV = 0;
+    for (size_t k = 0; k < ins.size(); ++k) {
+        const uint32_t *q = &w[ins[k].at];
+        if (ins[k].op == OpConstant && ins[k].len >= 4 && q[1] == idFloat) {
+            float v; memcpy(&v, &q[3], 4);
+            if (v == 1.0f) { idConstOneV = q[2]; break; }
+        }
+    }
+    if (!idConstOneV) { newOneV = bound++; idConstOneV = newOneV; }
     uint32_t idConst2NF = bound++;              // component index 2 of the vec4
     uint32_t idChainNF = bound++, idNFvec = bound++, idNFdist = bound++;
     uint32_t idNFcmp = bound++, idPrevSel = bound++;
@@ -553,6 +566,8 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // the driver has already compiled is better left as close to itself as
     // possible.
     if (newBool)     { globals.push_back(head(OpTypeBool, 2));    globals.push_back(newBool); }
+    if (newOneV)     { uint32_t bits; float o = 1.0f; memcpy(&bits, &o, 4);
+                       globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newOneV); globals.push_back(bits); }
     (void)idConst2NF;
 
     globals.push_back(head(OpTypeStruct, 4));  globals.push_back(idStructPC);    globals.push_back(idMat4); globals.push_back(idV4);
@@ -607,7 +622,29 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     //
     // TAA_MV_FLIP restores the old behaviour for comparison.
     static const bool flipForMatrix = (getenv("TAA_MV_FLIP") != nullptr);
-    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idLoadedMat); body.push_back(flipForMatrix ? idFlipped : storedValue);
+    static const bool clipToClip     = (getenv("TAA_MV_CLIP2CLIP") != nullptr);
+
+    // ---- THE VECTOR HANDED TO THE MATRIX IS (x, y, w, 1), NOT THE CLIP POSITION.
+    //
+    // uReproj is now a VIEW-to-previous-clip matrix. It expects the current view
+    // position, and with this projection that rebuilds from gl_Position with no
+    // subtraction: z_clip = w_clip + m14, so z_clip holds nothing w does not,
+    // and view = (x/sx, y/sy, -w, 1) with 1/sx, 1/sy and the -1 folded into the
+    // matrix on the host.
+    //
+    // The clip-to-clip form it replaces could not be evaluated in float32 here:
+    // its w row is +-1/near = +-61.9 and the shader computed 61.9 * (w - z), a
+    // difference of two nearly equal large numbers. prev.w collapsed to noise
+    // for distant geometry and the divide by it inflated the field 3x to 21x.
+    //
+    // The literal 1.0 is what makes this exact - it is a constant, not a
+    // difference, so nothing can cancel.
+    uint32_t idViewVec = bound++;
+    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idViewVec);
+    body.push_back(idPosX); body.push_back(idPosY); body.push_back(idPosW); body.push_back(idConstOneV);
+
+    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idLoadedMat);
+    body.push_back(clipToClip ? (flipForMatrix ? idFlipped : storedValue) : idViewVec);
 
     // ---- NEAR FIELD: THE COCKPIT'S CORRECT MOTION VECTOR IS ZERO.
     //
