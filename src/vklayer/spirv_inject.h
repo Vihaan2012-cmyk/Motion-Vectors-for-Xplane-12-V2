@@ -53,6 +53,7 @@ enum {
     OpGroupDecorate = 74, OpGroupMemberDecorate = 75,
     OpMatrixTimesVector = 145,
     OpVectorShuffle = 79, OpCompositeConstruct = 80, OpCompositeExtract = 81,
+    OpCompositeInsert = 82,
     OpFSub = 131, OpFDiv = 136, OpVectorTimesScalar = 142,
     OpFNegate = 127, OpFAdd = 129, OpFMul = 133,
     OpSelect = 169, OpFOrdLessThan = 184,
@@ -488,6 +489,10 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     uint32_t idPtrPCStruct = bound++;
     uint32_t idPtrPCMat4   = bound++;
     uint32_t idPCVar       = bound++;
+    // Per-vertex-module tag, mirroring the fragment one. The fragment tag named
+    // the wrong stage: it only divides varyings, while prevClip is built here.
+    static uint32_t s_vsPidCounter = 0;
+    const uint32_t myVsPid = ++s_vsPidCounter;
     uint32_t idOutCurr     = bound++;
     uint32_t idOutPrev     = bound++;
     uint32_t newMat4 = 0, newPtrOutV4 = 0, newInt = 0, newConst0 = 0, newConst1 = 0;
@@ -686,7 +691,31 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // currClip goes out in the same space the matrix works in, so the fragment's
     // subtraction is between two comparable vectors. Both raw, or both flipped -
     // never one of each.
-    body.push_back(head(OpStore, 3)); body.push_back(idOutCurr); body.push_back(flipForMatrix ? idFlipped : storedValue);
+    // ---- STAMP THE VERTEX SHADER'S IDENTITY INTO currClip.z.
+    //
+    // The fragment tag found the whole defect in one shader: pid 1477 owns
+    // 83165 of ~85500 bad pixels (97%), 28.74% of its own 289410 pixels wrong,
+    // mean error 48.99 px, while ten other shaders sit at 0.00% bad and
+    // 0.15-0.25 px. But that tag names the FRAGMENT stage, and the fragment
+    // only divides two varyings - prevClip is computed in the VERTEX shader, so
+    // that is the stage worth naming.
+    //
+    // currClip.z is dead: the fragment reads .xy and .w and never touches it.
+    // Writing the vertex module's own tag there costs nothing and carries the
+    // right stage's identity through to the readback.
+    uint32_t idCurrOut = flipForMatrix ? idFlipped : storedValue;
+    if (getenv("TAA_MV_PID")) {
+        uint32_t bits; float pv = (float)myVsPid; memcpy(&bits, &pv, 4);
+        const uint32_t idVsPidK = bound++;
+        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat);
+        globals.push_back(idVsPidK); globals.push_back(bits);
+        const uint32_t idTagged = bound++;
+        body.push_back(head(OpCompositeInsert, 6)); body.push_back(idV4);
+        body.push_back(idTagged); body.push_back(idVsPidK);
+        body.push_back(idCurrOut); body.push_back(2);
+        idCurrOut = idTagged;
+    }
+    body.push_back(head(OpStore, 3)); body.push_back(idOutCurr); body.push_back(idCurrOut);
 
     // ---- SUB-PIXEL JITTER, in clip space.
     //
@@ -992,7 +1021,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
             h ^= (uint64_t)w[k];
             h *= 1099511628211ull;
         }
-        trace("MV PID %u -> module hash %016llx, %llu words",
+        trace("MV FS PID %u -> module hash %016llx, %llu words",
               myPid, (unsigned long long)h, (unsigned long long)w.size());
     }
 
@@ -1065,8 +1094,17 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // flow can be predicted from measured depth instead of from an epipolar
     // line that degenerates near the focus of expansion.
     const uint32_t idCh2 = wantRGBA ? idCw : idConstZero;
-    // Channel 3 carries the pipeline tag when asked for, otherwise prevDepth.
-    const uint32_t idCh3 = idConstPid ? idConstPid : (wantRGBA ? idPw : idConstZero);
+    // Channel 3 carries the VERTEX shader's tag, which the vertex stage stamped
+    // into currClip.z - the component this shader never reads. The fragment's
+    // own tag named a stage that only performs a divide; prevClip is computed
+    // in the vertex shader, so that is the identity worth carrying out.
+    uint32_t idCh3 = wantRGBA ? idPw : idConstZero;
+    if (idConstPid) {
+        const uint32_t idVsTag = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat);
+        body.push_back(idVsTag); body.push_back(idLc); body.push_back(2);
+        idCh3 = idVsTag;
+    }
     body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(idCh0); body.push_back(idCh1); body.push_back(idCh2); body.push_back(idCh3);
     body.push_back(head(OpStore, 3)); body.push_back(idOutMV); body.push_back(idResult);
 
