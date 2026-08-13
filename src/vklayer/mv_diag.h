@@ -255,6 +255,97 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
         }
     }
 
+    // ---- DEPTH MODE: measure nearness instead of inferring it from the flow.
+    //
+    // With TAA_MV_WRITE_DEPTH the shader writes (currClip.w, prevClip.w), the
+    // view-space depths in metres, so this reports what is actually close to
+    // the lens. The residual tail was blamed on geometry about 0.2 m away, but
+    // that distance was solved from the very flow under test. If the bottom
+    // band really is centimetres from the camera the tail is a degenerate near
+    // field; if it is metres, the flow there is too large and the field is
+    // wrong.
+    if (getenv("TAA_MV_WRITE_DEPTH")) {
+        double rowDepSum[8]; uint64_t rowDepN[8]; double rowDepMin[8];
+        for (int i = 0; i < 8; ++i) { rowDepSum[i]=0.0; rowDepN[i]=0; rowDepMin[i]=1e30; }
+        const double depEdge[8] = { 0.05, 0.2, 0.5, 1.0, 5.0, 20.0, 100.0, 1e30 };
+        uint64_t depHist[8]; for (int i=0;i<8;++i) depHist[i]=0;
+        uint64_t depN = 0;
+        for (uint32_t y = 0; y < in.h; y += 4) {
+            for (uint32_t x = 0; x < in.w; x += 4) {
+                const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                const double dCur = velHalfToFloat(in.px[i2]);
+                if (!(dCur > 0.0) || dCur != dCur) continue;
+                ++depN;
+                const int rb = (int)((double)y / (double)in.h * 8.0);
+                if (rb >= 0 && rb < 8) {
+                    rowDepSum[rb] += dCur; ++rowDepN[rb];
+                    if (dCur < rowDepMin[rb]) rowDepMin[rb] = dCur;
+                }
+                for (int b = 0; b < 8; ++b)
+                    if (dCur < depEdge[b]) { ++depHist[b]; break; }
+            }
+        }
+        fprintf(f, "DEPTH MODE - target carries (currDepth, prevDepth) in metres\n");
+        fprintf(f, "view=%d  %ux%u  samples with depth %llu\n\n",
+                in.viewType, in.w, in.h, (unsigned long long)depN);
+        fprintf(f, "TRUE VIEW DEPTH BY SCREEN ROW (top to bottom, eighths)\n");
+        for (int b = 0; b < 8; ++b)
+            fprintf(f, "  rows %4u-%4u  mean %10.3f m   nearest %10.4f m   n=%llu\n",
+                    (unsigned)(in.h * b / 8), (unsigned)(in.h * (b + 1) / 8 - 1),
+                    rowDepN[b] ? rowDepSum[b] / (double)rowDepN[b] : -1.0,
+                    rowDepN[b] ? rowDepMin[b] : -1.0,
+                    (unsigned long long)rowDepN[b]);
+        // ---- prevDepth IS ALREADY IN CHANNEL 1 AND HAS NEVER BEEN LOOKED AT.
+        //
+        // prev.w = M[3]*x_c + M[7]*y_c + M[11]*w_c + M[15] is the denominator of
+        // both output components. Over a 0.06 m camera move it must stay within
+        // a few centimetres of currDepth. Where it does not, the denominator is
+        // wrong and the whole pixel follows; where it tracks but the flow is
+        // still large, the fault is in the numerator rows instead.
+        //
+        // This costs nothing - the channel is already being read.
+        {
+            double rowPD[8]; uint64_t rowPDN[8]; double rowPDMax[8];
+            for (int i = 0; i < 8; ++i) { rowPD[i]=0.0; rowPDN[i]=0; rowPDMax[i]=0.0; }
+            for (uint32_t y = 0; y < in.h; y += 4) {
+                for (uint32_t x = 0; x < in.w; x += 4) {
+                    const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                    const double dCur = velHalfToFloat(in.px[i2]);
+                    const double dPrv = velHalfToFloat(in.px[i2 + 1]);
+                    if (!(dCur > 0.0) || dCur != dCur || dPrv != dPrv) continue;
+                    const double rel = fabs(dPrv - dCur) / dCur;
+                    const int rb = (int)((double)y / (double)in.h * 8.0);
+                    if (rb >= 0 && rb < 8) {
+                        rowPD[rb] += rel; ++rowPDN[rb];
+                        if (rel > rowPDMax[rb]) rowPDMax[rb] = rel;
+                    }
+                }
+            }
+            fprintf(f, "\nPREV DEPTH AGAINST CURR DEPTH (the shared denominator)\n");
+            for (int b = 0; b < 8; ++b)
+                fprintf(f, "  rows %4u-%4u  mean |dPrev-dCurr|/dCurr %10.5f   worst %10.5f   n=%llu\n",
+                        (unsigned)(in.h * b / 8), (unsigned)(in.h * (b + 1) / 8 - 1),
+                        rowPDN[b] ? rowPD[b] / (double)rowPDN[b] : -1.0,
+                        rowPDN[b] ? rowPDMax[b] : -1.0,
+                        (unsigned long long)rowPDN[b]);
+            fprintf(f, "      a 0.06 m camera move over 7 m geometry is under 1%%;\n");
+            fprintf(f, "      a large value here means the denominator is wrong\n");
+        }
+
+        fprintf(f, "\nDEPTH HISTOGRAM\n");
+        const char *dlbl[8] = { "under 0.05 m", "0.05-0.2 m", "0.2-0.5 m",
+                                "0.5-1 m", "1-5 m", "5-20 m", "20-100 m",
+                                "over 100 m" };
+        for (int b = 0; b < 8; ++b)
+            fprintf(f, "  %-14s %8llu  (%.2f%%)\n", dlbl[b],
+                    (unsigned long long)depHist[b],
+                    depN ? 100.0 * depHist[b] / (double)depN : 0.0);
+        fprintf(f, "\n  The velocity run put the tail in rows 1890-2159 at 174 px\n");
+        fprintf(f, "  and implied 0.2 m. Compare the nearest depth in that band.\n");
+        fclose(f);
+        return;
+    }
+
     fprintf(f, "MOTION VECTOR DIAGNOSTIC\n");
     fprintf(f, "========================\n\n");
     fprintf(f, "view=%d phase=%d  target %ux%u  epipolar median %.3f px  relative %.5f\n",

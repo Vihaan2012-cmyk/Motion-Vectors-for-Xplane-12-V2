@@ -2697,8 +2697,28 @@ static float matrixCallback(float sinceLast, float, int, void *)
                  "The aeroplane is frozen, so every pixel is static world "
                  "geometry and the epipolar residual is valid on all of it.");
         }
-        if (f > 240 && (f % 3) == 0) {
-            const bool right = ((f / 60) % 2) == 0;
+        // ---- LIFT THE CAMERA OFF THE GROUND FIRST.
+        //
+        // In circle view the camera sits about a metre above the airport, so the
+        // bottom of the screen is ground almost touching the lens. The frozen
+        // run measured 790 px of flow from 0.056 m of translation, which puts
+        // that geometry at sx*t/flow_ndc = 1.57*0.056/0.412 = 0.21 m. Every
+        // pixel under 16 px/frame read 0.000-0.293 px residual; everything above
+        // it blew up to 320 px. The tail is entirely geometry within tens of
+        // centimetres.
+        //
+        // That is the degenerate near-field an earlier commit already flagged,
+        // not a case a user flies. Lifting the camera so nothing is within
+        // metres decides it: if the residual collapses, the field is correct and
+        // the tail was the camera sitting on the runway.
+        if (f > 130 && f <= 150 && (f % 2) == 0) {
+            if (XPLMCommandRef c = XPLMFindCommand("sim/general/up"))
+                XPLMCommandOnce(c);
+            if (XPLMCommandRef c = XPLMFindCommand("sim/general/backward"))
+                XPLMCommandOnce(c);
+        }
+        if (f > 150 && (f % 3) == 0) {
+            const bool right = ((f / 45) % 2) == 0;
             if (XPLMCommandRef c = XPLMFindCommand(right ? "sim/general/right"
                                                          : "sim/general/left"))
                 XPLMCommandOnce(c);

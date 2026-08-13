@@ -1006,7 +1006,28 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // (velocity.x, velocity.y, 0, 0). A colour attachment output is a
     // vec4; the target is two channels, so the last two are shape, not
     // information, and the format discards them.
-    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(idMx); body.push_back(idMy); body.push_back(idConstZero); body.push_back(idConstZero);
+    // ---- TRUE DEPTH, SO NEARNESS STOPS BEING INFERRED FROM THE FLOW.
+    //
+    // The residual tail was attributed to geometry about 0.2 m from the lens,
+    // via d = sx*t/flow_ndc. That distance is computed FROM the flow, so it
+    // assumes the flow is right - which is the thing under test. If the flow is
+    // wrongly large the inferred distance comes out spuriously small, and the
+    // conclusion "it is near geometry" follows no matter what the truth is. It
+    // is the same circularity as solving depth from the X channel and then
+    // finding X correct.
+    //
+    // currClip.w and prevClip.w ARE the view-space depths, already sitting in
+    // this shader. Writing them in place of the velocity pair routes real depth
+    // through the readback that already works, with no new buffer, no format
+    // handling and no layout transitions on an image X-Plane owns.
+    //
+    // Set TAA_MV_WRITE_DEPTH=1 and the target carries (currDepth, prevDepth).
+    // Then "are the huge-flow pixels actually near?" is answered by measurement
+    // instead of by assuming the answer.
+    static const bool writeDepth = getenv("TAA_MV_WRITE_DEPTH") != nullptr;
+    const uint32_t idCh0 = writeDepth ? idCw : idMx;
+    const uint32_t idCh1 = writeDepth ? idPw : idMy;
+    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(idCh0); body.push_back(idCh1); body.push_back(idConstZero); body.push_back(idConstZero);
     body.push_back(head(OpStore, 3)); body.push_back(idOutMV); body.push_back(idResult);
 
     out.clear();
