@@ -157,6 +157,12 @@ struct Snapshot {
     int32_t  bodyReprojValid;
     float    camBodyDrift, camGap;
     int32_t  selfTestPhase;
+    // Which view the frame was drawn from. The residual is measured per frame
+    // and reported as one number; without this there is no way to tell a
+    // cockpit frame from an external one after the fact, and the two behave
+    // completely differently - a capture showed 0.006 px with the aeroplane
+    // small in frame and 300.020 px with it filling the frame.
+    int32_t  viewType;
     float    selfTestExpectedPx;
     int32_t  reverseZ, historyReset, resetReason;
     int32_t  viewportW, viewportH;
@@ -193,6 +199,7 @@ static bool snapshot(Snapshot *o)
         o->camBodyDrift    = g_share->camBodyDrift;
         o->camGap          = g_share->camGap;
         o->selfTestPhase      = g_share->selfTestPhase;
+        o->viewType           = g_share->viewType;
         o->selfTestExpectedPx = g_share->selfTestExpectedPx;
         o->reverseZ      = g_share->reverseZ;
         o->historyReset  = g_share->historyReset;
@@ -3598,7 +3605,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                     mvRecordReadback(rdi->second, cb, g_lastPushed,
                                      g_velSnap.selfTestExpectedPx,
                                      g_velSnap.selfTestPhase, g_velSnap.frame,
-                                     g_velSnap.nearClip, g_velSnap.proj);
+                                     g_velSnap.nearClip, g_velSnap.proj,
+                                     g_velSnap.viewType);
 
             }
         }
@@ -4805,8 +4813,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 // would mean the plugin's world matrices are expressed in a
                 // frame that travels with the aircraft - or it is being lost
                 // between the recovery and the matrix.
+                // ---- FIRE IN EVERY VIEW, NOT ONLY DURING THE SELF-TEST.
+                //
+                // These were gated on a self-test phase, so the one case that is
+                // now known to be broken - an EXTERNAL view, which happens with
+                // the test finished and the phase back at 0 - produced no
+                // diagnostics at all. The residual reads 333 px there against
+                // 0.003 px in the cockpit, on a PARKED aeroplane, so the fault
+                // is in the camera path and these are the numbers that describe
+                // it.
                 const bool rotating = (stPhase >= 3 && stPhase <= 5);
-                if (stPhase >= 1 && (frames % 20) == 0 && g_mv.w) {
+                if ((frames % 20) == 0 && g_mv.w) {
                     double tr = 0.0;
                     for (int c = 0; c < 3; ++c)
                         for (int rr = 0; rr < 3; ++rr)
@@ -4854,11 +4871,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                     // lengths agreeing tells us nothing about direction: a
                     // rotation preserves length, so |t| = |dC| holds for every
                     // wrong rotation as well as the right one.
-                    trace("MV DELTA: phase=%d camera moved %.4f m between these "
+                    trace("MV DELTA: view=%d phase=%d camera moved %.4f m between these "
                           "two frames; the same delta in previous-camera axes is "
                           "%.4f m | dC=(%+.4f, %+.4f, %+.4f) t=(%+.4f, %+.4f, "
                           "%+.4f) | cam=(%.2f, %.2f, %.2f)",
-                          stPhase, dcLen, tcam, dx, dy, dz,
+                          fresh.viewType, stPhase, dcLen, tcam, dx, dy, dz,
                           (double)relRot[12], (double)relRot[13], (double)relRot[14],
                           ccx, ccy, ccz);
                     trace("MV ANGLE: same two matrices - trace says %.3f px, "

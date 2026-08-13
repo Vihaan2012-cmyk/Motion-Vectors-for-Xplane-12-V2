@@ -82,6 +82,7 @@ struct MvTarget {
     // varies while the field does means the two still are not the same frame.
     // Printing both ids says so outright instead of leaving it to be inferred.
     uint64_t       dumpShareFrame = 0;
+    int32_t        dumpViewType = 0;
     float          dumpNearClip   = 0.0f;
     // The projection, so the depth convention can be READ rather than assumed.
     float          dumpProj[16] = {0};
@@ -255,7 +256,7 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
 static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
                              const float *reproj, float expectedPx, int phase,
                              uint64_t shareFrame, float nearClip,
-                             const float *proj)
+                             const float *proj, int viewType)
 {
     MvTarget &m = g_mv;
     if (!m.ready || !m.readbackPtr || !m.wantDump) return;
@@ -265,6 +266,7 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
     m.dumpExpectedPx = expectedPx;
     m.dumpPhase      = phase;
     m.dumpShareFrame = shareFrame;
+    m.dumpViewType   = viewType;
     m.dumpNearClip   = nearClip;
     if (proj) memcpy(m.dumpProj, proj, sizeof(m.dumpProj));
 
@@ -818,13 +820,13 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                 g_share->mvResidualP95MilliPx = (uint32_t)p;
             }
         }
-        trace("MV EPI: phase=%d | distance from the measured previous position "
+        trace("MV EPI: view=%d phase=%d | distance from the measured previous position "
               "to the epipolar line, median per sign convention: %s=%.3f "
               "%s=%.3f %s=%.3f %s=%.3f px | best=%s p95=%.3f px | median line "
               "length=%.2f px over %llu of %llu samples (a short line means the "
               "frame is nearly a pure rotation, where depth cannot be recovered "
               "and the residual reduces to the fixed-depth comparison)",
-              m.dumpPhase,
+              m.dumpViewType, m.dumpPhase,
               kConv[0], mr[0], kConv[1], mr[1], kConv[2], mr[2], kConv[3], mr[3],
               bestC >= 0 ? kConv[bestC] : "none", r95, medD,
               (unsigned long long)solvedD.size(), (unsigned long long)n);

@@ -174,10 +174,21 @@ enum {
     // camera while the aircraft sits parked with the brake on, so the whole
     // suite verified rotation and a camera slide and nothing else.
     TAA_ST_FLY,
+    // ---- EXTERNAL VIEW, AIRCRAFT PARKED.
+    //
+    // Isolates one variable. A capture showed 0.006 px with the aeroplane small
+    // in frame and 300.020 px with it filling the frame, which says the
+    // aircraft's own surfaces reproject wrongly - but "external camera" and
+    // "aircraft is a moving object" were confounded in every frame that showed
+    // it. Parked and external separates them: if the residual is clean here,
+    // the external camera path is fine and the fault is the aircraft moving; if
+    // it is broken here, the camera path itself is wrong.
+    TAA_ST_EXTERNAL,
     TAA_ST_DONE
 };
 
 static int      g_stPhase      = TAA_ST_OFF;
+static bool     g_stPhaseWasExternal = false;
 static int      g_stFrame      = 0;
 static bool     g_stActive     = false;   // we hold the camera
 static bool     g_stRequested  = false;
@@ -1890,6 +1901,12 @@ static int taaSelfTestCamera(XPLMCameraPosition_t *pos, int losingControl, void 
         break;
     }
 
+    case TAA_ST_EXTERNAL:
+        // Camera released to X-Plane, exactly as in FLY - the point is to
+        // measure X-Plane's own external camera, not a scripted imitation of
+        // one.
+        return 0;
+
     case TAA_ST_FLY:
         // ---- THE CAMERA IS LEFT ALONE HERE, ON PURPOSE.
         //
@@ -1921,6 +1938,7 @@ static const char *taaSelfTestName(int p)
     case TAA_ST_TRANSLATE: return "TRANSLATE";
     case TAA_ST_HEADMOVE:  return "HEADMOVE";
     case TAA_ST_FLY:       return "FLY";
+    case TAA_ST_EXTERNAL:  return "EXTERNAL";
     case TAA_ST_DONE:      return "DONE";
     }
     return "OFF";
@@ -2464,6 +2482,21 @@ static float matrixCallback(float sinceLast, float, int, void *)
                 static float savedBrake = -1.0f, savedThrottle = -1.0f;
                 XPLMDataRef drBrake = XPLMFindDataRef("sim/flightmodel/controls/parkbrake");
                 XPLMDataRef drThr   = XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all");
+                // The external phase asks the sim to circle the aircraft, and
+                // hands the view back afterwards. Commands rather than datarefs:
+                // the view type dataref is read-only in X-Plane 12.
+                if (g_stPhase == TAA_ST_EXTERNAL) {
+                    if (XPLMCommandRef c = XPLMFindCommand("sim/view/circle"))
+                        XPLMCommandOnce(c);
+                    xlog("self-test: phase EXTERNAL - circling view, aircraft "
+                         "parked. This separates the external camera path from "
+                         "the aircraft being a moving object.");
+                } else if (g_stPhaseWasExternal) {
+                    if (XPLMCommandRef c = XPLMFindCommand("sim/view/3d_cockpit_cmnd_look"))
+                        XPLMCommandOnce(c);
+                }
+                g_stPhaseWasExternal = (g_stPhase == TAA_ST_EXTERNAL);
+
                 if (g_stPhase == TAA_ST_FLY) {
                     if (drBrake && savedBrake < 0.0f) {
                         savedBrake = XPLMGetDataf(drBrake);
