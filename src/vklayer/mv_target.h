@@ -94,15 +94,39 @@ static MvTarget g_mv;
 static const int g_dumpDelay = getenv("TAA_MV_DUMP_DELAY")
                              ? atoi(getenv("TAA_MV_DUMP_DELAY")) : 8;
 // .xy velocity in UV units. Two channels is all a velocity buffer carries -
-static const VkFormat kMvFormat = VK_FORMAT_R16G16_SFLOAT;
+// ---- FOUR CHANNELS IN DEBUG MODE, SO DEPTH AND VELOCITY ARRIVE TOGETHER.
+//
+// The residual tail survived every explanation that acted through depth,
+// translation, the matrix or the camera, and the denominator test finally
+// showed prev.w correct to 0.1% on every band including the worst one. prev.w
+// consumes the same clip inputs and the same pushed matrix as the numerator
+// rows, so if it is right on a band the inputs and the matrix are right on that
+// band, and no other row of that matrix can be wrong there.
+//
+// That points at the epipolar residual itself. It is a perpendicular distance
+// to an epipolar line, which is ill-conditioned near the focus of expansion and
+// degenerate under near-pure rotation - so a few pixels can throw enormous
+// values into a MEAN while the median stays at 0.000 px, which is exactly what
+// every run has reported.
+//
+// Settling it needs the flow predicted from MEASURED depth rather than from the
+// epipolar construction, and that needs depth and velocity in the same frame.
+// This target is ours, so widening it to RGBA16F under TAA_MV_RGBA costs
+// nothing in the shipping path and gives (vx, vy, currDepth, prevDepth).
+static bool mvWantRGBA()
+{
+    static const bool v = getenv("TAA_MV_RGBA") != nullptr;
+    return v;
+}
+#define kMvFormat (mvWantRGBA() ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R16G16_SFLOAT)
 
 // DERIVED, never restated. The readback size and the index stride both have to
 // track kMvFormat, and the comment below used to say so while the numbers said
 // otherwise: the format went back to RG16F and these stayed at RGBA16F values.
 // The result measured as exactly 50% zeros and hundreds of pixels of motion on
 // a camera that had not moved - every read landing on the wrong pixel.
-static const uint32_t kMvHalves = 2;                 // R16G16 = two halves
-static const uint32_t kMvBytes  = kMvHalves * 2;     // ...four bytes
+#define kMvHalves (mvWantRGBA() ? 4u : 2u)           // R16G16 = two halves
+#define kMvBytes  (kMvHalves * 2u)                   // ...four bytes
 
 static void mvDestroy(DeviceData &dd)
 {

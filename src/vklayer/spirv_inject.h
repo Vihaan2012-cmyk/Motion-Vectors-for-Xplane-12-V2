@@ -1025,9 +1025,15 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // Then "are the huge-flow pixels actually near?" is answered by measurement
     // instead of by assuming the answer.
     static const bool writeDepth = getenv("TAA_MV_WRITE_DEPTH") != nullptr;
+    static const bool wantRGBA   = getenv("TAA_MV_RGBA") != nullptr;
     const uint32_t idCh0 = writeDepth ? idCw : idMx;
     const uint32_t idCh1 = writeDepth ? idPw : idMy;
-    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(idCh0); body.push_back(idCh1); body.push_back(idConstZero); body.push_back(idConstZero);
+    // In RGBA mode both arrive together: velocity in xy, depths in zw, so the
+    // flow can be predicted from measured depth instead of from an epipolar
+    // line that degenerates near the focus of expansion.
+    const uint32_t idCh2 = wantRGBA ? idCw : idConstZero;
+    const uint32_t idCh3 = wantRGBA ? idPw : idConstZero;
+    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(idCh0); body.push_back(idCh1); body.push_back(idCh2); body.push_back(idCh3);
     body.push_back(head(OpStore, 3)); body.push_back(idOutMV); body.push_back(idResult);
 
     out.clear();

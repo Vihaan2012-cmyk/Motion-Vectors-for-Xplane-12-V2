@@ -7286,8 +7286,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             mvBlend.blendEnable    = VK_FALSE;   // a velocity is replaced, never blended
             // R and G only. The target is two channels, so enabling B would
             // name a component the attachment does not have.
-            mvBlend.colorWriteMask = fragPatched
-                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT) : 0;
+            //
+            // Under TAA_MV_RGBA the attachment IS four channels and the shader
+            // writes depths into zw. The mask has to open or they are dropped
+            // silently - which is exactly what happened on the first exact-mode
+            // run: coverage 99.7%, no image failures, the report printed its
+            // header, and every depth read back as zero because B and A were
+            // masked off downstream of a shader that wrote them correctly.
+            const VkColorComponentFlags mvMaskOn = mvWantRGBA()
+                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
+                : (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT);
+            mvBlend.colorWriteMask = fragPatched ? mvMaskOn : 0;
             blendAtt[i].push_back(mvBlend);
 
             blends[i] = *sb;

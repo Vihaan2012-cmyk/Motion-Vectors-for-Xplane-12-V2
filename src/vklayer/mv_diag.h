@@ -255,6 +255,105 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
         }
     }
 
+    // ---- EXACT MODE: predict the flow from MEASURED depth.
+    //
+    // Every residual number in this project comes from an epipolar construction:
+    // the perpendicular distance from the measured previous position to the
+    // epipolar line. That is depth-free, which is why it was built, but it is
+    // ill-conditioned near the focus of expansion and degenerate under near-pure
+    // rotation, so a handful of pixels can throw enormous values into a MEAN
+    // while the median sits at 0.000 px. Every run has reported exactly that
+    // shape, and the tail was read as a defect for many commits.
+    //
+    // With TAA_MV_RGBA the target carries (vx, vy, currDepth, prevDepth), so the
+    // flow can be predicted outright. Given NDC (u,v) and view depth d, the clip
+    // coordinates are (u*d, v*d, d, 1), and
+    //
+    //     prev = M * (u*d, v*d, d, 1),   prevNDC = prev.xy / prev.w
+    //
+    // is the whole answer with no line, no epipole and no depth solved from the
+    // number under test. The error printed here is in pixels, directly
+    // comparable with the flow beside it.
+    if (getenv("TAA_MV_RGBA") && in.halves >= 4) {
+        const double hw = in.w * 0.5, hh = in.h * 0.5;
+        const int kEB = 6;
+        const double eEdge[6] = { 1.0, 4.0, 16.0, 64.0, 256.0, 1e30 };
+        double eSum[6]; uint64_t eN[6];
+        for (int b = 0; b < 6; ++b) { eSum[b]=0.0; eN[b]=0; }
+        double rowESum[8]; uint64_t rowEN[8]; double rowEMax[8];
+        for (int b = 0; b < 8; ++b) { rowESum[b]=0.0; rowEN[b]=0; rowEMax[b]=0.0; }
+        uint64_t nOver1 = 0, nTot = 0;
+        std::vector<double> errAll;
+        for (uint32_t y = 0; y < in.h; y += 4) {
+            for (uint32_t x = 0; x < in.w; x += 4) {
+                const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                const double vx = velHalfToFloat(in.px[i2]);
+                const double vy = velHalfToFloat(in.px[i2 + 1]);
+                const double d  = velHalfToFloat(in.px[i2 + 2]);
+                if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                const double vTop = ((y + 0.5) / (double)in.h) * 2.0 - 1.0;
+                const double xc = u * d, yc = vTop * d;
+                const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
+                const double ny = M[1]*xc + M[5]*yc + M[9]*d + M[13];
+                const double nw = M[3]*xc + M[7]*yc + M[11]*d + M[15];
+                if (fabs(nw) < 1e-9) continue;
+                const double pu = nx / nw, pv = ny / nw;
+                // The field stores (prev - curr) in UV, scaled by 0.5.
+                const double predX = (pu - u)    * 0.5;
+                const double predY = (pv - vTop) * 0.5;
+                const double ex = (vx - predX) * 2.0 * hw;
+                const double ey = (vy - predY) * 2.0 * hh;
+                const double err = sqrt(ex*ex + ey*ey);
+                const double spd = sqrt(vx*vx + vy*vy) * 2.0 * hw;
+                ++nTot; if (err > 1.0) ++nOver1;
+                errAll.push_back(err);
+                for (int b = 0; b < kEB; ++b)
+                    if (spd < eEdge[b]) { eSum[b] += err; ++eN[b]; break; }
+                const int rb = (int)((double)y / (double)in.h * 8.0);
+                if (rb >= 0 && rb < 8) {
+                    rowESum[rb] += err; ++rowEN[rb];
+                    if (err > rowEMax[rb]) rowEMax[rb] = err;
+                }
+            }
+        }
+        double med = -1.0, p95 = -1.0, p999 = -1.0;
+        if (!errAll.empty()) {
+            std::sort(errAll.begin(), errAll.end());
+            med  = errAll[errAll.size() / 2];
+            p95  = errAll[(size_t)(errAll.size() * 0.95)];
+            p999 = errAll[(size_t)(errAll.size() * 0.999)];
+        }
+        fprintf(f, "EXACT MODE - flow predicted from MEASURED depth, no epipolar line\n");
+        fprintf(f, "view=%d  %ux%u  samples %llu\n\n",
+                in.viewType, in.w, in.h, (unsigned long long)nTot);
+        fprintf(f, "ERROR AGAINST EXACT PREDICTION (pixels)\n");
+        fprintf(f, "  median            %10.4f px\n", med);
+        fprintf(f, "  95th percentile   %10.4f px\n", p95);
+        fprintf(f, "  99.9th percentile %10.4f px\n", p999);
+        fprintf(f, "  beyond 1 px       %llu of %llu  (%.2f%%)\n\n",
+                (unsigned long long)nOver1, (unsigned long long)nTot,
+                nTot ? 100.0 * nOver1 / (double)nTot : 0.0);
+        fprintf(f, "ERROR BY MEASURED SPEED\n");
+        const char *elbl[6] = { "under 1 px", "1-4 px", "4-16 px", "16-64 px",
+                                "64-256 px", "over 256 px" };
+        for (int b = 0; b < kEB; ++b)
+            fprintf(f, "  %-12s mean error %10.4f px   n=%llu\n", elbl[b],
+                    eN[b] ? eSum[b] / (double)eN[b] : -1.0,
+                    (unsigned long long)eN[b]);
+        fprintf(f, "\nERROR BY SCREEN ROW (top to bottom, eighths)\n");
+        for (int b = 0; b < 8; ++b)
+            fprintf(f, "  rows %4u-%4u  mean %10.4f px   worst %10.2f px   n=%llu\n",
+                    (unsigned)(in.h * b / 8), (unsigned)(in.h * (b + 1) / 8 - 1),
+                    rowEN[b] ? rowESum[b] / (double)rowEN[b] : -1.0,
+                    rowEN[b] ? rowEMax[b] : -1.0,
+                    (unsigned long long)rowEN[b]);
+        fprintf(f, "\n  The epipolar metric called rows 1890-2159 174 px wrong.\n");
+        fprintf(f, "  If this says otherwise, the metric was the defect.\n");
+        fclose(f);
+        return;
+    }
+
     // ---- DEPTH MODE: measure nearness instead of inferring it from the flow.
     //
     // With TAA_MV_WRITE_DEPTH the shader writes (currClip.w, prevClip.w), the
