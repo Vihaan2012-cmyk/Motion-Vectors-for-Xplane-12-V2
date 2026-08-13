@@ -55,8 +55,10 @@ rem set "TAA_RESOLVE=1"
 
 
 
-rem set "TAA_FORCE_EXTERNAL=1"
-set "TAA_SELFTEST=1"
+
+set "TAA_MV_IMAGE=C:/Users/bansa/AppData/Local/Temp/mvimg"
+set "TAA_EXT_TEST=1"
+rem set "TAA_SELFTEST=1"
 
 rem Experiment switches are passed THROUGH this script, not set in it. setlocal
 rem scopes what is set here, but variables already in the environment survive -

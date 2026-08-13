@@ -2259,6 +2259,12 @@ static uint32_t g_mvBindsThisFrame = 0;
 // from attachment counts. -1 means no qualifying pass is open.
 static int      g_mvPassOrdinal = -1;
 static uint64_t g_mvPassDraws[16] = {0};
+// Per-FRAME geometry binds per qualifying pass, and the ordinal chosen from the
+// previous frame's counts. The lifetime totals above answer "which pass draws
+// the world overall"; this answers it for the view being rendered right now,
+// which is the question that matters when the view can change.
+static uint64_t g_mvPassDrawsFrame[16] = {0};
+static long     g_mvSceneOrdinal = 1;
 static uint32_t g_mvQualifyThisFrame = 0;
 // THE MATRIX ACTUALLY PUSHED, kept so the dump can compare against it.
 //
@@ -2928,8 +2934,32 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
     // injection dead for a whole session in this project: the code was right
     // and nothing set the variable. TAA_MV_PASS overrides, and -1 restores
     // binding every qualifying pass so the census can be re-run.
-    static const long onlyPass = getenv("TAA_MV_PASS")
-                               ? atol(getenv("TAA_MV_PASS")) : 1;
+    // ---- THE WORLD PASS IS FOUND, NOT PINNED.
+    //
+    // This was pinned to qualifying-pass ordinal 1, a number measured once by a
+    // census taken in the COCKPIT. Pass ordinals are counted per frame in
+    // submission order, and an external view composes its frame differently -
+    // there is no 3D cockpit pass - so ordinal 1 there is a different pass
+    // entirely. The world pass then never receives the velocity attachment, the
+    // target keeps its cleared zeros, and the field reports no motion at all.
+    //
+    // Measured: in the cockpit the field is accurate to 0.00002 of each pixel's
+    // own motion; in an external view the residual is 89 to 783 px with NO pixel
+    // carrying even one pixel of measured flow. That is not a wrong
+    // reprojection - it is an absent one.
+    //
+    // So identify the pass by what it is. The world pass is the one that draws
+    // the overwhelming majority of the geometry - the census that produced the
+    // "1" showed it carrying two orders of magnitude more binds than any other
+    // ([1]=57132 against [2]=540). That property holds in every view; the
+    // ordinal does not.
+    //
+    // The choice uses the PREVIOUS frame's counts, because the current frame's
+    // are still being accumulated when the first pass has to be decided. Passes
+    // are stable frame to frame, so a one-frame-old census is the right answer
+    // for this frame.
+    long onlyPass = g_mvSceneOrdinal;
+    if (const char *e = getenv("TAA_MV_PASS")) onlyPass = atol(e);
 
     // The ordinal counts every QUALIFYING pass, whether or not it ends up
     // bound - otherwise pinning to one pass would renumber the very thing being
@@ -5466,6 +5496,52 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         if (off) trace("MV PASS CENSUS: geometry binds per qualifying pass -%s", line);
     }
 
+    // ---- CHOOSE THE WORLD PASS FROM THE FRAME JUST FINISHED.
+    //
+    // The world pass is whichever qualifying pass drew the most geometry. That
+    // property is what makes it the world pass, and it holds in the cockpit, in
+    // an external view, and in whatever X-Plane does next - unlike the fixed
+    // ordinal it replaces, which was measured once in the cockpit and silently
+    // selected the wrong pass everywhere else.
+    //
+    // Only switch on a clear majority. A pass that merely edges ahead on one
+    // frame would make the choice oscillate, and alternating which pass owns
+    // the velocity target is worse than picking the wrong one consistently.
+    {
+        int best = -1; uint64_t bestN = 0, total = 0;
+        for (int i = 0; i < 16; ++i) {
+            total += g_mvPassDrawsFrame[i];
+            if (g_mvPassDrawsFrame[i] > bestN) { bestN = g_mvPassDrawsFrame[i]; best = i; }
+        }
+        // Print the distribution periodically whether or not it changes. The
+        // silent version could not distinguish "the chosen pass is already
+        // right" from "the census never ran", and those need opposite fixes.
+        static uint64_t nCensus = 0;
+        if ((++nCensus % 300) == 1) {
+            char b[256]; b[0] = 0;
+            for (int i = 0; i < 16; ++i) {
+                if (!g_mvPassDrawsFrame[i]) continue;
+                char one[48];
+                snprintf(one, sizeof(one), "[%d]=%llu ", i,
+                         (unsigned long long)g_mvPassDrawsFrame[i]);
+                if (strlen(b) + strlen(one) < sizeof(b) - 1) strcat(b, one);
+            }
+            trace("MV PASS SHARE: view=%d | geometry binds this frame per "
+                  "qualifying pass: %s| currently bound: ordinal %ld",
+                  g_velSnap.viewType, b, g_mvSceneOrdinal);
+        }
+        if (best >= 0 && total > 0 && bestN * 2 > total && best != g_mvSceneOrdinal) {
+            trace("MV SCENE PASS: now ordinal %d (%llu of %llu geometry binds "
+                  "this frame). Chosen by geometry share rather than pinned - a "
+                  "fixed ordinal measured in the cockpit selects the wrong pass "
+                  "in other views, and the velocity target then keeps its "
+                  "cleared zeros.",
+                  best, (unsigned long long)bestN, (unsigned long long)total);
+            g_mvSceneOrdinal = best;
+        }
+        memset(g_mvPassDrawsFrame, 0, sizeof(g_mvPassDrawsFrame));
+    }
+
     g_mvBindsThisFrame     = 0;
     g_mvQualifyThisFrame   = 0;
     g_pushDistinctThisFrame = 0;
@@ -7666,6 +7742,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // been guessed at and both were wrong.
     if (g_mvPassOrdinal >= 0 && g_mvPassOrdinal < 16 && isGeometry)
         ++g_mvPassDraws[g_mvPassOrdinal];
+        ++g_mvPassDrawsFrame[g_mvPassOrdinal];
 
     // TAA_MV_TESTYAW is gone. It pushed a synthetic clip-to-clip rotation to
     // separate "the matrix is wrong" from "the shader is wrong", and both of

@@ -491,6 +491,11 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // the fraction says whether the FIELD is wrong. A large absolute with a tiny
     // fraction is extreme parallax, not a defect.
     std::vector<float> residFrac;
+    // Per-pixel residual, kept for an image. A picture distinguishes "the
+    // aircraft is wrong" from "the scenery is wrong" in one look, and no
+    // percentile can.
+    const uint32_t riw = m.w / 4 + 1;
+    std::vector<float> residImg((size_t)riw * (m.h / 4 + 1), -1.0f);
     // ---- WHERE THE FIELD PUTS THE FOCUS OF EXPANSION.
     //
     // Under pure forward translation every flow vector points along a line
@@ -609,6 +614,10 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                             // Below a pixel of motion the fraction is dominated
                             // by its own denominator and says nothing.
                             if (fl > 1.0) residFrac.push_back((float)(r / fl));
+                    {
+                        const size_t ri = (size_t)(y / 4) * riw + (x / 4);
+                        if (ri < residImg.size()) residImg[ri] = (float)r;
+                    }
                             if (fl > 1.0) {
                                 const double nx = -fym / fl, ny = fxm / fl;
                                 const double pu = u * hw, pv = v * hh;
@@ -848,7 +857,37 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                 std::nth_element(residFrac.begin(), residFrac.begin() + k, residFrac.end());
                 fmed = (double)residFrac[k];
             }
-            trace("MV RELATIVE: view=%d phase=%d | median residual as a FRACTION "
+            if (const char *dir = getenv("TAA_MV_IMAGE")) {
+            static int nImg = 0;
+            if (nImg < 3) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/resid_%d.ppm", dir, nImg);
+                if (FILE *f = fopen(path, "wb")) {
+                    const uint32_t ow = m.w / 4, oh = m.h / 4;
+                    fprintf(f, "P6%c%u %u%c255%c", 10, ow, oh, 10, 10);
+                    std::vector<unsigned char> row(ow * 3);
+                    for (uint32_t yy = 0; yy < oh; ++yy) {
+                        for (uint32_t xx = 0; xx < ow; ++xx) {
+                            const size_t ri = (size_t)yy * riw + xx;
+                            const float rr = (ri < residImg.size()) ? residImg[ri] : -1.0f;
+                            unsigned char R = 0, G = 0, B = 0;
+                            if (rr < 0.0f)      B = 90;
+                            else if (rr <= 1.0f) G = 255;
+                            else { double v = rr / 20.0; if (v > 1.0) v = 1.0;
+                                   R = (unsigned char)(60 + 195.0 * v); }
+                            row[xx*3+0] = R; row[xx*3+1] = G; row[xx*3+2] = B;
+                        }
+                        fwrite(row.data(), 1, row.size(), f);
+                    }
+                    fclose(f);
+                    trace("MV RESID IMAGE: %s - GREEN under 1 px, RED over, BLUE "
+                          "no sample. view=%d phase=%d", path, m.dumpViewType,
+                          m.dumpPhase);
+                    ++nImg;
+                }
+            }
+        }
+        trace("MV RELATIVE: view=%d phase=%d | median residual as a FRACTION "
                   "of each pixel's own motion = %.5f over %llu samples. A large "
                   "absolute error with a small fraction is extreme parallax - a "
                   "camera close to what it is moving past - not a wrong field.",

@@ -2629,43 +2629,50 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // matters was never taken. TAA_FORCE_EXTERNAL asks the sim to circle the
     // aircraft a few seconds after flight starts and leaves it there, which
     // reaches the broken case in about a minute instead of five.
-    // ---- START EXTERNAL AND STAY THERE, MOVING.
+    // ---- A SUSTAINED EXTERNAL TEST, WITHOUT STEERING THE CAMERA.
     //
-    // Two things were wrong with the earlier version. It switched view partway
-    // through the run, so every measurement straddled a discontinuity - prevWorld
-    // describing the old camera and world the new one - and the transition was
-    // confounded with the thing being measured. And it left the camera STATIC,
-    // where external view measures 0.000 px and confirms only the case that
-    // already worked.
+    // Every external claim made today rested on thin data. The self-test's
+    // EXTERNAL phase is ninth and runs kept ending before reaching it, so tables
+    // labelled "per view" contained cockpit rows only - and I read external
+    // conclusions out of them anyway.
     //
-    // So: take the external view on the first flight frame, before anything is
-    // measured, and then keep it orbiting. A moving camera is the whole point -
-    // the error scales as 1/depth, which is the signature of the TRANSLATION
-    // term, and translation is exactly what a still camera does not exercise.
-    if (getenv("TAA_FORCE_EXTERNAL")) {
-        static bool took = false;
-        if (!took) {
-            took = true;
-            if (XPLMCommandRef c = XPLMFindCommand("sim/view/circle")) {
+    // This holds the sim in an external view for the whole run: the view is set
+    // ONCE at flight start, the camera is never steered (the previous version
+    // panned every frame and drove it under the runway), and the aeroplane is
+    // put under power so the chase camera moves because the AIRCRAFT does. That
+    // is the case a user actually flies, and it produces external frames
+    // continuously instead of for a few seconds at the end.
+    if (getenv("TAA_EXT_TEST")) {
+        static int f = 0;
+        ++f;
+        if (f == 120) {
+            if (XPLMCommandRef c = XPLMFindCommand("sim/view/circle"))
                 XPLMCommandOnce(c);
-                xlog("MV: external view taken on the first flight frame, and it "
-                     "will be kept moving. No view change happens mid-run.");
-            }
-        } else {
-            // Orbit continuously. One step per frame keeps dC in the range the
-            // self-test's phase 9 produced (up to 0.23 m per frame) without the
-            // self-test running at all.
-            if (XPLMCommandRef c = XPLMFindCommand("sim/general/right"))
-                XPLMCommandOnce(c);
-            // NOTE: this camera orbits 0.6 m above the ground (cam y 338.33
-            // against a field elevation near 337.7), so the geometry directly
-            // below is centimetres away while the camera moves 0.19 m per
-            // frame. That is the same extreme near-field case found at 0.0.11,
-            // where the TRANSLATE phase read 273 px until the camera was lifted
-            // to 150 m AGL and then read 0.000 px at the SAME rate. Any test
-            // run from here is measuring that, not the reprojection.
+            if (XPLMDataRef d = XPLMFindDataRef("sim/flightmodel/controls/parkbrake"))
+                XPLMSetDataf(d, 0.0f);
+            if (XPLMDataRef d = XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all"))
+                XPLMSetDataf(d, 1.0f);
+            xlog("MV EXT TEST: external view set once, brake off, throttle open. "
+                 "The camera is never steered - it moves because the aeroplane "
+                 "does, which is the case a user actually flies.");
         }
     }
+
+    // ---- REMOVED: the forced external view.
+    //
+    // It issued sim/general/right every frame to keep the camera orbiting, and
+    // it drove the camera straight through the runway. Every measurement taken
+    // with it - including the "external, camera moving, relative error 0.99"
+    // figures just committed - was made with the camera buried in terrain,
+    // where geometry is millimetres away and clipping through the near plane.
+    // That is a degenerate case, not a test of the reprojection.
+    //
+    // It also confounded two earlier runs by switching view mid-session, so
+    // measurements straddled a discontinuity.
+    //
+    // Camera motion in an external view is still the case worth measuring. The
+    // self-test's own EXTERNAL phase does it under control, from a known pose,
+    // without steering the camera into the ground.
 
     // ---- THE WHOLE PROJECTION, INCLUDING THE TERMS NEVER LOOKED AT.
     //
