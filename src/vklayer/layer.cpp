@@ -2655,6 +2655,45 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetViewport(
     // one-line detail with no logging on it.
     //
     // Only the pass we actually jitter gets a vote, and it is stated once.
+    // ---- EVERY DISTINCT VIEWPORT, NOT JUST THE ONE THAT MATCHES.
+    //
+    // The latch below only votes when the viewport equals the render target, so
+    // a pass drawing at a different size into the SAME velocity attachment is
+    // invisible to it - and that is now the leading suspect. With the identity
+    // matrix pushed the field is exactly zero everywhere, so the band is
+    // produced by the matrix; the matrix rebuilds view space with 1/sx and 1/sy
+    // from the published projection; and the band has vx EXACTLY zero with vy
+    // proportional to y, which is what a matching sx and a differing sy do.
+    //
+    // A different viewport height is one way to get a differing sy. This says
+    // whether that is happening rather than leaving it inferred.
+    if (vp && count > 0 && vp[0].height != 0.0f) {
+        struct VpSeen { float w, h; uint64_t n; };
+        static VpSeen seen[8];
+        static int nSeen = 0;
+        bool found = false;
+        for (int i = 0; i < nSeen; ++i)
+            if (seen[i].w == vp[0].width && seen[i].h == vp[0].height) {
+                ++seen[i].n; found = true; break;
+            }
+        if (!found && nSeen < 8) {
+            seen[nSeen].w = vp[0].width;
+            seen[nSeen].h = vp[0].height;
+            seen[nSeen].n = 1;
+            ++nSeen;
+            char buf[512]; buf[0] = 0;
+            for (int i = 0; i < nSeen; ++i) {
+                char one[64];
+                snprintf(one, sizeof(one), "%.0fx%.0f ", seen[i].w, seen[i].h);
+                if (strlen(buf) + strlen(one) < sizeof(buf) - 1) strcat(buf, one);
+            }
+            trace("VIEWPORT CENSUS: %d distinct so far - %s(render target is "
+                  "%ux%u). A height of the opposite sign or a different "
+                  "magnitude means a different sy for those draws.",
+                  nSeen, buf, g_renderW, g_renderH);
+        }
+    }
+
     if (vp && count > 0 && vp[0].height != 0.0f) {
         uint32_t vw = (uint32_t)fabsf(vp[0].width);
         uint32_t vh = (uint32_t)fabsf(vp[0].height);
@@ -4871,6 +4910,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                     // lengths agreeing tells us nothing about direction: a
                     // rotation preserves length, so |t| = |dC| holds for every
                     // wrong rotation as well as the right one.
+                    // ---- THE TWO PROJECTIONS, SIDE BY SIDE.
+                    //
+                    // M = prevProj * relRot * clipToView, and clipToView[5] is
+                    // 1/proj[5] from THIS frame while prevProj is LAST frame's.
+                    // So M[5] = prevProj[5]/proj[5], and if those disagree the
+                    // result is prev.y = (that ratio) * curr.y - a Y-only scale
+                    // with vx exactly zero, which is the measured signature of
+                    // the band down to the sign.
+                    trace("MV PROJ: view=%d | proj[0]=%.5f proj[5]=%.5f | "
+                          "prevProj[0]=%.5f prevProj[5]=%.5f | M[5] would be "
+                          "%.5f (1.0 means they agree)",
+                          fresh.viewType, (double)fresh.proj[0], (double)fresh.proj[5],
+                          (double)prevProjSaved[0], (double)prevProjSaved[5],
+                          fresh.proj[5] != 0.0f
+                              ? (double)prevProjSaved[5] / (double)fresh.proj[5]
+                              : 0.0);
                     trace("MV DELTA: view=%d phase=%d camera moved %.4f m between these "
                           "two frames; the same delta in previous-camera axes is "
                           "%.4f m | dC=(%+.4f, %+.4f, %+.4f) t=(%+.4f, %+.4f, "
