@@ -943,7 +943,6 @@ static VkImageLayout g_sceneDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "mv_target.h"
 #include "spirv_inject.h"
-#include "taa_resolve.h"
 
 
 // FSR2 is optional at BUILD time as well as run time. Its static library takes
@@ -3601,41 +3600,6 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                                      g_velSnap.selfTestPhase, g_velSnap.frame,
                                      g_velSnap.nearClip, g_velSnap.proj);
 
-                // ---- THE RESOLVE, AT THE SAME BOUNDARY.
-                //
-                // Recorded here for the same reason the readback is: this point
-                // is after every scene pass by construction. Running earlier
-                // would resolve a half-drawn frame, which reads as a broken
-                // history rather than as a mistimed pass - a distinction that
-                // has cost this project several rounds elsewhere.
-                //
-                // Off unless TAA_RESOLVE is set. The velocity field is the
-                // product; this is its first consumer and it changes what the
-                // user sees, so it does not turn itself on.
-                if (rdi != g_devices.end() && g_mv.ready && taaEnabled()
-                    && g_sceneColor.image && g_sceneColor.w && g_sceneColor.h) {
-                    DeviceData &rdd = rdi->second;
-                    if (taaInit(rdd, rdd.phys, g_sceneColor.w, g_sceneColor.h)) {
-                        VkImageView sv = taaSceneView(rdd, g_sceneColor.image,
-                                                      g_sceneColor.format);
-                        // historyReset is the plugin's statement that the camera
-                        // cut - a view change, a teleport - and that no history
-                        // from before it describes this frame.
-                        if (!taaRecordResolve(rdd, cb, g_sceneColor.image, sv,
-                                              g_mv.view,
-                                              g_velSnap.historyReset != 0)) {
-                            static bool said = false;
-                            if (!said) {
-                                said = true;
-                                trace("TAA: the resolve did NOT record - scene "
-                                      "view %p, velocity view %p. A pass that "
-                                      "silently does not run looks exactly like "
-                                      "one that runs and does nothing.",
-                                      (void*)sv, (void*)g_mv.view);
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -4038,7 +4002,12 @@ static void armLayerOnce()
             // So the two are tied. TAA_JITTER still forces it on for
             // measurement, but the resolve is what arms it in normal use, and
             // neither can be left on without the other by accident.
-            g_jitterArmed = (getenv("TAA_JITTER") != nullptr) || taaEnabled();
+            // TAA is gone, so the condition this was tied to is gone with it.
+            // Jitter alone shifts the sample grid every frame with nothing
+            // accumulating the result, which makes high-contrast edges crawl -
+            // strictly worse than none. It stays available for measurement and
+            // off otherwise.
+            g_jitterArmed = (getenv("TAA_JITTER") != nullptr);
             g_jitterViewport = (getenv("TAA_JITTER_VIEWPORT") != nullptr);
             if (const char *nf = getenv("TAA_NEARFIELD_M")) {
                 g_nearFieldM = (float)atof(nf);
@@ -7728,7 +7697,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             // two are tied together because either alone is a downgrade.
             static const float jitterScale = getenv("TAA_JITTER_SCALE")
                                            ? (float)atof(getenv("TAA_JITTER_SCALE"))
-                                           : (taaEnabled() ? 1.0f : 0.0f);
+                                           : 0.0f;
             block[16] =  2.0f * g_velSnap.jitterX * jitterScale / w;
             block[17] = ySign * 2.0f * g_velSnap.jitterY * jitterScale / h;
             if (block[16] != 0.0f || block[17] != 0.0f) ++g_jitterApplied;

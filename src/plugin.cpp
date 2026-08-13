@@ -1439,35 +1439,10 @@ static int   getJitterPhases(void*) { return g_share ? g_share->jitterPhases : 0
 static int   getObjectCount(void*)  { return g_share ? g_share->objectCount : 0; }
 static float getRenderScale(void*)  { return g_share ? g_share->renderScale : 1.0f; }
 
-// ---- TAA: THE SWITCH AND THE ONE KNOB.
-//
-// Held here and published into the shared block each frame, so the layer picks
-// them up on the next frame. Persisted to nothing: this is a rendering choice,
-// and a rendering choice that silently survives a restart is one the user
-// cannot find when they want it gone.
-static int   g_taaEnabled = 0;
-static float g_taaBlend   = 0.10f;
-
-static int   getTaaEnabled(void*)     { return g_taaEnabled; }
-static void  setTaaEnabled(void*, int v) { g_taaEnabled = v ? 1 : 0; }
-static float getTaaBlend(void*)       { return g_taaBlend; }
-static void  setTaaBlend(void*, float v)
-{
-    // Clamped here rather than trusted. 0.01 keeps a hundred frames of history,
-    // which is already far past where ghosting dominates; below that the pass
-    // stops converging at all and reads as a frozen image.
-    if (v < 0.01f) v = 0.01f;
-    if (v > 1.00f) v = 1.00f;
-    g_taaBlend = v;
-}
-static int   getTaaDispatches(void*)  { return g_share ? (int)g_share->taaDispatches : 0; }
-
-// ---- THE QUALITY FIGURES.
-//
-// The residual travels as milli-pixels because the shared block is written by
-// the layer and read here, and a torn float reads as a denormal rather than as
-// a stale number. It comes back out as a float because "0.002 px" is what a
-// person reads, not "2".
+// The residual, out of the shared block. It travels as milli-pixels because
+// that block is written by the layer and read here, and a torn float reads as a
+// denormal rather than as a stale number. It comes back out as a float because
+// "0.002 px" is what a person reads, not "2".
 static float getMvResidual(void*)
     { return g_share ? (float)g_share->mvResidualMilliPx * 0.001f : -1.0f; }
 static float getMvResidualP95(void*)
@@ -1565,12 +1540,6 @@ static void registerDatarefs()
     // error path rather than through Lua, and it quarantined the script and
     // took the whole Lua engine down with it - every other script the user had
     // loaded, for one name in a comment that was never code.
-    XPLMRegisterDataAccessor("taaimpl/taa_enabled", xplmType_Int, 1,
-        getTaaEnabled, setTaaEnabled, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/taa_blend", xplmType_Float, 1,
-        nullptr, nullptr, getTaaBlend, setTaaBlend, 0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/taa_dispatches", xplmType_Int, 0,
-        getTaaDispatches, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
     XPLMRegisterDataAccessor("taaimpl/render_scale", xplmType_Float, 0,
         nullptr, nullptr, getRenderScale, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
@@ -1592,7 +1561,7 @@ static void registerDatarefs()
         getVersionString, nullptr, nullptr, nullptr);
 
     xlog("registered %d datarefs under taaimpl/ (usable from FlyWithLua or any "
-         "script); build %s", 25, MV_VERSION);
+         "script); build %s", 22, MV_VERSION);
 }
 
 static void unregisterDatarefs()
@@ -2619,10 +2588,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
         }
         lastOwnX = ox; lastOwnY = oy; lastOwnZ = oz; haveOwn = true;
     }
-
-    // Published every frame so the panel's switch takes effect on the next one.
-    s->taaEnabledWanted = g_taaEnabled;
-    s->taaBlendMilli    = (uint32_t)(g_taaBlend * 1000.0f);
 
     deriveDepthRange(s);
 
