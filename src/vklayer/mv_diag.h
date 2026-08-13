@@ -87,6 +87,35 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
     // predicts k = 1.
     double   kSum = 0.0; uint64_t kN = 0;
 
+    // ---- HYPOTHESIS 18: WHICH MATRIX DOES THE FIELD ACTUALLY MATCH?
+    //
+    // The surviving description is a direction error on near, fast pixels that
+    // scales with camera translation. That is exactly what a field built from
+    // ROTATION ALONE looks like: far geometry is unaffected because translation
+    // contributes nothing there, and near geometry is wrong by precisely the
+    // translation parallax - measured at about half the flow.
+    //
+    // So stop reading code and ask the pixels. Predict each one three ways and
+    // count which prediction it lands nearest:
+    //
+    //   full        the matrix as pushed
+    //   rotOnly     the same matrix with its translation column zeroed
+    //   transOnly   identity rotation, translation kept
+    //
+    // If near pixels match rotOnly, the translation is not reaching the shader
+    // whatever the matrix contains.
+    float Mrot[16], Mtrans[16];
+    for (int i = 0; i < 16; ++i) { Mrot[i] = M[i]; Mtrans[i] = 0.0f; }
+    Mrot[12] = 0.0f; Mrot[13] = 0.0f; Mrot[14] = 0.0f; Mrot[15] = 0.0f;
+    Mtrans[0] = 1.0f; Mtrans[5] = 1.0f; Mtrans[10] = 1.0f;
+    Mtrans[11] = M[11];
+    Mtrans[12] = M[12]; Mtrans[13] = M[13];
+    Mtrans[14] = M[14]; Mtrans[15] = M[15];
+    uint64_t winFull = 0, winRot = 0, winTrans = 0, winNone = 0;
+    double angSum = 0.0, angAbsSum = 0.0; uint64_t angN = 0;
+    struct Row { uint32_t x, y; double mvxPx, mvyPx, pfxPx, pfyPx, prxPx, pryPx, resid; };
+    std::vector<Row> rows;
+
     for (uint32_t y = 0; y < in.h; y += 4) {
         for (uint32_t x = 0; x < in.w; x += 4) {
             const size_t i = ((size_t)y * in.w + x) * in.halves;
@@ -135,6 +164,67 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
 
             // Hypothesis 17: is the predicted previous position off-screen?
             if (px_ < -1.0 || px_ > 1.0 || py_ < -1.0 || py_ > 1.0) ++nPrevOffScreen;
+
+            // Predicted flow under each of the three matrices, at the depth
+            // the measured motion implies for the FULL matrix. The same depth
+            // is reused for all three so they are compared on one geometry.
+            if (fabs(Aw) > 1e-12) {
+                const double denom = Aw * px_ - Ax;
+                const double dd = (fabs(denom) > 1e-9)
+                                ? ((double)M[12] - px_ * (double)M[15]) / denom
+                                : -1.0;
+                if (dd > 0.01 && dd < 100000.0) {
+                    double fx1, fy1, fx2, fy2, fx3, fy3;
+                    const float *QS[3] = { M, Mrot, Mtrans };
+                    double OX[3], OY[3];
+                    for (int q = 0; q < 3; ++q) {
+                        const float *Q = QS[q];
+                        const double qx = Q[0]*u + Q[4]*vTop + Q[8];
+                        const double qy = Q[1]*u + Q[5]*vTop + Q[9];
+                        const double qw = Q[3]*u + Q[7]*vTop + Q[11];
+                        const double W  = dd * qw + Q[15];
+                        if (fabs(W) < 1e-12) { OX[q] = u; OY[q] = vTop; }
+                        else { OX[q] = (dd * qx + Q[12]) / W;
+                               OY[q] = (dd * qy + Q[13]) / W; }
+                    }
+                    fx1 = OX[0]; fy1 = OY[0];
+                    fx2 = OX[1]; fy2 = OY[1];
+                    fx3 = OX[2]; fy3 = OY[2];
+                    const double e1x = (px_ - fx1) * hw, e1y = (py_ - fy1) * hh;
+                    const double e2x = (px_ - fx2) * hw, e2y = (py_ - fy2) * hh;
+                    const double e3x = (px_ - fx3) * hw, e3y = (py_ - fy3) * hh;
+                    const double e1 = e1x*e1x + e1y*e1y;
+                    const double e2 = e2x*e2x + e2y*e2y;
+                    const double e3 = e3x*e3x + e3y*e3y;
+                    double best3 = e1; if (e2 < best3) best3 = e2; if (e3 < best3) best3 = e3;
+                    if (best3 > 256.0)       ++winNone;
+                    else if (best3 == e1)    ++winFull;
+                    else if (best3 == e2)    ++winRot;
+                    else                     ++winTrans;
+
+                    const double pfx = (fx1 - u) * hw, pfy = (fy1 - vTop) * hh;
+                    const double mfx = mvx * hw,       mfy = mvy * hh;
+                    const double lm = sqrt(mfx*mfx + mfy*mfy);
+                    const double lp = sqrt(pfx*pfx + pfy*pfy);
+                    if (lm > 4.0 && lp > 4.0) {
+                        double cs = (mfx*pfx + mfy*pfy) / (lm * lp);
+                        if (cs >  1.0) cs =  1.0;
+                        if (cs < -1.0) cs = -1.0;
+                        const double sn = (mfx*pfy - mfy*pfx) / (lm * lp);
+                        const double ang = atan2(sn, cs) * 57.29577951308232;
+                        angSum += ang; angAbsSum += fabs(ang); ++angN;
+                    }
+                    if (rows.size() < 24 && resid > 8.0 && (x % 512) < 4) {
+                        Row rw;
+                        rw.x = x; rw.y = y;
+                        rw.mvxPx = mvx * hw;  rw.mvyPx = mvy * hh;
+                        rw.pfxPx = pfx;       rw.pfyPx = pfy;
+                        rw.prxPx = (fx2 - u) * hw; rw.pryPx = (fy2 - vTop) * hh;
+                        rw.resid = resid;
+                        rows.push_back(rw);
+                    }
+                }
+            }
 
             if (resid >= 0.0) {
                 if (resid <= 1.0) ++nGoodPix; else ++nBadPix;
@@ -208,6 +298,38 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                 rowResN[r] ? rowResSum[r] / (double)rowResN[r] : -1.0,
                 (unsigned long long)rowResN[r]);
     fprintf(f, "      a sharp horizontal boundary is screen-space; a gradual one is depth\n\n");
+
+    fprintf(f, "18. WHICH MATRIX DOES THE FIELD MATCH?\n");
+    {
+        const uint64_t tot = winFull + winRot + winTrans + winNone;
+        const uint64_t den = tot ? tot : 1;
+        fprintf(f, "  full matrix      %8llu  (%.1f%%)\n",
+                (unsigned long long)winFull, 100.0 * winFull / den);
+        fprintf(f, "  rotation only    %8llu  (%.1f%%)  <- translation not reaching the shader\n",
+                (unsigned long long)winRot, 100.0 * winRot / den);
+        fprintf(f, "  translation only %8llu  (%.1f%%)\n",
+                (unsigned long long)winTrans, 100.0 * winTrans / den);
+        fprintf(f, "  none within 16px %8llu  (%.1f%%)\n\n",
+                (unsigned long long)winNone, 100.0 * winNone / den);
+    }
+
+    fprintf(f, "ANGLE BETWEEN MEASURED AND PREDICTED FLOW\n");
+    fprintf(f, "  mean signed %+8.3f deg, mean absolute %8.3f deg, n=%llu\n",
+            angN ? angSum / (double)angN : 0.0,
+            angN ? angAbsSum / (double)angN : 0.0, (unsigned long long)angN);
+    fprintf(f, "      a consistent signed angle is a rotation applied somewhere;\n");
+    fprintf(f, "      large absolute with near-zero mean is scatter, not a transform\n\n");
+
+    fprintf(f, "RAW PIXELS (residual over 8 px) - flow in pixels\n");
+    fprintf(f, "  %6s %6s | %9s %9s | %9s %9s | %9s %9s | %8s\n",
+            "x", "y", "meas dx", "meas dy", "full dx", "full dy",
+            "rot dx", "rot dy", "resid");
+    for (size_t i = 0; i < rows.size(); ++i)
+        fprintf(f, "  %6u %6u | %9.2f %9.2f | %9.2f %9.2f | %9.2f %9.2f | %8.2f\n",
+                rows[i].x, rows[i].y, rows[i].mvxPx, rows[i].mvyPx,
+                rows[i].pfxPx, rows[i].pfyPx, rows[i].prxPx, rows[i].pryPx,
+                rows[i].resid);
+    fprintf(f, "\n");
 
     fprintf(f, "D. PASSES\n");
     fprintf(f, "  13 qualifying passes this frame %u, of which bound %u\n",
