@@ -7952,6 +7952,23 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         block[18] = g_nearFieldM;
     g_diagLastBlock18 = block[18];
 
+    // ---- CALIBRATE THE Y ROW: perturb M[5] and watch what the field does.
+    //
+    // The raw pixel rows say the field's X matches the prediction to every
+    // printed digit while its Y behaves as though M[5] were about -0.70, with
+    // 1.00000 pushed. X and Y share the matrix, the input vector and the divide
+    // by prev.w, so the difference is in the Y row alone.
+    //
+    // Reading more code has not settled it. Multiplying M[5] by a known factor
+    // and measuring the response does: if prev.y scales with it the shader
+    // honours the element and the fault is in what we compute; if prev.y does
+    // not move, the element never reaches the multiply and the fault is in the
+    // patch.
+    if (const char *e5 = getenv("TAA_MV_M5")) {
+        static const float k5 = (float)atof(e5);
+        block[5] *= k5;
+    }
+
     // ---- HOW MANY DIFFERENT MATRICES ONE FRAME PUSHES.
     //
     // The identity test proved the field is built from the pushed matrix for

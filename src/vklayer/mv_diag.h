@@ -165,9 +165,22 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
             // Hypothesis 17: is the predicted previous position off-screen?
             if (px_ < -1.0 || px_ > 1.0 || py_ < -1.0 || py_ > 1.0) ++nPrevOffScreen;
 
-            // Predicted flow under each of the three matrices, at the depth
-            // the measured motion implies for the FULL matrix. The same depth
-            // is reused for all three so they are compared on one geometry.
+            // ---- THE DEPTH IS SOLVED FROM X, SO X CANNOT BE A TEST.
+            //
+            // dd below is chosen to make the FULL matrix reproduce the measured
+            // X exactly. Everything predicted with it therefore agrees with the
+            // measurement in X by construction, and the raw rows duly printed
+            // meas dx and full dx equal to every digit - 402480.00 against
+            // 402480.00. That was read as "the X component of the field is
+            // provably correct" and committed as such. It is a tautology.
+            //
+            // The Y column IS a test, because nothing forced it to agree: given
+            // the depth that explains X, does the same depth explain Y? When it
+            // does not, the measured previous position is consistent with no
+            // single depth - which is the same statement the epipolar residual
+            // makes, arrived at from the other side.
+            //
+            // Predicted flow under each of the three matrices, at that depth.
             if (fabs(Aw) > 1e-12) {
                 const double denom = Aw * px_ - Ax;
                 const double dd = (fabs(denom) > 1e-9)

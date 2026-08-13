@@ -57,6 +57,7 @@ rem set "TAA_RESOLVE=1"
 
 
 set "TAA_MV_IMAGE=C:/Users/bansa/AppData/Local/Temp/mvimg"
+set "TAA_MV_M5=2.0"
 set "TAA_MV_DIAG=C:/Users/bansa/AppData/Local/Temp/mvdiag"
 set "TAA_EXT_TEST=1"
 rem set "TAA_SELFTEST=1"
