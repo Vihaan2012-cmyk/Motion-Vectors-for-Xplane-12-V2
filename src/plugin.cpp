@@ -2622,6 +2622,109 @@ static float matrixCallback(float sinceLast, float, int, void *)
         lastOwnX = ox; lastOwnY = oy; lastOwnZ = oz; haveOwn = true;
     }
 
+    // ---- GO STRAIGHT TO THE VIEW BEING INVESTIGATED.
+    //
+    // The external phase sits ninth in the self-test, about 1350 frames in, and
+    // three runs in a row ended at FLY - one phase short - so the reading that
+    // matters was never taken. TAA_FORCE_EXTERNAL asks the sim to circle the
+    // aircraft a few seconds after flight starts and leaves it there, which
+    // reaches the broken case in about a minute instead of five.
+    // ---- START EXTERNAL AND STAY THERE, MOVING.
+    //
+    // Two things were wrong with the earlier version. It switched view partway
+    // through the run, so every measurement straddled a discontinuity - prevWorld
+    // describing the old camera and world the new one - and the transition was
+    // confounded with the thing being measured. And it left the camera STATIC,
+    // where external view measures 0.000 px and confirms only the case that
+    // already worked.
+    //
+    // So: take the external view on the first flight frame, before anything is
+    // measured, and then keep it orbiting. A moving camera is the whole point -
+    // the error scales as 1/depth, which is the signature of the TRANSLATION
+    // term, and translation is exactly what a still camera does not exercise.
+    if (getenv("TAA_FORCE_EXTERNAL")) {
+        static bool took = false;
+        if (!took) {
+            took = true;
+            if (XPLMCommandRef c = XPLMFindCommand("sim/view/circle")) {
+                XPLMCommandOnce(c);
+                xlog("MV: external view taken on the first flight frame, and it "
+                     "will be kept moving. No view change happens mid-run.");
+            }
+        } else {
+            // Orbit continuously. One step per frame keeps dC in the range the
+            // self-test's phase 9 produced (up to 0.23 m per frame) without the
+            // self-test running at all.
+            if (XPLMCommandRef c = XPLMFindCommand("sim/general/right"))
+                XPLMCommandOnce(c);
+            // NOTE: this camera orbits 0.6 m above the ground (cam y 338.33
+            // against a field elevation near 337.7), so the geometry directly
+            // below is centimetres away while the camera moves 0.19 m per
+            // frame. That is the same extreme near-field case found at 0.0.11,
+            // where the TRANSLATE phase read 273 px until the camera was lifted
+            // to 150 m AGL and then read 0.000 px at the SAME rate. Any test
+            // run from here is measuring that, not the reprojection.
+        }
+    }
+
+    // ---- THE WHOLE PROJECTION, INCLUDING THE TERMS NEVER LOOKED AT.
+    //
+    // clipToView is built as diag(1/sx, 1/sy, -1, 1), which ASSUMES a centred
+    // projection - proj[8] and proj[9] zero. Those two have never been logged
+    // once in this project; only [0], [5], [10], [11] and [14] ever were.
+    //
+    // If either is non-zero the view-space reconstruction is wrong, because
+    // x_clip = sx*x_view + proj[8]*z_view and the inverse used here drops the
+    // second term. An off-centre projection is exactly what a view that is not
+    // straight ahead would use.
+    {
+        static int said = 0;
+        if ((++said % 60) == 1)
+            xlog("MV PROJFULL: view=%d | [0]=%.5f [4]=%.5f [8]=%.5f [12]=%.5f | "
+                 "[1]=%.5f [5]=%.5f [9]=%.5f [13]=%.5f | [2]=%.5f [6]=%.5f "
+                 "[10]=%.5f [14]=%.5f | [3]=%.5f [7]=%.5f [11]=%.5f [15]=%.5f",
+                 s->viewType,
+                 s->proj[0], s->proj[4], s->proj[8],  s->proj[12],
+                 s->proj[1], s->proj[5], s->proj[9],  s->proj[13],
+                 s->proj[2], s->proj[6], s->proj[10], s->proj[14],
+                 s->proj[3], s->proj[7], s->proj[11], s->proj[15]);
+    }
+
+    // ---- IS THE RECOVERED CAMERA THE CAMERA X-PLANE RENDERED FROM?
+    //
+    // The reprojection's translation is C_curr - C_prev, and C is recovered from
+    // the world matrix as -R^T t. That recovery has never been checked against
+    // anything; it has only ever been checked against ITSELF, which cannot fail.
+    //
+    // It matters now because the residual image shows the error is
+    // depth-dependent - distant geometry and the aeroplane correct to under a
+    // pixel, the near runway 20 px or worse - which is the signature of a wrong
+    // translation, and a one-frame lag test just ruled out stale pairing
+    // (external unchanged at 358-665 px, cockpit made worse).
+    //
+    // XPLMReadCameraPosition is an independent answer from the sim itself. If
+    // the two disagree the recovery is the bug; if they agree the translation is
+    // right and the fault is downstream of it.
+    {
+        XPLMCameraPosition_t cp;
+        memset(&cp, 0, sizeof(cp));
+        XPLMReadCameraPosition(&cp);
+        const double t0 = (double)s->world[12], t1 = (double)s->world[13], t2 = (double)s->world[14];
+        const double rx = -((double)s->world[0] * t0 + (double)s->world[1] * t1 + (double)s->world[2]  * t2);
+        const double ry = -((double)s->world[4] * t0 + (double)s->world[5] * t1 + (double)s->world[6]  * t2);
+        const double rz = -((double)s->world[8] * t0 + (double)s->world[9] * t1 + (double)s->world[10] * t2);
+        static int every = 0;
+        if ((++every % 20) == 0) {
+            const double dx = rx - (double)cp.x, dy = ry - (double)cp.y, dz = rz - (double)cp.z;
+            xlog("MV CAMCHECK: view=%d | from world_matrix (-R^T t) = (%.3f, "
+                 "%.3f, %.3f) | XPLMReadCameraPosition = (%.3f, %.3f, %.3f) | "
+                 "difference %.4f m (a non-zero difference means the "
+                 "reprojection's translation is built from the wrong camera)",
+                 s->viewType, rx, ry, rz, (double)cp.x, (double)cp.y, (double)cp.z,
+                 sqrt(dx*dx + dy*dy + dz*dz));
+        }
+    }
+
     deriveDepthRange(s);
 
     // The matrix wins any disagreement with the art control: it is what the GPU

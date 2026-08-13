@@ -473,6 +473,24 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     // slides the point along it and leaves the angle at zero. The perpendicular
     // residual cannot tell those apart, and this can.
     std::vector<float> flowAngle;
+    // ---- THE RESIDUAL AS A FRACTION OF THE MOTION, NOT ONLY IN PIXELS.
+    //
+    // An absolute pixel residual is the wrong yardstick once the flow itself is
+    // enormous. An external camera orbiting 0.6 m above the ground moves 0.19 m
+    // per frame, so geometry a few centimetres below it genuinely travels
+    // thousands of pixels between frames - and a field accurate to one percent
+    // then reports tens of pixels of "error" while being entirely fit for use.
+    //
+    // That is what made an external view look broken all session: the same
+    // extreme near-field case that made the TRANSLATE phase read 273 px at
+    // 0.0.11 until the camera was lifted to 150 m AGL, where it read 0.000 px at
+    // the SAME translation rate. Nothing about the reprojection changed - only
+    // how far away the geometry was.
+    //
+    // So report both. Absolute pixels say whether a consumer will see an error;
+    // the fraction says whether the FIELD is wrong. A large absolute with a tiny
+    // fraction is extreme parallax, not a defect.
+    std::vector<float> residFrac;
     // ---- WHERE THE FIELD PUTS THE FOCUS OF EXPANSION.
     //
     // Under pure forward translation every flow vector points along a line
@@ -588,6 +606,9 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                         if (len >= 4.0) {
                             const double fxm = mx - u * hw, fym = my - v * hh;
                             const double fl = sqrt(fxm*fxm + fym*fym);
+                            // Below a pixel of motion the fraction is dominated
+                            // by its own denominator and says nothing.
+                            if (fl > 1.0) residFrac.push_back((float)(r / fl));
                             if (fl > 1.0) {
                                 const double nx = -fym / fl, ny = fxm / fl;
                                 const double pu = u * hw, pv = v * hh;
@@ -819,6 +840,20 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                 if (p > 4.0e9) p = 4.0e9;
                 g_share->mvResidualP95MilliPx = (uint32_t)p;
             }
+        }
+        {
+            double fmed = -1.0;
+            if (!residFrac.empty()) {
+                size_t k = residFrac.size() / 2;
+                std::nth_element(residFrac.begin(), residFrac.begin() + k, residFrac.end());
+                fmed = (double)residFrac[k];
+            }
+            trace("MV RELATIVE: view=%d phase=%d | median residual as a FRACTION "
+                  "of each pixel's own motion = %.5f over %llu samples. A large "
+                  "absolute error with a small fraction is extreme parallax - a "
+                  "camera close to what it is moving past - not a wrong field.",
+                  m.dumpViewType, m.dumpPhase, fmed,
+                  (unsigned long long)residFrac.size());
         }
         trace("MV EPI: view=%d phase=%d | distance from the measured previous position "
               "to the epipolar line, median per sign convention: %s=%.3f "

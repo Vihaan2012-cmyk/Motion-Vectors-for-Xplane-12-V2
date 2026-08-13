@@ -4658,6 +4658,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             // else falls back to the plugin's own pairing, which is correct by
             // construction because the plugin rolls prev into curr every
             // flight loop unconditionally.
+            // ---- ONE-FRAME LAG TEST.
+            //
+            // The residual image says the error is depth-dependent: distant
+            // geometry and the aeroplane are correct to under a pixel, the near
+            // runway is 20 px or worse. That is the signature of a wrong
+            // TRANSLATION - rotation dominates far geometry, translation
+            // dominates near geometry as 1/depth.
+            //
+            // The translation is not missing: t matches dC component by
+            // component. So it may describe the wrong PAIR of frames. X-Plane
+            // runs camera callbacks after flight loops, so world_matrix read in
+            // a flight loop can be one frame behind what is actually rendered -
+            // invisible with a still camera, worth a whole frame of parallax
+            // during an orbit, which is exactly the view that fails.
+            //
+            // TAA_MV_LAG pairs the two OLDER matrices instead. If the residual
+            // collapses, the pairing is the bug and this is the fix.
+            static const int lagFrames = getenv("TAA_MV_LAG")
+                                       ? atoi(getenv("TAA_MV_LAG")) : 0;
+            static float    prevPrevWorldSaved[16], prevPrevProjSaved[16];
+            static bool     havePrevPrev = false;
             static float    prevWorldSaved[16], prevProjSaved[16];
             static uint64_t prevSavedFrame = 0;
             static bool  havePrevFrame = false;
@@ -4731,17 +4752,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 // DOUBLE and differenced there, so the millimetre that survives
                 // is exact rather than the remains of a cancellation.
                 float prevWorldRel[16], prevVPrel[16], r[16];
-                const double ct0 = fresh.world[12], ct1 = fresh.world[13], ct2 = fresh.world[14];
-                const double pt0 = prevWorldSaved[12], pt1 = prevWorldSaved[13], pt2 = prevWorldSaved[14];
-                const double ccx = -((double)fresh.world[0] * ct0 + (double)fresh.world[1] * ct1 + (double)fresh.world[2]  * ct2);
-                const double ccy = -((double)fresh.world[4] * ct0 + (double)fresh.world[5] * ct1 + (double)fresh.world[6]  * ct2);
-                const double ccz = -((double)fresh.world[8] * ct0 + (double)fresh.world[9] * ct1 + (double)fresh.world[10] * ct2);
-                const double ppx = -((double)prevWorldSaved[0] * pt0 + (double)prevWorldSaved[1] * pt1 + (double)prevWorldSaved[2]  * pt2);
-                const double ppy = -((double)prevWorldSaved[4] * pt0 + (double)prevWorldSaved[5] * pt1 + (double)prevWorldSaved[6]  * pt2);
-                const double ppz = -((double)prevWorldSaved[8] * pt0 + (double)prevWorldSaved[9] * pt1 + (double)prevWorldSaved[10] * pt2);
+                // Under the lag test BOTH ends move back a frame, so the pair
+                // stays adjacent. Lagging only the rotation would compare a
+                // rotation from one pair against a translation from another and
+                // measure nothing.
+                const float *curW = (lagFrames && havePrevPrev) ? prevWorldSaved
+                                                                : fresh.world;
+                const float *preW = (lagFrames && havePrevPrev) ? prevPrevWorldSaved
+                                                                : prevWorldSaved;
+                const double ct0 = curW[12], ct1 = curW[13], ct2 = curW[14];
+                const double pt0 = preW[12], pt1 = preW[13], pt2 = preW[14];
+                const double ccx = -((double)curW[0] * ct0 + (double)curW[1] * ct1 + (double)curW[2]  * ct2);
+                const double ccy = -((double)curW[4] * ct0 + (double)curW[5] * ct1 + (double)curW[6]  * ct2);
+                const double ccz = -((double)curW[8] * ct0 + (double)curW[9] * ct1 + (double)curW[10] * ct2);
+                const double ppx = -((double)preW[0] * pt0 + (double)preW[1] * pt1 + (double)preW[2]  * pt2);
+                const double ppy = -((double)preW[4] * pt0 + (double)preW[5] * pt1 + (double)preW[6]  * pt2);
+                const double ppz = -((double)preW[8] * pt0 + (double)preW[9] * pt1 + (double)preW[10] * pt2);
                 const double dx = ccx - ppx, dy = ccy - ppy, dz = ccz - ppz;
 
-                memcpy(prevWorldRel, prevWorldSaved, sizeof(prevWorldRel));
+                memcpy(prevWorldRel, preW, sizeof(prevWorldRel));
                 for (int i = 0; i < 3; ++i)
                     prevWorldRel[12 + i] = (float)((double)prevWorldSaved[0 + i] * dx
                                                  + (double)prevWorldSaved[4 + i] * dy
@@ -4792,7 +4821,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                     for (int rr = 0; rr < 3; ++rr) {
                         double s = 0.0;
                         for (int k = 0; k < 3; ++k)
-                            s += (double)prevWorldSaved[k*4 + rr] * (double)fresh.world[k*4 + c];
+                            s += (double)preW[k*4 + rr] * (double)curW[k*4 + c];
                         relRot[c*4 + rr] = (float)s;      // R_prev * R_curr^T
                     }
                 for (int i = 0; i < 3; ++i)
@@ -4962,6 +4991,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 }
             }
 
+            memcpy(prevPrevWorldSaved, prevWorldSaved, sizeof(prevPrevWorldSaved));
+            memcpy(prevPrevProjSaved,  prevProjSaved,  sizeof(prevPrevProjSaved));
+            havePrevPrev = havePrevFrame;
             memcpy(prevWorldSaved, fresh.world, sizeof(prevWorldSaved));
             memcpy(prevProjSaved,  fresh.proj,  sizeof(prevProjSaved));
             prevSavedFrame = fresh.frame;
@@ -7689,6 +7721,45 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     if (useIdentity) memcpy(block, kIdentity, 64);
     if (useBody) ++g_bodyReprojPushes;
     block[16] = block[17] = block[18] = block[19] = 0.0f;
+
+    // ---- WHAT WE ACTUALLY PUSH.
+    //
+    // Every input is now verified: the projection is centred ([8] and [9]
+    // exactly zero), the camera position matches XPLMReadCameraPosition to
+    // sub-millimetre in both views, the pairing is right (a one-frame lag made
+    // the good case worse and the bad case identical), prevProj equals proj,
+    // and both patched shaders are correct in their disassembly. An identity
+    // matrix produces an exactly zero field.
+    //
+    // Yet a STATIC camera in an external view produces 339 to 681 px. With no
+    // camera motion this matrix must leave x and y alone - its top-left 2x2
+    // should be the identity and its last column zero in x and y. If it is not,
+    // the matrix is wrong despite correct inputs; if it is, the matrix is right
+    // and something between here and the shader changes it.
+    {
+        // Every 600 PUSHES was the wrong gate: there are about 14,000 geometry
+        // binds per frame, so all of it landed in the first two frames - on the
+        // loading screen, before the plugin had published anything - and read as
+        // an all-zero matrix. That is startup state, not a defect.
+        //
+        // Gated on the snapshot being live, and spaced far enough apart to be
+        // sampling steady flight.
+        static uint64_t nlog = 0;
+        // During the failing case specifically: an external view with the
+        // camera actually moving. A static camera in the same view measures
+        // 0.000 px, so a matrix sampled there confirms only the case that
+        // already worked - which is what the first correct reading did.
+        const bool failing = (g_velSnap.viewType != 0 && g_velSnap.viewType != 1026);
+        if (failing && (++nlog % 20000) == 1)
+            trace("MV PUSHED: view=%d | rows 0/1 of the pushed matrix: "
+                  "[0]=%.5f [4]=%.5f [8]=%.5f [12]=%.5f | [1]=%.5f [5]=%.5f "
+                  "[9]=%.5f [13]=%.5f | w row [3]=%.5f [7]=%.5f [11]=%.5f "
+                  "[15]=%.5f (a still camera wants 1,0,0,0 / 0,1,0,0)",
+                  g_velSnap.viewType,
+                  block[0], block[4], block[8],  block[12],
+                  block[1], block[5], block[9],  block[13],
+                  block[3], block[7], block[11], block[15]);
+    }
 
     // ---- JITTER, converted from framebuffer pixels to a clip-space offset.
     //

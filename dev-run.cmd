@@ -52,6 +52,10 @@ rem TAA is now switched from the panel; this only forces it on for debugging.
 rem set "TAA_RESOLVE=1"
 
 
+
+
+
+rem set "TAA_FORCE_EXTERNAL=1"
 set "TAA_SELFTEST=1"
 
 rem Experiment switches are passed THROUGH this script, not set in it. setlocal
