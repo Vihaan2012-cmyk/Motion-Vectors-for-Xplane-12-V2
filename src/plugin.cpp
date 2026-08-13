@@ -2658,6 +2658,53 @@ static float matrixCallback(float sinceLast, float, int, void *)
         }
     }
 
+    // ---- THE RESIDUAL TEST IS ONLY VALID ON STATIC GEOMETRY.
+    //
+    // The epipolar residual is depth-free, which is why it was worth building:
+    // it holds under rotation and translation alike, at any distance. But that
+    // property comes from the geometry being FIXED IN THE WORLD while only the
+    // camera moves. A pixel on something that moves independently has no reason
+    // to lie on the epipolar line, and registers a large residual even when its
+    // motion vector is perfectly correct.
+    //
+    // TAA_EXT_TEST points the camera at the aeroplane and opens the throttle.
+    // So the pixels it measures are largely MOVING geometry - fuselage, gear,
+    // prop disc - and those are near and fast, which is exactly the population
+    // the residual tail has been blamed on all along. The cockpit case, which
+    // reads 0.000-0.017 px, is geometry rigidly attached to the camera.
+    //
+    // So the tail may be the test misapplied rather than a defect in the field.
+    // This separates the two: external view, aeroplane frozen, camera the only
+    // thing that moves. Every pixel is then static world geometry and the
+    // residual is valid everywhere. If it collapses, the field was right and
+    // the tail was mine.
+    //
+    // The camera is oscillated rather than driven one way, and only every third
+    // frame, because a previous version issued sim/general/right every frame
+    // and drove the camera under the runway - measuring millimetre-range
+    // geometry through the near plane and calling it a reprojection error.
+    if (getenv("TAA_EXT_STATIC")) {
+        static int f = 0;
+        ++f;
+        if (f == 120) {
+            if (XPLMCommandRef c = XPLMFindCommand("sim/view/circle"))
+                XPLMCommandOnce(c);
+            if (XPLMDataRef d = XPLMFindDataRef("sim/flightmodel/controls/parkbrake"))
+                XPLMSetDataf(d, 1.0f);
+            if (XPLMDataRef d = XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all"))
+                XPLMSetDataf(d, 0.0f);
+            xlog("MV EXT STATIC: external view, parking brake ON, throttle shut. "
+                 "The aeroplane is frozen, so every pixel is static world "
+                 "geometry and the epipolar residual is valid on all of it.");
+        }
+        if (f > 240 && (f % 3) == 0) {
+            const bool right = ((f / 60) % 2) == 0;
+            if (XPLMCommandRef c = XPLMFindCommand(right ? "sim/general/right"
+                                                         : "sim/general/left"))
+                XPLMCommandOnce(c);
+        }
+    }
+
     // ---- REMOVED: the forced external view.
     //
     // It issued sim/general/right every frame to keep the camera orbiting, and
