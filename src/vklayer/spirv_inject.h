@@ -935,11 +935,31 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
 
     uint32_t bound = w[3];
     uint32_t newV2 = 0, newPtrOutV4 = 0, newPtrInV4 = 0, newHalf = 0, newZero = 0;
+    // ---- A PER-PIPELINE TAG, SO THE BAD DRAWS CAN BE NAMED.
+    //
+    // The exact-depth prediction agrees with the epipolar metric (176.0 px
+    // against 174 px on the worst band), so the metric was sound and the field
+    // really is wrong. The error is bimodal - median 0.2955 px with 22.88% of
+    // pixels beyond 1 px - which is a subset of DRAWS, not a wrong matrix.
+    //
+    // It cannot be the matrix or the inputs: rasterisation guarantees a
+    // fragment's NDC equals currClip.xy/currClip.w, one matrix is pushed per
+    // frame, and prev.w comes back correct to 0.1% on every band. So some draws
+    // must be producing a prevClip that is not M*currClip.
+    //
+    // prevDepth is verified good and no longer worth a channel. Spending it on
+    // a per-module tag turns "some subset" into a name: bin the error by tag,
+    // then dump that module's SPIR-V and read what it actually does.
+    static uint32_t s_pidCounter = 0;
+    const uint32_t myPid = ++s_pidCounter;
+    uint32_t newPid = 0;
     if (!idV2)        { newV2       = bound++; idV2        = newV2; }
     if (!idPtrOutV4)  { newPtrOutV4 = bound++; idPtrOutV4  = newPtrOutV4; }
     if (!idPtrInV4)   { newPtrInV4  = bound++; idPtrInV4   = newPtrInV4; }
     if (!idConstHalf) { newHalf     = bound++; idConstHalf = newHalf; }
     if (!idConstZero) { newZero     = bound++; idConstZero = newZero; }
+    uint32_t idConstPid = 0;
+    if (getenv("TAA_MV_PID")) { newPid = bound++; idConstPid = newPid; }
 
     uint32_t idInCurr  = bound++, idInPrev = bound++, idOutMV = bound++;
     uint32_t idLc = bound++, idLp = bound++;
@@ -962,6 +982,19 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newHalf); globals.push_back(bits); }
     if (newZero)     { uint32_t bits; float z = 0.0f; memcpy(&bits, &z, 4);
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newZero); globals.push_back(bits); }
+    if (newPid)      { uint32_t bits; float pv = (float)myPid; memcpy(&bits, &pv, 4);
+                       globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newPid); globals.push_back(bits); }
+    // A tag is only useful if it names something. Hash the incoming module so a
+    // pid in the report can be matched back to the exact shader and dumped.
+    if (newPid) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t k = 0; k < w.size(); ++k) {
+            h ^= (uint64_t)w[k];
+            h *= 1099511628211ull;
+        }
+        trace("MV PID %u -> module hash %016llx, %llu words",
+              myPid, (unsigned long long)h, (unsigned long long)w.size());
+    }
 
     globals.push_back(head(OpVariable, 4)); globals.push_back(idPtrInV4);  globals.push_back(idInCurr); globals.push_back(SC_Input);
     globals.push_back(head(OpVariable, 4)); globals.push_back(idPtrInV4);  globals.push_back(idInPrev); globals.push_back(SC_Input);
@@ -1032,7 +1065,8 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // flow can be predicted from measured depth instead of from an epipolar
     // line that degenerates near the focus of expansion.
     const uint32_t idCh2 = wantRGBA ? idCw : idConstZero;
-    const uint32_t idCh3 = wantRGBA ? idPw : idConstZero;
+    // Channel 3 carries the pipeline tag when asked for, otherwise prevDepth.
+    const uint32_t idCh3 = idConstPid ? idConstPid : (wantRGBA ? idPw : idConstZero);
     body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(idCh0); body.push_back(idCh1); body.push_back(idCh2); body.push_back(idCh3);
     body.push_back(head(OpStore, 3)); body.push_back(idOutMV); body.push_back(idResult);
 

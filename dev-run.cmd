@@ -60,6 +60,7 @@ set "TAA_MV_IMAGE=C:/Users/bansa/AppData/Local/Temp/mvimg"
 set "TAA_MV_DIAG=C:/Users/bansa/AppData/Local/Temp/mvdiag"
 set "TAA_EXT_STATIC=1"
 set "TAA_MV_RGBA=1"
+set "TAA_MV_PID=1"
 rem set "TAA_SELFTEST=1"
 
 rem Experiment switches are passed THROUGH this script, not set in it. setlocal

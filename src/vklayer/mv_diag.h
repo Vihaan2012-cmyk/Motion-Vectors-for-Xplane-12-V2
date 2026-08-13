@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <vector>
+#include <map>
 
 // Layer-side counters the report needs. Defined here, incremented in layer.cpp.
 static uint64_t g_diagPatchedBindsNoPush = 0;   // hypothesis 2
@@ -348,6 +349,68 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                     rowEN[b] ? rowESum[b] / (double)rowEN[b] : -1.0,
                     rowEN[b] ? rowEMax[b] : -1.0,
                     (unsigned long long)rowEN[b]);
+        // ---- WHICH FRAGMENT SHADER WROTE THE BAD PIXELS?
+        //
+        // Channel 3 carries the per-module tag baked in at injection time, so
+        // every bad pixel traces to the exact shader that produced it. The
+        // error is bimodal - most pixels perfect, about a quarter ruined - and
+        // nothing shared (the matrix, the inputs, prev.w) can do that. This
+        // names the subset instead of guessing at it.
+        if (getenv("TAA_MV_PID")) {
+            struct PidAcc { double sum; uint64_t n, bad; double worst; };
+            std::map<int, PidAcc> byPid;
+            for (uint32_t y = 0; y < in.h; y += 4) {
+                for (uint32_t x = 0; x < in.w; x += 4) {
+                    const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                    const double vx = velHalfToFloat(in.px[i2]);
+                    const double vy = velHalfToFloat(in.px[i2 + 1]);
+                    const double d  = velHalfToFloat(in.px[i2 + 2]);
+                    const double pf = velHalfToFloat(in.px[i2 + 3]);
+                    if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                    const int pid = (int)(pf + 0.5);
+                    if (pid <= 0) continue;
+                    const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                    const double vTop = ((y + 0.5) / (double)in.h) * 2.0 - 1.0;
+                    const double xc = u * d, yc = vTop * d;
+                    const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
+                    const double ny = M[1]*xc + M[5]*yc + M[9]*d + M[13];
+                    const double nw = M[3]*xc + M[7]*yc + M[11]*d + M[15];
+                    if (fabs(nw) < 1e-9) continue;
+                    const double predX = (nx / nw - u)    * 0.5;
+                    const double predY = (ny / nw - vTop) * 0.5;
+                    const double ex = (vx - predX) * 2.0 * hw;
+                    const double ey = (vy - predY) * 2.0 * hh;
+                    const double err = sqrt(ex*ex + ey*ey);
+                    PidAcc &a = byPid[pid];
+                    a.sum += err; ++a.n;
+                    if (err > 1.0) ++a.bad;
+                    if (err > a.worst) a.worst = err;
+                }
+            }
+            fprintf(f, "\nERROR BY FRAGMENT SHADER (channel 3 tag)\n");
+            fprintf(f, "  %6s %10s %10s %10s %12s %10s\n",
+                    "pid", "pixels", "bad>1px", "bad%", "mean err", "worst");
+            std::vector<std::pair<uint64_t, int> > order;
+            for (std::map<int, PidAcc>::const_iterator it = byPid.begin();
+                 it != byPid.end(); ++it)
+                order.push_back(std::make_pair(it->second.bad, it->first));
+            std::sort(order.begin(), order.end());
+            std::reverse(order.begin(), order.end());
+            const size_t show = order.size() < 24 ? order.size() : 24;
+            for (size_t k = 0; k < show; ++k) {
+                const PidAcc &a = byPid[order[k].second];
+                fprintf(f, "  %6d %10llu %10llu %9.2f%% %12.4f %10.2f\n",
+                        order[k].second, (unsigned long long)a.n,
+                        (unsigned long long)a.bad,
+                        a.n ? 100.0 * a.bad / (double)a.n : 0.0,
+                        a.n ? a.sum / (double)a.n : -1.0, a.worst);
+            }
+            fprintf(f, "  %llu distinct fragment shaders covered this frame\n",
+                    (unsigned long long)byPid.size());
+            fprintf(f, "      a few pids owning nearly all the bad pixels names\n");
+            fprintf(f, "      the shader family to dump and read\n");
+        }
+
         fprintf(f, "\n  The epipolar metric called rows 1890-2159 174 px wrong.\n");
         fprintf(f, "  If this says otherwise, the metric was the defect.\n");
         fclose(f);
