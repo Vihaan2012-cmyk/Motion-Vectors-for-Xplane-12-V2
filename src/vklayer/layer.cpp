@@ -291,15 +291,6 @@ struct DeviceData {
     PFN_vkCreateDescriptorPool      createDescriptorPool;
     PFN_vkAllocateDescriptorSets    allocateDescriptorSets;
     PFN_vkUpdateDescriptorSets      updateDescriptorSets;
-    // ---- TEMPLATES, BECAUSE X-PLANE DOES NOT USE THE PLAIN CALL.
-    //
-    // Measured: 10,801 FSR dispatches, 10,800 with compute sets bound, and ZERO
-    // storage views recorded through vkUpdateDescriptorSets. The engine updates
-    // its sets through an update template, so hooking the obvious entry point
-    // sees nothing at all - which reads exactly like "the pass has no storage
-    // image", and is not that.
-    PFN_vkCreateDescriptorUpdateTemplate     createDescriptorUpdateTemplate;
-    PFN_vkUpdateDescriptorSetWithTemplate    updateDescriptorSetWithTemplate;
     PFN_vkCreateShaderModule    createShaderModule;
     PFN_vkCreatePipelineLayout  createPipelineLayout;
     PFN_vkCreateComputePipelines createComputePipelines;
@@ -1058,26 +1049,6 @@ static std::vector<DepthCandidate> g_depthCandidates;
 // need (format, extent, sample count) is recorded per IMAGE, so the two have to
 // be tied together to answer "which image does the scene actually render into".
 static std::map<VkImageView, VkImage> g_viewToImage;
-
-// ---- WHERE X-PLANE'S UPSCALER WRITES.
-//
-// Temporal upsampling has to put a DISPLAY-sized image somewhere X-Plane will
-// present, and the only such image in the frame is the one its own FSR pass
-// writes. We do not own it, we are not told about it, and it is not the scene
-// colour - so it has to be found.
-//
-// It is found the way the pipeline itself finds it: through the descriptor set.
-// A storage image bound to a compute set that is bound while an FSR pipeline is
-// bound is, by construction, what that dispatch writes.
-static std::map<VkDescriptorSet, std::vector<VkImageView> > g_setStorageViews;
-
-// A template describes WHERE in an opaque blob each descriptor sits. Without
-// the entries the blob is unreadable, so they are kept from creation time.
-struct TemplateEntry { VkDescriptorType type; size_t offset; size_t stride; uint32_t count; };
-static std::map<VkDescriptorUpdateTemplate, std::vector<TemplateEntry> > g_templates;
-static std::map<VkCommandBuffer, std::vector<VkDescriptorSet> > g_cbComputeSets;
-static VkImage  g_xpUpscaleDst = VK_NULL_HANDLE;
-static uint32_t g_xpUpscaleW = 0, g_xpUpscaleH = 0;
 
 // commandBuffer -> device. Command recording functions carry no device handle,
 // but the dispatch table is per-device, so the two have to be tied together to
@@ -2619,10 +2590,6 @@ static uint64_t g_jitterApplied = 0;
 // them, so the picture shakes. Counting the misses is the difference between
 // diagnosing that in one run and guessing at it across six.
 static bool     g_resolveRanThisFrame = false;
-// Set when the TAA resolve records, cleared at present. The upsample copy is
-// gated on both: it must happen after the resolve, and only once.
-static bool     g_taaResolvedThisFrame = false;
-static bool     g_taaCopiedThisFrame   = false;
 static uint64_t g_resolveMissFrames = 0;
 static uint64_t g_resolveOkFrames   = 0;
 static bool     g_resolveRelaxed    = false;
@@ -3648,31 +3615,15 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                 if (rdi != g_devices.end() && g_mv.ready && taaEnabled()
                     && g_sceneColor.image && g_sceneColor.w && g_sceneColor.h) {
                     DeviceData &rdd = rdi->second;
-                    // ---- OUTPUT AT DISPLAY SIZE WHEN THERE IS ONE TO USE.
-                    //
-                    // If X-Plane is upscaling, its own upscale destination is
-                    // the only display-sized image in the frame that will be
-                    // presented, and writing there is what turns this pass from
-                    // TAA into temporal upsampling. Without it - render scale at
-                    // 1, or the destination not yet identified - the output
-                    // matches the scene colour and this is ordinary TAA.
-                    const bool upsample = taauEnabled()
-                                       && g_xpUpscaleDst != VK_NULL_HANDLE
-                                       && g_xpUpscaleW > g_sceneColor.w;
-                    const uint32_t outW = upsample ? g_xpUpscaleW : g_sceneColor.w;
-                    const uint32_t outH = upsample ? g_xpUpscaleH : g_sceneColor.h;
-                    if (taaInit(rdd, rdd.phys, outW, outH,
-                                g_sceneColor.w, g_sceneColor.h)) {
+                    if (taaInit(rdd, rdd.phys, g_sceneColor.w, g_sceneColor.h)) {
                         VkImageView sv = taaSceneView(rdd, g_sceneColor.image,
                                                       g_sceneColor.format);
                         // historyReset is the plugin's statement that the camera
                         // cut - a view change, a teleport - and that no history
                         // from before it describes this frame.
-                        g_taaResolvedThisFrame = true;
                         if (!taaRecordResolve(rdd, cb, g_sceneColor.image, sv,
                                               g_mv.view,
-                                              g_velSnap.historyReset != 0,
-                                              upsample)) {
+                                              g_velSnap.historyReset != 0)) {
                             static bool said = false;
                             if (!said) {
                                 said = true;
@@ -4373,14 +4324,6 @@ static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSets(
         if (it != g_devices.end()) next = it->second.updateDescriptorSets;
         for (uint32_t i = 0; i < nw && w; ++i) {
             if (!w[i].pImageInfo) continue;
-            if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
-                std::vector<VkImageView> &sv = g_setStorageViews[w[i].dstSet];
-                sv.clear();
-                for (uint32_t k = 0; k < w[i].descriptorCount; ++k)
-                    if (w[i].pImageInfo[k].imageView != VK_NULL_HANDLE)
-                        sv.push_back(w[i].pImageInfo[k].imageView);
-                continue;
-            }
             if (w[i].descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
                 w[i].descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) continue;
             std::vector<VkImageView> &v = g_setViews[w[i].dstSet];
@@ -4391,81 +4334,6 @@ static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSets(
         }
     }
     if (next) next(device, nw, w, nc, c);
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDescriptorUpdateTemplate(
-    VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *ci,
-    const VkAllocationCallbacks *alloc, VkDescriptorUpdateTemplate *out)
-{
-    PFN_vkCreateDescriptorUpdateTemplate next = nullptr;
-    {
-        std::lock_guard<std::mutex> g(g_lock);
-        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
-        if (it != g_devices.end()) next = it->second.createDescriptorUpdateTemplate;
-    }
-    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
-    VkResult r = next(device, ci, alloc, out);
-    if (r != VK_SUCCESS || !ci) return r;
-
-    std::lock_guard<std::mutex> g(g_lock);
-    std::vector<TemplateEntry> &v = g_templates[*out];
-    v.clear();
-    for (uint32_t i = 0; i < ci->descriptorUpdateEntryCount; ++i) {
-        const VkDescriptorUpdateTemplateEntry &e = ci->pDescriptorUpdateEntries[i];
-        TemplateEntry te;
-        te.type   = e.descriptorType;
-        te.offset = e.offset;
-        te.stride = e.stride;
-        te.count  = e.descriptorCount;
-        v.push_back(te);
-    }
-    return r;
-}
-
-static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSetWithTemplate(
-    VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate tmpl,
-    const void *data)
-{
-    PFN_vkUpdateDescriptorSetWithTemplate next = nullptr;
-    {
-        std::lock_guard<std::mutex> g(g_lock);
-        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
-        if (it != g_devices.end()) next = it->second.updateDescriptorSetWithTemplate;
-
-        std::map<VkDescriptorUpdateTemplate, std::vector<TemplateEntry> >::iterator ti =
-            g_templates.find(tmpl);
-        if (ti != g_templates.end() && data) {
-            // ---- SAMPLED IMAGES TOO, NOT JUST STORAGE.
-            //
-            // The first version read only storage entries, so the destination
-            // was found and the INPUT never was - and the test "does this
-            // dispatch read the scene colour" then rejected every dispatch in
-            // the frame. The chain counters said it exactly: 13,200 dispatches
-            // with compute sets, 3,751 storage views recorded, and zero sets
-            // that carried one. An engine that updates through templates does
-            // so for every descriptor type, not the one being looked for.
-            bool clearedS = false, clearedR = false;
-            for (size_t i = 0; i < ti->second.size(); ++i) {
-                const TemplateEntry &e = ti->second[i];
-                const bool storage = (e.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-                const bool sampled = (e.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
-                                      e.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
-                if (!storage && !sampled) continue;
-                std::vector<VkImageView> &v = storage ? g_setStorageViews[set]
-                                                      : g_setViews[set];
-                bool &cleared = storage ? clearedS : clearedR;
-                if (!cleared) { v.clear(); cleared = true; }
-                for (uint32_t k = 0; k < e.count; ++k) {
-                    const unsigned char *p =
-                        (const unsigned char*)data + e.offset + (size_t)k * e.stride;
-                    VkDescriptorImageInfo ii;
-                    memcpy(&ii, p, sizeof(ii));
-                    if (ii.imageView != VK_NULL_HANDLE) v.push_back(ii.imageView);
-                }
-            }
-        }
-    }
-    if (next) next(device, set, tmpl, data);
 }
 
 static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
@@ -4481,13 +4349,6 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
             std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
             if (di != g_devices.end()) next = di->second.cmdBindDescriptorSets;
         }
-        // Remember the compute sets bound on this buffer, so a dispatch can be
-        // asked what it writes to.
-        if (bp == VK_PIPELINE_BIND_POINT_COMPUTE && sets) {
-            std::vector<VkDescriptorSet> &cs = g_cbComputeSets[cb];
-            cs.assign(sets, sets + n);
-        }
-
         std::map<VkCommandBuffer, bool>::iterator sp = g_cbInSwapPass.find(cb);
         if (sp != g_cbInSwapPass.end() && sp->second && sets) {
             static std::set<VkImage> reported;
@@ -5508,10 +5369,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // of those alternating with resolved frames is precisely what "the screen
     // is shaky" means.
     g_resolveRanThisFrame = false;
-    // Both cleared at present, so "after the resolve" and "once" mean this
-    // frame rather than since the layer loaded.
-    g_taaResolvedThisFrame = false;
-    g_taaCopiedThisFrame   = false;
 
     // Measure the injected velocity field. Read one frame after the copy was
     // recorded, so the GPU has certainly finished with it - reading the same
@@ -7468,190 +7325,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
         if (it == g_devices.end()) it = g_devices.begin();
         if (it != g_devices.end()) dd = &it->second;
     }
-    // ---- IDENTIFY THE UPSCALE DESTINATION.
-    //
-    // Only while an FSR pipeline is bound, and only once. The destination is a
-    // storage image bound to one of this buffer's compute sets whose size is the
-    // DISPLAY size rather than the render size - which is the whole point of the
-    // pass, so it is the one unambiguous discriminator available.
-    // THIS dispatch's destination, not the last one identified.
-    //
-    // The upscale target is double buffered - two 3840x2160 images alternating
-    // per frame - and copying into whichever was seen most recently put the
-    // frame into the one that was not being presented. The result was a
-    // half-stale composite with black bands through it, which reads as a broken
-    // upsample and is a broken ADDRESS.
-    VkImage thisDst = VK_NULL_HANDLE;
-    {
-        std::lock_guard<std::mutex> g(g_lock);
-        // ---- COUNT EACH LINK, RATHER THAN GUESS WHICH ONE IS MISSING.
-        //
-        // Four things have to line up for the destination to be found: an FSR
-        // dispatch has to be seen, compute sets have to have been recorded for
-        // that buffer, one of them has to carry a storage image we know about,
-        // and that image has to be bigger than the scene colour. Any one of
-        // them failing produces the same silence, and a modern engine that
-        // updates sets through vkUpdateDescriptorSetWithTemplate or push
-        // descriptors would break the third without touching the others.
-        static uint64_t nFsrDispatch = 0, nHaveSets = 0, nHaveStorage = 0,
-                        nHaveImage = 0, nBigEnough = 0;
-        std::map<void*, bool>::iterator fb = g_cbFsrBound.find((void*)cb);
-        if (fb != g_cbFsrBound.end() && fb->second) {
-            ++nFsrDispatch;
-            if ((nFsrDispatch % 600) == 1)
-                trace("XP FSR CHAIN: %llu dispatches | %llu had compute sets | "
-                      "%llu of those carried a storage view | %llu resolved to a "
-                      "known image | %llu were bigger than the scene colour | "
-                      "%llu storage views recorded in total",
-                      (unsigned long long)nFsrDispatch, (unsigned long long)nHaveSets,
-                      (unsigned long long)nHaveStorage, (unsigned long long)nHaveImage,
-                      (unsigned long long)nBigEnough,
-                      (unsigned long long)g_setStorageViews.size());
-            std::map<VkCommandBuffer, std::vector<VkDescriptorSet> >::iterator cs =
-                g_cbComputeSets.find(cb);
-            if (cs != g_cbComputeSets.end()) {
-                ++nHaveSets;
-                // ---- IT MUST ALSO READ THE SCENE COLOUR.
-                //
-                // "A display-sized storage image written by an FSR pipeline" is
-                // not specific enough. X-Plane runs the same upscale shaders on
-                // more than the main view - the instrument displays are
-                // upscaled too - so that criterion matched the panel's upscale
-                // as well, and the scene got copied over the instruments. The
-                // capture showed it plainly: washed-out PFDs and a black band
-                // where a panel target had been overwritten with something the
-                // wrong shape.
-                //
-                // The main upscale is the one that READS the scene colour. That
-                // is what makes it the main upscale, so it is the right test.
-                // IDENTITY WAS THE WRONG TEST. SHAPE IS THE RIGHT ONE.
-                //
-                // The first attempt required the dispatch to sample
-                // g_sceneColor.image itself, and it rejected all 11,400 FSR
-                // dispatches in a run. X-Plane's upscale does not read the HDR
-                // scene target - it reads a post-processed intermediate, which
-                // is a different image with the same dimensions.
-                //
-                // What actually distinguishes the main upscale is its SHAPE:
-                // render-sized in, display-sized out. The instrument displays
-                // are upscaled by the same shaders from their own, differently
-                // sized, sources - so the pair of sizes separates them without
-                // needing to know which image is which.
-                bool readsScene = false;
-                for (size_t i = 0; i < cs->second.size() && !readsScene; ++i) {
-                    std::map<VkDescriptorSet, std::vector<VkImageView> >::iterator rv =
-                        g_setViews.find(cs->second[i]);
-                    if (rv == g_setViews.end()) continue;
-                    for (size_t k = 0; k < rv->second.size(); ++k) {
-                        std::map<VkImageView, VkImage>::iterator vi =
-                            g_viewToImage.find(rv->second[k]);
-                        if (vi == g_viewToImage.end()) continue;
-                        std::map<VkImage, ColorTarget>::iterator sc =
-                            g_colorImages.find(vi->second);
-                        if (sc == g_colorImages.end()) continue;
-                        if (sc->second.w == g_sceneColor.w &&
-                            sc->second.h == g_sceneColor.h) { readsScene = true; break; }
-                    }
-                }
-                if (!readsScene) { cs = g_cbComputeSets.end(); }
-                for (size_t i = 0; readsScene && i < cs->second.size(); ++i) {
-                    std::map<VkDescriptorSet, std::vector<VkImageView> >::iterator sv =
-                        g_setStorageViews.find(cs->second[i]);
-                    if (sv == g_setStorageViews.end()) continue;
-                    ++nHaveStorage;
-                    for (size_t k = 0; k < sv->second.size(); ++k) {
-                        std::map<VkImageView, VkImage>::iterator vi =
-                            g_viewToImage.find(sv->second[k]);
-                        if (vi == g_viewToImage.end()) continue;
-                        std::map<VkImage, ColorTarget>::iterator ct =
-                            g_colorImages.find(vi->second);
-                        if (ct == g_colorImages.end()) continue;
-                        ++nHaveImage;
-                        // Bigger than the scene colour means it is the upscaled
-                        // side of the pass, not its input.
-                        if (g_sceneColor.w && ct->second.w <= g_sceneColor.w) continue;
-                        ++nBigEnough;
-                        thisDst = vi->second;
-                        if (vi->second != g_xpUpscaleDst) {
-                            g_xpUpscaleDst = vi->second;
-                            g_xpUpscaleW   = ct->second.w;
-                            g_xpUpscaleH   = ct->second.h;
-                            trace("XP FSR: the upscale writes image %p at %ux%u, "
-                                  "from a scene colour of %ux%u - this is where a "
-                                  "temporally upsampled frame has to go",
-                                  (void*)g_xpUpscaleDst, g_xpUpscaleW, g_xpUpscaleH,
-                                  g_sceneColor.w, g_sceneColor.h);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     if (dd && dd->cmdDispatch) dd->cmdDispatch(cb, gx, gy, gz);
-
-    // ---- OVERWRITE THE UPSCALE WITH THE TEMPORALLY UPSAMPLED FRAME.
-    //
-    // X-Plane's dispatch is allowed to run rather than dropped. Dropping it
-    // would save a little GPU time and would also mean guessing what layout the
-    // destination is left in, what barriers followed it, and whether anything
-    // else in the frame reads it - three guesses about someone else's frame
-    // graph, each of which fails as a corrupted image rather than as an error.
-    //
-    // Letting it run and copying over the result costs one full-screen copy and
-    // needs no guesses: the image is in a layout the engine itself just wrote,
-    // and the copy is ordered after it by the barrier below.
-    // ---- ONCE PER FRAME, AND ONLY AFTER THE RESOLVE HAS RUN.
-    //
-    // Two dispatches per frame match the shape test - EASU and whatever follows
-    // it - and copying on both wrote the frame twice, the second time over
-    // whatever the first had already been sharpened into. The order also has to
-    // be proven rather than assumed: if the upscale runs BEFORE the 3D/UI
-    // boundary where the resolve records, the copy carries last frame's output
-    // and the result tears between two frames, which is exactly what the
-    // capture showed.
-    if (dd && g_taa.ready && g_taa.w > g_taa.inW && thisDst != VK_NULL_HANDLE
-        && taaEnabled() && taauEnabled()) {
-        if (!g_taaResolvedThisFrame) {
-            static uint64_t nEarly = 0;
-            if (++nEarly <= 3)
-                trace("TAAU: the upscale dispatch came BEFORE this frame's "
-                      "resolve (%llu). Copying here would present the previous "
-                      "frame's output.", (unsigned long long)nEarly);
-        } else if (g_taaCopiedThisFrame) {
-            // Second and later matching dispatches in the same frame.
-        } else {
-            g_taaCopiedThisFrame = true;
-            taaBarrier(*dd, cb, thisDst,
-                       VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkImageCopy rg;
-            memset(&rg, 0, sizeof(rg));
-            rg.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            rg.srcSubresource.layerCount = 1;
-            rg.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            rg.dstSubresource.layerCount = 1;
-            rg.extent.width  = g_taa.w;
-            rg.extent.height = g_taa.h;
-            rg.extent.depth  = 1;
-            dd->cmdCopyImage(cb, g_taa.output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                             thisDst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                             1, &rg);
-            taaBarrier(*dd, cb, thisDst,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            static uint64_t nOver = 0;
-            if (++nOver <= 3 || (nOver % 600) == 0)
-                trace("TAAU: overwrote X-Plane's upscale %llu times - %ux%u "
-                      "accumulated from a %ux%u render",
-                      (unsigned long long)nOver, g_taa.w, g_taa.h,
-                      g_taa.inW, g_taa.inH);
-        }
-    }
 }
 
 // Re-push immediately before the draw. Cheap - a push constant write is a few
@@ -8714,8 +8388,6 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     GD(createBuffer, CreateBuffer);                GD(destroyBuffer, DestroyBuffer);
     GD(createDescriptorSetLayout, CreateDescriptorSetLayout);   GD(createDescriptorPool, CreateDescriptorPool);
     GD(allocateDescriptorSets, AllocateDescriptorSets);      GD(updateDescriptorSets, UpdateDescriptorSets);
-    GD(createDescriptorUpdateTemplate, CreateDescriptorUpdateTemplate);
-    GD(updateDescriptorSetWithTemplate, UpdateDescriptorSetWithTemplate);
     GD(createShaderModule, CreateShaderModule);          GD(createPipelineLayout, CreatePipelineLayout);
     GD(createComputePipelines, CreateComputePipelines);
     GD(createCommandPool, CreateCommandPool);           GD(allocateCommandBuffers, AllocateCommandBuffers);
@@ -8920,8 +8592,6 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkCmdBlitImage",        Layer_CmdBlitImage)
     RETURN_IF("vkCmdResolveImage",     Layer_CmdResolveImage)
     RETURN_IF("vkUpdateDescriptorSets", Layer_UpdateDescriptorSets)
-    RETURN_IF("vkCreateDescriptorUpdateTemplate", Layer_CreateDescriptorUpdateTemplate)
-    RETURN_IF("vkUpdateDescriptorSetWithTemplate", Layer_UpdateDescriptorSetWithTemplate)
     RETURN_IF("vkCmdBindDescriptorSets", Layer_CmdBindDescriptorSets)
     RETURN_IF("vkCmdCopyImage",        Layer_CmdCopyImage)
     RETURN_IF("vkQueueSubmit",         Layer_QueueSubmit)
