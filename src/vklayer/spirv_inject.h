@@ -484,6 +484,24 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     }
     if (!storeEnd) return INJ_NO_STORE;
 
+    // ---- WITH THE EYE PATH THE BODY MUST GO AT THE END, NOT AT THE STORE.
+    //
+    // storeEnd sits immediately after the gl_Position write. In the offending
+    // shader that is instruction 318, while v_position_eye_* is written at
+    // 328-336 - AFTER. Reading the varying at storeEnd therefore reads an
+    // output nothing has written yet, and the first attempt duly produced a
+    // median of 978 px against 4.8 px on the old path. The idea was sound and
+    // the placement was not.
+    //
+    // Moving the splice to the last OpReturn fixes it: gl_Position and the eye
+    // varying are both stored by then, and every id used is still live, since
+    // each is defined before the return that it dominates.
+    size_t injectAt = storeEnd;
+    if (getenv("TAA_MV_EYE")) {
+        for (size_t k = 0; k < ins.size(); ++k)
+            if (ins[k].op == OpReturn) injectAt = ins[k].at;
+    }
+
     uint32_t bound = w[3];
     uint32_t idStructPC    = bound++;
     uint32_t idPtrPCStruct = bound++;
@@ -493,6 +511,28 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // the wrong stage: it only divides varyings, while prevClip is built here.
     static uint32_t s_vsPidCounter = 0;
     const uint32_t myVsPid = ++s_vsPidCounter;
+    // Name the module so a tag in the report identifies a real shader, and dump
+    // it on request so the thing can actually be read rather than theorised
+    // about. VS pid 180 owns 164509 of ~200000 bad pixels.
+    if (getenv("TAA_MV_PID")) {
+        uint64_t vh = 1469598103934665603ull;
+        for (size_t k = 0; k < w.size(); ++k) { vh ^= (uint64_t)w[k]; vh *= 1099511628211ull; }
+        trace("MV VS PID %u -> module hash %016llx, %llu words",
+              myVsPid, (unsigned long long)vh, (unsigned long long)w.size());
+        if (const char *want = getenv("TAA_MV_DUMP_VS")) {
+            if ((uint32_t)atoi(want) == myVsPid) {
+                char pth[512];
+                snprintf(pth, sizeof(pth), "%s/mv_vs_%u.spv",
+                         getenv("TAA_MV_DIAG") ? getenv("TAA_MV_DIAG") : ".", myVsPid);
+                if (FILE *vf = fopen(pth, "wb")) {
+                    fwrite(&w[0], 4, w.size(), vf);
+                    fclose(vf);
+                    trace("MV VS DUMP: wrote %s (%llu words)", pth,
+                          (unsigned long long)w.size());
+                }
+            }
+        }
+    }
     uint32_t idOutCurr     = bound++;
     uint32_t idOutPrev     = bound++;
     uint32_t newMat4 = 0, newPtrOutV4 = 0, newInt = 0, newConst0 = 0, newConst1 = 0;
@@ -634,9 +674,72 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     //
     // The literal 1.0 is what makes this exact - it is a constant, not a
     // difference, so nothing can cancel.
+    // ---- USE THE EYE-SPACE POSITION THE SHADER ALREADY COMPUTED.
+    //
+    // (idPosX, idPosY, idPosW, 1) is clip xy with w in slot 2, which only
+    // becomes view space after clipToView = diag(1/sx, 1/sy, -1, 1) divides the
+    // projection back out. That step assumes ONE projection for the whole
+    // frame, and the offending shader disproves the assumption:
+    //
+    //     transformIdx = (gl_InstanceIndex - gl_BaseInstance) % u_transform_count
+    //     gl_Position  = mvp_matrix[transformIdx] * vec4(a_vertex - u_mv_offset, 1)
+    //     eye          = modelview_matrix[transformIdx] * vec4(pos, 1)
+    //
+    // mvp_matrix and modelview_matrix are ARRAYS selected per instance, and the
+    // shader writes gl_ViewportIndex and gl_Layer, so one draw can emit the same
+    // geometry through several projections. A single sampled proj cannot invert
+    // all of them, and the residual error is the parallax term M[12]/d - which
+    // is why it tracks 1/depth and why the shaders drawing near ground are the
+    // worst while distant ones look clean.
+    //
+    // But the shader hands us the answer: it already computed eye space and
+    // wrote it to v_position_eye_*. Reading that varying skips the inversion
+    // entirely, so it does not matter which projection the draw used. The layer
+    // then pushes prevProj*relRot instead of prevProj*relRot*clipToView.
+    uint32_t idEyeVar = 0;
+    if (getenv("TAA_MV_EYE")) {
+        // Walk OpName (opcode 5) looking for the eye-space varying. The literal
+        // is a packed, null-terminated string starting at word 2.
+        size_t sc = 5;
+        while (sc < w.size()) {
+            const uint16_t sop = (uint16_t)(w[sc] & 0xFFFF);
+            const uint16_t slen = (uint16_t)(w[sc] >> 16);
+            if (slen == 0) break;
+            if (sop == 5 && slen >= 3) {
+                std::string nm;
+                for (size_t q = sc + 2; q < sc + slen && q < w.size(); ++q) {
+                    const uint32_t packed = w[q];
+                    bool done = false;
+                    for (int b = 0; b < 4; ++b) {
+                        const char ch = (char)((packed >> (8 * b)) & 0xFF);
+                        if (ch == '\0') { done = true; break; }
+                        nm.push_back(ch);
+                    }
+                    if (done) break;
+                }
+                if (nm.find("position_eye") != std::string::npos) {
+                    idEyeVar = w[sc + 1];
+                    break;
+                }
+            }
+            sc += slen;
+        }
+    }
     uint32_t idViewVec = bound++;
-    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idViewVec);
-    body.push_back(idPosX); body.push_back(idPosY); body.push_back(idPosW); body.push_back(idConstOneV);
+    if (idEyeVar) {
+        const uint32_t idEyeLoad = bound++;
+        const uint32_t idEx = bound++, idEy = bound++, idEz = bound++;
+        body.push_back(head(OpLoad, 4)); body.push_back(idV4);
+        body.push_back(idEyeLoad); body.push_back(idEyeVar);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idEx); body.push_back(idEyeLoad); body.push_back(0);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idEy); body.push_back(idEyeLoad); body.push_back(1);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idEz); body.push_back(idEyeLoad); body.push_back(2);
+        body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idViewVec);
+        body.push_back(idEx); body.push_back(idEy); body.push_back(idEz); body.push_back(idConstOneV);
+    } else {
+        body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idViewVec);
+        body.push_back(idPosX); body.push_back(idPosY); body.push_back(idPosW); body.push_back(idConstOneV);
+    }
 
     body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idLoadedMat);
     body.push_back(clipToClip ? (flipForMatrix ? idFlipped : storedValue) : idViewVec);
@@ -780,7 +883,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 
         if (i == annotationsEnd) for (size_t k = 0; k < annos.size();   ++k) out.push_back(annos[k]);
         if (i == globalsEnd)     for (size_t k = 0; k < globals.size(); ++k) out.push_back(globals[k]);
-        if (i == storeEnd)       for (size_t k = 0; k < body.size();    ++k) out.push_back(body[k]);
+        if (i == injectAt)       for (size_t k = 0; k < body.size();    ++k) out.push_back(body[k]);
     }
 
     if (location) *location = prevClipLocation();

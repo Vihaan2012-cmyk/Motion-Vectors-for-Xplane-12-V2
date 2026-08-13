@@ -4866,8 +4866,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 clipToView[15] = 1.0f;
 
                 float viewToPrevClip[16], m2[16];
-                taaMul(m2, relRot, clipToView);
-                taaMul(viewToPrevClip, prevProjSaved, m2);
+                // ---- WITH TAA_MV_EYE THE SHADER SUPPLIES VIEW SPACE ITSELF.
+                //
+                // clipToView divides one globally sampled projection back out of
+                // clip space. The offending shader selects mvp_matrix[] and
+                // modelview_matrix[] per INSTANCE and writes gl_ViewportIndex,
+                // so a single draw can emit through several projections and no
+                // one inverse fits them all. The leftover is the parallax term
+                // M[12]/d, which is why the error tracks 1/depth and why near
+                // ground is worst while distant geometry looks clean.
+                //
+                // When the vertex shader reads its own eye-space varying there
+                // is nothing to invert, so the matrix is just prevProj*relRot.
+                static const bool useEye = (getenv("TAA_MV_EYE") != nullptr);
+                if (useEye) {
+                    taaMul(viewToPrevClip, prevProjSaved, relRot);
+                } else {
+                    taaMul(m2, relRot, clipToView);
+                    taaMul(viewToPrevClip, prevProjSaved, m2);
+                }
 
                 static const bool useClipToClip = (getenv("TAA_MV_CLIP2CLIP") != nullptr);
                 if (useClipToClip) {
