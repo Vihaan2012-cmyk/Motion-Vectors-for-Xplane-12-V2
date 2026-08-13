@@ -49,7 +49,9 @@ rem compare the vectors against the pixel displacement that motion must
 rem produce. This is what turns "does it look right" into a number, and it is
 rem the only way to measure without someone flying.
 rem TAA is now switched from the panel; this only forces it on for debugging.
-rem set "TAA_RESOLVE=1"
+set "TAA_RESOLVE=1"
+rem TAAU is off: overwriting X-Plane.s upscale destination corrupts the frame.
+rem set "TAA_UPSAMPLE=1"
 set "TAA_SELFTEST=1"
 
 rem Experiment switches are passed THROUGH this script, not set in it. setlocal

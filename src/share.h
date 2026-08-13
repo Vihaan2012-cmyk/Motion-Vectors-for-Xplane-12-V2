@@ -521,6 +521,7 @@ struct TaaShare {
     // read by another, and a torn float reads as a denormal rather than as a
     // stale number.
     int32_t  taaEnabledWanted;     // 1 = run the resolve
+    int32_t  taauEnabledWanted;    // 1 = accumulate at display resolution
     uint32_t taaBlendMilli;        // current-frame weight * 1000, 10..1000
     uint32_t taaDispatches;        // layer -> plugin: proof it is actually running
     uint32_t mvResidualMilliPx;    // median epipolar residual, px * 1000

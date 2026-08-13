@@ -69,7 +69,11 @@ struct TaaResolve {
     enum { kSets = 8 };
     VkDescriptorSet sets[kSets] = { VK_NULL_HANDLE };
 
+    // Two sizes now. w/h is the OUTPUT - the history accumulates there - and
+    // inW/inH is what X-Plane actually rendered. Equal means TAA; output larger
+    // means temporal upsampling.
     uint32_t        w = 0, h = 0;
+    uint32_t        inW = 0, inH = 0;
     VkFormat        format = VK_FORMAT_UNDEFINED;
     bool            ready = false;
     bool            historyValid = false;
@@ -114,6 +118,17 @@ static float taaBlendWeight()
 // The environment variable still forces it on, because a switch that can only
 // be reached through a running plugin is no use when the plugin is what is
 // being debugged. Otherwise the plugin decides.
+// Temporal upsampling is a separate switch from TAA. It only does anything when
+// X-Plane is rendering below display resolution, and it changes which image the
+// result is written into - so it is not something to turn on implicitly.
+static bool taauEnabled()
+{
+    static int forced = -1;
+    if (forced < 0) forced = getenv("TAA_UPSAMPLE") ? 1 : 0;
+    if (forced) return true;
+    return g_share && g_share->magic == TAA_MAGIC && g_share->taauEnabledWanted != 0;
+}
+
 static bool taaEnabled()
 {
     static int forced = -1;
@@ -228,13 +243,14 @@ static VkImageView taaSceneView(DeviceData &dd, VkImage img, VkFormat fmt)
     return g_taaSceneView;
 }
 
-static bool taaInit(DeviceData &dd, VkPhysicalDevice phys, uint32_t w, uint32_t h)
+static bool taaInit(DeviceData &dd, VkPhysicalDevice phys, uint32_t w, uint32_t h,
+                    uint32_t inW, uint32_t inH)
 {
     TaaResolve &t = g_taa;
-    if (t.ready && t.w == w && t.h == h) return true;
+    if (t.ready && t.w == w && t.h == h && t.inW == inW && t.inH == inH) return true;
     if (t.ready) taaDestroy(dd);
     t.device = dd.device;
-    t.w = w; t.h = h;
+    t.w = w; t.h = h; t.inW = inW; t.inH = inH;
 
     // RGBA16F regardless of what the scene target is. The history has to survive
     // being blended into repeatedly, and an 8-bit history quantises a 10%
@@ -371,10 +387,12 @@ static bool taaInit(DeviceData &dd, VkPhysicalDevice phys, uint32_t w, uint32_t 
 
     t.ready = true;
     t.historyValid = false;
-    trace("TAA: resolve ready %ux%u RGBA16F, history pair %.1f MB total, "
-          "blend %.2f - the history is sampled at uv + velocity because the "
-          "field is prev - curr",
-          w, h, 2.0 * (double)w * h * 8.0 / (1024.0 * 1024.0), taaBlendWeight());
+    trace("TAA: resolve ready - input %ux%u, output %ux%u (%s), history pair "
+          "%.1f MB total, blend %.2f. The history is sampled at uv + velocity "
+          "because the field is prev - curr.",
+          inW, inH, w, h,
+          (w > inW) ? "TEMPORAL UPSAMPLING" : "native",
+          2.0 * (double)w * h * 8.0 / (1024.0 * 1024.0), taaBlendWeight());
     return true;
 }
 
@@ -413,7 +431,8 @@ static void taaBarrier(DeviceData &dd, VkCommandBuffer cb, VkImage img,
 // this project has already lost days to exactly that distinction.
 static bool taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                              VkImage sceneImage, VkImageView sceneView,
-                             VkImageView velocityView, bool resetHistory)
+                             VkImageView velocityView, bool resetHistory,
+                             bool upsample)
 {
     TaaResolve &t = g_taa;
     if (!t.ready || !sceneView || !velocityView) return false;
@@ -482,6 +501,10 @@ static bool taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     dd.cmdPushConstants(cb, t.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                         sizeof(pc), &pc);
 
+    // Dispatched over the OUTPUT, which is what makes this an upsample rather
+    // than a resolve followed by a stretch: every output pixel gets its own
+    // history sample and its own clip, instead of being interpolated from a
+    // decision made at render resolution.
     dd.cmdDispatch(cb, (t.w + 7) / 8, (t.h + 7) / 8, 1);
 
     // The result goes back over the scene colour, so everything downstream -
@@ -508,8 +531,15 @@ static bool taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     region.extent.width  = t.w;
     region.extent.height = t.h;
     region.extent.depth  = 1;
-    dd.cmdCopyImage(cb, t.output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    sceneImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    // The scene-colour copy, when it happens, is at the scene's size - which
+    // equals the output size in the non-upsampling case and is unused otherwise.
+    // When upsampling, the scene colour is the WRONG SIZE to receive this and
+    // is not what gets presented anyway - X-Plane's upscale destination is. That
+    // copy happens at the dispatch that would have written it, because only
+    // there is the image in a layout we can reason about.
+    if (!upsample)
+        dd.cmdCopyImage(cb, t.output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        sceneImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     // ...and it also becomes the next frame's history.
     taaBarrier(dd, cb, t.history,
@@ -525,6 +555,11 @@ static bool taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT,
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    // When upsampling, the output stays in TRANSFER_SRC_OPTIMAL so the copy at
+    // X-Plane's upscale dispatch - later in the same command buffer - can read
+    // it without another transition. Leaving it in GENERAL would need a barrier
+    // there that this function cannot see the other side of.
 
     // Scene colour back to what X-Plane expects to keep drawing into.
     taaBarrier(dd, cb, sceneImage,

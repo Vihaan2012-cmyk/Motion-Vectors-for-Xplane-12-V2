@@ -19,10 +19,21 @@ layout(set = 0, binding = 2) uniform sampler2D uVelocity;
 layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D uOutput;
 
 layout(push_constant) uniform Params {
-    vec2  invSize;      // 1 / render target size
+    vec2  invSize;      // 1 / OUTPUT size
     float blend;        // weight of the CURRENT frame at rest, 0..1
     float reset;        // 1 = ignore history entirely this frame
 } pc;
+
+// ---- ONE SHADER FOR TAA AND TAAU.
+//
+// When the render and output sizes are equal this is ordinary TAA. When the
+// output is larger it is temporal UPSAMPLING: the history accumulates at output
+// resolution while each frame contributes only render-resolution samples, and
+// the jitter that already exists to anti-alias is what fills in the rest.
+//
+// Nothing branches on the ratio. Everything works in normalised coordinates and
+// asks each image for its own size, so the two cases are the same code and the
+// upsampling one cannot rot while only the other is being tested.
 
 // ---- YCoCg.
 //
@@ -110,12 +121,17 @@ vec3 sampleHistory(vec2 uv, vec2 texSize, vec2 invSize)
 
 void main()
 {
-    ivec2 size = textureSize(uCurrent, 0);
-    ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
-    if (p.x >= size.x || p.y >= size.y) return;
+    ivec2 outSize = imageSize(uOutput);
+    ivec2 inSize  = textureSize(uCurrent, 0);
+    ivec2 p       = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= outSize.x || p.y >= outSize.y) return;
 
-    vec2 uv  = (vec2(p) + 0.5) * pc.invSize;
-    vec3 cur = texelFetch(uCurrent, p, 0).rgb;
+    // uv is in the OUTPUT grid; every read is normalised, so a render target
+    // smaller than the output simply means the current frame is sampled with
+    // filtering while the history is not.
+    vec2 uv     = (vec2(p) + 0.5) * pc.invSize;
+    vec2 inTexel = 1.0 / vec2(inSize);
+    vec3 cur    = texture(uCurrent, uv).rgb;
 
     // ---- THE PIXEL'S OWN VELOCITY. NOT THE LONGEST IN THE NEIGHBOURHOOD.
     //
@@ -136,11 +152,15 @@ void main()
     // fastest. There is no depth bound to this pass, so it takes the pixel's
     // own velocity - correct for every pixel, at the cost of some trailing on
     // moving silhouettes, which is the smaller and much more local error.
+    // The neighbourhood is taken in the INPUT's texels, not the output's. At
+    // equal sizes those are the same thing. When upsampling they are not, and a
+    // 3x3 in output texels would span less than two input texels - a box far too
+    // tight to hold the history, which then gets clipped to almost the current
+    // frame and the accumulation that upsampling depends on never happens.
     vec3 m1 = vec3(0.0), m2 = vec3(0.0);
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), size - 1);
-            vec3 c  = rgbToYCoCg(texelFetch(uCurrent, q, 0).rgb);
+            vec3 c = rgbToYCoCg(texture(uCurrent, uv + vec2(dx, dy) * inTexel).rgb);
             m1 += c;
             m2 += c * c;
         }
@@ -174,7 +194,7 @@ void main()
 
     vec3 outColour = cur;
     if (valid) {
-        vec3 his = rgbToYCoCg(sampleHistory(hisUv, vec2(size), pc.invSize));
+        vec3 his = rgbToYCoCg(sampleHistory(hisUv, vec2(outSize), pc.invSize));
 
         // Clip toward the mean rather than clamping per channel. Clamping moves
         // the colour to the nearest face of the box, which changes hue on the

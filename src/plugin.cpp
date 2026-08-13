@@ -1447,6 +1447,10 @@ static float getRenderScale(void*)  { return g_share ? g_share->renderScale : 1.
 // cannot find when they want it gone.
 static int   g_taaEnabled = 0;
 static float g_taaBlend   = 0.10f;
+// Temporal upsampling. Separate from TAA because it only does anything when
+// X-Plane is rendering below display resolution, and because it changes which
+// image the result lands in - not something to enable implicitly.
+static int   g_taauEnabled = 0;
 
 static int   getTaaEnabled(void*)     { return g_taaEnabled; }
 static void  setTaaEnabled(void*, int v) { g_taaEnabled = v ? 1 : 0; }
@@ -1461,6 +1465,8 @@ static void  setTaaBlend(void*, float v)
     g_taaBlend = v;
 }
 static int   getTaaDispatches(void*)  { return g_share ? (int)g_share->taaDispatches : 0; }
+static int   getTaauEnabled(void*)     { return g_taauEnabled; }
+static void  setTaauEnabled(void*, int v) { g_taauEnabled = v ? 1 : 0; }
 
 // ---- THE QUALITY FIGURES.
 //
@@ -1569,6 +1575,8 @@ static void registerDatarefs()
         getTaaEnabled, setTaaEnabled, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
     XPLMRegisterDataAccessor("taaimpl/taa_blend", xplmType_Float, 1,
         nullptr, nullptr, getTaaBlend, setTaaBlend, 0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/taau_enabled", xplmType_Int, 1,
+        getTaauEnabled, setTaauEnabled, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
     XPLMRegisterDataAccessor("taaimpl/taa_dispatches", xplmType_Int, 0,
         getTaaDispatches, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
@@ -1592,7 +1600,7 @@ static void registerDatarefs()
         getVersionString, nullptr, nullptr, nullptr);
 
     xlog("registered %d datarefs under taaimpl/ (usable from FlyWithLua or any "
-         "script); build %s", 25, MV_VERSION);
+         "script); build %s", 26, MV_VERSION);
 }
 
 static void unregisterDatarefs()
@@ -2623,6 +2631,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // Published every frame so the panel's switch takes effect on the next one.
     s->taaEnabledWanted = g_taaEnabled;
     s->taaBlendMilli    = (uint32_t)(g_taaBlend * 1000.0f);
+    s->taauEnabledWanted = g_taauEnabled;
 
     deriveDepthRange(s);
 
