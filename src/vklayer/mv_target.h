@@ -253,6 +253,8 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
 // a half-written field and produce numbers that look like a broken shader
 // rather than a mistimed read, which is a distinction that has already cost
 // this project several rounds elsewhere.
+#include "mv_diag.h"
+
 static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
                              const float *reproj, float expectedPx, int phase,
                              uint64_t shareFrame, float nearClip,
@@ -886,6 +888,20 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                     ++nImg;
                 }
             }
+        }
+        {
+            MvDiagInput di;
+            di.px      = px;
+            di.w       = m.w;
+            di.h       = m.h;
+            di.halves  = kMvHalves;
+            di.reproj  = m.dumpReproj;
+            di.proj    = m.dumpProj;
+            di.viewType = m.dumpViewType;
+            di.phase   = m.dumpPhase;
+            di.medianAbsPx = (bestC >= 0) ? mr[bestC] : -1.0;
+            di.medianFrac  = fmed;
+            mvWriteDiagnostic(di);
         }
         trace("MV RELATIVE: view=%d phase=%d | median residual as a FRACTION "
                   "of each pixel's own motion = %.5f over %llu samples. A large "

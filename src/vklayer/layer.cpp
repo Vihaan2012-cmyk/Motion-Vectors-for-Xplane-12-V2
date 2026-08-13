@@ -4956,6 +4956,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                     const double m10 = fresh.proj[10], m11 = fresh.proj[11];
                     const double zInf = (fabs(m11) > 1e-12) ? m10 / m11 : 0.0;
                     const double dcLen = sqrt(dx*dx + dy*dy + dz*dz);
+                    g_diagDcMetres = (float)dcLen;
                     const double tcam = sqrt((double)relRot[12]*relRot[12]
                                            + (double)relRot[13]*relRot[13]
                                            + (double)relRot[14]*relRot[14]);
@@ -5542,6 +5543,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         memset(g_mvPassDrawsFrame, 0, sizeof(g_mvPassDrawsFrame));
     }
 
+    g_diagQualifyingPasses = g_mvQualifyThisFrame;
+    g_diagBoundPasses      = g_mvBindsThisFrame;
     g_mvBindsThisFrame     = 0;
     g_mvQualifyThisFrame   = 0;
     g_pushDistinctThisFrame = 0;
@@ -7798,6 +7801,12 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     if (useIdentity) memcpy(block, kIdentity, 64);
     if (useBody) ++g_bodyReprojPushes;
     block[16] = block[17] = block[18] = block[19] = 0.0f;
+    // Recorded for the diagnostic. block[18] is the near-field threshold the
+    // shader compares gl_Position.w against, and it is the one push value never
+    // actually observed at runtime - the code path says zero, which is not the
+    // same as having seen zero.
+    g_diagLastBlock18 = block[18];
+    g_diagBodyValid   = g_velSnap.bodyReprojValid;
 
     // ---- WHAT WE ACTUALLY PUSH.
     //
@@ -7941,6 +7950,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // gl_Position.w is positive for anything in front of the camera.
     if (g_velSnap.bodyReprojValid && g_nearFieldM > 0.0f)
         block[18] = g_nearFieldM;
+    g_diagLastBlock18 = block[18];
 
     // ---- HOW MANY DIFFERENT MATRICES ONE FRAME PUSHES.
     //
