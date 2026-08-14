@@ -300,7 +300,10 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                 const double m0 = velHalfToFloat(in.px[i2 + 2]);
                 if (vx != vx || vy != vy || m5 != m5) continue;
                 const double spd = sqrt(vx*vx + vy*vy) * 2.0 * (in.w * 0.5);
-                m5hist[(int)(m5 * 100.0 + (m5 < 0 ? -0.5 : 0.5))] += 1;
+                // Finer bucket: M[13] is small, so 100x buckets would collapse
+                // every distinct value into one and hide the very variation
+                // being looked for.
+                m5hist[(int)(m5 * 10000.0 + (m5 < 0 ? -0.5 : 0.5))] += 1;
                 if (spd > 64.0) { ++nBad; m5BadSum += m5; }
                 else            { ++nGood; m5GoodSum += m5; }
                 if (shown < 12 && spd > 64.0 && (x % 384) < 4 && y > in.h * 3 / 4) {
@@ -370,11 +373,11 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                 nGood ? m5GoodSum / (double)nGood : -1.0, (unsigned long long)nGood);
         fprintf(f, "  mean M[5] on fast pixels (>64 px)  %10.5f   n=%llu\n\n",
                 nBad ? m5BadSum / (double)nBad : -1.0, (unsigned long long)nBad);
-        fprintf(f, "DISTINCT M[5] VALUES SEEN (x100, count)\n");
+        fprintf(f, "DISTINCT M[13] VALUES SEEN (count)\n");
         int emitted = 0;
         for (std::map<int, uint64_t>::const_iterator it = m5hist.begin();
              it != m5hist.end() && emitted < 20; ++it, ++emitted)
-            fprintf(f, "  %8.2f   %llu\n", it->first / 100.0,
+            fprintf(f, "  %10.5f   %llu\n", it->first / 10000.0,
                     (unsigned long long)it->second);
         fprintf(f, "\nFAST PIXELS IN THE BAD REGION\n");
         for (size_t k = 0; k < rows.size(); ++k) fprintf(f, "%s\n", rows[k].c_str());
@@ -823,9 +826,21 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                 const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
                 const double d    = cw;
                 const double xc = u * d, yc = vSh * d;
-                // Use the shader's OWN M[5]; only the tiny row-1 terms come
-                // from the layer's copy, and those contribute under 0.05.
-                const double expPy = M[1]*xc + m5s*yc + M[9]*d + M[13];
+                // ---- CHANNEL 3 IS NOW M[13], THE SHADER'S OWN TRANSLATION.
+                //
+                // M[5] histogrammed as a single value so it does not vary.
+                // M[12..14] are the terms that change every frame as the camera
+                // moves, so they are what a frame skew between the readback and
+                // the diagnostic's matrix would corrupt - and the error would
+                // scale as translation/depth, which is the 1/d signature.
+                //
+                // Comparing the shader's M[13] against the diagnostic's in the
+                // SAME run is the apples-to-apples test. The previous apparent
+                // mismatch (0.00080 against 0.00521) came from two different
+                // runs on different frames, which is the trap this
+                // investigation has fallen into repeatedly.
+                const double m13s = m5s;
+                const double expPy = M[1]*xc + M[5]*yc + M[9]*d + m13s;
                 // ---- RELATIVE, NOT ABSOLUTE.
                 //
                 // The first pass used an absolute threshold of 0.01 on prevY,
@@ -911,6 +926,140 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                     }
                 }
             }
+            // ---- IS THE NEAR-FIELD SELECT FIRING?
+            //
+            // idPrevSel = select(posW < nearFieldDist, idFlipped, idPrevClip)
+            // with idFlipped = (posX, -posY, posZ, posW). When it fires,
+            // prevW = posW = d, which MATCHES the matrix prediction because
+            // M[11] is ~1 and prevW is approximately d anyway - while prevY is
+            // the negation of currClip.y. Row 3 looks perfect and row 1 is
+            // wrong, which is precisely the contradiction measured.
+            //
+            // block[18] read 0.000000 and the old flip test read low, but both
+            // predate the v-sign correction, so neither ruled this out.
+            {
+                uint64_t flipFit = 0, flipN = 0;
+                for (uint32_t y = 0; y < in.h; y += 4) {
+                    for (uint32_t x = 0; x < in.w; x += 4) {
+                        const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                        const double py2 = velHalfToFloat(in.px[i2]);
+                        const double cy2 = velHalfToFloat(in.px[i2 + 2]);
+                        if (py2 != py2 || cy2 != cy2) continue;
+                        if (fabs(cy2) < 1e-6) continue;
+                        ++flipN;
+                        const double r = py2 / cy2;
+                        if (r < -0.9 && r > -1.1) ++flipFit;
+                    }
+                }
+                // ---- SOLVE FOR THE ROW 1 THE SHADER IS ACTUALLY USING.
+            //
+            // prevY = a*xc + b*yc + c*d + e is linear in four unknowns and
+            // there are hundreds of thousands of pixels, so row 1 can be
+            // recovered by least squares instead of guessed one channel at a
+            // time. Comparing the fit against M[1], M[5], M[9], M[13] says
+            // exactly which element is wrong - or, if the fit matches the
+            // pushed row, that prevY is not a linear function of these inputs
+            // at all and the input vector is not what the code says.
+            {
+                double A[4][5];
+                for (int r = 0; r < 4; ++r)
+                    for (int c2 = 0; c2 < 5; ++c2) A[r][c2] = 0.0;
+                uint64_t fitN = 0;
+                for (uint32_t y = 0; y < in.h; y += 4) {
+                    for (uint32_t x = 0; x < in.w; x += 4) {
+                        const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                        const double py2 = velHalfToFloat(in.px[i2]);
+                        const double cy2 = velHalfToFloat(in.px[i2 + 2]);
+                        if (py2 != py2 || cy2 != cy2) continue;
+                        static const double vS9 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                        const double vP9 = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS9;
+                        if (fabs(vP9) < 1e-6) continue;
+                        const double dd = cy2 / vP9;
+                        if (!(dd > 0.0) || dd > 1e5) continue;
+                        const double uu = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                        // ---- WEIGHT THE FIT, OR THE FAR FIELD DECIDES IT.
+                        //
+                        // prevY reaches 8000 on distant geometry where the
+                        // half-float step is 8, so those residuals swamp the
+                        // near pixels the error actually lives in. The first
+                        // fit returned a constant of 0.395 against a pushed
+                        // M[13] of 0.00126 - but at a near pixel the PUSHED
+                        // value predicted better than the fitted one, which is
+                        // the signature of a fit decided by the far tail.
+                        //
+                        // Restricting to the near field and weighting by 1/|py|
+                        // makes every pixel contribute its RELATIVE error, which
+                        // is the quantity that matters after the divide.
+                        if (dd > 200.0) continue;
+                        const double wgt = 1.0 / (fabs(py2) > 1.0 ? fabs(py2) : 1.0);
+                        const double b[4] = { uu * dd * wgt, cy2 * wgt, dd * wgt, wgt };
+                        for (int r = 0; r < 4; ++r) {
+                            for (int c2 = 0; c2 < 4; ++c2) A[r][c2] += b[r] * b[c2];
+                            A[r][4] += b[r] * py2 * wgt;
+                        }
+                        ++fitN;
+                    }
+                }
+                // Gaussian elimination with partial pivoting.
+                double sol[4] = {0,0,0,0};
+                bool ok = fitN > 100;
+                if (ok) {
+                    for (int i3 = 0; i3 < 4 && ok; ++i3) {
+                        int piv = i3;
+                        for (int r = i3 + 1; r < 4; ++r)
+                            if (fabs(A[r][i3]) > fabs(A[piv][i3])) piv = r;
+                        if (fabs(A[piv][i3]) < 1e-12) { ok = false; break; }
+                        for (int c2 = 0; c2 < 5; ++c2) {
+                            const double tmp = A[i3][c2]; A[i3][c2] = A[piv][c2]; A[piv][c2] = tmp;
+                        }
+                        for (int r = 0; r < 4; ++r) {
+                            if (r == i3) continue;
+                            const double f2 = A[r][i3] / A[i3][i3];
+                            for (int c2 = i3; c2 < 5; ++c2) A[r][c2] -= f2 * A[i3][c2];
+                        }
+                    }
+                    if (ok) for (int i3 = 0; i3 < 4; ++i3) sol[i3] = A[i3][4] / A[i3][i3];
+                }
+                {
+                    // Per-pixel M[13] against the diagnostic's, same run.
+                    std::map<int, uint64_t> m13h;
+                    for (uint32_t y = 0; y < in.h; y += 16)
+                        for (uint32_t x = 0; x < in.w; x += 16) {
+                            const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                            const double v3 = velHalfToFloat(in.px[i2 + 3]);
+                            if (v3 != v3) continue;
+                            m13h[(int)(v3 * 100000.0 + (v3 < 0 ? -0.5 : 0.5))] += 1;
+                        }
+                    fprintf(f, "SHADER M[13] vs DIAGNOSTIC M[13], SAME RUN\n");
+                    fprintf(f, "  diagnostic M[13]  %12.6f\n", (double)M[13]);
+                    int shownH = 0;
+                    for (std::map<int, uint64_t>::const_iterator it = m13h.begin();
+                         it != m13h.end() && shownH < 8; ++it, ++shownH)
+                        fprintf(f, "  shader    M[13]  %12.6f   n=%llu\n",
+                                it->first / 100000.0, (unsigned long long)it->second);
+                    fprintf(f, "\n");
+                }
+                fprintf(f, "ROW 1 RECOVERED FROM THE PIXELS (weighted, d<200 m, n=%llu)\n",
+                        (unsigned long long)fitN);
+                if (ok) {
+                    fprintf(f, "  coefficient of xc  fitted %10.5f   pushed M[1]  %10.5f\n", sol[0], (double)M[1]);
+                    fprintf(f, "  coefficient of yc  fitted %10.5f   pushed M[5]  %10.5f\n", sol[1], (double)M[5]);
+                    fprintf(f, "  coefficient of d   fitted %10.5f   pushed M[9]  %10.5f\n", sol[2], (double)M[9]);
+                    fprintf(f, "  constant           fitted %10.5f   pushed M[13] %10.5f\n\n", sol[3], (double)M[13]);
+                } else {
+                    fprintf(f, "  fit failed\n\n");
+                }
+            }
+
+            fprintf(f, "IS THE NEAR-FIELD FLIP FIRING?\n");
+                fprintf(f, "  prevY / currY within 10%% of -1   %llu of %llu  (%.2f%%)\n",
+                        (unsigned long long)flipFit, (unsigned long long)flipN,
+                        flipN ? 100.0 * flipFit / (double)flipN : 0.0);
+                fprintf(f, "      the flip preserves w, so prevW still matches the\n");
+                fprintf(f, "      matrix while prevY is negated - row 3 right,\n");
+                fprintf(f, "      row 1 wrong, which is the observed contradiction\n\n");
+            }
+
             fprintf(f, "IS prevClip.w THE PUSHED MATRIX APPLIED?  (RELATIVE)\n");
             fprintf(f, "  mean relative error       %12.8f\n", wN ? wRelSum / (double)wN : -1.0);
             fprintf(f, "  worst                     %12.8f\n", worstW);

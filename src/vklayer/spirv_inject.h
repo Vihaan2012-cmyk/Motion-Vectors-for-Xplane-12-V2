@@ -656,7 +656,11 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         // Carry M[5] out, the one element that determines prevY for a near
         // identity matrix, so the prediction can use the matrix THIS draw saw
         // rather than whatever the layer last pushed in some other frame.
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(idCol2); body.push_back(idLoadedMat); body.push_back(1);
+        // Carry M[13] out now, not M[5]. M[5] histogrammed as a single value
+        // so it is not varying; the least-squares model failing under two
+        // different weightings means SOME element differs between draws, and
+        // M[13] is the one still untested per-pixel.
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(idCol2); body.push_back(idLoadedMat); body.push_back(3);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatRow1a); body.push_back(idCol2); body.push_back(1);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(idCol3); body.push_back(idLoadedMat); body.push_back(3);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatRow1b); body.push_back(idCol3); body.push_back(1);
