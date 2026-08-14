@@ -2277,6 +2277,7 @@ static uint32_t g_mvQualifyThisFrame = 0;
 // without either being wrong.
 static float g_lastPushed[16];
 static uint64_t g_layoutOverlap = 0;
+static uint64_t g_drawRepushMissed = 0;
 static uint32_t g_pushDistinctThisFrame = 0;
 static uint32_t g_pushDistinctMax       = 0;
 static uint32_t g_mvBindsMax       = 0;
@@ -6706,6 +6707,47 @@ struct PendingPush { VkCommandBuffer cb; VkPipelineLayout layout; float block[20
 // A recording thread has exactly one command buffer open and one pipeline last
 // bound, so the state is naturally per-thread. No sharing, no lock, no map
 // lookup - a pointer compare and a memcpy.
+// ---- ONE SLOT PER THREAD WAS THE BUG.
+//
+// The single-slot version assumed a recording thread has exactly one command
+// buffer open. X-Plane interleaves several, so any draw into a command buffer
+// other than the last one bound on that thread failed the
+// `g_tlPush.cb != cb` guard and skipped its re-push - leaving whatever was last
+// written in that buffer, which is X-Plane's own data.
+//
+// Measured: the shader loads M[12] = 110.94 / 161.00 / 179.88 on the bad pixels
+// while the layer pushes -0.024233. A few distinct values, per draw, not noise.
+// prevNDC.x - u is about M[12]/d, so 179/180 is 0.6 NDC or 1150 px - exactly
+// the flows exact mode reports on pixels whose real depth cannot produce them.
+//
+// A mutex-guarded map was tried before and ran the sim at 9 fps. This keeps the
+// state thread-local so there is still no lock, but holds a few slots so
+// interleaved command buffers each keep their own matrix. Linear scan over 8
+// entries is cheaper than the map lookup and allocates nothing.
+struct PushSlots {
+    static const int kN = 8;
+    PendingPush slot[kN];
+    int next;
+    PushSlots() : next(0) {
+        for (int i = 0; i < kN; ++i) {
+            slot[i].cb = VK_NULL_HANDLE;
+            slot[i].layout = VK_NULL_HANDLE;
+            slot[i].valid = false;
+        }
+    }
+    PendingPush *find(VkCommandBuffer cb) {
+        for (int i = 0; i < kN; ++i)
+            if (slot[i].valid && slot[i].cb == cb) return &slot[i];
+        return nullptr;
+    }
+    PendingPush *obtain(VkCommandBuffer cb) {
+        if (PendingPush *p = find(cb)) return p;
+        PendingPush *p = &slot[next];
+        next = (next + 1) % kN;
+        return p;
+    }
+};
+static thread_local PushSlots g_tlPushSlots;
 static thread_local PendingPush g_tlPush = { VK_NULL_HANDLE, VK_NULL_HANDLE, {0}, false };
 
 // Does this pipeline draw geometry from vertex buffers, and how many of each
@@ -7579,11 +7621,12 @@ static void mvRepushBeforeDraw(VkCommandBuffer cb)
 {
     static const bool off = (getenv("TAA_MV_NO_REPUSH") != nullptr);
     if (off || !g_nextCmdPushConstants) return;
-    if (!g_tlPush.valid || g_tlPush.cb != cb) return;
+    PendingPush *pp = g_tlPushSlots.find(cb);
+    if (!pp) { ++g_drawRepushMissed; return; }
     g_inOurPush = true;
-    g_nextCmdPushConstants(cb, g_tlPush.layout, VK_SHADER_STAGE_VERTEX_BIT,
+    g_nextCmdPushConstants(cb, pp->layout, VK_SHADER_STAGE_VERTEX_BIT,
                            spvinj::pushConstantOffset(),
-                           spvinj::kPushConstantBytes, g_tlPush.block);
+                           spvinj::kPushConstantBytes, pp->block);
     g_inOurPush = false;
     ++g_drawRepushes;
 }
@@ -8071,6 +8114,11 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
                            spvinj::kPushConstantBytes,
                            block);
     g_inOurPush = false;
+    PendingPush *pp = g_tlPushSlots.obtain(cb);
+    pp->cb     = cb;
+    pp->layout = layout;
+    memcpy(pp->block, block, sizeof(pp->block));
+    pp->valid  = true;
     g_tlPush.cb     = cb;
     g_tlPush.layout = layout;
     memcpy(g_tlPush.block, block, sizeof(g_tlPush.block));

@@ -367,13 +367,15 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                     nBoth ? 100.0 * badLocal / (double)nBoth : 0.0);
         }
 
+        fprintf(f, "  diagnostic M[12]  %12.6f   <- compare against the values below\n\n",
+                (double)M[12]);
         fprintf(f, "MATRIX AS THE SHADER RECEIVED IT\n");
         fprintf(f, "view=%d  %ux%u\n\n", in.viewType, in.w, in.h);
         fprintf(f, "  mean M[5] on slow pixels (<64 px)  %10.5f   n=%llu\n",
                 nGood ? m5GoodSum / (double)nGood : -1.0, (unsigned long long)nGood);
         fprintf(f, "  mean M[5] on fast pixels (>64 px)  %10.5f   n=%llu\n\n",
                 nBad ? m5BadSum / (double)nBad : -1.0, (unsigned long long)nBad);
-        fprintf(f, "DISTINCT M[13] VALUES SEEN (count)\n");
+        fprintf(f, "DISTINCT M[12] VALUES SEEN (count)\n");
         int emitted = 0;
         for (std::map<int, uint64_t>::const_iterator it = m5hist.begin();
              it != m5hist.end() && emitted < 20; ++it, ++emitted)
@@ -385,8 +387,12 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
         return;
     }
 
+    // Every mode reuses the same four channels, so each new one has to be
+    // excluded here or exact mode consumes the frame first and reports
+    // confident nonsense. This is the third time - the guard should be a single
+    // mode enum rather than a growing chain of negations.
     if (getenv("TAA_MV_RGBA") && in.halves >= 4 && !getenv("TAA_MV_RAWCLIP")
-        && !getenv("TAA_MV_MATDUMP")) {
+        && !getenv("TAA_MV_MATDUMP") && !getenv("TAA_MV_FIELDCHK")) {
         const double hw = in.w * 0.5, hh = in.h * 0.5;
         const int kEB = 6;
         const double eEdge[6] = { 1.0, 4.0, 16.0, 64.0, 256.0, 1e30 };
@@ -1114,6 +1120,59 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
         fprintf(f, "DISAGREEING PIXELS\n");
         for (size_t k = 0; k < rows.size(); ++k)
             fprintf(f, "%s\n", rows[k].c_str());
+        fclose(f);
+        return;
+    }
+
+    // ---- FIELD CHECK: is the velocity consistent with its own clip values?
+    //
+    // Channels are (vx, vy, prevY, prevW). vel_y is defined in the shader as
+    // (prevClip.y/prevClip.w - currClip.y/currClip.w)*0.5, and currClip.y/w is
+    // verified equal to the pixel v. So vel_y must equal (prevY/prevW - v)*0.5.
+    //
+    // prevY/prevW is a ratio of two values of similar size, so unlike the
+    // earlier prevY-versus-matrix test this does not subtract two large nearly
+    // equal half-floats - the quantisation enters only through the ratio.
+    if (getenv("TAA_MV_FIELDCHK") && in.halves >= 4) {
+        double sum = 0.0, worst = 0.0; uint64_t n = 0, bad = 0;
+        int shown = 0;
+        std::vector<std::string> rows;
+        for (uint32_t y = 0; y < in.h; y += 4) {
+            for (uint32_t x = 0; x < in.w; x += 4) {
+                const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                const double vy = velHalfToFloat(in.px[i2 + 1]);
+                const double pY = velHalfToFloat(in.px[i2 + 2]);
+                const double pW = velHalfToFloat(in.px[i2 + 3]);
+                if (vy != vy || pY != pY || pW != pW) continue;
+                if (fabs(pW) < 1e-6) continue;
+                static const double vSF = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                const double vPix = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vSF;
+                const double expVy = (pY / pW - vPix) * 0.5;
+                const double errPx = fabs(vy - expVy) * 2.0 * (in.h * 0.5);
+                ++n; sum += errPx;
+                if (errPx > 1.0) ++bad;
+                if (errPx > worst) worst = errPx;
+                if (shown < 10 && errPx > 1.0 && y > in.h * 3 / 4 && (x % 384) < 4) {
+                    char b[224];
+                    snprintf(b, sizeof(b),
+                             "  %6u %6u | vy %10.6f expected %10.6f | prevY %9.3f prevW %9.3f | err %8.2f px",
+                             x, y, vy, expVy, pY, pW, errPx);
+                    rows.push_back(std::string(b));
+                    ++shown;
+                }
+            }
+        }
+        fprintf(f, "FIELD AGAINST ITS OWN CLIP VALUES\n");
+        fprintf(f, "view=%d  %ux%u  samples %llu\n\n", in.viewType, in.w, in.h,
+                (unsigned long long)n);
+        fprintf(f, "  vel_y vs (prevY/prevW - v)*0.5\n");
+        fprintf(f, "  mean error   %10.4f px\n", n ? sum / (double)n : -1.0);
+        fprintf(f, "  worst        %10.4f px\n", worst);
+        fprintf(f, "  beyond 1 px  %llu of %llu  (%.2f%%)\n\n",
+                (unsigned long long)bad, (unsigned long long)n,
+                n ? 100.0 * bad / (double)n : 0.0);
+        fprintf(f, "DISAGREEING PIXELS\n");
+        for (size_t k = 0; k < rows.size(); ++k) fprintf(f, "%s\n", rows[k].c_str());
         fclose(f);
         return;
     }

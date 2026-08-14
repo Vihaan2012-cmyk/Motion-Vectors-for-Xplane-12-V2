@@ -682,8 +682,17 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         // so it is not varying; the least-squares model failing under two
         // different weightings means SOME element differs between draws, and
         // M[13] is the one still untested per-pixel.
+        // ---- CARRY M[12], THE TERM THAT ACTUALLY MOVES.
+        //
+        // M[13] was verified equal between shader and diagnostic (0.001005 vs
+        // 0.001000) but it is tiny and nearly static, so it could never expose a
+        // frame skew. M[12] is the x translation - large and changing every
+        // frame as the camera moves. prevNDC.x - u is about M[12]/d, so a stale
+        // M[12] produces error scaling as 1/depth: worst on near geometry,
+        // invisible far away, concentrated where flow is large. That is the
+        // exact-mode tail.
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(idCol2); body.push_back(idLoadedMat); body.push_back(3);
-        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatRow1a); body.push_back(idCol2); body.push_back(1);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatRow1a); body.push_back(idCol2); body.push_back(0);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(idCol3); body.push_back(idLoadedMat); body.push_back(3);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatRow1b); body.push_back(idCol3); body.push_back(1);
     }
@@ -1356,6 +1365,10 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // TAA_MV_RAWCLIP writes (prevClip.y, prevClip.w, currClip.y, currClip.w) so
     // the shader's own numbers can be compared against both the pixel position
     // and the pushed matrix, ending the inference.
+    // Field check: emit (vx, vy, prevY, prevW) so the velocity can be tested
+    // against the clip values it is computed from - the last link in the chain
+    // that has never been measured.
+    static const bool fieldChk = getenv("TAA_MV_FIELDCHK") != nullptr;
     static const bool matDump = getenv("TAA_MV_MATDUMP") != nullptr;
     static const bool rawClip = getenv("TAA_MV_RAWCLIP") != nullptr;
     uint32_t idCh3 = wantRGBA ? idPw : idConstZero;
@@ -1369,7 +1382,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // so prevY = M[1]*currX + M[5]*currY + M[9]*currW + M[13] can be checked
     // against the shader's own numbers.
     uint32_t idRawCy = 0, idRawPy = 0, idRawCx = 0;
-    if (rawClip) {
+    if (rawClip || fieldChk) {
         idRawCy = bound++; idRawPy = bound++; idRawCx = bound++;
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idRawCx); body.push_back(idLc); body.push_back(0);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idRawCy); body.push_back(idLc); body.push_back(1);
@@ -1381,7 +1394,9 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
         body.push_back(idVsTag); body.push_back(idLc); body.push_back(2);
         idCh3 = idVsTag;
     }
-    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(rawClip ? idRawPy : idCh0); body.push_back(rawClip ? idRawCx : idCh1);
+    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult);
+    body.push_back(fieldChk ? idMx : (rawClip ? idRawPy : idCh0));
+    body.push_back(fieldChk ? idMy : (rawClip ? idRawCx : idCh1));
     // ---- ONE FRAGMENT, ONE FRAME, EVERY QUANTITY.
     //
     // prevW measured right to 0.03% while prevY was wrong by 23% at the same
@@ -1390,8 +1405,8 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // (prevY, prevW, currY, M[5]) in a single fragment so the shader's own
     // numbers can be checked against each other with nothing cross-run left.
     // currW is recoverable as currY / v, so no fifth channel is needed.
-    body.push_back(rawClip ? idRawCy : (matDump ? idCw : idCh2));
-    body.push_back(rawClip ? idCw : (matDump ? idMatCz : idCh3));
+    body.push_back(fieldChk ? idRawPy : (rawClip ? idRawCy : (matDump ? idCw : idCh2)));
+    body.push_back(fieldChk ? idPw   : (rawClip ? idCw   : (matDump ? idMatCz : idCh3)));
     body.push_back(head(OpStore, 3)); body.push_back(idOutMV); body.push_back(idResult);
 
     out.clear();
