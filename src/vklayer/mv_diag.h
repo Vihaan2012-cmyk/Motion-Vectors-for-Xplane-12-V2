@@ -812,17 +812,18 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                 // currW is recovered as currY / v, which is exact because
                 // currClip.y/currClip.w was already verified to equal the pixel
                 // v to better than 0.001 on every sample.
+                // Channels are (prevY, currX, currY, currW) - all measured.
                 const double py  = velHalfToFloat(in.px[i2]);
-                const double pw  = velHalfToFloat(in.px[i2 + 1]);
+                const double cx  = velHalfToFloat(in.px[i2 + 1]);
                 const double cy  = velHalfToFloat(in.px[i2 + 2]);
-                const double m5s = velHalfToFloat(in.px[i2 + 3]);
-                if (cy != cy || pw != pw || py != py || !(fabs(m5s) > 1e-6)) continue;
+                const double cwm = velHalfToFloat(in.px[i2 + 3]);
+                const double pw = cwm, m5s = 1.0;
+                if (cy != cy || cx != cx || py != py || !(cwm > 0.0)) continue;
                 static const double vS5 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
                 const double vPix = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS5;
                 if (fabs(vPix) < 1e-6) continue;
-                const double cw   = cy / vPix;
-                if (!(cw > 0.0) || cw != cw) continue;
-                const double vSh  = vPix;
+                const double cw   = cwm;
+                const double vSh  = cy / cw;
                 const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
                 const double d    = cw;
                 const double xc = u * d, yc = vSh * d;
@@ -839,8 +840,9 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                 // mismatch (0.00080 against 0.00521) came from two different
                 // runs on different frames, which is the trap this
                 // investigation has fallen into repeatedly.
-                const double m13s = m5s;
-                const double expPy = M[1]*xc + M[5]*yc + M[9]*d + m13s;
+                // Nothing derived: currX straight from the shader.
+                const double expPy = M[1]*cx + M[5]*cy + M[9]*cw + M[13];
+                (void)xc; (void)yc; (void)d; (void)m5s;
                 // ---- RELATIVE, NOT ABSOLUTE.
                 //
                 // The first pass used an absolute threshold of 0.01 on prevY,
@@ -871,6 +873,43 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
         fprintf(f, "RAW CLIP MODE - the shader's own clip values\n");
         fprintf(f, "view=%d  %ux%u  samples %llu\n\n",
                 in.viewType, in.w, in.h, (unsigned long long)vN);
+        // ---- THE X MAPPING, NEVER CHECKED.
+        //
+        // prevY = M[1]*cx + M[5]*cy + M[9]*cw + M[13] holds to 0.14% with every
+        // term taken from the shader, so the vertex shader is correct and so is
+        // the velocity it writes. Exact mode disagrees because IT reconstructs
+        // xc = u*d from the pixel position rather than using currClip.x. The Y
+        // mapping was verified; the X one never was. If cx/cw differs from u,
+        // the 20% tail is the prediction, not the field.
+        {
+            double xSum = 0.0, xWorst = 0.0; uint64_t xN = 0, xBad = 0;
+            for (uint32_t y = 0; y < in.h; y += 4) {
+                for (uint32_t x = 0; x < in.w; x += 4) {
+                    const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                    const double cx2 = velHalfToFloat(in.px[i2 + 1]);
+                    const double cy2 = velHalfToFloat(in.px[i2 + 2]);
+                    if (cx2 != cx2 || cy2 != cy2) continue;
+                    static const double vSX = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                    const double vPx = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vSX;
+                    if (fabs(vPx) < 1e-6) continue;
+                    const double cwd = cy2 / vPx;             // currW via the verified Y map
+                    if (!(cwd > 0.0)) continue;
+                    const double uPix = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                    const double uSh  = cx2 / cwd;
+                    const double dx2  = fabs(uSh - uPix);
+                    ++xN; xSum += dx2;
+                    if (dx2 > 0.001) ++xBad;
+                    if (dx2 > xWorst) xWorst = dx2;
+                }
+            }
+            fprintf(f, "IS currClip.x/currClip.w THE PIXEL'S u?\n");
+            fprintf(f, "  mean |uShader - uPixel|   %14.8f\n", xN ? xSum / (double)xN : -1.0);
+            fprintf(f, "  worst                     %14.8f\n", xWorst);
+            fprintf(f, "  beyond 0.001              %llu of %llu  (%.2f%%)\n\n",
+                    (unsigned long long)xBad, (unsigned long long)xN,
+                    xN ? 100.0 * xBad / (double)xN : 0.0);
+        }
+
         fprintf(f, "IS currClip.y/currClip.w THE PIXEL'S v?\n");
         fprintf(f, "  mean |vShader - vPixel|   %12.8f\n", vN ? vErrSum / (double)vN : -1.0);
         fprintf(f, "  worst                     %12.8f\n", worstV);

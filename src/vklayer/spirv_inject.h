@@ -1325,9 +1325,13 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatCz); body.push_back(idLc); body.push_back(2);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatPz); body.push_back(idLp); body.push_back(2);
     }
-    uint32_t idRawCy = 0, idRawPy = 0;
+    // All four inputs measured: (prevY, currX, currY, currW). Nothing derived,
+    // so prevY = M[1]*currX + M[5]*currY + M[9]*currW + M[13] can be checked
+    // against the shader's own numbers.
+    uint32_t idRawCy = 0, idRawPy = 0, idRawCx = 0;
     if (rawClip) {
-        idRawCy = bound++; idRawPy = bound++;
+        idRawCy = bound++; idRawPy = bound++; idRawCx = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idRawCx); body.push_back(idLc); body.push_back(0);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idRawCy); body.push_back(idLc); body.push_back(1);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idRawPy); body.push_back(idLp); body.push_back(1);
     }
@@ -1337,7 +1341,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
         body.push_back(idVsTag); body.push_back(idLc); body.push_back(2);
         idCh3 = idVsTag;
     }
-    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(rawClip ? idRawPy : idCh0); body.push_back(rawClip ? idPw : idCh1);
+    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(rawClip ? idRawPy : idCh0); body.push_back(rawClip ? idRawCx : idCh1);
     // ---- ONE FRAGMENT, ONE FRAME, EVERY QUANTITY.
     //
     // prevW measured right to 0.03% while prevY was wrong by 23% at the same
@@ -1347,7 +1351,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // numbers can be checked against each other with nothing cross-run left.
     // currW is recoverable as currY / v, so no fifth channel is needed.
     body.push_back(rawClip ? idRawCy : (matDump ? idCw : idCh2));
-    body.push_back(rawClip ? idMatCz : (matDump ? idMatCz : idCh3));
+    body.push_back(rawClip ? idCw : (matDump ? idMatCz : idCh3));
     body.push_back(head(OpStore, 3)); body.push_back(idOutMV); body.push_back(idResult);
 
     out.clear();
