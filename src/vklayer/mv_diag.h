@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <vector>
+#include <string>
 #include <map>
 
 // Layer-side counters the report needs. Defined here, incremented in layer.cpp.
@@ -275,7 +276,114 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
     // is the whole answer with no line, no epipole and no depth solved from the
     // number under test. The error printed here is in pixels, directly
     // comparable with the flow beside it.
-    if (getenv("TAA_MV_RGBA") && in.halves >= 4) {
+    // Raw-clip mode reuses the same four channels for different quantities, so
+    // exact mode must stand aside or it reads clip values as velocities - which
+    // it duly did, reporting a median of 125135 px.
+    // ---- MATRIX DUMP: what each draw actually loaded from the push constant.
+    //
+    // Channels are (vx, vy, M[5], M[0]) as seen by the vertex shader itself.
+    // If the bad pixels report M[5] != 1, their draws never received our push
+    // and the fault is upstream of every shader-side theory. If they report
+    // M[5] == 1, the matrix is fine and the error is in what we do with it.
+    if (getenv("TAA_MV_MATDUMP") && in.halves >= 4) {
+        std::map<int, uint64_t> m5hist;
+        uint64_t nGood = 0, nBad = 0;
+        double m5GoodSum = 0.0, m5BadSum = 0.0;
+        int shown = 0;
+        std::vector<std::string> rows;
+        for (uint32_t y = 0; y < in.h; y += 4) {
+            for (uint32_t x = 0; x < in.w; x += 4) {
+                const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                const double vx = velHalfToFloat(in.px[i2]);
+                const double vy = velHalfToFloat(in.px[i2 + 1]);
+                const double m5 = velHalfToFloat(in.px[i2 + 3]);
+                const double m0 = velHalfToFloat(in.px[i2 + 2]);
+                if (vx != vx || vy != vy || m5 != m5) continue;
+                const double spd = sqrt(vx*vx + vy*vy) * 2.0 * (in.w * 0.5);
+                m5hist[(int)(m5 * 100.0 + (m5 < 0 ? -0.5 : 0.5))] += 1;
+                if (spd > 64.0) { ++nBad; m5BadSum += m5; }
+                else            { ++nGood; m5GoodSum += m5; }
+                if (shown < 12 && spd > 64.0 && (x % 384) < 4 && y > in.h * 3 / 4) {
+                    char b[192];
+                    snprintf(b, sizeof(b), "  %6u %6u | speed %8.1f px | M[5] %9.5f  M[0] %9.5f",
+                             x, y, spd, m5, m0);
+                    rows.push_back(std::string(b));
+                    ++shown;
+                }
+            }
+        }
+        // ---- PREDICT WITH THE MATRIX THIS PIXEL'S DRAW ACTUALLY SAW.
+        //
+        // Every element of row 1 checked out individually and prevW is right to
+        // 0.03%, yet prevY is wrong by 23% at the same pixel. With identical
+        // inputs and a correct row 3, the only way row 1 can be wrong is if the
+        // matrix the shader used is not the one the diagnostic is comparing
+        // against - and those readings came from different runs and frames.
+        //
+        // Channels are now (vx, vy, currW, M[5]) from the same fragment, so the
+        // prediction can substitute the per-pixel M[5] and see whether the error
+        // collapses. If it does, the field is right and the diagnostic has been
+        // comparing against a stale matrix all along.
+        {
+            uint64_t nBoth = 0, badGlobal = 0, badLocal = 0;
+            for (uint32_t y = 0; y < in.h; y += 4) {
+                for (uint32_t x = 0; x < in.w; x += 4) {
+                    const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                    const double vx = velHalfToFloat(in.px[i2]);
+                    const double vy = velHalfToFloat(in.px[i2 + 1]);
+                    const double d  = velHalfToFloat(in.px[i2 + 2]);
+                    const double m5 = velHalfToFloat(in.px[i2 + 3]);
+                    if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                    if (!(fabs(m5) > 1e-6)) continue;
+                    static const double vS7 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                    const double u  = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                    const double vT = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS7;
+                    const double xc = u * d, yc = vT * d;
+                    ++nBoth;
+                    for (int s = 0; s < 2; ++s) {
+                        const double m5u = s ? m5 : (double)M[5];
+                        const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
+                        const double ny = M[1]*xc + m5u*yc + M[9]*d + M[13];
+                        const double nw = M[3]*xc + M[7]*yc + M[11]*d + M[15];
+                        if (fabs(nw) < 1e-9) continue;
+                        const double pX = (nx / nw - u)  * 0.5;
+                        const double pY = (ny / nw - vT) * 0.5;
+                        const double ex = (vx - pX) * 2.0 * (in.w * 0.5);
+                        const double ey = (vy - pY) * 2.0 * (in.h * 0.5);
+                        if (sqrt(ex*ex + ey*ey) > 1.0) { if (s) ++badLocal; else ++badGlobal; }
+                    }
+                }
+            }
+            fprintf(f, "PREDICTION WITH GLOBAL vs PER-PIXEL M[5]\n");
+            fprintf(f, "  pixels compared           %llu\n", (unsigned long long)nBoth);
+            fprintf(f, "  bad with global M[5]      %llu  (%.2f%%)\n",
+                    (unsigned long long)badGlobal,
+                    nBoth ? 100.0 * badGlobal / (double)nBoth : 0.0);
+            fprintf(f, "  bad with per-pixel M[5]   %llu  (%.2f%%)\n\n",
+                    (unsigned long long)badLocal,
+                    nBoth ? 100.0 * badLocal / (double)nBoth : 0.0);
+        }
+
+        fprintf(f, "MATRIX AS THE SHADER RECEIVED IT\n");
+        fprintf(f, "view=%d  %ux%u\n\n", in.viewType, in.w, in.h);
+        fprintf(f, "  mean M[5] on slow pixels (<64 px)  %10.5f   n=%llu\n",
+                nGood ? m5GoodSum / (double)nGood : -1.0, (unsigned long long)nGood);
+        fprintf(f, "  mean M[5] on fast pixels (>64 px)  %10.5f   n=%llu\n\n",
+                nBad ? m5BadSum / (double)nBad : -1.0, (unsigned long long)nBad);
+        fprintf(f, "DISTINCT M[5] VALUES SEEN (x100, count)\n");
+        int emitted = 0;
+        for (std::map<int, uint64_t>::const_iterator it = m5hist.begin();
+             it != m5hist.end() && emitted < 20; ++it, ++emitted)
+            fprintf(f, "  %8.2f   %llu\n", it->first / 100.0,
+                    (unsigned long long)it->second);
+        fprintf(f, "\nFAST PIXELS IN THE BAD REGION\n");
+        for (size_t k = 0; k < rows.size(); ++k) fprintf(f, "%s\n", rows[k].c_str());
+        fclose(f);
+        return;
+    }
+
+    if (getenv("TAA_MV_RGBA") && in.halves >= 4 && !getenv("TAA_MV_RAWCLIP")
+        && !getenv("TAA_MV_MATDUMP")) {
         const double hw = in.w * 0.5, hh = in.h * 0.5;
         const int kEB = 6;
         const double eEdge[6] = { 1.0, 4.0, 16.0, 64.0, 256.0, 1e30 };
@@ -401,7 +509,51 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                     }
                 }
             }
-            fprintf(f, "\nPROFILE OF THE PIXELS STILL WRONG (err > 1 px)\n");
+            // ---- WHERE ARE THE BAD PIXELS ON SCREEN?
+        //
+        // A contiguous blob is a moving object - water, most likely, since this
+        // is the terrain/water shader and the scenery is Seattle. Scatter across
+        // the frame is a systematic fault. The row means cannot tell these apart
+        // but a coarse tile map can.
+        {
+            fprintf(f, "\nBAD-PIXEL MAP (16x8 tiles, %% of tile beyond 1 px)\n");
+            for (int ty = 0; ty < 8; ++ty) {
+                fprintf(f, "  ");
+                for (int tx = 0; tx < 16; ++tx) {
+                    uint64_t tn = 0, tb = 0;
+                    const uint32_t y0 = in.h * ty / 8, y1 = in.h * (ty + 1) / 8;
+                    const uint32_t x0 = in.w * tx / 16, x1 = in.w * (tx + 1) / 16;
+                    for (uint32_t y = y0; y < y1; y += 8) {
+                        for (uint32_t x = x0; x < x1; x += 8) {
+                            const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                            const double vx = velHalfToFloat(in.px[i2]);
+                            const double vy = velHalfToFloat(in.px[i2 + 1]);
+                            const double d  = velHalfToFloat(in.px[i2 + 2]);
+                            if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                            static const double vS4 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                            const double u  = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                            const double vT = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS4;
+                            const double xc = u * d, yc = vT * d;
+                            const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
+                            const double ny = M[1]*xc + M[5]*yc + M[9]*d + M[13];
+                            const double nw = M[3]*xc + M[7]*yc + M[11]*d + M[15];
+                            if (fabs(nw) < 1e-9) continue;
+                            const double pX = (nx / nw - u)  * 0.5;
+                            const double pY = (ny / nw - vT) * 0.5;
+                            const double ex = (vx - pX) * 2.0 * hw;
+                            const double ey = (vy - pY) * 2.0 * hh;
+                            ++tn;
+                            if (sqrt(ex*ex + ey*ey) > 1.0) ++tb;
+                        }
+                    }
+                    fprintf(f, "%4d", tn ? (int)(100.0 * tb / (double)tn) : -1);
+                }
+                fprintf(f, "\n");
+            }
+            fprintf(f, "      -1 = nothing drew there\n");
+        }
+
+        fprintf(f, "\nPROFILE OF THE PIXELS STILL WRONG (err > 1 px)\n");
             fprintf(f, "  count                       %llu\n", (unsigned long long)rN);
             fprintf(f, "  mean |measured|/|predicted| %10.4f   (1 = right size)\n",
                     rN ? rSum / (double)rN : -1.0);
@@ -456,6 +608,56 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                         if (bestAlt >= 0.0 && bestAlt <= 1.0) ++altFit;
                     }
                 }
+            // ---- DO THE BAD PIXELS FIT THE TRANSPOSED MATRIX?
+            //
+            // The shader reports M[5] = 0.99951, so the matrix it receives is
+            // right - the "effective M[5] = -0.79" was a bad inference. M[5]
+            // and M[0] are the DIAGONAL, which a transpose leaves untouched
+            // while swapping the translation column M[12..14] into the w row
+            // M[3],M[7],M[11]. At the bad pixels that changes prevW from about
+            // 10.82 to about 0.56, and the resulting error scales as 1/depth -
+            // which is why it tracks speed, spares distant geometry and hugs
+            // the bottom-right corner.
+            {
+                uint64_t trFit = 0, trN = 0;
+                float T[16];
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        T[c * 4 + r] = M[r * 4 + c];
+                for (uint32_t y = 0; y < in.h; y += 4) {
+                    for (uint32_t x = 0; x < in.w; x += 4) {
+                        const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                        const double vx = velHalfToFloat(in.px[i2]);
+                        const double vy = velHalfToFloat(in.px[i2 + 1]);
+                        const double d  = velHalfToFloat(in.px[i2 + 2]);
+                        if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                        static const double vS6 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                        const double u  = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                        const double vT = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS6;
+                        const double xc = u * d, yc = vT * d;
+                        double e[2];
+                        for (int s = 0; s < 2; ++s) {
+                            const float *Q = s ? T : M;
+                            const double nx = Q[0]*xc + Q[4]*yc + Q[8]*d + Q[12];
+                            const double ny = Q[1]*xc + Q[5]*yc + Q[9]*d + Q[13];
+                            const double nw = Q[3]*xc + Q[7]*yc + Q[11]*d + Q[15];
+                            if (fabs(nw) < 1e-9) { e[s] = 1e30; continue; }
+                            const double pX = (nx / nw - u)  * 0.5;
+                            const double pY = (ny / nw - vT) * 0.5;
+                            const double ex = (vx - pX) * 2.0 * hw;
+                            const double ey = (vy - pY) * 2.0 * hh;
+                            e[s] = sqrt(ex*ex + ey*ey);
+                        }
+                        if (e[0] <= 1.0) continue;
+                        ++trN;
+                        if (e[1] <= 1.0) ++trFit;
+                    }
+                }
+                fprintf(f, "  bad pixels fitting TRANSPOSED M  %llu of %llu  (%.2f%%)\n",
+                        (unsigned long long)trFit, (unsigned long long)trN,
+                        trN ? 100.0 * trFit / (double)trN : 0.0);
+            }
+
                 fprintf(f, "  bad pixels fitting NEGATED v  %llu of %llu  (%.2f%%)\n",
                         (unsigned long long)altFit, (unsigned long long)altN,
                         altN ? 100.0 * altFit / (double)altN : 0.0);
@@ -528,8 +730,10 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                     const double d  = velHalfToFloat(in.px[i2 + 2]);
                     const double pf = velHalfToFloat(in.px[i2 + 3]);
                     if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                    // Instance index 0 is the ordinary path and most of the
+                    // frame; excluding it hid exactly the pixels under test.
                     const int pid = (int)(pf + 0.5);
-                    if (pid <= 0) continue;
+                    if (pid < 0) continue;
                     static const double vSign2 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
                     const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
                     const double vTop = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vSign2;
@@ -549,7 +753,8 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                     if (err > a.worst) a.worst = err;
                 }
             }
-            fprintf(f, "\nERROR BY FRAGMENT SHADER (channel 3 tag)\n");
+            fprintf(f, "\nERROR BY %s (channel 3 tag)\n",
+                    getenv("TAA_MV_INST") ? "INSTANCE INDEX" : "FRAGMENT SHADER");
             fprintf(f, "  %6s %10s %10s %10s %12s %10s\n",
                     "pid", "pixels", "bad>1px", "bad%", "mean err", "worst");
             std::vector<std::pair<uint64_t, int> > order;
@@ -575,6 +780,152 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
 
         fprintf(f, "\n  The epipolar metric called rows 1890-2159 174 px wrong.\n");
         fprintf(f, "  If this says otherwise, the metric was the defect.\n");
+        fclose(f);
+        return;
+    }
+
+    // ---- RAW CLIP MODE: check the assumption everything else rests on.
+    //
+    // Channels are (prevClip.y, prevClip.w, currClip.y, currClip.w) straight
+    // from the shader. Two things get tested that never have been:
+    //
+    //   currClip.y / currClip.w  ==  the pixel's NDC v ?
+    //   prevClip.y  ==  M[1]*xc + M[5]*yc + M[9]*d + M[13] ?
+    //
+    // The first is the assumption behind every prediction and elimination in
+    // this investigation. The second says whether the shader is applying the
+    // matrix that was pushed.
+    if (getenv("TAA_MV_RAWCLIP") && in.halves >= 4) {
+        const double hw2 = in.w * 0.5, hh2 = in.h * 0.5;
+        (void)hw2;
+        double vErrSum = 0.0, pErrSum = 0.0; uint64_t vN = 0, vBad = 0, pBad = 0;
+        double worstV = 0.0, worstP = 0.0;
+        int shown = 0;
+        std::vector<std::string> rows;
+        for (uint32_t y = 0; y < in.h; y += 4) {
+            for (uint32_t x = 0; x < in.w; x += 4) {
+                const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                // Channels are now (prevY, prevW, currY, M[5]) from ONE fragment.
+                // currW is recovered as currY / v, which is exact because
+                // currClip.y/currClip.w was already verified to equal the pixel
+                // v to better than 0.001 on every sample.
+                const double py  = velHalfToFloat(in.px[i2]);
+                const double pw  = velHalfToFloat(in.px[i2 + 1]);
+                const double cy  = velHalfToFloat(in.px[i2 + 2]);
+                const double m5s = velHalfToFloat(in.px[i2 + 3]);
+                if (cy != cy || pw != pw || py != py || !(fabs(m5s) > 1e-6)) continue;
+                static const double vS5 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                const double vPix = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS5;
+                if (fabs(vPix) < 1e-6) continue;
+                const double cw   = cy / vPix;
+                if (!(cw > 0.0) || cw != cw) continue;
+                const double vSh  = vPix;
+                const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                const double d    = cw;
+                const double xc = u * d, yc = vSh * d;
+                // Use the shader's OWN M[5]; only the tiny row-1 terms come
+                // from the layer's copy, and those contribute under 0.05.
+                const double expPy = M[1]*xc + m5s*yc + M[9]*d + M[13];
+                // ---- RELATIVE, NOT ABSOLUTE.
+                //
+                // The first pass used an absolute threshold of 0.01 on prevY,
+                // whose values reach 8000 at far geometry where half-float
+                // steps are 4 and 8. It reported 31% disagreement and was
+                // measuring the readback's quantisation. Relative error, and
+                // only where the flow is big enough to matter, tests the shader
+                // instead of the channel.
+                const double dv = fabs(vSh - vPix);
+                const double scale = fabs(expPy) > 1.0 ? fabs(expPy) : 1.0;
+                const double dp = fabs(py - expPy) / scale;
+                ++vN; vErrSum += dv; pErrSum += dp;
+                if (dv > 0.001) ++vBad;
+                if (dp > 0.001) ++pBad;
+                if (dv > worstV) worstV = dv;
+                if (dp > worstP) worstP = dp;
+                // Aim at the bottom-right, where the bad pixels actually are.
+                if (shown < 16 && dp > 0.001 && y > in.h * 3 / 4 && (x % 384) < 4) {
+                    char b[256];
+                    snprintf(b, sizeof(b),
+                             "  %6u %6u | vPix %9.5f vShader %9.5f | prevY %10.4f expected %10.4f | w %8.3f",
+                             x, y, vPix, vSh, py, expPy, cw);
+                    rows.push_back(std::string(b));
+                    ++shown;
+                }
+            }
+        }
+        fprintf(f, "RAW CLIP MODE - the shader's own clip values\n");
+        fprintf(f, "view=%d  %ux%u  samples %llu\n\n",
+                in.viewType, in.w, in.h, (unsigned long long)vN);
+        fprintf(f, "IS currClip.y/currClip.w THE PIXEL'S v?\n");
+        fprintf(f, "  mean |vShader - vPixel|   %12.8f\n", vN ? vErrSum / (double)vN : -1.0);
+        fprintf(f, "  worst                     %12.8f\n", worstV);
+        fprintf(f, "  beyond 0.001              %llu of %llu  (%.2f%%)\n\n",
+                (unsigned long long)vBad, (unsigned long long)vN,
+                vN ? 100.0 * vBad / (double)vN : 0.0);
+        fprintf(f, "IS prevClip.y THE PUSHED MATRIX APPLIED?  (RELATIVE)\n");
+        fprintf(f, "  mean relative error       %12.8f\n", vN ? pErrSum / (double)vN : -1.0);
+        fprintf(f, "  worst                     %12.8f\n", worstP);
+        fprintf(f, "  beyond 0.001 relative     %llu of %llu  (%.2f%%)\n\n",
+                (unsigned long long)pBad, (unsigned long long)vN,
+                vN ? 100.0 * pBad / (double)vN : 0.0);
+        // ---- prevClip.w IS THE DENOMINATOR AND HAS NEVER BEEN COMPARED.
+        //
+        // Measured flow is 19.7x the prediction at 73 degrees. The matrix is
+        // confirmed correct (M[5] = 0.99951), the inputs are confirmed correct
+        // (currClip.y/w equals the pixel v), transpose fits 0 of 88660 and
+        // negated v fits 33. A field that much too large is a divide that blew
+        // up, and prevClip.w is the divisor. It has been sitting in channel 1
+        // the whole time unexamined.
+        {
+            double wRelSum = 0.0, worstW = 0.0; uint64_t wN = 0, wBad = 0;
+            int shownW = 0;
+            std::vector<std::string> wrows;
+            for (uint32_t y = 0; y < in.h; y += 4) {
+                for (uint32_t x = 0; x < in.w; x += 4) {
+                    const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                    const double pw = velHalfToFloat(in.px[i2 + 1]);
+                    const double cy = velHalfToFloat(in.px[i2 + 2]);
+                    const double py = velHalfToFloat(in.px[i2]);
+                    static const double vS8 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                    const double vP8 = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS8;
+                    if (fabs(vP8) < 1e-6) continue;
+                    const double cw = cy / vP8;
+                    if (!(cw > 0.0) || cw != cw || pw != pw || cy != cy) continue;
+                    const double u  = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                    const double d  = cw;
+                    const double xc = u * d, yc = cy;
+                    const double expPw = M[3]*xc + M[7]*yc + M[11]*d + M[15];
+                    (void)0;
+                    const double sc = fabs(expPw) > 1.0 ? fabs(expPw) : 1.0;
+                    const double rel = fabs(pw - expPw) / sc;
+                    ++wN; wRelSum += rel;
+                    if (rel > 0.001) ++wBad;
+                    if (rel > worstW) worstW = rel;
+                    if (shownW < 12 && rel > 0.001 && y > in.h * 3 / 4 && (x % 384) < 4) {
+                        char b[224];
+                        snprintf(b, sizeof(b),
+                                 "  %6u %6u | prevW %10.4f expected %10.4f | currW %9.3f | prevY %9.3f",
+                                 x, y, pw, expPw, cw, py);
+                        wrows.push_back(std::string(b));
+                        ++shownW;
+                    }
+                }
+            }
+            fprintf(f, "IS prevClip.w THE PUSHED MATRIX APPLIED?  (RELATIVE)\n");
+            fprintf(f, "  mean relative error       %12.8f\n", wN ? wRelSum / (double)wN : -1.0);
+            fprintf(f, "  worst                     %12.8f\n", worstW);
+            fprintf(f, "  beyond 0.001 relative     %llu of %llu  (%.2f%%)\n\n",
+                    (unsigned long long)wBad, (unsigned long long)wN,
+                    wN ? 100.0 * wBad / (double)wN : 0.0);
+            fprintf(f, "DISAGREEING prevW PIXELS (bottom quarter)\n");
+            for (size_t k = 0; k < wrows.size(); ++k)
+                fprintf(f, "%s\n", wrows[k].c_str());
+            fprintf(f, "\n");
+        }
+
+        fprintf(f, "DISAGREEING PIXELS\n");
+        for (size_t k = 0; k < rows.size(); ++k)
+            fprintf(f, "%s\n", rows[k].c_str());
         fclose(f);
         return;
     }

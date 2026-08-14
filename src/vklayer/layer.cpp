@@ -2276,6 +2276,7 @@ static uint32_t g_mvQualifyThisFrame = 0;
 // against what was really pushed removes the last place the two can disagree
 // without either being wrong.
 static float g_lastPushed[16];
+static uint64_t g_layoutOverlap = 0;
 static uint32_t g_pushDistinctThisFrame = 0;
 static uint32_t g_pushDistinctMax       = 0;
 static uint32_t g_mvBindsMax       = 0;
@@ -6567,6 +6568,47 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreatePipelineLayout(
     // invalid by overlap; if X-Plane pushes a range spanning them, its own
     // writes land on our matrix. Either way the shader reads something nobody
     // intended, and zero is the commonest something.
+    // ---- ANY STAGE'S RANGE CAN CLOBBER OURS, NOT JUST A VERTEX ONE.
+    //
+    // Push constant memory is ONE block shared by every stage. The check above
+    // only skips layouts that declare a VERTEX range, so a FRAGMENT range
+    // covering our bytes is merely logged and then patched anyway - and when
+    // X-Plane pushes to it, its writes land on our matrix and the vertex shader
+    // reads whatever X-Plane put there.
+    //
+    // That is what the raw clip values show. currClip.y is verified correct and
+    // M[9] is ~0, so yc and d are right, yet the shader's prevY moves OPPOSITE
+    // to the prediction - d(prevY)/d(yc) = -0.79 where M[5] = 1.0000 was pushed.
+    // Every input checks out, so the matrix those draws actually saw was not
+    // ours. It is not a flip either: substituting -yc predicts +7.013 against a
+    // measured -6.957.
+    //
+    // A wrong vector is worse than none, so overlapping layouts go unpatched.
+    {
+        bool anyOverlap = false;
+        for (uint32_t i = 0; i < ci->pushConstantRangeCount; ++i) {
+            const VkPushConstantRange &e = ci->pPushConstantRanges[i];
+            if ((e.offset < spvinj::pushConstantOffset() + spvinj::kPushConstantBytes) &&
+                (spvinj::pushConstantOffset() < e.offset + e.size))
+                anyOverlap = true;
+        }
+        if (anyOverlap) {
+            VkResult r = next(device, ci, alloc, out);
+            if (r == VK_SUCCESS) {
+                std::lock_guard<std::mutex> g(g_lock);
+                g_layoutHasOurPC[*out] = false;
+                if (++g_layoutOverlap <= 5)
+                    trace("SPIRV INJECT: a declared push range OVERLAPS ours at "
+                          "%u..%u in another stage - left unpatched (%llu so far). "
+                          "X-Plane's pushes would land on our matrix.",
+                          spvinj::pushConstantOffset(),
+                          spvinj::pushConstantOffset() + spvinj::kPushConstantBytes,
+                          (unsigned long long)g_layoutOverlap);
+            }
+            return r;
+        }
+    }
+
     {
         static bool said = false;
         if (!said) {

@@ -53,7 +53,7 @@ enum {
     OpGroupDecorate = 74, OpGroupMemberDecorate = 75,
     OpMatrixTimesVector = 145,
     OpVectorShuffle = 79, OpCompositeConstruct = 80, OpCompositeExtract = 81,
-    OpCompositeInsert = 82,
+    OpCompositeInsert = 82, OpConvertSToF = 111, OpISub = 130,
     OpFSub = 131, OpFDiv = 136, OpVectorTimesScalar = 142,
     OpFNegate = 127, OpFAdd = 129, OpFMul = 133,
     OpSelect = 169, OpFOrdLessThan = 184,
@@ -561,6 +561,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     uint32_t idConst2NF = bound++;              // component index 2 of the vec4
     uint32_t idChainNF = bound++, idNFvec = bound++, idNFdist = bound++;
     uint32_t idNFcmp = bound++, idPrevSel = bound++;
+    uint32_t idPrevSelTagged = 0;
     uint32_t idLoadedMat = bound++;
     uint32_t idChainPC   = bound++;
     uint32_t idPrevClip  = bound++;
@@ -634,6 +635,32 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 
     body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrPCMat4); body.push_back(idChainPC); body.push_back(idPCVar); body.push_back(idConst0);
     body.push_back(head(OpLoad, 4));        body.push_back(idMat4);      body.push_back(idLoadedMat); body.push_back(idChainPC);
+
+    // ---- ROW 1 IS THE ONLY ROW LEFT.
+    //
+    // prevClip.w is confirmed correct (relative error 0.0003), so row 3 is
+    // right. dx is correct, so row 0 is right. M[5] came back 0.99951. Yet
+    // prevY is wrong on 20.4% of pixels, so the fault is M[1], M[9] or M[13].
+    // The divergence grows as depth falls, which points at M[9]*d: the observed
+    // +0.43 shift over a depth change of -0.4 needs M[9] about -1.07, where the
+    // layer reports 0.0000.
+    //
+    // Extract here, right after the load, so both the prevClip and currClip
+    // stores can carry a value out. The previous attempt inserted into prevClip
+    // AFTER its store had already been emitted, which is why M[0] came back as
+    // the real z (about 10.3) instead of a matrix element.
+    uint32_t idMatRow1a = 0, idMatRow1b = 0;
+    if (getenv("TAA_MV_MATDUMP") || getenv("TAA_MV_RAWCLIP")) {
+        const uint32_t idCol2 = bound++, idCol3 = bound++;
+        idMatRow1a = bound++; idMatRow1b = bound++;
+        // Carry M[5] out, the one element that determines prevY for a near
+        // identity matrix, so the prediction can use the matrix THIS draw saw
+        // rather than whatever the layer last pushed in some other frame.
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(idCol2); body.push_back(idLoadedMat); body.push_back(1);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatRow1a); body.push_back(idCol2); body.push_back(1);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idV4); body.push_back(idCol3); body.push_back(idLoadedMat); body.push_back(3);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatRow1b); body.push_back(idCol3); body.push_back(1);
+    }
     // ---- THE MATRIX IS APPLIED TO THE RAW CLIP POSITION, NOT THE FLIPPED ONE.
     //
     // uReproj is built from X-Plane's world and projection matrices, which are
@@ -790,7 +817,14 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // prevClip.w into .y in this mode, so .y becomes m33: 1.0 if the matrix
     // arrived, 0.0 if the load returned zeros and every motion vector this
     // shader has ever written was a difference against nothing.
-    body.push_back(head(OpStore, 3)); body.push_back(idOutPrev); body.push_back(idPrevSel);
+    if (idMatRow1b) {
+        const uint32_t idPT = bound++;
+        body.push_back(head(OpCompositeInsert, 6)); body.push_back(idV4);
+        body.push_back(idPT); body.push_back(idMatRow1b);
+        body.push_back(idPrevSel); body.push_back(2);
+        idPrevSelTagged = idPT;
+    }
+    body.push_back(head(OpStore, 3)); body.push_back(idOutPrev); body.push_back(idPrevSelTagged ? idPrevSelTagged : idPrevSel);
     // currClip goes out in the same space the matrix works in, so the fragment's
     // subtraction is between two comparable vectors. Both raw, or both flipped -
     // never one of each.
@@ -806,8 +840,75 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // currClip.z is dead: the fragment reads .xy and .w and never touches it.
     // Writing the vertex module's own tag there costs nothing and carries the
     // right stage's identity through to the readback.
+    // Locate gl_InstanceIndex (BuiltIn 43), gl_BaseInstance (BuiltIn 4425) and
+    // the signed 32-bit int type, so the instance tag can be emitted. Any of
+    // them missing simply disables the tag for that module.
+    uint32_t idInstIdxVar = 0, idBaseInstVar = 0, idIntType = 0;
+    if (getenv("TAA_MV_INST")) {
+        size_t q = 5;
+        while (q < w.size()) {
+            const uint16_t qop = (uint16_t)(w[q] & 0xFFFF);
+            const uint16_t qln = (uint16_t)(w[q] >> 16);
+            if (qln == 0) break;
+            if (qop == OpDecorate && qln >= 4 && w[q + 2] == Deco_BuiltIn) {
+                if (w[q + 3] == 43)   idInstIdxVar  = w[q + 1];
+                if (w[q + 3] == 4425) idBaseInstVar = w[q + 1];
+            }
+            if (qop == OpTypeInt && qln >= 4 && w[q + 2] == 32 && w[q + 3] == 1)
+                idIntType = w[q + 1];
+            q += qln;
+        }
+        if (!idIntType) { idInstIdxVar = 0; idBaseInstVar = 0; }
+    }
+
+    // ---- IS THE BAD GEOMETRY DRAWN AT A NONZERO INSTANCE INDEX?
+    //
+    // The dominant shader selects mvp_matrix[] and modelview_matrix[] by
+    // (gl_InstanceIndex - gl_BaseInstance) % u_transform_count and writes
+    // gl_ViewportIndex and gl_Layer, so one draw can emit the same geometry
+    // through several transforms. 26.75% of that shader's pixels are wrong
+    // while the rest are exact, which is what a subset of instances looks like.
+    //
+    // u_transform_count cannot be read generically, but gl_InstanceIndex is a
+    // built-in available in every vertex shader. Stamping the relative instance
+    // index into currClip.z tests the whole family at once: if the bad pixels
+    // carry nonzero indices and the good ones carry zero, the multi-view path
+    // is the mechanism and our single pushed matrix is wrong for those draws.
+    // ---- LET THE SHADER REPORT THE MATRIX IT ACTUALLY RECEIVED.
+    //
+    // Twice now "the matrix must be wrong" has been INFERRED from the shader's
+    // outputs. currClip.y is verified equal to the pixel's v, M[9] is ~0, and
+    // still d(prevY)/d(yc) comes out -0.79 where 1.0000 was pushed. The push
+    // range overlap was a real hazard but only 3 layouts hit it and the tail did
+    // not move, so that was not the mechanism either.
+    //
+    // currClip.z and prevClip.z are both dead - the fragment reads .xy and .w
+    // from each. Carrying M[5] and M[0] out through them reports, per pixel,
+    // exactly what the vertex shader loaded from the push constant, next to the
+    // velocity it produced. No inference left.
+    const uint32_t idMatM5 = idMatRow1a;
+
     uint32_t idCurrOut = flipForMatrix ? idFlipped : storedValue;
-    if (getenv("TAA_MV_PID")) {
+    if (idMatM5) {
+        const uint32_t idCurrTag = bound++;
+        body.push_back(head(OpCompositeInsert, 6)); body.push_back(idV4);
+        body.push_back(idCurrTag); body.push_back(idMatM5);
+        body.push_back(idCurrOut); body.push_back(2);
+        idCurrOut = idCurrTag;
+    }
+    if (getenv("TAA_MV_INST") && idInstIdxVar && idBaseInstVar) {
+        const uint32_t idII = bound++, idBI = bound++, idRel = bound++, idRelF = bound++;
+        const uint32_t idTagged2 = bound++;
+        body.push_back(head(OpLoad, 4)); body.push_back(idIntType); body.push_back(idII); body.push_back(idInstIdxVar);
+        body.push_back(head(OpLoad, 4)); body.push_back(idIntType); body.push_back(idBI); body.push_back(idBaseInstVar);
+        body.push_back(head(OpISub, 5)); body.push_back(idIntType); body.push_back(idRel); body.push_back(idII); body.push_back(idBI);
+        body.push_back(head(OpConvertSToF, 4)); body.push_back(idFloat); body.push_back(idRelF); body.push_back(idRel);
+        body.push_back(head(OpCompositeInsert, 6)); body.push_back(idV4);
+        body.push_back(idTagged2); body.push_back(idRelF);
+        body.push_back(idCurrOut); body.push_back(2);
+        idCurrOut = idTagged2;
+    }
+    else if (getenv("TAA_MV_PID")) {
         uint32_t bits; float pv = (float)myVsPid; memcpy(&bits, &pv, 4);
         const uint32_t idVsPidK = bound++;
         globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat);
@@ -1201,14 +1302,48 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // into currClip.z - the component this shader never reads. The fragment's
     // own tag named a stage that only performs a divide; prevClip is computed
     // in the vertex shader, so that is the identity worth carrying out.
+    // ---- HAND BACK THE RAW CLIP VALUES.
+    //
+    // Every prediction in this project assumes currClip.y/currClip.w equals the
+    // pixel's NDC v. Rasterisation guarantees that only if currClip really is
+    // gl_Position, and that assumption has never been measured - it is the one
+    // thing every elimination so far has rested on.
+    //
+    // TAA_MV_RAWCLIP writes (prevClip.y, prevClip.w, currClip.y, currClip.w) so
+    // the shader's own numbers can be compared against both the pixel position
+    // and the pushed matrix, ending the inference.
+    static const bool matDump = getenv("TAA_MV_MATDUMP") != nullptr;
+    static const bool rawClip = getenv("TAA_MV_RAWCLIP") != nullptr;
     uint32_t idCh3 = wantRGBA ? idPw : idConstZero;
+    uint32_t idMatCz = 0, idMatPz = 0;
+    if (matDump || rawClip) {
+        idMatCz = bound++; idMatPz = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatCz); body.push_back(idLc); body.push_back(2);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMatPz); body.push_back(idLp); body.push_back(2);
+    }
+    uint32_t idRawCy = 0, idRawPy = 0;
+    if (rawClip) {
+        idRawCy = bound++; idRawPy = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idRawCy); body.push_back(idLc); body.push_back(1);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idRawPy); body.push_back(idLp); body.push_back(1);
+    }
     if (idConstPid) {
         const uint32_t idVsTag = bound++;
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat);
         body.push_back(idVsTag); body.push_back(idLc); body.push_back(2);
         idCh3 = idVsTag;
     }
-    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(idCh0); body.push_back(idCh1); body.push_back(idCh2); body.push_back(idCh3);
+    body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult); body.push_back(rawClip ? idRawPy : idCh0); body.push_back(rawClip ? idPw : idCh1);
+    // ---- ONE FRAGMENT, ONE FRAME, EVERY QUANTITY.
+    //
+    // prevW measured right to 0.03% while prevY was wrong by 23% at the same
+    // pixel, with every row-1 element verified - a contradiction only possible
+    // because those two readings came from different RUNS. This puts
+    // (prevY, prevW, currY, M[5]) in a single fragment so the shader's own
+    // numbers can be checked against each other with nothing cross-run left.
+    // currW is recoverable as currY / v, so no fifth channel is needed.
+    body.push_back(rawClip ? idRawCy : (matDump ? idCw : idCh2));
+    body.push_back(rawClip ? idMatCz : (matDump ? idMatCz : idCh3));
     body.push_back(head(OpStore, 3)); body.push_back(idOutMV); body.push_back(idResult);
 
     out.clear();
