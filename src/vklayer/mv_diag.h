@@ -714,6 +714,45 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
             }
         }
 
+        // ---- WRITE THE FIELD AS A PICTURE.
+        //
+        // Enough arguing about metrics. A correct camera-motion field is smooth,
+        // grows toward the near edge, and is zero where nothing drew. A uniform
+        // wash or a hard-edged block is visibly wrong at a glance, and no
+        // statistic has to be trusted to see it.
+        if (const char *dir = getenv("TAA_MV_IMAGE")) {
+            static int nField = 0;
+            if (nField < 2) {
+                char pth[512];
+                snprintf(pth, sizeof(pth), "%s/field_%d.ppm", dir, nField++);
+                if (FILE *im = fopen(pth, "wb")) {
+                    const uint32_t ow = in.w / 4, oh = in.h / 4;
+                    fprintf(im, "P6%c%u %u%c255%c", 10, ow, oh, 10, 10);
+                    std::vector<unsigned char> row(ow * 3);
+                    for (uint32_t yy = 0; yy < oh; ++yy) {
+                        for (uint32_t xx = 0; xx < ow; ++xx) {
+                            const size_t i2 = ((size_t)(yy * 4) * in.w + xx * 4) * in.halves;
+                            const double vx = velHalfToFloat(in.px[i2]);
+                            const double vy = velHalfToFloat(in.px[i2 + 1]);
+                            const double sx = vx * 2.0 * (in.w * 0.5);
+                            const double sy = vy * 2.0 * (in.h * 0.5);
+                            // +-64 px full scale, grey = zero.
+                            double r = 128.0 + sx * 2.0;
+                            double g = 128.0 + sy * 2.0;
+                            if (r < 0) r = 0; if (r > 255) r = 255;
+                            if (g < 0) g = 0; if (g > 255) g = 255;
+                            const bool zero = (vx == 0.0 && vy == 0.0);
+                            row[xx*3+0] = zero ? 0   : (unsigned char)r;
+                            row[xx*3+1] = zero ? 0   : (unsigned char)g;
+                            row[xx*3+2] = zero ? 160 : 128;
+                        }
+                        fwrite(&row[0], 1, row.size(), im);
+                    }
+                    fclose(im);
+                }
+            }
+        }
+
         fprintf(f, "\nERROR BY SCREEN ROW (top to bottom, eighths)\n");
         for (int b = 0; b < 8; ++b)
             fprintf(f, "  rows %4u-%4u  mean %10.4f px   worst %10.2f px   n=%llu\n",
