@@ -2693,6 +2693,25 @@ static float matrixCallback(float sinceLast, float, int, void *)
                 XPLMSetDataf(d, 1.0f);
             if (XPLMDataRef d = XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all"))
                 XPLMSetDataf(d, 0.0f);
+            // ---- PAUSE THE SIM SO ANIMATED GEOMETRY STOPS TOO.
+            //
+            // Freezing the aeroplane is not enough. prevClip = M*currClip
+            // assumes each vertex held the same world position last frame, and
+            // X-Plane's water and camera-relative meshes do not: the grid
+            // follows the camera, so the same vertex index is a different world
+            // point every frame. No camera-only reprojection can be right for
+            // that geometry however correct the matrix is.
+            //
+            // The dominant shader is exactly the terrain/water one - it outputs
+            // v_water_height - and the scenery is Seattle. Pausing stops the
+            // animation while the camera can still be moved, so if the bad
+            // pixels collapse the residual is moving geometry and not a bug.
+            if (const char *p = getenv("TAA_MV_PAUSE")) {
+                (void)p;
+                if (XPLMDataRef d = XPLMFindDataRef("sim/time/paused"))
+                    XPLMSetDatai(d, 1);
+                xlog("MV EXT STATIC: sim PAUSED - animated geometry frozen too");
+            }
             xlog("MV EXT STATIC: external view, parking brake ON, throttle shut. "
                  "The aeroplane is frozen, so every pixel is static world "
                  "geometry and the epipolar residual is valid on all of it.");

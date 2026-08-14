@@ -414,8 +414,93 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
             fprintf(f, "  measured exactly zero       %llu\n", (unsigned long long)zeroN);
             fprintf(f, "  predicted prev off-screen   %llu  (%.2f%%)\n",
                     (unsigned long long)offN, rN ? 100.0 * offN / (double)rN : 0.0);
+
+            // ---- DO THE BAD PIXELS FIT THE OPPOSITE Y CONVENTION?
+            //
+            // The raw rows show dx correct to 2% while dy ramps linearly at
+            // 1.64 px per row against a flat prediction. Depth cannot do that -
+            // dy proportional to 1/d would need 0.85 m and would ruin dx too.
+            // A linear ramp in v is what a Y-convention mismatch looks like, so
+            // re-predict these pixels with v negated and count the matches. If
+            // they fit, some draws use the opposite Y sign from the rest and the
+            // fix belongs in the shader, per pipeline.
+            {
+                uint64_t altFit = 0, altN = 0;
+                for (uint32_t y = 0; y < in.h; y += 4) {
+                    for (uint32_t x = 0; x < in.w; x += 4) {
+                        const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                        const double vx = velHalfToFloat(in.px[i2]);
+                        const double vy = velHalfToFloat(in.px[i2 + 1]);
+                        const double d  = velHalfToFloat(in.px[i2 + 2]);
+                        if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                        static const double vS3 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                        const double u  = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                        const double v0 = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS3;
+                        double bestOwn = -1.0, bestAlt = -1.0;
+                        for (int s = 0; s < 2; ++s) {
+                            const double vv = s ? -v0 : v0;
+                            const double xc = u * d, yc = vv * d;
+                            const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
+                            const double ny = M[1]*xc + M[5]*yc + M[9]*d + M[13];
+                            const double nw = M[3]*xc + M[7]*yc + M[11]*d + M[15];
+                            if (fabs(nw) < 1e-9) continue;
+                            const double pX = (nx / nw - u)  * 0.5;
+                            const double pY = (ny / nw - vv) * 0.5;
+                            const double ex = (vx - pX) * 2.0 * hw;
+                            const double ey = (vy - pY) * 2.0 * hh;
+                            const double e  = sqrt(ex*ex + ey*ey);
+                            if (s) bestAlt = e; else bestOwn = e;
+                        }
+                        if (bestOwn <= 1.0 || bestOwn < 0.0) continue;
+                        ++altN;
+                        if (bestAlt >= 0.0 && bestAlt <= 1.0) ++altFit;
+                    }
+                }
+                fprintf(f, "  bad pixels fitting NEGATED v  %llu of %llu  (%.2f%%)\n",
+                        (unsigned long long)altFit, (unsigned long long)altN,
+                        altN ? 100.0 * altFit / (double)altN : 0.0);
+                fprintf(f, "      a high share means those draws use the opposite\n");
+                fprintf(f, "      Y convention and the fix is per pipeline\n");
+            }
             fprintf(f, "      ratio 0 = field empty, 2 = doubled, 1 with a large\n");
             fprintf(f, "      angle = right size wrong direction\n");
+
+            // Summary statistics have misled this investigation repeatedly.
+            // Print the actual pixels: position, depth, measured and predicted
+            // flow in pixels, and a clean neighbour for contrast.
+            fprintf(f, "\nRAW BAD PIXELS\n");
+            fprintf(f, "  %6s %6s %9s | %9s %9s | %9s %9s | %8s\n",
+                    "x", "y", "depth", "meas dx", "meas dy", "pred dx", "pred dy", "ratio");
+            int shown = 0;
+            for (uint32_t y = 0; y < in.h && shown < 20; y += 4) {
+                for (uint32_t x = 0; x < in.w && shown < 20; x += 4) {
+                    const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                    const double vx = velHalfToFloat(in.px[i2]);
+                    const double vy = velHalfToFloat(in.px[i2 + 1]);
+                    const double d  = velHalfToFloat(in.px[i2 + 2]);
+                    if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                    static const double vS2 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                    const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                    const double vTop = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS2;
+                    const double xc = u * d, yc = vTop * d;
+                    const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
+                    const double ny = M[1]*xc + M[5]*yc + M[9]*d + M[13];
+                    const double nw = M[3]*xc + M[7]*yc + M[11]*d + M[15];
+                    if (fabs(nw) < 1e-9) continue;
+                    const double predX = (nx / nw - u) * 0.5;
+                    const double predY = (ny / nw - vTop) * 0.5;
+                    const double ex = (vx - predX) * 2.0 * hw;
+                    const double ey = (vy - predY) * 2.0 * hh;
+                    if (sqrt(ex*ex + ey*ey) <= 8.0) continue;
+                    if ((x % 384) > 4) continue;
+                    const double mM = sqrt(vx*vx + vy*vy), pM = sqrt(predX*predX + predY*predY);
+                    fprintf(f, "  %6u %6u %9.3f | %9.2f %9.2f | %9.2f %9.2f | %8.2f\n",
+                            x, y, d, vx * 2.0 * hw, vy * 2.0 * hh,
+                            predX * 2.0 * hw, predY * 2.0 * hh,
+                            pM > 1e-12 ? mM / pM : -1.0);
+                    ++shown;
+                }
+            }
         }
 
         fprintf(f, "\nERROR BY SCREEN ROW (top to bottom, eighths)\n");
