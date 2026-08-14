@@ -511,6 +511,11 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // the wrong stage: it only divides varyings, while prevClip is built here.
     static uint32_t s_vsPidCounter = 0;
     const uint32_t myVsPid = ++s_vsPidCounter;
+    // Set when this module is the one being dumped, so the PATCHED words can be
+    // written too. The original was dumped before; the injected code itself has
+    // never been read back, and the identity it is supposed to implement fails
+    // on a fifth of pixels.
+    uint32_t g_dumpThisVsPid = 0;
     // Name the module so a tag in the report identifies a real shader, and dump
     // it on request so the thing can actually be read rather than theorised
     // about. VS pid 180 owns 164509 of ~200000 bad pixels.
@@ -519,8 +524,25 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         for (size_t k = 0; k < w.size(); ++k) { vh ^= (uint64_t)w[k]; vh *= 1099511628211ull; }
         trace("MV VS PID %u -> module hash %016llx, %llu words",
               myVsPid, (unsigned long long)vh, (unsigned long long)w.size());
-        if (const char *want = getenv("TAA_MV_DUMP_VS")) {
-            if ((uint32_t)atoi(want) == myVsPid) {
+        // Match on the module HASH, not the pid. The pid counter follows module
+        // creation order, which varies between runs - pid 180 identified the
+        // terrain shader in one run and did not exist in the next. The hash is
+        // a property of the module itself and is stable.
+        // The hash used earlier (67f90e8ea1acad18) belongs to the FRAGMENT
+        // module, not the vertex one - the two were conflated. Word count is a
+        // stable property of the vertex module itself: the terrain shader is
+        // 2077 words.
+        if (const char *wantW = getenv("TAA_MV_DUMP_WORDS")) {
+            if ((size_t)atoi(wantW) == w.size()) g_dumpThisVsPid = myVsPid;
+        }
+        const char *wantHash = getenv("TAA_MV_DUMP_HASH");
+        char myHash[32];
+        snprintf(myHash, sizeof(myHash), "%016llx", (unsigned long long)vh);
+        const char *want = getenv("TAA_MV_DUMP_VS");
+        if (wantHash || want) {
+            if ((wantHash && strcmp(wantHash, myHash) == 0) ||
+                (!wantHash && want && (uint32_t)atoi(want) == myVsPid)) {
+                g_dumpThisVsPid = myVsPid;
                 char pth[512];
                 snprintf(pth, sizeof(pth), "%s/mv_vs_%u.spv",
                          getenv("TAA_MV_DIAG") ? getenv("TAA_MV_DIAG") : ".", myVsPid);
@@ -989,6 +1011,24 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         if (i == annotationsEnd) for (size_t k = 0; k < annos.size();   ++k) out.push_back(annos[k]);
         if (i == globalsEnd)     for (size_t k = 0; k < globals.size(); ++k) out.push_back(globals[k]);
         if (i == injectAt)       for (size_t k = 0; k < body.size();    ++k) out.push_back(body[k]);
+    }
+
+    // ---- DUMP THE PATCHED MODULE, NOT JUST THE ORIGINAL.
+    //
+    // prevY = M[1]*cx + M[5]*cy + M[9]*cw + M[13] is forced by the code as
+    // written and fails on 21.95% of pixels with every term measured. The
+    // injected instructions themselves have never been read back. This writes
+    // them so the disassembly can be compared against what the source intends.
+    if (g_dumpThisVsPid) {
+        char pth2[512];
+        snprintf(pth2, sizeof(pth2), "%s/mv_vs_%u_patched.spv",
+                 getenv("TAA_MV_DIAG") ? getenv("TAA_MV_DIAG") : ".", g_dumpThisVsPid);
+        if (FILE *pf = fopen(pth2, "wb")) {
+            fwrite(&out[0], 4, out.size(), pf);
+            fclose(pf);
+            trace("MV VS DUMP: wrote %s (%llu words patched)", pth2,
+                  (unsigned long long)out.size());
+        }
     }
 
     if (location) *location = prevClipLocation();
