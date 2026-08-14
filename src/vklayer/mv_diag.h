@@ -355,6 +355,69 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
             fprintf(f, "  %-12s mean error %10.4f px   n=%llu\n", elbl[b],
                     eN[b] ? eSum[b] / (double)eN[b] : -1.0,
                     (unsigned long long)eN[b]);
+        // ---- PROFILE THE PIXELS THAT ARE STILL WRONG.
+        //
+        // With the v sign corrected everything under 16 px/frame is exact
+        // (0.008-0.025 px) and then 64-256 px jumps to 86.7 px - an error the
+        // same size as the flow itself. That shape is not a small inaccuracy,
+        // it is the field being roughly zero, roughly doubled, or pointing the
+        // wrong way. The ratio of measured to predicted magnitude and the angle
+        // between them says which, so measure it instead of theorising again.
+        {
+            double rSum = 0.0, aSum = 0.0, dSum = 0.0, pwSum = 0.0;
+            uint64_t rN = 0, offN = 0, zeroN = 0;
+            for (uint32_t y = 0; y < in.h; y += 4) {
+                for (uint32_t x = 0; x < in.w; x += 4) {
+                    const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                    const double vx = velHalfToFloat(in.px[i2]);
+                    const double vy = velHalfToFloat(in.px[i2 + 1]);
+                    const double d  = velHalfToFloat(in.px[i2 + 2]);
+                    if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                    static const double vS = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
+                    const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
+                    const double vTop = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vS;
+                    const double xc = u * d, yc = vTop * d;
+                    const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
+                    const double ny = M[1]*xc + M[5]*yc + M[9]*d + M[13];
+                    const double nw = M[3]*xc + M[7]*yc + M[11]*d + M[15];
+                    if (fabs(nw) < 1e-9) continue;
+                    const double pu = nx / nw, pv = ny / nw;
+                    const double predX = (pu - u) * 0.5, predY = (pv - vTop) * 0.5;
+                    const double ex = (vx - predX) * 2.0 * hw;
+                    const double ey = (vy - predY) * 2.0 * hh;
+                    if (sqrt(ex*ex + ey*ey) <= 1.0) continue;
+                    const double mMag = sqrt(vx*vx + vy*vy);
+                    const double pMag = sqrt(predX*predX + predY*predY);
+                    ++rN;
+                    dSum += d; pwSum += nw;
+                    if (pMag > 1e-12) rSum += mMag / pMag;
+                    if (mMag < 1e-9) ++zeroN;
+                    if (fabs(pu) > 1.0 || fabs(pv) > 1.0) ++offN;
+                    if (mMag > 1e-12 && pMag > 1e-12) {
+                        double cs = (vx*predX + vy*predY) / (mMag * pMag);
+                        if (cs > 1.0) cs = 1.0;
+                        if (cs < -1.0) cs = -1.0;
+                        aSum += acos(cs) * 57.29577951308232;
+                    }
+                }
+            }
+            fprintf(f, "\nPROFILE OF THE PIXELS STILL WRONG (err > 1 px)\n");
+            fprintf(f, "  count                       %llu\n", (unsigned long long)rN);
+            fprintf(f, "  mean |measured|/|predicted| %10.4f   (1 = right size)\n",
+                    rN ? rSum / (double)rN : -1.0);
+            fprintf(f, "  mean angle between them     %10.4f deg\n",
+                    rN ? aSum / (double)rN : -1.0);
+            fprintf(f, "  mean depth                  %10.4f m\n",
+                    rN ? dSum / (double)rN : -1.0);
+            fprintf(f, "  mean predicted prev.w       %10.4f\n",
+                    rN ? pwSum / (double)rN : -1.0);
+            fprintf(f, "  measured exactly zero       %llu\n", (unsigned long long)zeroN);
+            fprintf(f, "  predicted prev off-screen   %llu  (%.2f%%)\n",
+                    (unsigned long long)offN, rN ? 100.0 * offN / (double)rN : 0.0);
+            fprintf(f, "      ratio 0 = field empty, 2 = doubled, 1 with a large\n");
+            fprintf(f, "      angle = right size wrong direction\n");
+        }
+
         fprintf(f, "\nERROR BY SCREEN ROW (top to bottom, eighths)\n");
         for (int b = 0; b < 8; ++b)
             fprintf(f, "  rows %4u-%4u  mean %10.4f px   worst %10.2f px   n=%llu\n",
