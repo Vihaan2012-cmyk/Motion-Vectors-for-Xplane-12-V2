@@ -7388,17 +7388,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // R and G only. The target is two channels, so enabling B would
             // name a component the attachment does not have.
             //
-            // Under TAA_MV_RGBA the attachment IS four channels and the shader
-            // writes depths into zw. The mask has to open or they are dropped
-            // silently - which is exactly what happened on the first exact-mode
-            // run: coverage 99.7%, no image failures, the report printed its
-            // header, and every depth read back as zero because B and A were
-            // masked off downstream of a shader that wrote them correctly.
-            const VkColorComponentFlags mvMaskOn = mvWantRGBA()
-                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
-                : (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT);
-            mvBlend.colorWriteMask = fragPatched ? mvMaskOn : 0;
+            mvBlend.colorWriteMask = fragPatched
+                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT) : 0;
             blendAtt[i].push_back(mvBlend);
 
             blends[i] = *sb;
@@ -8064,22 +8055,6 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         block[18] = g_nearFieldM;
     g_diagLastBlock18 = block[18];
 
-    // ---- CALIBRATE THE Y ROW: perturb M[5] and watch what the field does.
-    //
-    // The raw pixel rows say the field's X matches the prediction to every
-    // printed digit while its Y behaves as though M[5] were about -0.70, with
-    // 1.00000 pushed. X and Y share the matrix, the input vector and the divide
-    // by prev.w, so the difference is in the Y row alone.
-    //
-    // Reading more code has not settled it. Multiplying M[5] by a known factor
-    // and measuring the response does: if prev.y scales with it the shader
-    // honours the element and the fault is in what we compute; if prev.y does
-    // not move, the element never reaches the multiply and the fault is in the
-    // patch.
-    if (const char *e5 = getenv("TAA_MV_M5")) {
-        static const float k5 = (float)atof(e5);
-        block[5] *= k5;
-    }
 
     // ---- HOW MANY DIFFERENT MATRICES ONE FRAME PUSHES.
     //

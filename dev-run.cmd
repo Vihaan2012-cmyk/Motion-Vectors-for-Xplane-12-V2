@@ -52,21 +52,6 @@ rem TAA is now switched from the panel; this only forces it on for debugging.
 rem set "TAA_RESOLVE=1"
 
 
-
-
-
-
-set "TAA_MV_IMAGE=C:/Users/bansa/AppData/Local/Temp/mvimg"
-set "TAA_MV_DIAG=C:/Users/bansa/AppData/Local/Temp/mvdiag"
-set "TAA_EXT_STATIC=1"
-set "TAA_MV_RGBA=1"
-set "TAA_MV_PID=1"
-set "TAA_MV_WATCH_PUSH=1"
-set "TAA_MV_PID=1"
-set "TAA_MV_WATCH_PUSH=1"
-set "TAA_MV_DUMP_WORDS=2077"
-set "TAA_MV_VNEG=1"
-set "TAA_MV_PAUSE=1"
 rem set "TAA_SELFTEST=1"
 
 rem Experiment switches are passed THROUGH this script, not set in it. setlocal
