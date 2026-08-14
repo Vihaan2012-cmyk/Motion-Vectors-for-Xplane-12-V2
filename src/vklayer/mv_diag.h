@@ -292,8 +292,21 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                 const double vy = velHalfToFloat(in.px[i2 + 1]);
                 const double d  = velHalfToFloat(in.px[i2 + 2]);
                 if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
+                // ---- THE VIEWPORT HEIGHT IS NEGATIVE.
+                //
+                // X-Plane renders with 3840x-2160. A negative-height viewport
+                // flips the NDC-to-framebuffer mapping, so ndc_y = +1 is at the
+                // TOP, while this line has always produced -1 there. Every error
+                // figure in this project used that convention, and both the
+                // epipolar metric and this exact prediction share it - which is
+                // how they agreed at 174 and 176 px while both could be wrong.
+                //
+                // A sign error in v produces error proportional to v and exactly
+                // zero at the centre row. That is the signature the whole hunt
+                // started from: "slope 1.712 px/row, zero at y = 1080".
+                static const double vSign = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
                 const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
-                const double vTop = ((y + 0.5) / (double)in.h) * 2.0 - 1.0;
+                const double vTop = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vSign;
                 const double xc = u * d, yc = vTop * d;
                 const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
                 const double ny = M[1]*xc + M[5]*yc + M[9]*d + M[13];
@@ -369,8 +382,9 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
                     if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
                     const int pid = (int)(pf + 0.5);
                     if (pid <= 0) continue;
+                    static const double vSign2 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
                     const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
-                    const double vTop = ((y + 0.5) / (double)in.h) * 2.0 - 1.0;
+                    const double vTop = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vSign2;
                     const double xc = u * d, yc = vTop * d;
                     const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
                     const double ny = M[1]*xc + M[5]*yc + M[9]*d + M[13];
