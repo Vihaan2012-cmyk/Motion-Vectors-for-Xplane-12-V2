@@ -990,14 +990,34 @@ static float g_scaleStep    = 0.5f;   // what the pager multiplies by, after pat
 struct PostAAControl {
     const char *path;
     const char *envKeep;
+    int         want;       // the value held while TAA runs
     XPLMDataRef ref;
     int         saved;
     bool        held;
 };
 
 static PostAAControl g_postAA[] = {
-    { "sim/private/controls/hdr/use_post_aa", "TAA_KEEP_FXAA", nullptr, 0, false },
-    { "sim/private/controls/hdr/msaa_hw",     "TAA_KEEP_MSAA", nullptr, 0, false },
+    { "sim/private/controls/hdr/use_post_aa", "TAA_KEEP_FXAA", 0, nullptr, 0, false },
+    { "sim/private/controls/hdr/msaa_hw",     "TAA_KEEP_MSAA", 0, nullptr, 0, false },
+    // ---- SSR IS A TEMPORAL FEEDBACK LOOP AROUND OUR RESOLVE. KILL IT.
+    //
+    // ssr_deferred samples tex_ssr - the PREVIOUS frame's rendered colour - as
+    // its reflection source, and X-Plane ping-pongs its two HDR targets. We
+    // write the TAA result into the scene target; one frame later SSR reads
+    // that target as "last frame" and composites it back into every glossy
+    // surface. Anything TAA leaves in history is thereby RE-INJECTED into the
+    // next frame's input, which is why ghost residue on the reflective apron
+    // refused to decay: a mode-2 ghost the clamp merely tolerates fades below
+    // visibility in under a second at alpha 0.1, and these sat there for
+    // minutes, re-fed every frame.
+    //
+    // There is no SSR toggle in the settings UI. The binary carries a private
+    // kill switch - debug/kill_ssr, alongside ssr/min_gloss and
+    // ssr/sample_count - and holding it at 1 removes the loop at its source.
+    // The cost is screen-space reflections while TAA runs; the alternative is
+    // reflections OF OUR ACCUMULATED HISTORY, which is not a reflection of
+    // anything real. Restored on unload like the others; TAA_KEEP_SSR opts out.
+    { "sim/private/controls/debug/kill_ssr",  "TAA_KEEP_SSR",  1, nullptr, 0, false },
 };
 
 static void suppressXPlanePostAA()
@@ -1012,7 +1032,7 @@ static void suppressXPlanePostAA()
             // Re-assert: X-Plane rewrites these from its own settings when the
             // rendering options change, and a value that silently comes back is
             // the same failure as one that never applied.
-            if (c.ref && XPLMGetDatai(c.ref) != 0) XPLMSetDatai(c.ref, 0);
+            if (c.ref && XPLMGetDatai(c.ref) != c.want) XPLMSetDatai(c.ref, c.want);
             continue;
         }
         if (getenv(c.envKeep)) continue;
@@ -1021,11 +1041,10 @@ static void suppressXPlanePostAA()
             if (!c.ref) continue;      // taaFind already recorded the miss
         }
         c.saved = XPLMGetDatai(c.ref);
-        if (c.saved != 0) {
-            XPLMSetDatai(c.ref, 0);
-            xlog("post-aa: %s %d -> 0. X-Plane's own pass runs AFTER our resolve, "
-                 "so it would blur a frame that is already antialiased. "
-                 "%s=1 keeps it.", c.path, c.saved, c.envKeep);
+        if (c.saved != c.want) {
+            XPLMSetDatai(c.ref, c.want);
+            xlog("post-aa: %s %d -> %d while TAA runs. %s=1 keeps X-Plane's "
+                 "own value.", c.path, c.saved, c.want, c.envKeep);
         }
         c.held = true;
     }

@@ -372,6 +372,22 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
     // the buffer, so a stamp that matches PROVES every pixel before it is this
     // dump's data. The CPU side then has a fact to check instead of a delay to
     // trust.
+    // Say ONCE whether the completion stamp is in force. Silence was ambiguous
+    // last session: no "landed late" line can mean every copy landed in time,
+    // or that vkCmdFillBuffer failed to resolve and the whole verification is
+    // quietly absent - and those two need opposite levels of trust in the
+    // numbers.
+    {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            trace(dd.cmdFillBuffer
+                  ? "MV DUMP: completion stamp ACTIVE - statistics are only "
+                    "reported from buffers the GPU has provably finished"
+                  : "MV DUMP: vkCmdFillBuffer unavailable - falling back to the "
+                    "delay guess; treat dump statistics with suspicion");
+        }
+    }
     if (dd.cmdFillBuffer) {
         VkBufferMemoryBarrier bb;
         memset(&bb, 0, sizeof(bb));
