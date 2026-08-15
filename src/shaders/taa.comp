@@ -61,6 +61,27 @@ layout(binding = 0)          uniform sampler2DArray uScene;    // current frame,
 layout(binding = 1, rgba16f) uniform image2DArray  uHistory;   // the only thing written
 layout(binding = 2)          uniform sampler2DArray uVelocity;
 layout(binding = 3)          uniform sampler2DArray uHistorySampler;
+// ---- X-PLANE'S OWN PER-PIXEL MOVING-GEOMETRY FLAG.
+//
+// gbuffer_vel, found in the corpus: a uint image read by ssr_deferred as
+// `flags & 4` to choose the LOCAL reprojection matrix over the world one. Bit 2
+// is therefore X-Plane's own statement that this pixel is local/moving
+// geometry - the airframe, the panel, the prop - exactly the set whose true
+// motion our world-reprojection field cannot express. A parked aircraft still
+// VIBRATES with the engine; its pixels flicker against the background every
+// frame, and accumulating that flicker is the prop halo, the tailwheel streak
+// and the cockpit shake in one mechanism.
+//
+// The correct weight for such a pixel is 1.0: take the current frame, keep no
+// history, because the history is of somewhere the geometry no longer is.
+// That trades antialiasing on the airframe for the end of its ghosts, which is
+// the trade every shipping TAA makes for "responsive" pixels.
+//
+// When the candidate image has not been identified (flagsValid = 0), a 1x1
+// zero-filled fallback is bound - Vulkan requires every statically-used
+// binding to be valid even behind a branch - and reads as bit-2-clear, a
+// no-op.
+layout(binding = 4)          uniform usampler2DArray uFlags;
 
 layout(push_constant) uniform Params {
     vec2  invSize;      // 1 / target size
@@ -109,6 +130,8 @@ layout(push_constant) uniform Params {
     // camera per combination replaces an afternoon of reasoning about them.
     float velScale;     // multiplies the fetched vector; 1.0 = shipping belief
     float velYSign;     // -1.0 = shipping belief (negative viewport), +1.0 = flipped
+    // 1 when uFlags is X-Plane's real gbuffer_vel; 0 when it is the fallback.
+    int   flagsValid;
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -449,6 +472,12 @@ void main()
     // quantity that can vanish, so there is no configuration of inputs that
     // produces a firefly or a black pixel.
     float a = clamp(pc.alpha + pc.gain * moved * pc.alpha, pc.alpha, 1.0);
+
+    // Moving-geometry pixels take the current frame outright - see uFlags.
+    if (pc.flagsValid != 0) {
+        uint fl = texelFetch(uFlags, ivec3(px, layer), 0).r;
+        if ((fl & 4u) != 0u) a = 1.0;
+    }
 
     // How far the clamp had to move history, in standard deviations. Edges under
     // motion should light up and flat interiors should stay black; a frame that

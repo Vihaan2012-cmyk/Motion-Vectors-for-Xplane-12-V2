@@ -57,6 +57,19 @@ struct TaaState {
     VkImage         sceneImage  = VK_NULL_HANDLE;   // the view above belongs to this
     VkImageView     velView     = VK_NULL_HANDLE;
     VkSampler       sampler     = VK_NULL_HANDLE;
+    // ---- X-PLANE'S gbuffer_vel, AND A FALLBACK FOR WHEN IT IS UNKNOWN.
+    //
+    // The flags view is over an image X-Plane owns, identified by shape by the
+    // layer's census; views over it are cached like the scene views. The
+    // fallback is a 1x1 zero uint image of our own: Vulkan requires every
+    // statically-used binding to be valid even behind a branch, and a zero
+    // flag word reads as bit-2-clear, which makes the fallback a no-op.
+    std::map<VkImage, VkImageView> flagsViews;
+    VkImageView     flagsView   = VK_NULL_HANDLE;   // what binding 4 gets
+    bool            flagsValid  = false;            // true only for the real image
+    VkImage         flagsFallback     = VK_NULL_HANDLE;
+    VkDeviceMemory  flagsFallbackMem  = VK_NULL_HANDLE;
+    VkImageView     flagsFallbackView = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkPipelineLayout      pipeLayout = VK_NULL_HANDLE;
@@ -107,6 +120,8 @@ struct TaaPush {
     // Live A/B knobs for the reprojection convention - see the shader's note.
     float   velScale;
     float   velYSign;
+    // 1 when binding 4 is X-Plane's real gbuffer_vel rather than the fallback.
+    int32_t flagsValid;
 };
 
 enum {
@@ -148,6 +163,11 @@ static float taaVizScale() { return live::f("taa.viz_scale", nullptr, 1.0f); }
 static float taaVelScale() { return live::f("taa.vel_scale", nullptr, 1.0f); }
 // -1.0 is the shipping belief (negative-height viewport => d(uv_y) = -vel_y).
 static float taaVelYSign() { return live::onoff("taa.vel_ypos", nullptr, false) ? 1.0f : -1.0f; }
+// The gbuffer_vel weight override - on by default because everything it
+// addresses (prop halo, airframe streaks, cockpit shake) is worse than the
+// aliasing it reintroduces on the airframe. taa.objflags=0 turns it off live
+// so its exact visual contribution can be isolated in one edit.
+static bool taaObjFlags() { return live::onoff("taa.objflags", nullptr, true); }
 static bool taaFreezeHistory() { return live::onoff("taa.freeze_history", nullptr, false); }
 static bool taaNoMotion()      { return live::onoff("taa.no_motion",      nullptr, false); }
 static bool taaNoAccum()       { return live::onoff("taa.no_accum",       nullptr, false); }
@@ -180,6 +200,13 @@ static void taaDestroy(DeviceData &dd)
         if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
     g_taa.sceneViews.clear();
     if (g_taa.velView)     dd.destroyImageView(g_taa.device, g_taa.velView, nullptr);
+    for (std::map<VkImage, VkImageView>::iterator it = g_taa.flagsViews.begin();
+         it != g_taa.flagsViews.end(); ++it)
+        if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
+    g_taa.flagsViews.clear();
+    if (g_taa.flagsFallbackView) dd.destroyImageView(g_taa.device, g_taa.flagsFallbackView, nullptr);
+    if (g_taa.flagsFallback)     dd.destroyImage(g_taa.device, g_taa.flagsFallback, nullptr);
+    if (g_taa.flagsFallbackMem)  dd.freeMemory(g_taa.device, g_taa.flagsFallbackMem, nullptr);
     for (int i = 0; i < 2; ++i) {
         if (g_taa.history[i])    dd.destroyImage(g_taa.device, g_taa.history[i], nullptr);
         if (g_taa.historyMem[i]) dd.freeMemory(g_taa.device, g_taa.historyMem[i], nullptr);
@@ -268,7 +295,55 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     sci.maxLod = 0.0f;
     if (dd.createSampler(dev, &sci, nullptr, &g_taa.sampler) != VK_SUCCESS) return false;
 
-    VkDescriptorSetLayoutBinding b[4];
+    // ---- THE FALLBACK FLAG IMAGE. 1x1, uint, zero.
+    //
+    // Created unconditionally so binding 4 is always valid; cleared alongside
+    // the history on first use.
+    {
+        VkImageCreateInfo fci;
+        memset(&fci, 0, sizeof(fci));
+        fci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        fci.imageType = VK_IMAGE_TYPE_2D;
+        fci.format = VK_FORMAT_R32_UINT;
+        fci.extent.width = 1; fci.extent.height = 1; fci.extent.depth = 1;
+        fci.mipLevels = 1; fci.arrayLayers = 1;
+        fci.samples = VK_SAMPLE_COUNT_1_BIT;
+        fci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        fci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        fci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        fci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (dd.createImage(dev, &fci, nullptr, &g_taa.flagsFallback) == VK_SUCCESS) {
+            VkMemoryRequirements fmr;
+            dd.getImageMemReq(dev, g_taa.flagsFallback, &fmr);
+            VkMemoryAllocateInfo fai;
+            memset(&fai, 0, sizeof(fai));
+            fai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            fai.allocationSize = fmr.size;
+            fai.memoryTypeIndex = taaFindMemory(dd, fmr.memoryTypeBits,
+                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (fai.memoryTypeIndex != UINT32_MAX &&
+                dd.allocateMemory(dev, &fai, nullptr, &g_taa.flagsFallbackMem) == VK_SUCCESS) {
+                dd.bindImageMemory(dev, g_taa.flagsFallback, g_taa.flagsFallbackMem, 0);
+                VkImageViewCreateInfo fvci;
+                memset(&fvci, 0, sizeof(fvci));
+                fvci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                fvci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+                fvci.format = VK_FORMAT_R32_UINT;
+                fvci.image = g_taa.flagsFallback;
+                fvci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                fvci.subresourceRange.levelCount = 1;
+                fvci.subresourceRange.layerCount = 1;
+                dd.createImageView(dev, &fvci, nullptr, &g_taa.flagsFallbackView);
+            }
+        }
+        g_taa.flagsView  = g_taa.flagsFallbackView;
+        g_taa.flagsValid = false;
+        if (!g_taa.flagsFallbackView)
+            trace("TAA: flags fallback unavailable - the gbuffer_vel weight "
+                  "override stays off");
+    }
+
+    VkDescriptorSetLayoutBinding b[5];
     memset(b, 0, sizeof(b));
     // Binding 0 is a SAMPLER now, not a storage image: the dispatch only reads
     // the scene. That is what lets the scene target keep X-Plane's own usage
@@ -277,14 +352,15 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     b[3].binding = 3; b[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    for (int i = 0; i < 4; ++i) {
+    b[4].binding = 4; b[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    for (int i = 0; i < 5; ++i) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci;
     memset(&dlci, 0, sizeof(dlci));
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 4; dlci.pBindings = b;
+    dlci.bindingCount = 5; dlci.pBindings = b;
     if (dd.createDescriptorSetLayout(dev, &dlci, nullptr, &g_taa.setLayout) != VK_SUCCESS) return false;
 
     VkPushConstantRange pcr;
@@ -327,7 +403,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = 1 * TaaState::kSets;   // history write only
     ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    ps[1].descriptorCount = 3 * TaaState::kSets;   // scene, velocity, history read
+    ps[1].descriptorCount = 4 * TaaState::kSets;   // scene, velocity, history, flags
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -471,6 +547,46 @@ static TaaBackend g_taaBackend;
 // knows nothing about how we intercepted it.
 static DeviceData *g_taaDevice = nullptr;
 
+// Point binding 4 at X-Plane's gbuffer_vel, creating that view once per image.
+// Refuses multisampled or non-uint candidates: the shader declares a
+// single-sample uint array sampler, and a mismatched view is exactly the class
+// of silent wrongness the shape checks exist to prevent.
+static void taaBindFlags(DeviceData &dd, VkImage image, VkFormat fmt,
+                         uint32_t layers, VkSampleCountFlagBits samples)
+{
+    if (image == VK_NULL_HANDLE || samples != VK_SAMPLE_COUNT_1_BIT) {
+        g_taa.flagsView  = g_taa.flagsFallbackView;
+        g_taa.flagsValid = false;
+        return;
+    }
+    std::map<VkImage, VkImageView>::iterator it = g_taa.flagsViews.find(image);
+    if (it != g_taa.flagsViews.end()) {
+        g_taa.flagsView  = it->second;
+        g_taa.flagsValid = (it->second != VK_NULL_HANDLE);
+        return;
+    }
+    VkImageViewCreateInfo v;
+    memset(&v, 0, sizeof(v));
+    v.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    v.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    v.format = fmt;
+    v.image = image;
+    v.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    v.subresourceRange.levelCount = 1;
+    v.subresourceRange.layerCount = layers ? layers : 1;
+    VkImageView view = VK_NULL_HANDLE;
+    if (dd.createImageView(g_taa.device, &v, nullptr, &view) != VK_SUCCESS) {
+        trace("TAA: gbuffer_vel view creation failed - weight override off");
+        view = VK_NULL_HANDLE;
+    } else {
+        trace("TAA: gbuffer_vel bound - moving-geometry pixels (bit 2) now "
+              "take the current frame outright. taa.objflags=0 disables live.");
+    }
+    g_taa.flagsViews[image] = view;
+    g_taa.flagsView  = view ? view : g_taa.flagsFallbackView;
+    g_taa.flagsValid = (view != VK_NULL_HANDLE);
+}
+
 // ---- RECORD THE RESOLVE.
 //
 // Called from vkCmdEndRendering once the scene pass has finished, which is the
@@ -548,6 +664,31 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         for (int hi = 0; hi < 2; ++hi)
             dd.cmdClearColorImage(cb, g_taa.history[hi],
                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &r);
+        // The flags fallback too: UNDEFINED to zero to SHADER_READ_ONLY, once.
+        if (g_taa.flagsFallback != VK_NULL_HANDLE) {
+            VkImageMemoryBarrier fb = tb[0];
+            fb.image = g_taa.flagsFallback;
+            fb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            fb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            fb.srcAccessMask = 0;
+            fb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            fb.subresourceRange.layerCount = 1;
+            dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                  0, nullptr, 0, nullptr, 1, &fb);
+            VkClearColorValue fz;
+            memset(&fz, 0, sizeof(fz));
+            dd.cmdClearColorImage(cb, g_taa.flagsFallback,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &fz, 1,
+                                  &fb.subresourceRange);
+            fb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            fb.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            fb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                  0, nullptr, 0, nullptr, 1, &fb);
+        }
         for (int hi = 0; hi < 2; ++hi) {
             tb[hi].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             tb[hi].newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -564,7 +705,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     VkDescriptorSet set = g_taa.sets[g_taa.nextSet];
     g_taa.nextSet = (g_taa.nextSet + 1) % TaaState::kSets;
 
-    VkDescriptorImageInfo ii[4];
+    VkDescriptorImageInfo ii[5];
     memset(ii, 0, sizeof(ii));
     ii[0].imageView = g_taa.sceneView;
     ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -574,10 +715,19 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     ii[2].sampler   = g_taa.sampler;
     ii[3].imageView = g_taa.historyView[hr_]; ii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[3].sampler   = g_taa.sampler;
+    // Binding 4: X-Plane's gbuffer_vel when identified, our zero fallback
+    // otherwise. NO BARRIER is recorded for the real image: by the time the
+    // resolve runs, ssr_deferred and the lighting pass have both consumed it,
+    // so X-Plane has already transitioned it to a shader-readable layout and
+    // will not write it again until next frame's G-buffer pass.
+    ii[4].imageView = (g_taa.flagsValid && g_taa.flagsView) ? g_taa.flagsView
+                                                            : g_taa.flagsFallbackView;
+    ii[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ii[4].sampler   = g_taa.sampler;
 
-    VkWriteDescriptorSet wr[4];
+    VkWriteDescriptorSet wr[5];
     memset(wr, 0, sizeof(wr));
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[i].dstSet = set;
         wr[i].dstBinding = (uint32_t)i;
@@ -588,7 +738,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     wr[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wr[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    dd.updateDescriptorSets(g_taa.device, 4, wr, 0, nullptr);
+    wr[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    dd.updateDescriptorSets(g_taa.device, 5, wr, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -612,6 +763,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0);
     pcv.velScale = taaVelScale();
     pcv.velYSign = taaVelYSign();
+    pcv.flagsValid = (g_taa.flagsValid && taaObjFlags()) ? 1 : 0;
     // ---- A CHANGED KNOB IS A CHANGED HISTORY.
     //
     // Every one of these redefines what the accumulated image MEANS: a

@@ -1053,6 +1053,10 @@ static std::map<VkImage, ColorTarget> g_colorImages;   // every colour image mad
 // image-identification work lives. Declared here because the colour-image census
 // runs long before it.
 static void noteGbufferVelCandidate(const ColorTarget &c);
+// The identified gbuffer_vel image. Lives up here because both the census
+// (early) and the resolve (middle) touch it, while the identification logic
+// stays with the transfer census below.
+static VkImage g_gbufferVelCandidate = VK_NULL_HANDLE;
 
 // Defined with the injector plumbing much further down; the full-state report
 // calls them and sits above it.
@@ -4391,6 +4395,27 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                           temporal::resetReasonName(tf.reset));
                 }
                 g_taaDevice = &tdd;
+                // Hand the resolve X-Plane's own moving-geometry flags if the
+                // census has identified them. Shape-checked in taaBindFlags.
+                {
+                    VkImage fi = g_gbufferVelCandidate;
+                    VkFormat ff = VK_FORMAT_UNDEFINED;
+                    uint32_t fl = 1;
+                    VkSampleCountFlagBits fsm = VK_SAMPLE_COUNT_1_BIT;
+                    if (fi != VK_NULL_HANDLE) {
+                        std::lock_guard<std::mutex> g(g_lock);
+                        std::map<VkImage, ColorTarget>::iterator fc =
+                            g_colorImages.find(fi);
+                        if (fc != g_colorImages.end()) {
+                            ff  = fc->second.format;
+                            fl  = fc->second.arrayLayers;
+                            fsm = fc->second.samples;
+                        } else {
+                            fi = VK_NULL_HANDLE;
+                        }
+                    }
+                    taaBindFlags(tdd, fi, ff, fl, fsm);
+                }
                 g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
                 // Watched by noteSsrFeedbackCheck for the rest of the frame.
@@ -4709,7 +4734,7 @@ static void armLayerOnce()
 // explanations.
 //
 // Naming the image is the part that needed the corpus. The rest needs a sim.
-static VkImage g_gbufferVelCandidate = VK_NULL_HANDLE;
+// (Defined early, beside the census forward declaration.)
 
 static bool velFormatIsUint(VkFormat f)
 {
