@@ -2658,6 +2658,92 @@ static float matrixCallback(float sinceLast, float, int, void *)
         }
     }
 
+    // ---- THE RESIDUAL TEST IS ONLY VALID ON STATIC GEOMETRY.
+    //
+    // The epipolar residual is depth-free, which is why it was worth building:
+    // it holds under rotation and translation alike, at any distance. But that
+    // property comes from the geometry being FIXED IN THE WORLD while only the
+    // camera moves. A pixel on something that moves independently has no reason
+    // to lie on the epipolar line, and registers a large residual even when its
+    // motion vector is perfectly correct.
+    //
+    // TAA_EXT_TEST points the camera at the aeroplane and opens the throttle.
+    // So the pixels it measures are largely MOVING geometry - fuselage, gear,
+    // prop disc - and those are near and fast, which is exactly the population
+    // the residual tail has been blamed on all along. The cockpit case, which
+    // reads 0.000-0.017 px, is geometry rigidly attached to the camera.
+    //
+    // So the tail may be the test misapplied rather than a defect in the field.
+    // This separates the two: external view, aeroplane frozen, camera the only
+    // thing that moves. Every pixel is then static world geometry and the
+    // residual is valid everywhere. If it collapses, the field was right and
+    // the tail was mine.
+    //
+    // The camera is oscillated rather than driven one way, and only every third
+    // frame, because a previous version issued sim/general/right every frame
+    // and drove the camera under the runway - measuring millimetre-range
+    // geometry through the near plane and calling it a reprojection error.
+    if (getenv("TAA_EXT_STATIC")) {
+        static int f = 0;
+        ++f;
+        if (f == 120) {
+            if (XPLMCommandRef c = XPLMFindCommand("sim/view/circle"))
+                XPLMCommandOnce(c);
+            if (XPLMDataRef d = XPLMFindDataRef("sim/flightmodel/controls/parkbrake"))
+                XPLMSetDataf(d, 1.0f);
+            if (XPLMDataRef d = XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all"))
+                XPLMSetDataf(d, 0.0f);
+            // ---- PAUSE THE SIM SO ANIMATED GEOMETRY STOPS TOO.
+            //
+            // Freezing the aeroplane is not enough. prevClip = M*currClip
+            // assumes each vertex held the same world position last frame, and
+            // X-Plane's water and camera-relative meshes do not: the grid
+            // follows the camera, so the same vertex index is a different world
+            // point every frame. No camera-only reprojection can be right for
+            // that geometry however correct the matrix is.
+            //
+            // The dominant shader is exactly the terrain/water one - it outputs
+            // v_water_height - and the scenery is Seattle. Pausing stops the
+            // animation while the camera can still be moved, so if the bad
+            // pixels collapse the residual is moving geometry and not a bug.
+            if (const char *p = getenv("TAA_MV_PAUSE")) {
+                (void)p;
+                if (XPLMDataRef d = XPLMFindDataRef("sim/time/paused"))
+                    XPLMSetDatai(d, 1);
+                xlog("MV EXT STATIC: sim PAUSED - animated geometry frozen too");
+            }
+            xlog("MV EXT STATIC: external view, parking brake ON, throttle shut. "
+                 "The aeroplane is frozen, so every pixel is static world "
+                 "geometry and the epipolar residual is valid on all of it.");
+        }
+        // ---- LIFT THE CAMERA OFF THE GROUND FIRST.
+        //
+        // In circle view the camera sits about a metre above the airport, so the
+        // bottom of the screen is ground almost touching the lens. The frozen
+        // run measured 790 px of flow from 0.056 m of translation, which puts
+        // that geometry at sx*t/flow_ndc = 1.57*0.056/0.412 = 0.21 m. Every
+        // pixel under 16 px/frame read 0.000-0.293 px residual; everything above
+        // it blew up to 320 px. The tail is entirely geometry within tens of
+        // centimetres.
+        //
+        // That is the degenerate near-field an earlier commit already flagged,
+        // not a case a user flies. Lifting the camera so nothing is within
+        // metres decides it: if the residual collapses, the field is correct and
+        // the tail was the camera sitting on the runway.
+        if (f > 130 && f <= 150 && (f % 2) == 0) {
+            if (XPLMCommandRef c = XPLMFindCommand("sim/general/up"))
+                XPLMCommandOnce(c);
+            if (XPLMCommandRef c = XPLMFindCommand("sim/general/backward"))
+                XPLMCommandOnce(c);
+        }
+        if (f > 150 && (f % 3) == 0) {
+            const bool right = ((f / 45) % 2) == 0;
+            if (XPLMCommandRef c = XPLMFindCommand(right ? "sim/general/right"
+                                                         : "sim/general/left"))
+                XPLMCommandOnce(c);
+        }
+    }
+
     // ---- REMOVED: the forced external view.
     //
     // It issued sim/general/right every frame to keep the camera orbiting, and
