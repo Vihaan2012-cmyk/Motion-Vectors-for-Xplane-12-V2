@@ -1147,6 +1147,10 @@ static uint32_t g_hdrPassesLastFrame   = 0;
 // noteSsrFeedbackCheck - if it becomes the source of a half-resolution transfer,
 // our output is feeding SSR's reflection pyramid and the loop is closed.
 static VkImage  g_taaWroteImageThisFrame = VK_NULL_HANDLE;
+// Set while resolves are being skipped because the velocity field is stale;
+// consumed by the first live resolve, which must reset history rather than
+// blend pre-freeze accumulation into the resumed picture.
+static bool     g_taaStaleResume = false;
 static int      dumpEvery = 0;   // frames between dumps; 0 = off, set at runtime
 
 // Per-command-buffer record of whether it rendered into OUR depth image, and in
@@ -2387,6 +2391,27 @@ static uint64_t g_drawRepushMissed = 0;
 static uint32_t g_pushDistinctThisFrame = 0;
 static uint32_t g_pushDistinctMax       = 0;
 static uint32_t g_mvBindsMax       = 0;
+// The frame on which the velocity target was last BOUND - which, because the
+// first bind of a frame carries LOAD_OP_CLEAR, is also the frame on which it
+// was last cleared and written. This is the staleness authority for everything
+// that consumes the field.
+//
+// It exists because the resolve's old gate, g_mvBindsThisFrame > 0, is a
+// per-frame counter sampled DURING RECORDING - and X-Plane records command
+// buffers on worker threads, so the lit pass can be recorded before or after
+// the scene pass in wall-clock order regardless of submission order. A counter
+// read mid-recording answers "has the scene pass been recorded YET", not "does
+// this frame have a live field", and during the frozen episodes it let the
+// resolve consume a texture nothing had written for three hundred frames. A
+// frame stamp compared with one frame of tolerance answers the real question
+// and survives the recording-order race.
+static std::atomic<uint64_t> g_mvLastBindFrame(0);
+// Frames in a row with no velocity bind, counted at the frame boundary. The
+// transitions are the story: onset says the pass identification lost the scene
+// pass, recovery says how long the episode ran - and the frozen-field episodes
+// this exists to catch ran for ~370 frames while every per-frame log line
+// looked individually normal.
+static uint32_t g_mvNoBindStreak   = 0;
 static uint32_t g_passSizes[32][2];
 static uint32_t g_passHasDepth[32];
 static uint32_t g_passColorCount[32];
@@ -3095,6 +3120,11 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
         // and its vectors are both complete and neither post-processing nor the
         // cockpit has run. That is the only correct boundary.
         uint32_t n = ++g_mvBindsThisFrame;
+        // The staleness stamp. g_frameCount is the PRESENTED frame count, so
+        // during recording of the next frame this stores the previous frame's
+        // number - which is why every consumer compares with one frame of
+        // tolerance rather than for equality.
+        g_mvLastBindFrame.store(g_frameCount);
         if (n > g_mvBindsMax) {
             g_mvBindsMax = n;
             trace("MV BINDS: %u pass(es) bound the velocity target in one frame "
@@ -4095,9 +4125,16 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     if (taaEnabled()) {
         static uint64_t gateLog = 0;
         if ((gateLog++ % 600) == 0)
-            trace("TAA GATE: scenePass=%d mvBinds=%d resolved=%d ends=%u/%u "
-                  "ready=%d mvReady=%d mvView=%p sceneImg=%p %ux%u",
+            // bindAge is the only number here that is NOT mid-frame-racy:
+            // mvBinds and ends are per-frame counters sampled during recording,
+            // so "0" from them can mean "not yet this frame" as easily as
+            // "never" - which is exactly the ambiguity that made the frozen
+            // episodes hard to see. An age over 1 is stale regardless of where
+            // in the frame it is read.
+            trace("TAA GATE: scenePass=%d mvBinds=%d bindAge=%llu resolved=%d "
+                  "ends=%u/%u ready=%d mvReady=%d mvView=%p sceneImg=%p %ux%u",
                   wasScenePass ? 1 : 0, (int)g_mvBindsThisFrame,
+                  (unsigned long long)(g_frameCount - g_mvLastBindFrame.load()),
                   g_taaResolvedThisFrame ? 1 : 0,
                   g_sceneEndsThisFrame, g_sceneEndsLastFrame,
                   g_taa.ready ? 1 : 0, g_mv.ready ? 1 : 0,
@@ -4131,16 +4168,40 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     // Once the HDR-format check was added it fired on most passes, so the
     // function bailed nearly every frame and the screen went fully black. A
     // guard that rejects a pass must skip the RESOLVE only.
+    // ---- IS THE FIELD ALIVE, OR A FOSSIL?
+    //
+    // The old gate here was g_mvBindsThisFrame > 0, and it failed in both
+    // directions for the same reason: it is a per-frame counter sampled during
+    // RECORDING, and X-Plane records command buffers on worker threads, so the
+    // lit pass can be recorded before the scene pass regardless of submission
+    // order. It answers "has the scene pass been recorded yet", not "is the
+    // field current".
+    //
+    // The consequence was the frozen-field episodes: when the pass
+    // identification loses the scene pass, nothing binds the velocity target,
+    // and because the per-frame clear rides on the FIRST BIND, nothing clears
+    // it either - the texture holds the last written motion indefinitely. The
+    // resolve kept running through ~370-frame dropouts, reprojecting every
+    // frame through motion from seconds ago. That stale field, consumed as
+    // current, was the mirror, the mode-2 streaks, and "red ground with a
+    // still camera".
+    //
+    // The bind site stamps the frame it bound on; one frame of tolerance
+    // absorbs the recording-order race. Anything older is a fossil and the
+    // only correct resolve is no resolve.
+    const uint64_t mvBindAge = g_frameCount - g_mvLastBindFrame.load();
+    if (litPass && taaEnabled() && !g_taaResolvedThisFrame && mvBindAge > 1) {
+        static uint64_t nStaleSkip = 0;
+        if ((++nStaleSkip % 300) == 1)
+            trace("TAA: velocity field is STALE (last bound %llu frame(s) ago) "
+                  "- resolve skipped, history will reset on resume. The field "
+                  "froze because no pass bound the velocity target, which is "
+                  "the pass-identification dropout, not a TAA fault.",
+                  (unsigned long long)mvBindAge);
+        g_taaStaleResume = true;
+    }
     do if (litPass && taaEnabled() && !g_taaResolvedThisFrame && !g_mv.wantDump &&
-        // Gate on a flag something actually SETS. This read
-        // g_velInjectedThisFrame, which is declared and reset at present but
-        // never assigned true anywhere in the layer - a leftover from V1 that
-        // nothing in V2 maintains. The resolve could therefore never run, and
-        // two crashes were blamed on TAA while the log showed it had never
-        // initialised. g_mvBindsThisFrame counts velocity-target binds and is
-        // incremented where the bind happens, so non-zero means this frame
-        // really does have vectors to reproject with.
-        g_mvBindsThisFrame > 0) {
+        mvBindAge <= 1) {
         std::map<VkCommandBuffer, VkDevice>::iterator tci = g_cbToDevice.find(cb);
         if (tci != g_cbToDevice.end()) {
             std::map<void*, DeviceData>::iterator tdi = g_devices.find(dispatchKey(tci->second));
@@ -4318,6 +4379,16 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // image belongs to the old one, and reprojecting into it would
                 // drag a whole frame of the wrong picture forward.
                 if (needInit) tf.reset |= temporal::RESET_TARGET_SWAP;
+                // Resuming after a stale-field skip is a discontinuity too:
+                // whatever is in history was accumulated before the freeze,
+                // and blending it into the first live frame drags the fossil
+                // forward one last time.
+                if (g_taaStaleResume) {
+                    tf.reset |= temporal::RESET_SCENE_LOAD;
+                    g_taaStaleResume = false;
+                    trace("TAA: field is live again - history reset (%s)",
+                          temporal::resetReasonName(tf.reset));
+                }
                 g_taaDevice = &tdd;
                 g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
@@ -6212,11 +6283,58 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                   best, (unsigned long long)bestN, (unsigned long long)total);
             g_mvSceneOrdinal = best;
         }
+        // ---- A DEAD CHOICE LOSES TO ANY LIVE ONE. NO MAJORITY REQUIRED.
+        //
+        // The majority rule above exists to stop the choice oscillating between
+        // two passes that both draw real geometry. It also meant that when the
+        // frame's structure shifted - a scenery-streaming burst inserting or
+        // removing passes - and the chosen ordinal stopped receiving ANY draws,
+        // nothing switched away from it: the best live pass rarely clears 50%
+        // of a frame in flux, so the census sat on a ghost for entire episodes
+        // while the velocity target went unbound and unclear-ed, frame after
+        // frame. Ordinal-points-at-nothing is not an oscillation risk; there is
+        // nothing to oscillate WITH. Any pass that actually drew beats it.
+        else if (best >= 0 && bestN > 0 && g_mvSceneOrdinal >= 0 &&
+                 g_mvSceneOrdinal < 16 &&
+                 g_mvPassDrawsFrame[g_mvSceneOrdinal] == 0) {
+            trace("MV SCENE PASS: ordinal %ld received ZERO geometry this frame "
+                  "- the frame's pass structure moved under it. Switching to "
+                  "ordinal %d (%llu of %llu binds) immediately rather than "
+                  "waiting for a majority a frame in flux may never produce.",
+                  g_mvSceneOrdinal, best,
+                  (unsigned long long)bestN, (unsigned long long)total);
+            g_mvSceneOrdinal = best;
+        }
         memset(g_mvPassDrawsFrame, 0, sizeof(g_mvPassDrawsFrame));
     }
 
     g_diagQualifyingPasses = g_mvQualifyThisFrame;
     g_diagBoundPasses      = g_mvBindsThisFrame;
+    // ---- EPISODE BOUNDARIES, NOT PER-FRAME NOISE.
+    //
+    // Counted here, at the frame boundary, where the per-frame totals are
+    // final - the mid-recording samples that made the GATE line ambiguous
+    // cannot happen at present time. The two transitions carry the story:
+    // onset distinguishes "nothing qualified" (the world rendered at a size or
+    // shape the heuristics do not recognise) from "qualified but the ordinal
+    // matched nothing" (the census pointing at a ghost - the case the
+    // dead-choice rule above now heals), and recovery records how long the
+    // field was frozen. The 2026-08-15 episodes ran ~370 frames and every
+    // individual log line looked normal; only the boundary view showed them.
+    if (g_mv.ready) {
+        if (g_mvBindsThisFrame == 0) {
+            if (++g_mvNoBindStreak == 1)
+                trace("MV FREEZE: no pass bound the velocity target this frame "
+                      "(%u qualified). The target is neither written nor "
+                      "cleared while this lasts - it holds STALE MOTION, and "
+                      "the resolve refuses it from the second frame on.",
+                      g_mvQualifyThisFrame);
+        } else if (g_mvNoBindStreak) {
+            trace("MV FREEZE: over after %u frame(s) - the field is being "
+                  "written again.", g_mvNoBindStreak);
+            g_mvNoBindStreak = 0;
+        }
+    }
     g_mvBindsThisFrame     = 0;
     g_mvQualifyThisFrame   = 0;
     g_pushDistinctThisFrame = 0;
