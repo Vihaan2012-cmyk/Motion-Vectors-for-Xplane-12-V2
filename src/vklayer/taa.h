@@ -128,6 +128,7 @@ enum {
     kTaaFlagFreezeHistory = 1 << 0,
     kTaaFlagNoMotion      = 1 << 1,
     kTaaFlagNoAccum       = 1 << 2,
+    kTaaFlagReactive      = 1 << 3,
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -168,6 +169,10 @@ static float taaVelYSign() { return live::onoff("taa.vel_ypos", nullptr, false) 
 // aliasing it reintroduces on the airframe. taa.objflags=0 turns it off live
 // so its exact visual contribution can be isolated in one edit.
 static bool taaObjFlags() { return live::onoff("taa.objflags", nullptr, true); }
+// The C14 reactive mask - on by default for the same reason as the flag
+// override: flicker parked in history is worse than aliasing on the flickering
+// content. taa.reactive=0 isolates its contribution live.
+static bool taaReactive() { return live::onoff("taa.reactive", nullptr, true); }
 static bool taaFreezeHistory() { return live::onoff("taa.freeze_history", nullptr, false); }
 static bool taaNoMotion()      { return live::onoff("taa.no_motion",      nullptr, false); }
 static bool taaNoAccum()       { return live::onoff("taa.no_accum",       nullptr, false); }
@@ -760,7 +765,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.varClip  = taaVarClip();
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
-                 | (taaNoAccum()       ? kTaaFlagNoAccum       : 0);
+                 | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
+                 | (taaReactive()      ? kTaaFlagReactive      : 0);
     pcv.velScale = taaVelScale();
     pcv.velYSign = taaVelYSign();
     pcv.flagsValid = (g_taa.flagsValid && taaObjFlags()) ? 1 : 0;

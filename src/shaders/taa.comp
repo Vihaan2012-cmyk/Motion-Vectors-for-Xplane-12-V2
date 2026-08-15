@@ -137,6 +137,7 @@ layout(push_constant) uniform Params {
 const int FLAG_FREEZE_HISTORY = 1;
 const int FLAG_NO_MOTION      = 2;
 const int FLAG_NO_ACCUM       = 4;
+const int FLAG_REACTIVE       = 8;   // consume the coverage mask in .a
 
 const int VIZ_OFF       = 0;
 const int VIZ_MOTION    = 1;   // direction as colour
@@ -249,7 +250,18 @@ void main()
     // ndc_y = +1 is at the TOP and uv_y = 0.5 - 0.5 * ndc_y. That makes
     // d(uv_y) = -vel_y while d(uv_x) = +vel_x. The same sign that took the
     // field's own diagnostic from 4.8 px to 0.0015 px applies here.
-    vec2 vel  = texture(uVelocity, vec3(uv, float(layer))).xy * pc.velScale;
+    vec4 velS = texture(uVelocity, vec3(uv, float(layer)));
+    vec2 vel  = velS.xy * pc.velScale;
+    // ---- THE COVERAGE MASK (C13 -> C14).
+    //
+    // The velocity target is RGBA16F and its alpha carries the transparency
+    // gate the fragment patcher writes: 1 where opaque geometry owns the
+    // pixel, 0 where nothing drew or only transparent texels landed - the sky,
+    // and the propeller's blur disc. Those pixels flicker by construction
+    // (animated transparency alternates blade and background every frame), and
+    // accumulating a flicker is the prop halo and its ground trail. Coverage
+    // below half forces the weight to the current frame further down.
+    float cov = velS.w;
     if ((pc.flags & FLAG_NO_MOTION) != 0) vel = vec2(0.0);
     vec2 hUv  = uv + vec2(vel.x, pc.velYSign * vel.y);
 
@@ -331,9 +343,15 @@ void main()
     //          leading edge, thickening with speed.
     //   GREEN  accepted, reprojected, blended.
     if (pc.viz == VIZ_INVALID) {
-        vec3 c = noVector ? vec3(1.0, 0.0, 0.0)
-               : !valid   ? vec3(0.0, 0.0, 1.0)
-                          : vec3(0.0, 1.0, 0.0);
+        // YELLOW joins the classes: covered by transparent/animated content,
+        // which the reactive mask hands to the current frame. The prop disc
+        // should be a clean yellow circle; yellow over the whole airframe
+        // would mean the gate is misreading opaque geometry.
+        vec3 c = noVector    ? vec3(1.0, 0.0, 0.0)
+               : !valid     ? vec3(0.0, 0.0, 1.0)
+               : (cov < 0.5 && (pc.flags & FLAG_REACTIVE) != 0)
+                            ? vec3(1.0, 1.0, 0.0)
+                            : vec3(0.0, 1.0, 0.0);
         imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
         return;
     }
@@ -422,8 +440,19 @@ void main()
     // term narrows it where the neighbourhood actually agrees.
     vec3 mu    = m1 / 9.0;
     vec3 sigma = sqrt(max(m2 / 9.0 - mu * mu, vec3(0.0)));
-    vec3 lo    = max(mu - pc.varClip * sigma, nmin);
-    vec3 hi    = min(mu + pc.varClip * sigma, nmax);
+    // ---- TIGHTER IN THE DARK.
+    //
+    // The shadow interiors mottled because X-Plane dithers its soft shadows
+    // per frame and the clamp box, sized by variance, is WIDE exactly where
+    // that dither is the dominant signal - so bright dither outliers inside a
+    // shadow passed as plausible and parked. Luminance says which regime a
+    // pixel is in: below ~2% luminance the box narrows to just over half its
+    // width, fading back to full by ~15%. Scaled from pc.varClip so the live
+    // knob still moves the whole family together.
+    float clipK = pc.varClip * mix(0.55, 1.0,
+                                   smoothstep(0.02, 0.15, luma(tm(curr))));
+    vec3 lo    = max(mu - clipK * sigma, nmin);
+    vec3 hi    = min(mu + clipK * sigma, nmax);
 
     vec3 hRaw = rgb2ycocg(tm(hist));
     vec3 hy   = clamp(hRaw, lo, hi);
@@ -478,6 +507,9 @@ void main()
         uint fl = texelFetch(uFlags, ivec3(px, layer), 0).r;
         if ((fl & 4u) != 0u) a = 1.0;
     }
+    // Transparent-covered pixels likewise - the C14 reactive mask. See the
+    // coverage note at the fetch.
+    if ((pc.flags & FLAG_REACTIVE) != 0 && cov < 0.5) a = 1.0;
 
     // How far the clamp had to move history, in standard deviations. Edges under
     // motion should light up and flat interiors should stay black; a frame that

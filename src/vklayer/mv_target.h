@@ -142,7 +142,15 @@ static bool mvWantRGBA()
     static const bool v = getenv("TAA_MV_RGBA") != nullptr;
     return v;
 }
-#define kMvFormat (mvWantRGBA() ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R16G16_SFLOAT)
+// RGBA16F ALWAYS, and the reason is the alpha channel, not the debug modes.
+//
+// The C13 transparency gate ends life in the blend stage unless the format can
+// store it, and stored it becomes the C14 reactive mask: a = 0 where nothing
+// drew or only transparent texels landed (sky, the prop blur disc), a = 1
+// where opaque geometry owns the pixel. The resolve reads it to stop animated
+// transparency flickering into history. Doubling the target to 63 MB is the
+// price of a per-pixel coverage signal that costs no extra pass.
+#define kMvFormat (VK_FORMAT_R16G16B16A16_SFLOAT)
 
 // DERIVED, never restated. The readback size and the index stride both have to
 // track kMvFormat, and the comment below used to say so while the numbers said
@@ -650,6 +658,27 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
 
 
             if (vx != vx || vy != vy) { ++nan; ++n; continue; }
+            // ---- COVERAGE BELOW HALF IS NOT A SAMPLE.
+            //
+            // Alpha carries the C13/C14 gate: below half means no opaque
+            // geometry owns the pixel - sky, or the transparent texels of an
+            // animated draw like the propeller blur. Their motion is not the
+            // camera's to predict, and counting them is how the residual read
+            // BROKEN on a parked aircraft with a spinning prop: with a still
+            // camera the ONLY moving pixels were ones no matrix could ever
+            // match. The debug channel modes own channel 3 for their own
+            // diagnostics and keep the old accounting.
+            {
+                static const bool plainChannels =
+                    !getenv("TAA_MV_WRITE_DEPTH") && !getenv("TAA_MV_RGBA") &&
+                    !getenv("TAA_MV_FIELDCHK")   && !getenv("TAA_MV_MATDUMP") &&
+                    !getenv("TAA_MV_RAWCLIP")    && !getenv("TAA_MV_PID");
+                if (plainChannels && kMvHalves >= 4 &&
+                    velHalfToFloat(px[i + 3]) < 0.5f) {
+                    ++zero; ++n;
+                    continue;
+                }
+            }
             double mag = sqrt((double)vx * vx + (double)vy * vy);
             // Sky and anything else with no geometry behind it writes zero, and
             // at 4K that can be most of the frame - enough to drag a median to

@@ -2779,7 +2779,11 @@ static bool g_jitterViewport = false;
 // airframe genuinely has zero velocity, and the body frame is now measured to
 // 0.0022 m/frame - but the cockpit has to be IDENTIFIED, not inferred from
 // distance. TAA_NEARFIELD_M re-enables it for experiments.
-static float g_nearFieldM = 0.0f;
+// 2.0 m by default, not zero. Zero kept the cockpit fix disabled through
+// every session in which the shake was reported; two metres covers the panel
+// and the window frame while leaving the runway (below and ahead of the
+// glareshield at more than that) on the world path. Live: taa.nearfield_m.
+static float g_nearFieldM = 2.0f;
 
 static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetViewport(
     VkCommandBuffer cb, uint32_t first, uint32_t count, const VkViewport *vp)
@@ -8307,10 +8311,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // run: coverage 99.7%, no image failures, the report printed its
             // header, and every depth read back as zero because B and A were
             // masked off downstream of a shader that wrote them correctly.
-            const VkColorComponentFlags mvMaskOn = mvWantRGBA()
-                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
-                : (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT);
+            // All four channels, always: the target is RGBA16F now, and the
+            // alpha channel CARRIES the C13/C14 coverage gate - masking it off
+            // would silently drop the reactive mask the resolve depends on,
+            // the same silent-channel failure the RGBA note below records.
+            const VkColorComponentFlags mvMaskOn =
+                  VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
             mvBlend.colorWriteMask = fragPatched ? mvMaskOn : 0;
             // ---- ALPHA-BLENDED PIPELINES GET A PER-PIXEL SELECT, NOT A STAMP.
             //
@@ -9009,7 +9016,24 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // panel is not stationary relative to it, and zeroing its velocity would be
     // a new bug rather than a fix. Zero disables the select entirely, because
     // gl_Position.w is positive for anything in front of the camera.
-    if (g_velSnap.bodyReprojValid && g_nearFieldM > 0.0f)
+    // ---- PROVISIONAL ARMING: THE CALIBRATION CANNOT RESOLVE WHILE PARKED.
+    //
+    // bodyReprojValid requires 120 frames of the aircraft ROTATING in a
+    // cockpit view before the quaternion-mapping census is decisive - read the
+    // gate: `rigid && rotating && !external`, then `samples >= 120`. A parked
+    // aircraft never rotates, so every parked session ever flown had
+    // bodyValid=0 and the near-field select disarmed, which is the cockpit
+    // shake in one sentence.
+    //
+    // viewType 1018 is X-Plane's 3-D cockpit: the camera rides the airframe by
+    // construction there, which is the exact premise the calibration exists to
+    // verify for exotic cameras. So the select arms provisionally in 1018, and
+    // the calibrated path simply confirms it once the aircraft has flown. The
+    // failure mode of a wrong provisional arming is zeroed velocity on
+    // geometry within two metres of the eye in a cockpit view - which is the
+    // panel, whose correct velocity in that view IS zero.
+    if ((g_velSnap.bodyReprojValid || g_velSnap.viewType == 1018) &&
+        g_nearFieldM > 0.0f)
         block[18] = g_nearFieldM;
     g_diagLastBlock18 = block[18];
 
