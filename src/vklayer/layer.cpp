@@ -2738,6 +2738,12 @@ static bool g_jitterArmed = false;
 // crawl, a consumer with no jitter averages identical samples and cannot
 // antialias anything.
 static float g_jitterScale = 0.0f;
+// The NDC offsets actually pushed this frame - what the resolve must be told,
+// as opposed to g_velSnap.jitterX/Y, which is the plugin's REQUEST in units of
+// pixels. The resolve was told the request for a while, believing it was NDC:
+// three orders of magnitude and one axis convention wrong, which is why the
+// value is stored at the single site that knows what was applied.
+static float g_appliedJitX = 0.0f, g_appliedJitY = 0.0f;
 static uint64_t g_jitterApplied = 0;
 
 // Did a resolve actually happen this frame, and how often does it not.
@@ -4343,8 +4349,11 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 tf.motion.objectMotionIncluded = true;
                 tf.renderW = tf.outputW = passInfo.w;
                 tf.renderH = tf.outputH = passInfo.h;
-                tf.jitter.x = g_velSnap.jitterX;
-                tf.jitter.y = g_velSnap.jitterY;
+                // The APPLIED NDC values, not g_velSnap's pixel-unit request - the
+                // shader adds pc.jitter as an NDC offset, so it must be told the
+                // same number the vertex splice consumed.
+                tf.jitter.x = g_appliedJitX;
+                tf.jitter.y = g_appliedJitY;
                 memcpy(tf.camera.reproj, g_velSnap.reproj, sizeof(tf.camera.reproj));
                 // Not camDelta: that is translation only, and a camera rotating
                 // in place moves every pixel while translating zero. The
@@ -6303,6 +6312,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         }
     }
 
+    // Resolve duty, counted per frame at the boundary. The GATE lines are
+    // sampled mid-recording and cannot distinguish "not yet" from "never";
+    // this can. Every frame the resolve skips while jitter is armed shows the
+    // raw offset raster on screen, so duty below ~99% IS a visible twitch and
+    // the number says whether the pass-identification tail is worth more work.
+    if (taaEnabled()) {
+        static uint64_t dutyFrames = 0, dutyResolved = 0;
+        ++dutyFrames;
+        if (g_taaResolvedThisFrame) ++dutyResolved;
+        if ((dutyFrames % 600) == 0)
+            trace("RESOLVE DUTY: %llu of %llu frames resolved (%.1f%%)",
+                  (unsigned long long)dutyResolved,
+                  (unsigned long long)dutyFrames,
+                  100.0 * (double)dutyResolved / (double)dutyFrames);
+    }
     g_velInjectedThisFrame = false;
     g_taaResolvedThisFrame = false;
     g_sceneEndsLastFrame   = g_sceneEndsThisFrame;
@@ -9025,6 +9049,8 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             // frame from the live enable, default 1.0 while resolving.
             block[16] =  2.0f * g_velSnap.jitterX * g_jitterScale / w;
             block[17] = ySign * 2.0f * g_velSnap.jitterY * g_jitterScale / h;
+            g_appliedJitX = block[16];
+            g_appliedJitY = block[17];
             if (block[16] != 0.0f || block[17] != 0.0f) ++g_jitterApplied;
         }
     }

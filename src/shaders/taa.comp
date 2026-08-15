@@ -85,7 +85,7 @@ layout(binding = 4)          uniform usampler2DArray uFlags;
 
 layout(push_constant) uniform Params {
     vec2  invSize;      // 1 / target size
-    vec2  jitter;       // current frame's jitter, in NDC
+    vec2  jitter;       // the APPLIED NDC offset this frame - scaled, Y-signed
     float alpha;        // weight of the current frame
     int   mode;         // 0 passthrough, 1 reproject, 2 full
     int   reset;        // 1 = ignore history this frame
@@ -138,6 +138,7 @@ const int FLAG_FREEZE_HISTORY = 1;
 const int FLAG_NO_MOTION      = 2;
 const int FLAG_NO_ACCUM       = 4;
 const int FLAG_REACTIVE       = 8;   // consume the coverage mask in .a
+const int FLAG_NO_UNJITTER    = 16;  // sample the raster raw - isolation only
 
 const int VIZ_OFF       = 0;
 const int VIZ_MOTION    = 1;   // direction as colour
@@ -239,6 +240,25 @@ void main()
 
     vec2 uv = (vec2(px) + 0.5) * pc.invSize;
 
+    // ---- UNJITTER: read the raster where the geometry actually is.
+    //
+    // pc.jitter is the NDC offset the vertex splice ADDED this frame - the
+    // applied value, not the plugin's request, so scale and Y sign are already
+    // in it. The whole raster is displaced by it: colour, velocity and
+    // coverage all live at uv + S, while history is stored unjittered (it
+    // converges to the mean of the offsets). Fetching current AT uv therefore
+    // blends a displaced sample into a stable history, which drags alpha's
+    // worth of the displacement into the output every frame - and that is the
+    // whole image visibly shaking. Jitter is only invisible when the resolve
+    // that consumes it cancels it; this is the cancellation.
+    //
+    // NDC to UV: uv_x = 0.5 + 0.5*ndc_x but uv_y = 0.5 - 0.5*ndc_y, because
+    // the viewport height is negative - the same sign the velocity fetch
+    // below already carries.
+    vec2 S = (pc.flags & FLAG_NO_UNJITTER) != 0
+           ? vec2(0.0)
+           : vec2(0.5 * pc.jitter.x, -0.5 * pc.jitter.y);
+
     // ---- THE STORED VALUE IS ALREADY A UV OFFSET.
     //
     // The field holds (prevNDC - currNDC) * 0.5. Since uv = ndc * 0.5 + 0.5,
@@ -250,7 +270,7 @@ void main()
     // ndc_y = +1 is at the TOP and uv_y = 0.5 - 0.5 * ndc_y. That makes
     // d(uv_y) = -vel_y while d(uv_x) = +vel_x. The same sign that took the
     // field's own diagnostic from 4.8 px to 0.0015 px applies here.
-    vec4 velS = texture(uVelocity, vec3(uv, float(layer)));
+    vec4 velS = texture(uVelocity, vec3(uv + S, float(layer)));
     vec2 vel  = velS.xy * pc.velScale;
     // ---- THE COVERAGE MASK (C13 -> C14).
     //
@@ -262,6 +282,24 @@ void main()
     // accumulating a flicker is the prop halo and its ground trail. Coverage
     // below half forces the weight to the current frame further down.
     float cov = velS.w;
+
+    // ---- COVERAGE IS A REGION PROPERTY, NOT A PIXEL PROPERTY.
+    //
+    // With jitter armed, a silhouette pixel's coverage flips above and below
+    // one half every frame - the sub-pixel offset moves the edge across the
+    // sample point, which is the entire point of jittering. Firing the
+    // reactive mask on the CENTRE sample therefore set a=1.0 along every edge
+    // in the scene, every frame, and every edge refreshed as raw jittered
+    // current: the reported whole-scene shake. The prop disc - the thing the
+    // mask exists for - is transparent across a REGION, not along a line, so
+    // the mask now fires on the neighbourhood maximum: an edge pixel has an
+    // opaque neighbour and stays temporal, the disc interior has none and
+    // takes the current frame.
+    float covMax = 0.0;
+    for (int cy = -1; cy <= 1; ++cy)
+        for (int cx = -1; cx <= 1; ++cx)
+            covMax = max(covMax, texelFetch(uVelocity,
+                ivec3(clamp(px + ivec2(cx, cy), ivec2(0), size - 1), layer), 0).w);
     if ((pc.flags & FLAG_NO_MOTION) != 0) vel = vec2(0.0);
     vec2 hUv  = uv + vec2(vel.x, pc.velYSign * vel.y);
 
@@ -349,15 +387,23 @@ void main()
         // would mean the gate is misreading opaque geometry.
         vec3 c = noVector    ? vec3(1.0, 0.0, 0.0)
                : !valid     ? vec3(0.0, 0.0, 1.0)
-               : (cov < 0.5 && (pc.flags & FLAG_REACTIVE) != 0)
+               : (covMax < 0.5 && (pc.flags & FLAG_REACTIVE) != 0)
                             ? vec3(1.0, 1.0, 0.0)
                             : vec3(0.0, 1.0, 0.0);
         imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
         return;
     }
 
+    // The aligned read of the current frame. Bilinear, so it costs half a
+    // texel of softness at most - the alternative is the displacement itself
+    // reaching the screen. Everything below that consumes "the current frame"
+    // as a colour consumes this; the raster-space statistics loop keeps its
+    // texelFetches because a box built from the actual raster is still the
+    // right box, S being well under one texel.
+    vec3 currA = texture(uScene, vec3(uv + S, float(layer))).rgb;
+
     if (pc.reset != 0 || !valid || noVector) {
-        imageStore(uHistory, ivec3(px, layer), vec4(curr, 1.0));
+        imageStore(uHistory, ivec3(px, layer), vec4(currA, 1.0));
         return;
     }
 
@@ -377,7 +423,7 @@ void main()
     // pipeline does not.
     if ((pc.flags & FLAG_FREEZE_HISTORY) != 0) return;
     if ((pc.flags & FLAG_NO_ACCUM) != 0) {
-        imageStore(uHistory, ivec3(px, layer), vec4(curr, 1.0));
+        imageStore(uHistory, ivec3(px, layer), vec4(currA, 1.0));
         return;
     }
 
@@ -387,7 +433,7 @@ void main()
     // fetched and blended, and that the velocity is steering it. A frame that
     // ghosts along motion is a frame whose reprojection works.
     if (pc.mode == MODE_REPROJECT) {
-        vec3 outc = mix(hist, curr, pc.alpha);
+        vec3 outc = mix(hist, currA, pc.alpha);
         imageStore(uHistory, ivec3(px, layer), vec4(outc, 1.0));
         return;
     }
@@ -450,7 +496,7 @@ void main()
     // width, fading back to full by ~15%. Scaled from pc.varClip so the live
     // knob still moves the whole family together.
     float clipK = pc.varClip * mix(0.55, 1.0,
-                                   smoothstep(0.02, 0.15, luma(tm(curr))));
+                                   smoothstep(0.02, 0.15, luma(tm(currA))));
     vec3 lo    = max(mu - clipK * sigma, nmin);
     vec3 hi    = min(mu + clipK * sigma, nmax);
 
@@ -472,7 +518,7 @@ void main()
     // Flooring relative to the signal fixes it: below a hundredth of the local
     // luminance the neighbourhood genuinely agrees, history is genuinely fine,
     // and `moved` should read as zero rather than as noise amplified.
-    float floorS = 0.01 * luma(tm(curr)) + 1e-4;
+    float floorS = 0.01 * luma(tm(currA)) + 1e-4;
     float moved  = length(hy - hRaw) / max(length(sigma), floorS);
 
     // ---- THE CLAMP DRIVES THE WEIGHT. IT IS NOT APPLIED TO THE COLOUR.
@@ -518,7 +564,7 @@ void main()
     }
     // Transparent-covered pixels likewise - the C14 reactive mask. See the
     // coverage note at the fetch.
-    if ((pc.flags & FLAG_REACTIVE) != 0 && cov < 0.5) a = 1.0;
+    if ((pc.flags & FLAG_REACTIVE) != 0 && covMax < 0.5) a = 1.0;
 
     // How far the clamp had to move history, in standard deviations. Edges under
     // motion should light up and flat interiors should stay black; a frame that
@@ -540,7 +586,7 @@ void main()
 
     // The negative-component floor stays. Those were the black dots along
     // high-contrast edges, and flooring costs nothing.
-    vec3 outc = max(mix(hist, curr, a), vec3(0.0));
+    vec3 outc = max(mix(hist, currA, a), vec3(0.0));
 
     imageStore(uHistory, ivec3(px, layer), vec4(outc, 1.0));
 }

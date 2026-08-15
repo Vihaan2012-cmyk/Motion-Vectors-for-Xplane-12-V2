@@ -129,6 +129,7 @@ enum {
     kTaaFlagNoMotion      = 1 << 1,
     kTaaFlagNoAccum       = 1 << 2,
     kTaaFlagReactive      = 1 << 3,
+    kTaaFlagNoUnjitter    = 1 << 4,
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -173,6 +174,9 @@ static bool taaObjFlags() { return live::onoff("taa.objflags", nullptr, true); }
 // override: flicker parked in history is worse than aliasing on the flickering
 // content. taa.reactive=0 isolates its contribution live.
 static bool taaReactive() { return live::onoff("taa.reactive", nullptr, true); }
+// The unjitter alignment - isolation knob for the aligned sampling, so its
+// contribution can be removed live without touching the jitter itself.
+static bool taaUnjitter() { return live::onoff("taa.unjitter", nullptr, true); }
 static bool taaFreezeHistory() { return live::onoff("taa.freeze_history", nullptr, false); }
 static bool taaNoMotion()      { return live::onoff("taa.no_motion",      nullptr, false); }
 static bool taaNoAccum()       { return live::onoff("taa.no_accum",       nullptr, false); }
@@ -766,7 +770,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
-                 | (taaReactive()      ? kTaaFlagReactive      : 0);
+                 | (taaReactive()      ? kTaaFlagReactive      : 0)
+                 | (taaUnjitter()      ? 0 : kTaaFlagNoUnjitter);
     pcv.velScale = taaVelScale();
     pcv.velYSign = taaVelYSign();
     pcv.flagsValid = (g_taa.flagsValid && taaObjFlags()) ? 1 : 0;

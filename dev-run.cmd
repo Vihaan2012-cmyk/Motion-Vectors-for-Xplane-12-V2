@@ -42,14 +42,32 @@ rem Measure the velocity field every N frames. This is the acceptance gate for
 rem the whole project, so it is on for debugging - but it reads back 31.9 MB at
 rem 4K, which is why it stays off in a release build rather than defaulting on
 rem like the injection does.
-set "TAA_VELOCITY_DUMP=20"
+set "TAA_VELOCITY_DUMP=60"
+
+rem ---- VRAM pager, restored to the settings V1 shipped and proved.
+rem
+rem The code was ported in e69589a but the run script never set any of it, so
+rem the mip-drop path has been dormant in V2 since the port. DROP_ABOVE 2048
+rem with MAX_DROP 1 takes 4096 sheets to 2048 and leaves everything smaller
+rem alone; AUTOGEN_TO 1024 is the harder target for streamed scenery only;
+rem HEADROOM 200 MB is when it engages at all.
+set "TAA_PAGER_DROP_ABOVE=2048"
+set "TAA_PAGER_MAX_DROP=1"
+rem set "TAA_PAGER_AUTOGEN_TO=1024"   (off: multi-level drop, and switching
+rem aircraft mid-flight makes the AIRCRAFT count as streamed - V1 assumed it
+rem always loaded before the flight and never hit this path)
+set "TAA_PAGER_HEADROOM_MB=200"
+
 
 rem Drive the camera through a known yaw and pitch once the flight settles, and
 rem compare the vectors against the pixel displacement that motion must
 rem produce. This is what turns "does it look right" into a number, and it is
 rem the only way to measure without someone flying.
 rem TAA is now switched from the panel; this only forces it on for debugging.
-rem set "TAA_RESOLVE=1"
+set "TAA_RESOLVE=1"
+set "TAA_MODE=2"
+rem set "TAA_SHOT_SECONDS=12"   (TAA off - re-enable to resume at mode 1)
+set "TAA_ALPHA=0.1"
 
 
 rem set "TAA_SELFTEST=1"
