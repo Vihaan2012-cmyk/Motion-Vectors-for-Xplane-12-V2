@@ -2731,6 +2731,13 @@ static bool     g_cbDumpOn = false;
 static uint64_t g_cbDumpsLeft = 0;
 
 static bool g_jitterArmed = false;
+// Amplitude, in fractions of the full +/-0.5 px Halton offset. Computed once
+// per frame at present time - the push path runs millions of times a frame and
+// must never take the live-file mutex - and it FOLLOWS THE RESOLVE, because
+// either alone is a downgrade: jitter with no consumer is deliberate edge
+// crawl, a consumer with no jitter averages identical samples and cannot
+// antialias anything.
+static float g_jitterScale = 0.0f;
 static uint64_t g_jitterApplied = 0;
 
 // Did a resolve actually happen this frame, and how often does it not.
@@ -6284,6 +6291,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // stops the jitter - jitter with nothing accumulating it is deliberate
     // edge crawl. TAA_JITTER still forces it for measurement.
     g_jitterArmed = taaEnabled() || (getenv("TAA_JITTER") != nullptr);
+    g_jitterScale = live::f("taa.jitter_scale", "TAA_JITTER_SCALE",
+                            taaEnabled() ? 1.0f : 0.0f);
     {
         float nf = live::f("taa.nearfield_m", "TAA_NEARFIELD_M", g_nearFieldM);
         if (nf < 0.0f)  nf = 0.0f;
@@ -9008,11 +9017,14 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             //
             // Still overridable, and still zero when the resolve is off - the
             // two are tied together because either alone is a downgrade.
-            static const float jitterScale = getenv("TAA_JITTER_SCALE")
-                                           ? (float)atof(getenv("TAA_JITTER_SCALE"))
-                                           : 0.0f;
-            block[16] =  2.0f * g_velSnap.jitterX * jitterScale / w;
-            block[17] = ySign * 2.0f * g_velSnap.jitterY * jitterScale / h;
+            // The comment above said "the default follows the resolve" and
+            // the code said 0.0f - the prose was updated when the resolve was
+            // built and the constant was not, so the amplitude stayed zero
+            // through every session and the resolve averaged identical
+            // samples. The value now lives in g_jitterScale, computed once per
+            // frame from the live enable, default 1.0 while resolving.
+            block[16] =  2.0f * g_velSnap.jitterX * g_jitterScale / w;
+            block[17] = ySign * 2.0f * g_velSnap.jitterY * g_jitterScale / h;
             if (block[16] != 0.0f || block[17] != 0.0f) ++g_jitterApplied;
         }
     }
