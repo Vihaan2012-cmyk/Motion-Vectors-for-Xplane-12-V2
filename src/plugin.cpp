@@ -184,6 +184,24 @@ enum {
     // the external camera path is fine and the fault is the aircraft moving; if
     // it is broken here, the camera path itself is wrong.
     TAA_ST_EXTERNAL,
+    // ---- SCRIPTED MOTION IN THE EXTERNAL VIEW.
+    //
+    // EXTERNAL above hands the camera to X-Plane's circle view, which then
+    // sits perfectly still - so the one view where the wing-ghost artifact
+    // forms was only ever measured motionless, where any reprojection error
+    // reads as zero. These two phases drive the missing half deterministically:
+    // ORBIT circles the parked aircraft at a fixed radius - the exact motion a
+    // user's hand makes when the ghost appears - and HOLD then freezes at the
+    // final orbit pose, which is the parked-residue check: whatever ORBIT
+    // smeared into history either clears here or is convicted of parking.
+    //
+    // The camera is RE-ACQUIRED for these phases: the EXTERNAL case surrenders
+    // it by returning 0, which uninstalls the callback, so the phase change
+    // into ORBIT calls XPLMControlCamera again. The view TYPE stays circle
+    // (1026) throughout - taking the camera positions it but does not change
+    // the view - which is precisely the point: external view, our motion.
+    TAA_ST_EXT_ORBIT,
+    TAA_ST_EXT_HOLD,
     TAA_ST_DONE
 };
 
@@ -1881,6 +1899,14 @@ static void deriveDepthRange(TaaShare *s)
 static int taaSelfTestCamera(XPLMCameraPosition_t *pos, int losingControl, void *)
 {
     if (losingControl || g_stPhase == TAA_ST_DONE) {
+        // The transition INTO the external phase is our own doing: the flight
+        // loop issues sim/view/circle while this callback is still installed,
+        // so the resulting losingControl is the command landing, not the user
+        // taking over. Ending the test here is what made everything after
+        // EXTERNAL unreachable. Hand the camera over and keep the phase clock
+        // running; EXT_ORBIT re-acquires control explicitly.
+        if (losingControl && g_stPhase == TAA_ST_EXTERNAL)
+            return 0;
         g_stActive   = false;
         g_stHaveBase = false;
         g_stPhase    = TAA_ST_DONE;
@@ -1982,6 +2008,30 @@ static int taaSelfTestCamera(XPLMCameraPosition_t *pos, int losingControl, void 
         // one.
         return 0;
 
+    case TAA_ST_EXT_ORBIT:
+    case TAA_ST_EXT_HOLD: {
+        // Circle the parked aircraft at a fixed radius, facing it - the
+        // ghost-forming motion, made deterministic. HOLD freezes at the orbit's
+        // final azimuth rather than snapping anywhere new, so the transition
+        // itself adds no motion and anything visible during HOLD is history
+        // that PARKED, not history being made.
+        //
+        // The camera base was captured in the cockpit, so it sits inside the
+        // fuselage - as an orbit CENTRE that is exactly right.
+        const float azd = kStYawPerFrame * 4.0f *
+            (float)(g_stPhase == TAA_ST_EXT_ORBIT ? g_stFrame : kStPhaseFrames);
+        const float az  = azd * 3.14159265f / 180.0f;
+        const float R   = 12.0f;
+        pos->x = g_stBaseX + sinf(az) * R;
+        pos->z = g_stBaseZ + cosf(az) * R;
+        pos->y = g_stBaseY + 3.0f;
+        // Local axes are +X east, +Z south; heading 0 faces north (-Z). The
+        // camera at azimuth a must face the centre, which solves to h = -a.
+        pos->heading = -azd;
+        pos->pitch   = -8.0f;
+        break;
+    }
+
     case TAA_ST_FLY:
         // ---- THE CAMERA IS LEFT ALONE HERE, ON PURPOSE.
         //
@@ -2014,6 +2064,8 @@ static const char *taaSelfTestName(int p)
     case TAA_ST_HEADMOVE:  return "HEADMOVE";
     case TAA_ST_FLY:       return "FLY";
     case TAA_ST_EXTERNAL:  return "EXTERNAL";
+    case TAA_ST_EXT_ORBIT: return "EXT-ORBIT";
+    case TAA_ST_EXT_HOLD:  return "EXT-HOLD";
     case TAA_ST_DONE:      return "DONE";
     }
     return "OFF";
@@ -2560,17 +2612,35 @@ static float matrixCallback(float sinceLast, float, int, void *)
                 // The external phase asks the sim to circle the aircraft, and
                 // hands the view back afterwards. Commands rather than datarefs:
                 // the view type dataref is read-only in X-Plane 12.
+                const bool nowExternal =
+                    g_stPhase == TAA_ST_EXTERNAL ||
+                    g_stPhase == TAA_ST_EXT_ORBIT ||
+                    g_stPhase == TAA_ST_EXT_HOLD;
                 if (g_stPhase == TAA_ST_EXTERNAL) {
                     if (XPLMCommandRef c = XPLMFindCommand("sim/view/circle"))
                         XPLMCommandOnce(c);
                     xlog("self-test: phase EXTERNAL - circling view, aircraft "
                          "parked. This separates the external camera path from "
                          "the aircraft being a moving object.");
+                } else if (g_stPhase == TAA_ST_EXT_ORBIT) {
+                    // EXTERNAL surrendered the camera by returning 0, which
+                    // uninstalls the callback - so scripted motion in the
+                    // external view needs it re-acquired. The view TYPE stays
+                    // circle; control positions the camera without changing it.
+                    XPLMControlCamera(xplm_ControlCameraUntilViewChanges,
+                                      taaSelfTestCamera, nullptr);
+                    xlog("self-test: phase EXT-ORBIT - scripted orbit of the "
+                         "parked aircraft in the external view. This is the "
+                         "ghost-forming motion, made deterministic.");
+                } else if (g_stPhase == TAA_ST_EXT_HOLD) {
+                    xlog("self-test: phase EXT-HOLD - frozen at the orbit's "
+                         "final pose. Anything visible now is history that "
+                         "PARKED, not history being made.");
                 } else if (g_stPhaseWasExternal) {
                     if (XPLMCommandRef c = XPLMFindCommand("sim/view/3d_cockpit_cmnd_look"))
                         XPLMCommandOnce(c);
                 }
-                g_stPhaseWasExternal = (g_stPhase == TAA_ST_EXTERNAL);
+                g_stPhaseWasExternal = nowExternal;
 
                 if (g_stPhase == TAA_ST_FLY) {
                     if (drBrake && savedBrake < 0.0f) {
