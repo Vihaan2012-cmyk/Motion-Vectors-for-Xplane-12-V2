@@ -4398,6 +4398,21 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // Hand the resolve X-Plane's own moving-geometry flags if the
                 // census has identified them. Shape-checked in taaBindFlags.
                 {
+                    // The census identifies candidates at image CREATION, and
+                    // X-Plane creates its G-buffer at startup - before our
+                    // velocity target exists, when the size comparison inside
+                    // noteGbufferVelCandidate cannot succeed. Sweep the images
+                    // already recorded once the target is real; the sweep is at
+                    // most 256 map entries and stops mattering the moment a
+                    // candidate is found.
+                    if (g_gbufferVelCandidate == VK_NULL_HANDLE && g_mv.ready) {
+                        std::lock_guard<std::mutex> g(g_lock);
+                        for (std::map<VkImage, ColorTarget>::iterator ci2 =
+                                 g_colorImages.begin();
+                             ci2 != g_colorImages.end() &&
+                                 g_gbufferVelCandidate == VK_NULL_HANDLE; ++ci2)
+                            noteGbufferVelCandidate(ci2->second);
+                    }
                     VkImage fi = g_gbufferVelCandidate;
                     VkFormat ff = VK_FORMAT_UNDEFINED;
                     uint32_t fl = 1;
