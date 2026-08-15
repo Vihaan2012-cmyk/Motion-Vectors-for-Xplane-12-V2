@@ -6268,6 +6268,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // it rides the camera, so its true screen motion is zero - and the pushed
     // threshold has been 0 the whole time, so the select never fired and the
     // panel got the scenery's world reprojection instead. That is the shake.
+    // ---- JITTER RIDES THE RESOLVE. The old design's invariant, restored.
+    //
+    // "The resolve is what arms it in normal use, and neither can be left on
+    // without the other by accident" - written when the coupling existed,
+    // still true, and broken when the resolve was rebuilt: arming became
+    // env-only, the sequence generated its 8 phases, and the offsets stayed
+    // (0, 0) through every session. Without sub-pixel jitter each frame
+    // samples the identical grid, accumulation averages identical samples,
+    // and TAA can remove shimmer but never aliasing - which, with X-Plane's
+    // FXAA also held off, leaves the picture RAWER than stock. That is
+    // "no artifacts but still aliased" in one line.
+    //
+    // Tied to the live enable per frame, so switching the resolve off also
+    // stops the jitter - jitter with nothing accumulating it is deliberate
+    // edge crawl. TAA_JITTER still forces it for measurement.
+    g_jitterArmed = taaEnabled() || (getenv("TAA_JITTER") != nullptr);
     {
         float nf = live::f("taa.nearfield_m", "TAA_NEARFIELD_M", g_nearFieldM);
         if (nf < 0.0f)  nf = 0.0f;
