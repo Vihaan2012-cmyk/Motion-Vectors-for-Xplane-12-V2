@@ -46,7 +46,7 @@ enum {
     OpEntryPoint = 15,
     OpTypeBool = 20, OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23,
     OpTypeMatrix = 24, OpTypeStruct = 30, OpTypePointer = 32,
-    OpConstant = 43,
+    OpConstant = 43, OpConstantComposite = 44,
     OpFunction = 54, OpVariable = 59, OpLoad = 61, OpStore = 62,
     OpAccessChain = 65,
     OpDecorate = 71, OpMemberDecorate = 72, OpDecorationGroup = 73,
@@ -928,7 +928,54 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         body.push_back(idPosX); body.push_back(idPosY); body.push_back(idPosW); body.push_back(idConstOneV);
     }
 
-    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idLoadedMat);
+    // ---- TAA_MV_IDENTITY: REPLACE THE PUSHED MATRIX WITH A KNOWN IDENTITY.
+    //
+    // The one probe that separates "the matrix arriving here is wrong" from
+    // "everything downstream of it is wrong", and it is decisive because the
+    // expected result is not a judgement call.
+    //
+    // With M = identity: clipToView maps (x, y, w, 1) to the view position, and
+    // an identity in its place hands that straight to the multiply - so
+    // prevClip = (x/sx, y/sy, -w, 1). That is NOT currClip, so this is not a
+    // no-op; what it IS is a field computed from a matrix whose every element
+    // is known exactly. Any disagreement with the pushed values is then in the
+    // delivery, not the arithmetic.
+    //
+    // Why it matters here: with the camera provably still - "camera moved
+    // 0.000 m", and the plugin, trace and reprojection all reporting 0.000 px -
+    // the field still reads 64 to 1094 px on the ground, scaling as 1/depth.
+    // Flow proportional to 1/depth is the signature of TRANSLATION, and the one
+    // measurement this project never explained is the shader reading
+    // M[12] = 111/161/180 where the layer pushed -0.024. M[12] is the
+    // translation column. The two facts describe the same defect.
+    uint32_t idMatForMul = idLoadedMat;
+    if (getenv("TAA_MV_IDENTITY")) {
+        uint32_t idZeroF = bound++;
+        uint32_t idC0 = bound++, idC1 = bound++, idC2 = bound++, idC3 = bound++;
+        uint32_t idIdent = bound++;
+        uint32_t bits0 = 0;                       // 0.0f
+        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat);
+        globals.push_back(idZeroF); globals.push_back(bits0);
+        // Column-major, as SPIR-V matrices are.
+        const uint32_t cols[4][4] = {
+            { idConstOneV, idZeroF,     idZeroF,     idZeroF },
+            { idZeroF,     idConstOneV, idZeroF,     idZeroF },
+            { idZeroF,     idZeroF,     idConstOneV, idZeroF },
+            { idZeroF,     idZeroF,     idZeroF,     idConstOneV },
+        };
+        const uint32_t colId[4] = { idC0, idC1, idC2, idC3 };
+        for (int c = 0; c < 4; ++c) {
+            globals.push_back(head(OpConstantComposite, 7));
+            globals.push_back(idV4); globals.push_back(colId[c]);
+            for (int r = 0; r < 4; ++r) globals.push_back(cols[c][r]);
+        }
+        globals.push_back(head(OpConstantComposite, 7));
+        globals.push_back(idMat4); globals.push_back(idIdent);
+        for (int c = 0; c < 4; ++c) globals.push_back(colId[c]);
+        idMatForMul = idIdent;
+    }
+
+    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idMatForMul);
     body.push_back(clipToClip ? (flipForMatrix ? idFlipped : idLoadedPos) : idViewVec);
 
     // ---- NEAR FIELD: THE COCKPIT'S CORRECT MOTION VECTOR IS ZERO.
