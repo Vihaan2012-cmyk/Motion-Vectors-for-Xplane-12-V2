@@ -928,54 +928,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         body.push_back(idPosX); body.push_back(idPosY); body.push_back(idPosW); body.push_back(idConstOneV);
     }
 
-    // ---- TAA_MV_IDENTITY: REPLACE THE PUSHED MATRIX WITH A KNOWN IDENTITY.
-    //
-    // The one probe that separates "the matrix arriving here is wrong" from
-    // "everything downstream of it is wrong", and it is decisive because the
-    // expected result is not a judgement call.
-    //
-    // With M = identity: clipToView maps (x, y, w, 1) to the view position, and
-    // an identity in its place hands that straight to the multiply - so
-    // prevClip = (x/sx, y/sy, -w, 1). That is NOT currClip, so this is not a
-    // no-op; what it IS is a field computed from a matrix whose every element
-    // is known exactly. Any disagreement with the pushed values is then in the
-    // delivery, not the arithmetic.
-    //
-    // Why it matters here: with the camera provably still - "camera moved
-    // 0.000 m", and the plugin, trace and reprojection all reporting 0.000 px -
-    // the field still reads 64 to 1094 px on the ground, scaling as 1/depth.
-    // Flow proportional to 1/depth is the signature of TRANSLATION, and the one
-    // measurement this project never explained is the shader reading
-    // M[12] = 111/161/180 where the layer pushed -0.024. M[12] is the
-    // translation column. The two facts describe the same defect.
-    uint32_t idMatForMul = idLoadedMat;
-    if (getenv("TAA_MV_IDENTITY")) {
-        uint32_t idZeroF = bound++;
-        uint32_t idC0 = bound++, idC1 = bound++, idC2 = bound++, idC3 = bound++;
-        uint32_t idIdent = bound++;
-        uint32_t bits0 = 0;                       // 0.0f
-        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat);
-        globals.push_back(idZeroF); globals.push_back(bits0);
-        // Column-major, as SPIR-V matrices are.
-        const uint32_t cols[4][4] = {
-            { idConstOneV, idZeroF,     idZeroF,     idZeroF },
-            { idZeroF,     idConstOneV, idZeroF,     idZeroF },
-            { idZeroF,     idZeroF,     idConstOneV, idZeroF },
-            { idZeroF,     idZeroF,     idZeroF,     idConstOneV },
-        };
-        const uint32_t colId[4] = { idC0, idC1, idC2, idC3 };
-        for (int c = 0; c < 4; ++c) {
-            globals.push_back(head(OpConstantComposite, 7));
-            globals.push_back(idV4); globals.push_back(colId[c]);
-            for (int r = 0; r < 4; ++r) globals.push_back(cols[c][r]);
-        }
-        globals.push_back(head(OpConstantComposite, 7));
-        globals.push_back(idMat4); globals.push_back(idIdent);
-        for (int c = 0; c < 4; ++c) globals.push_back(colId[c]);
-        idMatForMul = idIdent;
-    }
-
-    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idMatForMul);
+    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idLoadedMat);
     body.push_back(clipToClip ? (flipForMatrix ? idFlipped : idLoadedPos) : idViewVec);
 
     // ---- NEAR FIELD: THE COCKPIT'S CORRECT MOTION VECTOR IS ZERO.
@@ -1031,7 +984,31 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         body.push_back(idPrevSel); body.push_back(2);
         idPrevSelTagged = idPT;
     }
-    body.push_back(head(OpStore, 3)); body.push_back(idOutPrev); body.push_back(idPrevSelTagged ? idPrevSelTagged : idPrevSel);
+    // ---- TAA_MV_PREV_EQ_CURR: STORE THE SAME VALUE TO BOTH VARYINGS.
+    //
+    // The probe the identity substitution should have been, and this time the
+    // expected result is EXACT, not a judgement call: prevClip and currClip
+    // carry the identical id, so the fragment's (prev/pw - curr/cw) * 0.5 is
+    // zero at every pixel by construction - same interpolated value, same
+    // divide, same rounding. Nothing about the matrix, the push constants or
+    // the reconstruction is involved.
+    //
+    //   field reads zero everywhere  ->  varyings, locations, interpolation,
+    //                                    the fragment divide and the write are
+    //                                    ALL clean. The fault is upstream: the
+    //                                    matrix the multiply consumed.
+    //   field still shows motion     ->  the fault is downstream of the vertex
+    //                                    maths, and the M[12] anomaly is a
+    //                                    separate problem, not this one.
+    //
+    // The identity probe failed as a probe because the matrix it replaced also
+    // carries clipToView, so "identity" was not a no-op and the output had no
+    // exact expected value - median 450 px of meaningless signal. This one has
+    // exactly one possible correct answer.
+    static const bool prevEqCurr = (getenv("TAA_MV_PREV_EQ_CURR") != nullptr);
+    body.push_back(head(OpStore, 3)); body.push_back(idOutPrev);
+    body.push_back(prevEqCurr ? (flipForMatrix ? idFlipped : idLoadedPos)
+                              : (idPrevSelTagged ? idPrevSelTagged : idPrevSel));
     // currClip goes out in the same space the matrix works in, so the fragment's
     // subtraction is between two comparable vectors. Both raw, or both flipped -
     // never one of each.

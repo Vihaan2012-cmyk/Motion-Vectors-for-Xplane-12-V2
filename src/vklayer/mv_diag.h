@@ -62,6 +62,15 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
     if (!dir) return;
     static int nWritten = 0;
     if (nWritten >= 4) return;
+    // ---- ONLY WRITE WHEN THE FIELD IS ACTUALLY BROKEN.
+    //
+    // Four reports per session, and the defect is INTERMITTENT - session 3
+    // measured 0.062 px for minutes and then 1430 px with the same still
+    // camera. Unconditional reports spend all four on the clean state and the
+    // broken one arrives after the quota is gone. 50 px of median error cannot
+    // be produced by a working field under any camera motion the readback
+    // frames capture, so this gate cannot eat a healthy report by accident.
+    if (getenv("TAA_MV_MATDUMP") && in.medianAbsPx < 50.0) return;
 
     char path[512];
     snprintf(path, sizeof(path), "%s/mv_diag_%d.txt", dir, nWritten);
