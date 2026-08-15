@@ -964,7 +964,13 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     body.push_back(head(OpLoad, 4));        body.push_back(idV4);      body.push_back(idNFvec);   body.push_back(idChainNF);
     body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idNFdist); body.push_back(idNFvec); body.push_back(2);
     body.push_back(head(OpFOrdLessThan, 5)); body.push_back(idBool); body.push_back(idNFcmp); body.push_back(idPosW); body.push_back(idNFdist);
-    body.push_back(head(OpSelect, 6)); body.push_back(idV4); body.push_back(idPrevSel); body.push_back(idNFcmp); body.push_back(idFlipped); body.push_back(idPrevClip);
+    // The near-field substitute is the SAME value currClip carries -
+    // idLoadedPos, the unflipped position - so near geometry differences to
+    // exactly zero. This selected idFlipped, the Y-NEGATED position from the
+    // flip era, while currClip stores the unflipped one: not zero velocity but
+    // a VERTICAL-MIRROR velocity on every near pixel, wrong since the flip was
+    // removed and invisible until the select first armed.
+    body.push_back(head(OpSelect, 6)); body.push_back(idV4); body.push_back(idPrevSel); body.push_back(idNFcmp); body.push_back(idLoadedPos); body.push_back(idPrevClip);
 
     // ---- DEBUG: REPORT THE MATRIX THE VERTEX SHADER ACTUALLY LOADED.
     //

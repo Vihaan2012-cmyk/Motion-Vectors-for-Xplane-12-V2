@@ -504,7 +504,16 @@ void main()
 
     // Moving-geometry pixels take the current frame outright - see uFlags.
     if (pc.flagsValid != 0) {
-        uint fl = texelFetch(uFlags, ivec3(px, layer), 0).r;
+        // Clamped, unconditionally. texelFetch performs no bounds checking,
+        // and this fetch runs at full-frame coordinates against whatever is
+        // bound - which is the 1x1 fallback whenever the real image is
+        // unidentified. The branch above should keep the fallback unfetched,
+        // but an out-of-bounds texelFetch is undefined behaviour of exactly
+        // the kind that becomes VK_ERROR_DEVICE_LOST on a driver that hoists,
+        // and a clamp costs two instructions against losing the device.
+        ivec3 fsz = textureSize(uFlags, 0);
+        ivec2 fpx = min(px, fsz.xy - 1);
+        uint fl = texelFetch(uFlags, ivec3(fpx, min(layer, fsz.z - 1)), 0).r;
         if ((fl & 4u) != 0u) a = 1.0;
     }
     // Transparent-covered pixels likewise - the C14 reactive mask. See the
