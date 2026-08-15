@@ -157,7 +157,14 @@ static bool mvWantRGBA()
 // otherwise: the format went back to RG16F and these stayed at RGBA16F values.
 // The result measured as exactly 50% zeros and hundreds of pixels of motion on
 // a camera that had not moved - every read landing on the wrong pixel.
-#define kMvHalves (mvWantRGBA() ? 4u : 2u)           // R16G16 = two halves
+// FOUR, unconditionally, because the FORMAT is unconditional - and this pair
+// desynchronising is a lost device, not a wrong number: kMvFormat went to
+// RGBA16F while this stayed keyed to the old env check, so the readback buffer
+// was sized for two channels (33 MB) while the dump copied the real
+// four-channel image (63.7 MB) into it - a 30 MB GPU write past the end of the
+// buffer on every dump frame, resolve on or off. Two constants describing one
+// layout must be one expression; deriving both from the format ends the class.
+#define kMvHalves (4u)                               // RGBA16F = four halves
 #define kMvBytes  (kMvHalves * 2u)                   // ...four bytes
 
 static void mvDestroy(DeviceData &dd)
@@ -307,7 +314,7 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
 
     m.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     m.ready  = true;
-    trace("MV: velocity target ready %ux%u RG16F vel.xy (%.1f MB) - this is "
+    trace("MV: velocity target ready %ux%u RGBA16F vel.xy + coverage.a (%.1f MB) - this is "
           "the one X-Plane's own shaders render into",
           w, h, mr.size / 1048576.0);
     return true;
