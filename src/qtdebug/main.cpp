@@ -73,6 +73,7 @@
 // presents as a rendering fault, in the other process, minutes later.
 // ---------------------------------------------------------------------------
 #include "../share.h"
+#include "../mv_icon.h"
 
 struct ShareView {
     HANDLE          handle = nullptr;
@@ -579,38 +580,13 @@ private:
     }
 };
 
-// A drawn icon rather than a shipped .ico, so there is no binary asset to keep
-// in step with anything and the app has a recognisable mark on the taskbar the
-// moment it is built: a velocity field, which is what all of this is about.
-static QIcon makeIcon()
-{
-    QPixmap pm(64, 64);
-    pm.fill(Qt::transparent);
-    QPainter p(&pm);
-    p.setRenderHint(QPainter::Antialiasing);
-    p.setBrush(QColor(24, 32, 48));
-    p.setPen(Qt::NoPen);
-    p.drawRoundedRect(2, 2, 60, 60, 12, 12);
-    for (int i = 0; i < 4; ++i) {
-        const int y = 16 + i * 11;
-        const int len = 12 + i * 8;
-        QColor c = QColor::fromHsv(200 - i * 40, 220, 245);
-        p.setPen(QPen(c, 3, Qt::SolidLine, Qt::RoundCap));
-        p.drawLine(12, y, 12 + len, y);
-        p.drawLine(12 + len, y, 12 + len - 5, y - 4);
-        p.drawLine(12 + len, y, 12 + len - 5, y + 4);
-    }
-    p.end();
-    return QIcon(pm);
-}
-
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
     app.setApplicationName("Motion Vectors Debug Console");
-    app.setWindowIcon(makeIcon());
+    app.setWindowIcon(mvIcon());
     Console c;
-    c.setWindowIcon(makeIcon());
+    c.setWindowIcon(mvIcon());
     c.show();
     return app.exec();
 }

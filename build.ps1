@@ -1,4 +1,4 @@
-param([switch]$Installer)
+param([switch]$Installer, [switch]$Dev)
 
 # Build: XPLM plugin + Vulkan layer.
 #
@@ -20,7 +20,22 @@ $root  = $PSScriptRoot
 # define, the installer takes it on the command line, and the Lua panel reads
 # it back out of the plugin over a dataref.
 $mvVersion = (Get-Content (Join-Path $root "VERSION") -Raw).Trim()
+
+# ---- -Dev PRODUCES A DEVELOPER BUILD, AND SAYS SO IN THE VERSION.
+#
+# The launcher opens its developer surfaces - the Advanced tab, the debug
+# console, the layer log, and the unfinished backends as SELECTABLE rather than
+# merely visible - when its version string contains "dev".
+#
+# Deciding that from the version rather than a separate define is deliberate. A
+# binary that reports 0.0.16 and behaves like a development build is the same
+# class of problem as a launcher that reported 0.0.08 while the build was 0.0.16:
+# two facts about one binary that disagree. With one string deciding both, a
+# build that claims to be a release IS one, and there is nothing to keep in step.
+if ($Dev) { $mvVersion = "$mvVersion-dev" }
+
 Write-Host "Motion Vectors $mvVersion"
+if ($Dev) { Write-Host "  DEVELOPER BUILD - launcher shows all dev surfaces" -ForegroundColor Cyan }
 
 $src   = Join-Path $root "src"
 $out   = Join-Path $root "build"
@@ -116,18 +131,46 @@ if ($LASTEXITCODE -ne 0) { throw "launcher build failed" }
 # platforms\qwindows.dll, and a missing plugin folder fails at run time on the
 # user's machine rather than here.
 $qtRoot = "C:\Qt\6.8.3\mingw_64"
-if (Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) {
+
+# ---- THE Qt APPS NEED AN MSVCRT COMPILER. THIS IS NOT A PREFERENCE.
+#
+# Qt6Core.dll imports msvcrt.dll. The default g++ here is the UCRT variant
+# (x86_64-ucrt-posix-seh), so it imports ucrtbase.dll. Those are two different C
+# runtimes with two different HEAPS - so a QString allocated inside Qt and
+# destroyed in our code calls free() on a pointer that heap never issued, and
+# Windows answers "Invalid address specified to RtlFreeHeap".
+#
+# The symptom is a segfault before the window ever appears, in the constructor,
+# on a line as innocent as setWindowTitle. Nothing in the application code is
+# wrong and no amount of reading it helps - which is why BOTH Qt apps had it, and
+# why the launcher this installer has been shipping had never once run.
+#
+# Confirmed directly:  objdump -p Qt6Core.dll | grep "DLL Name"  ->  msvcrt.dll
+#
+# The layer and the plugin stay on the UCRT compiler. They link no Qt, they are
+# statically linked, and changing a working toolchain to match an unrelated
+# dependency would be the wrong trade.
+$qtcxx = @(
+    "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\g++.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
+    Write-Host "Qt found, but no MSVCRT g++ - skipping the Qt apps." -ForegroundColor Yellow
+    Write-Host "  Qt6Core.dll imports msvcrt.dll; building against it with the UCRT" -ForegroundColor Yellow
+    Write-Host "  compiler produces binaries that crash on the first QString." -ForegroundColor Yellow
+    Write-Host "  Install with: winget install BrechtSanders.WinLibs.POSIX.MSVCRT" -ForegroundColor Yellow
+} elseif (Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) {
     Write-Host "Building Qt launcher..."
     $qtOut = Join-Path $out "qtlauncher"
     # Cleared first. windeployqt only ADDS files, so a runtime left behind by a
     # previous Qt version would be shipped alongside the current one.
     if (Test-Path $qtOut) { Remove-Item -Recurse -Force $qtOut }
     New-Item -ItemType Directory -Force $qtOut | Out-Null
-    & g++ -o (Join-Path $qtOut "MotionVectors.exe") "$src\qtlauncher\main.cpp" `
+    & $qtcxx -o (Join-Path $qtOut "MotionVectors.exe") "$src\qtlauncher\main.cpp" `
       "-I$qtRoot\include" "-I$qtRoot\include\QtCore" "-I$qtRoot\include\QtGui" `
       "-I$qtRoot\include\QtWidgets" "-I$qtRoot\include\QtNetwork" `
-      -m64 -O2 -std=c++17 -mwindows "-DMV_VERSION=\`"$mvVersion\`"" `
-      "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network -lQt6Network
+      -m64 -O2 -std=c++17 -mwindows -DQT_NO_DEBUG -DNDEBUG "-DMV_VERSION=\`"$mvVersion\`"" `
+      "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network
     if ($LASTEXITCODE -ne 0) { throw "Qt launcher build failed" }
     # ---- THE DEBUG CONSOLE.
     #
@@ -140,10 +183,10 @@ if (Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) {
     # runs while the sim is flying, and the launcher's job ends the moment the
     # sim starts.
     Write-Host "Building debug console..."
-    & g++ -o (Join-Path $qtOut "MotionVectorsDebug.exe") "$src\qtdebug\main.cpp" `
+    & $qtcxx -o (Join-Path $qtOut "MotionVectorsDebug.exe") "$src\qtdebug\main.cpp" `
       "-I$qtRoot\include" "-I$qtRoot\include\QtCore" "-I$qtRoot\include\QtGui" `
       "-I$qtRoot\include\QtWidgets" `
-      -m64 -O2 -std=c++17 -mwindows "-DMV_VERSION=\`"$mvVersion\`"" `
+      -m64 -O2 -std=c++17 -mwindows -DQT_NO_DEBUG -DNDEBUG "-DMV_VERSION=\`"$mvVersion\`"" `
       "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core
     if ($LASTEXITCODE -ne 0) { throw "debug console build failed" }
 
