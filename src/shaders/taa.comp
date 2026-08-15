@@ -238,7 +238,10 @@ void main()
         // Vectors in PIXELS, then to colour around a grey zero. Sky and cloud
         // should be flat grey: they have no vectors, and if they are not grey
         // something wrote there that should not have.
-        vec2 px2 = vel * vec2(size) ;
+        // Through the SAME convention the fetch uses, or the picture and the
+        // consumer can disagree in sign - an instrument must show what is
+        // consumed, not what is stored.
+        vec2 px2 = vec2(vel.x, pc.velYSign * vel.y) * vec2(size);
         vec3 c = vec3(0.5) + vec3(px2.x, px2.y, 0.0) * 0.02 * pc.vizScale;
         imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
         return;
