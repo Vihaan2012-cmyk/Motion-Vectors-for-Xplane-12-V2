@@ -79,7 +79,7 @@
 #include <math.h>
 
 #define TAA_MAGIC       0x4D414154u            // 'TAAM'
-#define TAA_VERSION     6      // 6: bodyReproj for own-aircraft/cockpit geometry
+#define TAA_VERSION     7      // 7: VRAM system state (zone, shaped budget, ...)
 
 // Which temporal backend to run. All of them consume the SAME inputs - velocity
 // buffer, jitter sequence, insertion point - which is the whole reason the
@@ -527,6 +527,18 @@ struct TaaShare {
     uint32_t vramTotalMB;     // physical size of the device-local heap
     uint32_t vramBudgetMB;    // what the driver says this process may use
     uint32_t vramUsageMB;     // what this process currently has allocated
+
+    // ---- THE VRAM SYSTEM, WRITTEN BY THE LAYER (see vram.h).
+    //
+    // The zone is the one word that summarises memory pressure; the rest are
+    // the live counters a debug overlay needs to say what the system is doing
+    // without anyone reading a trace file.
+    uint32_t vramZone;          // 0 GREEN, 1 YELLOW, 2 ORANGE, 3 RED, 4 CRITICAL
+    uint32_t vramShapedMB;      // the budget as reported to X-Plane after shaping
+    uint32_t vramUploadKBFrame; // last frame's upload estimate, KB
+    uint32_t vramHeldSubmits;   // upload submissions the governor is holding
+    uint32_t vramPoolMB;        // recycle pool residency, MB
+    uint32_t vramAllocFails;    // allocation failures this session
 
     // ---- FRAME RATE, MEASURED WHERE THE FRAMES ACTUALLY LEAVE.
     //

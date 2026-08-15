@@ -736,7 +736,8 @@ static int geomBucketOf(uint64_t bytes)
 // picture at all - but it should never have been assumed free.
 static bool g_ledgerOn = true;
 
-struct VramEntry { int cat; uint64_t bytes; };
+struct VramEntry { int cat; uint64_t bytes;
+                   uint32_t w, h, fmt, mips; };   // dims: images only (SS66)
 static std::map<VkImage,  VramEntry> g_vramImg;
 static std::map<VkBuffer, VramEntry> g_vramBuf;
 
@@ -1006,7 +1007,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindImageMemory(
 {
     int cat = vramCatOfImageHandle(image);
     if (cat >= 0)
-        vram::onBind(mem, cat, g_share && g_share->valid);
+        vram::onBind(mem, cat, g_share && g_share->valid,
+                     vram::churnHot(image));
     return g_nextBindImageMemory
          ? g_nextBindImageMemory(device, image, mem, offset)
          : VK_ERROR_INITIALIZATION_FAILED;
@@ -1018,7 +1020,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindImageMemory2(
     for (uint32_t i = 0; i < count && infos; ++i) {
         int cat = vramCatOfImageHandle(infos[i].image);
         if (cat >= 0)
-            vram::onBind(infos[i].memory, cat, g_share && g_share->valid);
+            vram::onBind(infos[i].memory, cat, g_share && g_share->valid,
+                         vram::churnHot(infos[i].image));
     }
     return g_nextBindImageMemory2
          ? g_nextBindImageMemory2(device, count, infos)
@@ -1138,6 +1141,19 @@ static VKAPI_ATTR void VKAPI_CALL Vram_CmdCopyBuffer(
     for (uint32_t i = 0; i < count && regions; ++i) bytes += regions[i].size;
     if (bytes) vram::chargeCopy(cb, bytes);
     g_nextCmdCopyBuffer(cb, src, dst, count, regions);
+}
+
+// Descriptor-set allocation counter (SS35) - measurement only; the engine
+// owns its descriptors and the layer's job is to know whether they churn.
+static PFN_vkAllocateDescriptorSets g_nextAllocDescSets = nullptr;
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_AllocateDescriptorSets(
+    VkDevice device, const VkDescriptorSetAllocateInfo *ai,
+    VkDescriptorSet *out)
+{
+    if (ai) vram::noteDescriptorAllocs(ai->descriptorSetCount);
+    return g_nextAllocDescSets
+         ? g_nextAllocDescSets(device, ai, out)
+         : VK_ERROR_INITIALIZATION_FAILED;
 }
 static PFN_vkCreateSampler      g_nextCreateSampler = nullptr;
 static PFN_vkCmdSetViewport     g_nextCmdSetViewport = nullptr;
@@ -1614,6 +1630,9 @@ struct TexPolicy {
 };
 static std::map<VkImage, TexPolicy> g_texPolicy;
 static uint32_t g_pagerDropAbove = 0;     // drop a mip above this size; 0 = off
+// The environment pins the pager thresholds; the VRAM system's zone policy
+// drives them only when nothing was pinned. Set where the env is parsed.
+static bool     g_pagerEnvLocked = false;
 
 // Textures left alone because X-Plane had already scaled them to a
 // non-power-of-two size. Counted rather than silent: if this is large, the two
@@ -2000,10 +2019,15 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdCopyBufferToImage(
     // same estimate.
     {
         uint64_t bytes = 0;
-        for (uint32_t i = 0; i < count && regions; ++i)
+        for (uint32_t i = 0; i < count && regions; ++i) {
             bytes += (uint64_t)regions[i].imageExtent.width *
                      regions[i].imageExtent.height *
                      (regions[i].imageExtent.depth ? regions[i].imageExtent.depth : 1) * 4ull;
+            // Duplicate-upload detection (SS52): same image mip twice in one
+            // frame is bandwidth spent on nothing.
+            vram::noteUploadRegion((uint64_t)(uintptr_t)dst,
+                                   regions[i].imageSubresource.mipLevel);
+        }
         if (bytes) vram::chargeCopy(cb, bytes);
     }
 
@@ -2203,10 +2227,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
             memset(&req, 0, sizeof(req));
             getReq(device, *out, &req);
             int cat = vramCatOfImage(ci, isDepthFormat(ci->format));
-            std::lock_guard<std::mutex> g(g_lock);
-            vramAdd(cat, req.size);
-            VramEntry e; e.cat = cat; e.bytes = req.size;
-            g_vramImg[*out] = e;
+            {
+                std::lock_guard<std::mutex> g(g_lock);
+                vramAdd(cat, req.size);
+                VramEntry e; e.cat = cat; e.bytes = req.size;
+                e.w = ci->extent.width; e.h = ci->extent.height;
+                e.fmt = (uint32_t)ci->format; e.mips = ci->mipLevels;
+                g_vramImg[*out] = e;
+            }
+            // Churn tracking (SS50): the shape is the identity, because a
+            // pager reload creates a NEW handle for the same texture.
+            bool hot = false;
+            vram::noteImageCreate(*out, ci->extent.width, ci->extent.height,
+                                  (uint32_t)ci->format, ci->mipLevels,
+                                  req.size, &hot);
+            if (hot) {
+                static uint64_t hotSaid = 0;
+                if (++hotSaid <= 20)
+                    trace("VRAMSYS: %ux%u fmt=%d is churning through residency "
+                          "- its blocks now take retention priority 0.65",
+                          ci->extent.width, ci->extent.height, (int)ci->format);
+            }
         }
     }
 
@@ -2452,6 +2493,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImageView(
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
     VkDevice device, VkImage img, const VkAllocationCallbacks *alloc)
 {
+    vram::noteImageDestroy(img);
     PFN_vkDestroyImage next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -4953,8 +4995,10 @@ static void armLayerOnce()
             if (const char *md = getenv("TAA_PAGER_MAX_DROP")) {
                 int v = atoi(md);
                 if (v >= 1 && v <= 4) g_pagerMaxDrop = (uint32_t)v;
+                g_pagerEnvLocked = true;
             }
             if (const char *dp = getenv("TAA_PAGER_DROP_ABOVE")) {
+                g_pagerEnvLocked = true;
                 g_pagerDropAbove = (uint32_t)atoi(dp);
                 trace("PAGER: custom texture pager armed - textures larger "
                       "than %u px lose up to %u mip level%s at creation, and "
@@ -4964,6 +5008,7 @@ static void armLayerOnce()
             }
 
             if (const char *ag = getenv("TAA_PAGER_AUTOGEN_TO")) {
+                g_pagerEnvLocked = true;
                 g_pagerAutogenTo = (uint32_t)atoi(ag);
                 if (g_pagerAutogenTo)
                     trace("PAGER: streamed scenery capped at %u px - textures "
@@ -5389,6 +5434,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSets(
     VkDevice device, uint32_t nw, const VkWriteDescriptorSet *w,
     uint32_t nc, const VkCopyDescriptorSet *c)
 {
+    vram::noteDescriptorUpdates(nw + nc);
     PFN_vkUpdateDescriptorSets next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -6532,11 +6578,56 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     live::poll();
 
     // The VRAM system's frame tick: fresh heap sample, zone update, governor
-    // release, recycle trim, priority walk. The camera delta feeds the
-    // teleport detector; garbage (pre-flight, unset snapshot) is passed as -1
-    // so it can never fake a teleport.
+    // release, recycle trim, priority walk, frame-time feedback. The camera
+    // delta feeds the teleport detector; garbage (pre-flight, unset snapshot)
+    // is passed as -1 so it can never fake a teleport.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        vram::ledgerRt(g_vram[VRAM_RT].bytes + g_vram[VRAM_DEPTH].bytes +
+                       g_vram[VRAM_STORAGE].bytes);
+    }
     vram::onPresent((snap.camDelta >= 0.0f && snap.camDelta < 100000.0f)
                         ? snap.camDelta : -1.0f);
+
+    // Zone-driven texture quality caps (SS25/43/47): the create-time pager's
+    // thresholds follow the zone unless the environment pinned them - an env
+    // variable was always the explicit override here and stays the strongest
+    // word. GREEN and YELLOW leave textures entirely alone; each zone above
+    // caps streamed scenery harder while the preload set (aircraft, cockpit)
+    // keeps a gentler ceiling, which is SS47's "autogen degrades first" made
+    // concrete.
+    if (!g_pagerEnvLocked) {
+        struct { uint32_t dropAbove, maxDrop, autogenTo; } zp;
+        switch (vram::zone) {
+            case vram::GREEN: case vram::YELLOW: zp.dropAbove = 0; zp.maxDrop = 1; zp.autogenTo = 0;    break;
+            case vram::ORANGE:   zp.dropAbove = 0;    zp.maxDrop = 1; zp.autogenTo = 4096; break;
+            case vram::RED:      zp.dropAbove = 4096; zp.maxDrop = 1; zp.autogenTo = 2048; break;
+            default:             zp.dropAbove = 2048; zp.maxDrop = 2; zp.autogenTo = 1024; break;
+        }
+        zp.dropAbove = (uint32_t)live::i("vram.tex_drop_above", nullptr, (int)zp.dropAbove);
+        zp.autogenTo = (uint32_t)live::i("vram.tex_streamed_to", nullptr, (int)zp.autogenTo);
+        if (zp.dropAbove != g_pagerDropAbove || zp.autogenTo != g_pagerAutogenTo) {
+            trace("VRAMSYS: zone %s texture policy - preload cap %u px "
+                  "(drop %u), streamed cap %u px",
+                  vram::zoneName(vram::zone), zp.dropAbove, zp.maxDrop,
+                  zp.autogenTo);
+            g_pagerDropAbove = zp.dropAbove;
+            g_pagerMaxDrop   = zp.maxDrop;
+            g_pagerAutogenTo = zp.autogenTo;
+        }
+    }
+
+    // Publish the VRAM system's state to the shared block (SS65): the plugin
+    // and the debug window get the zone and the live counters without reading
+    // a log.
+    if (g_share) {
+        g_share->vramZone          = (uint32_t)vram::zone;
+        g_share->vramShapedMB      = (uint32_t)(vram::lastReported / 1048576ull);
+        g_share->vramUploadKBFrame = (uint32_t)(vram::upBytesLast / 1024ull);
+        g_share->vramHeldSubmits   = (uint32_t)vram::heldNow;
+        g_share->vramPoolMB        = (uint32_t)(vram::g_poolBytes / 1048576ull);
+        g_share->vramAllocFails    = (uint32_t)vram::allocFails.load();
+    }
     mvMaybeReport(frames);
     // The near-field threshold, live. Read ONCE per frame here rather than in
     // the push path - the push runs millions of times a frame and a mutexed
@@ -7210,6 +7301,25 @@ static VKAPI_ATTR void VKAPI_CALL TAA_GetPhysicalDeviceMemoryProperties2(
                       pageable / 1048576.0,
                       total ? (100.0 * pageable / total) : 0.0);
 
+                // The largest individual residents (SS66) - when one number in
+                // the categories looks wrong, these are the names behind it.
+                {
+                    std::vector<std::pair<uint64_t, const VramEntry*> > top;
+                    for (std::map<VkImage, VramEntry>::const_iterator ti =
+                             g_vramImg.begin(); ti != g_vramImg.end(); ++ti)
+                        top.push_back(std::make_pair(ti->second.bytes,
+                                                     &ti->second));
+                    std::sort(top.begin(), top.end());
+                    int shown = 0;
+                    for (size_t ti = top.size(); ti > 0 && shown < 8; --ti) {
+                        const VramEntry *e = top[ti - 1].second;
+                        trace("  biggest: %7.1f MB  %ux%u fmt=%u mips=%u  %s",
+                              e->bytes / 1048576.0, e->w, e->h, e->fmt,
+                              e->mips, vramCatName(e->cat));
+                        ++shown;
+                    }
+                }
+
                 // THIS TOTAL IS NOT VRAM, and the gap says by how much.
                 //
                 // vkGetImageMemoryRequirements reports what a resource NEEDS,
@@ -7615,7 +7725,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateComputePipelines(
     }
     if (!next) return VK_ERROR_INITIALIZATION_FAILED;
 
+    LARGE_INTEGER cpc0, cpc1, cpcf;
+    QueryPerformanceCounter(&cpc0);
     VkResult r = next(device, cache, count, ci, alloc, out);
+    QueryPerformanceCounter(&cpc1);
+    QueryPerformanceFrequency(&cpcf);
+    if (cpcf.QuadPart > 0)
+        vram::notePipelines(count,
+            (uint64_t)((cpc1.QuadPart - cpc0.QuadPart) * 1000000ll /
+                       cpcf.QuadPart));
     if (r == VK_SUCCESS && ci && out) {
         std::lock_guard<std::mutex> g(g_lock);
         for (uint32_t i = 0; i < count; ++i) {
@@ -8680,10 +8798,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
         }
     }
 
+    // Pipeline-compile stutter telemetry (SS59): count and time every driver
+    // compile. Creations after the first present are JIT - the classic
+    // mid-flight hitch - and the per-frame peak names the guilty frame.
+    LARGE_INTEGER vpc0, vpc1, vpcf;
+    QueryPerformanceCounter(&vpc0);
     VkResult r = g_nextCreateGfxPipelines
         ? g_nextCreateGfxPipelines(device, cache, count,
                                    ci2.empty() ? ci : ci2.data(), alloc, out)
         : VK_ERROR_INITIALIZATION_FAILED;
+    QueryPerformanceCounter(&vpc1);
+    QueryPerformanceFrequency(&vpcf);
+    if (vpcf.QuadPart > 0)
+        vram::notePipelines(count,
+            (uint64_t)((vpc1.QuadPart - vpc0.QuadPart) * 1000000ll /
+                       vpcf.QuadPart));
 
     // If the extended pipelines were rejected, retry unmodified. A pipeline we
     // cannot extend is a hole in the velocity buffer; a pipeline that fails to
@@ -9511,9 +9640,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_AllocateMemory(
     if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY) return r;
 
     ++g_allocFailed;
-    trace("ALLOC: OUT OF DEVICE MEMORY for %.1f MB (type %u) - this is the "
-          "moment X-Plane's pager is trying to avoid",
-          ai->allocationSize / 1048576.0, ai->memoryTypeIndex);
+    // Never hide an allocation failure (SS69): size, type, its property
+    // flags, and the budget picture at the moment it happened.
+    trace("ALLOC: OUT OF DEVICE MEMORY for %.1f MB (type %u: %s) - usage "
+          "%.2f GB of %.2f GB raw budget, %.2f GB shaped, ledger %.2f GB. "
+          "This is the moment X-Plane's pager is trying to avoid.",
+          ai->allocationSize / 1048576.0, ai->memoryTypeIndex,
+          vram::typeFlagsText(ai->memoryTypeIndex),
+          vram::rawUsage / 1073741824.0, vram::rawBudget / 1073741824.0,
+          vram::lastReported / 1073741824.0,
+          g_vramTotalBytes / 1073741824.0);
 
     // ---- EMERGENCY LADDER, before overcommit. Flush the recycle pool (real
     // bytes returned to the driver), release every held upload, deflate the
@@ -10232,6 +10368,7 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     g_nextDeviceWaitIdle    = (PFN_vkDeviceWaitIdle)nextGDPA(*out, "vkDeviceWaitIdle");
     g_nextQueueBindSparse   = (PFN_vkQueueBindSparse)nextGDPA(*out, "vkQueueBindSparse");
     g_nextCmdCopyBuffer     = (PFN_vkCmdCopyBuffer)nextGDPA(*out, "vkCmdCopyBuffer");
+    g_nextAllocDescSets     = (PFN_vkAllocateDescriptorSets)nextGDPA(*out, "vkAllocateDescriptorSets");
     PFN_vkSetDeviceMemoryPriorityEXT setPrio =
         (PFN_vkSetDeviceMemoryPriorityEXT)nextGDPA(*out, "vkSetDeviceMemoryPriorityEXT");
 
@@ -10394,6 +10531,7 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkDeviceWaitIdle",      Vram_DeviceWaitIdle)
     RETURN_IF("vkQueueBindSparse",     Vram_QueueBindSparse)
     RETURN_IF("vkCmdCopyBuffer",       Vram_CmdCopyBuffer)
+    RETURN_IF("vkAllocateDescriptorSets", Vram_AllocateDescriptorSets)
     RETURN_IF("vkCmdCopyBufferToImage", TAA_CmdCopyBufferToImage)
     RETURN_IF("vkCmdPipelineBarrier",  TAA_CmdPipelineBarrier)
     RETURN_IF("vkCmdPipelineBarrier2", TAA_CmdPipelineBarrier2)

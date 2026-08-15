@@ -49,7 +49,10 @@
 
 #include <vulkan/vulkan.h>
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -79,11 +82,13 @@ struct Config {
     float teleportM;         // vram.teleport_m         camera jump threshold
     int   teleportFrames;    // vram.teleport_frames    zone bias duration
     int   traceEvery;        // vram.trace_every        heartbeat cadence
+    float speedReserve;      // vram.speed_reserve      reserve growth per m/frame
+    bool  adaptive;          // vram.adaptive           frame-time feedback
 };
 static Config cfg = { true, true, true, true, true,
                       0.02f, {128,256,384,512,768}, 512, 600,
                       256, 180, {0,0,64,24,8}, 2,
-                      2000.0f, 900, 600 };
+                      2000.0f, 900, 600, 0.01f, true };
 
 // ------------------------------------------------------------------ zones
 enum Zone { GREEN = 0, YELLOW, ORANGE, RED, CRITICAL };
@@ -144,6 +149,71 @@ static uint64_t flushOnWait = 0, flushOnDep = 0, flushOnAge = 0, flushOnPresent 
 static uint64_t sparseBinds = 0;
 static double   camSpeedEma = 0.0;
 static uint64_t teleports = 0;
+
+// ---- frame-time statistics (plan SS29/30): the primary metric is
+// consistency, not average. A ring of present-to-present times feeds an EMA
+// for the adaptive upload notch and percentiles for the report.
+static double        g_ftRing[512];
+static int           g_ftAt = 0, g_ftN = 0;
+static LARGE_INTEGER g_lastPresentQpc;
+static bool          g_havePresentQpc = false;
+static double        frameAvgMs = 0.0;     // EMA, alpha 0.05
+static double        frameBestMs = 1e9;    // best recent EMA, decays upward
+static int           uploadNotch = 0;      // halves the upload budget per step
+static uint64_t      notchCalm = 0;        // clean frames since last notch
+
+// ---- churn (SS50/51): a texture that cycles resident->evicted->resident is
+// the classic streaming failure. Identity is the creation shape - the reload
+// creates a NEW VkImage, so the handle cannot carry it, but dims+format+mips
+// can. A key seen destroyed and re-created within the window is a cycle;
+// three cycles make the shape HOT, and hot images take a higher memory
+// priority at bind so the driver stops demoting exactly them.
+struct ChurnKey {
+    uint32_t w, h, fmt, mips;
+    bool operator<(const ChurnKey &o) const {
+        if (w != o.w) return w < o.w;
+        if (h != o.h) return h < o.h;
+        if (fmt != o.fmt) return fmt < o.fmt;
+        return mips < o.mips;
+    }
+};
+struct ChurnRec {
+    uint32_t creates = 0, destroys = 0, cycles = 0;
+    uint64_t lastDestroyFrame = 0, bytes = 0;
+};
+static std::map<ChurnKey, ChurnRec> g_churn;
+static std::map<VkImage, ChurnKey>  g_imgKey;
+static std::set<VkImage>            g_hotImgs;
+static uint64_t churnCycles = 0;
+
+// ---- pipeline creation (SS59): JIT pipeline compiles are a classic stutter
+// source. Counted and timed; creations after the first present are "live"
+// and the per-frame peak is the number that indicts a hitch.
+static std::atomic<uint64_t> pipesTotal(0), pipesLive(0), pipesFrame(0);
+static std::atomic<uint64_t> pipeUsTotal(0);
+static uint64_t pipesFramePeak = 0, pipesFramePeakAt = 0;
+
+// ---- descriptor churn (SS35): counters only - the engine owns its
+// descriptors; the layer's job is to know whether they are a problem.
+static std::atomic<uint64_t> descUpdFrame(0), descAllocFrame(0);
+static uint64_t descUpdPeak = 0, descAllocPeak = 0;
+
+// ---- duplicate uploads (SS52): the same image mip uploaded twice in one
+// frame is wasted PCIe bandwidth. Detected per frame, cleared at present.
+static std::set<std::pair<uint64_t, uint32_t> > g_upSeen;
+static uint64_t dupUploads = 0;
+
+// ---- render-target bytes (SS34): fed from the ledger each frame; the sum of
+// RT + depth + storage is the theoretical upper bound transient aliasing
+// could reclaim, reported so the investigation the plan asks for has its
+// number.
+static uint64_t rtBytesNow = 0;
+
+// ---- persistence (SS77): a small state file carries what a session learned
+// - allocation failures ever seen become a standing reserve bias, so a
+// machine that has hit the wall keeps more margin from the next launch on.
+static int      reserveBiasMB = 0;
+static uint64_t failsEver = 0;
 
 // ---- recycle pool
 struct Held { VkDeviceMemory mem; uint64_t size; uint32_t type; uint64_t frame; };
@@ -210,7 +280,140 @@ static float prioOfCat(int cat, bool streamed)
 static uint64_t zoneUploadBudget()
 {
     int mb = cfg.uploadBudgetMB[zone];
-    return mb <= 0 ? ~0ull : (uint64_t)mb * 1048576ull;
+    if (mb <= 0) {
+        // Unlimited by zone - but the adaptive notch still applies: frame-time
+        // pressure caps uploads even in GREEN (plan SS29: a theoretically
+        // perfect streaming system can still cause stutters).
+        if (uploadNotch <= 0) return ~0ull;
+        return (uint64_t)(256 >> uploadNotch) * 1048576ull;
+    }
+    uint64_t b = (uint64_t)mb * 1048576ull;
+    return b >> (uploadNotch > 3 ? 3 : uploadNotch);
+}
+
+// ============================================================ churn tracking
+static void noteImageCreate(VkImage img, uint32_t w, uint32_t h, uint32_t fmt,
+                            uint32_t mips, uint64_t bytes, bool *hotOut)
+{
+    if (hotOut) *hotOut = false;
+    if (!cfg.enable || !img) return;
+    std::lock_guard<std::mutex> g(m);
+    ChurnKey k; k.w = w; k.h = h; k.fmt = fmt; k.mips = mips;
+    ChurnRec &r = g_churn[k];
+    ++r.creates;
+    r.bytes = bytes;
+    // A re-create within ten seconds of a destroy of the same shape is the
+    // cycle the plan's SS50 describes.
+    if (r.destroys && frameIndex - r.lastDestroyFrame < 600) {
+        ++r.cycles;
+        ++churnCycles;
+    }
+    g_imgKey[img] = k;
+    if (r.cycles >= 3) {
+        g_hotImgs.insert(img);
+        if (hotOut) *hotOut = true;
+    }
+}
+
+static void noteImageDestroy(VkImage img)
+{
+    if (!img) return;
+    std::lock_guard<std::mutex> g(m);
+    std::map<VkImage, ChurnKey>::iterator it = g_imgKey.find(img);
+    if (it != g_imgKey.end()) {
+        ChurnRec &r = g_churn[it->second];
+        ++r.destroys;
+        r.lastDestroyFrame = frameIndex;
+        g_imgKey.erase(it);
+    }
+    g_hotImgs.erase(img);
+}
+
+static bool churnHot(VkImage img)
+{
+    std::lock_guard<std::mutex> g(m);
+    return g_hotImgs.count(img) != 0;
+}
+
+// ============================================================ misc telemetry
+static void notePipelines(uint32_t count, uint64_t us)
+{
+    pipesTotal.fetch_add(count);
+    pipeUsTotal.fetch_add(us);
+    if (frameIndex > 0) {                 // after the first present = in flight
+        pipesLive.fetch_add(count);
+        pipesFrame.fetch_add(count);
+    }
+}
+
+static void noteDescriptorUpdates(uint32_t n) { descUpdFrame.fetch_add(n); }
+static void noteDescriptorAllocs(uint32_t n)  { descAllocFrame.fetch_add(n); }
+
+static void noteUploadRegion(uint64_t imgHandle, uint32_t mip)
+{
+    std::lock_guard<std::mutex> g(m);
+    if (!g_upSeen.insert(std::make_pair(imgHandle, mip)).second) ++dupUploads;
+}
+
+static void ledgerRt(uint64_t bytes) { rtBytesNow = bytes; }
+
+// ============================================================ persistence
+static const char *statePath()
+{
+    static char p[MAX_PATH] = {0};
+    if (!p[0]) {
+        const char *t = getenv("TEMP");
+        _snprintf(p, sizeof(p) - 1, "%s\\taa_vram_state.txt", t ? t : ".");
+    }
+    return p;
+}
+
+static void stateLoad()
+{
+    FILE *f = fopen(statePath(), "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long v = 0;
+        if (sscanf(line, "fails_ever=%llu", &v) == 1) failsEver = v;
+        else if (sscanf(line, "reserve_bias_mb=%llu", &v) == 1)
+            reserveBiasMB = (int)(v > 256 ? 256 : v);
+        else if (sscanf(line, "upload_peak_mb=%llu", &v) == 1)
+            upBytesPeak = v * 1048576ull;
+    }
+    fclose(f);
+    if (reserveBiasMB || failsEver)
+        trace("VRAMSYS: state loaded - %llu historical allocation failures, "
+              "standing reserve bias +%d MB",
+              (unsigned long long)failsEver, reserveBiasMB);
+}
+
+static void stateSave()
+{
+    FILE *f = fopen(statePath(), "w");
+    if (!f) return;
+    fprintf(f, "# VRAM system state - carried across sessions (plan SS77).\n"
+               "fails_ever=%llu\n"
+               "reserve_bias_mb=%d\n"
+               "upload_peak_mb=%llu\n",
+            (unsigned long long)failsEver, reserveBiasMB,
+            (unsigned long long)(upBytesPeak / 1048576ull));
+    fclose(f);
+}
+
+// A memory type's property flags, for the enriched failure log (SS69).
+static const char *typeFlagsText(uint32_t typeIndex)
+{
+    static char buf[96];
+    buf[0] = 0;
+    if (typeIndex >= dev.memProps.memoryTypeCount) return "unknown-type";
+    VkMemoryPropertyFlags f = dev.memProps.memoryTypes[typeIndex].propertyFlags;
+    if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)  strcat(buf, "DEVICE ");
+    if (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)  strcat(buf, "HOSTVIS ");
+    if (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) strcat(buf, "COHERENT ");
+    if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)   strcat(buf, "CACHED ");
+    if (!buf[0]) strcat(buf, "none");
+    return buf;
 }
 
 // ============================================================ device binding
@@ -235,6 +438,7 @@ static void bindDevice(VkDevice d, VkPhysicalDevice p,
           prioExt ? "ON" : "off",
           dev.pageableExt ? "ON" : "off",
           transferOnlyFamily == ~0u ? "NONE" : "found", transferOnlyFamily);
+    stateLoad();
 }
 
 static void noteQueue(uint32_t family, VkQueue q)
@@ -364,10 +568,14 @@ static void noteFreeGone(VkDeviceMemory mem)
 
 // First-bind classification: the resource's category names what the block
 // holds, and the block takes the highest priority of anything bound into it.
-static void onBind(VkDeviceMemory mem, int cat, bool streamed)
+// A churn-hot resource (SS50: cycling resident->evicted->resident) takes at
+// least 0.65 whatever its class - "increase its retention priority", made
+// literal at the driver level.
+static void onBind(VkDeviceMemory mem, int cat, bool streamed, bool hot = false)
 {
     if (!cfg.enable || !cfg.priority || !dev.pageableExt || !dev.dev) return;
     float p = prioOfCat(cat, streamed);
+    if (hot && p < 0.65f) p = 0.65f;
     bool  set = false;
     {
         std::lock_guard<std::mutex> g(m);
@@ -745,8 +953,16 @@ static void shapeReport(const VkPhysicalDeviceMemoryProperties *mp,
 
         // Zone reserve - the split thresholds the engine's pager lacks. In
         // GREEN almost everything is offered; each zone up withholds more, so
-        // the engine starts adapting BEFORE the wall, not at it.
-        uint64_t reserve = (uint64_t)cfg.reserveMB[zone] * 1048576ull;
+        // the engine starts adapting BEFORE the wall, not at it. Two
+        // modulations on top: the persistent bias a session that ever hit an
+        // allocation failure carries forward (SS77), and camera speed - a fast
+        // camera is about to demand scenery, so the reserve grows with it
+        // (SS11/49, prediction without a single dataref).
+        double speedFactor = camSpeedEma * cfg.speedReserve;
+        if (speedFactor > 1.0) speedFactor = 1.0;
+        uint64_t reserve = (uint64_t)(((double)cfg.reserveMB[zone] +
+                                       (double)reserveBiasMB) *
+                                      (1.0 + speedFactor)) * 1048576ull;
         report = report > reserve ? report - reserve : 0;
 
         // Emergency deflate after an allocation failure: make the engine's
@@ -786,7 +1002,12 @@ static bool emergency()
         before = g_poolBytes;
         deflateLeft = cfg.deflateFrames;
         zone = CRITICAL; zoneDwell = 0;
+        // Learn from it: every failure raises the standing reserve carried
+        // into future sessions, capped so one bad day cannot eat the card.
+        ++failsEver;
+        if (reserveBiasMB < 256) reserveBiasMB += 64;
     }
+    stateSave();
     flushAll(&flushOnDep);            // held uploads complete, then retire
     poolTrim(true);                   // pooled blocks back to the driver
     trace("VRAMSYS: EMERGENCY - allocation failed; recycle pool flushed "
@@ -822,16 +1043,90 @@ static void refreshConfig()
     cfg.teleportM      = live::f("vram.teleport_m",      nullptr, 2000.0f);
     cfg.teleportFrames = live::i("vram.teleport_frames", nullptr, 900);
     cfg.traceEvery     = live::i("vram.trace_every",     nullptr, 600);
+    cfg.speedReserve   = live::f("vram.speed_reserve",   nullptr, 0.01f);
+    cfg.adaptive       = live::onoff("vram.adaptive",    nullptr, true);
+}
+
+// Frame-time sample and the adaptive upload notch (SS29/58). If the rolling
+// average degrades more than 30% past the best recent average while uploads
+// are flowing, the upload budget halves; after 600 clean frames it steps back.
+// Smoothing both ways so it cannot oscillate.
+static void frameTimeTick()
+{
+    LARGE_INTEGER now, fq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&fq);
+    if (g_havePresentQpc && fq.QuadPart > 0) {
+        double ms = (double)(now.QuadPart - g_lastPresentQpc.QuadPart) *
+                    1000.0 / (double)fq.QuadPart;
+        if (ms > 0.01 && ms < 10000.0) {
+            g_ftRing[g_ftAt] = ms;
+            g_ftAt = (g_ftAt + 1) & 511;
+            if (g_ftN < 512) ++g_ftN;
+            if (frameAvgMs <= 0.0) frameAvgMs = ms;
+            frameAvgMs += (ms - frameAvgMs) * 0.05;
+            if (frameAvgMs < frameBestMs) frameBestMs = frameAvgMs;
+            frameBestMs *= 1.0001;         // decays upward: "recent" best
+            if (cfg.adaptive) {
+                bool uploadsFlowing = upBytesLast > (4ull << 20);
+                if (frameAvgMs > frameBestMs * 1.30 && uploadsFlowing) {
+                    if (uploadNotch < 3) {
+                        ++uploadNotch;
+                        notchCalm = 0;
+                        trace("VRAMSYS: frame time %.1f ms against a best of "
+                              "%.1f ms with uploads flowing - upload budget "
+                              "notched down to 1/%d",
+                              frameAvgMs, frameBestMs, 1 << uploadNotch);
+                    }
+                } else if (uploadNotch > 0) {
+                    if (frameAvgMs < frameBestMs * 1.10) {
+                        if (++notchCalm >= 600) {
+                            --uploadNotch;
+                            notchCalm = 0;
+                            trace("VRAMSYS: frame time recovered - upload "
+                                  "budget notch released to 1/%d",
+                                  1 << uploadNotch);
+                        }
+                    } else notchCalm = 0;
+                }
+            }
+        }
+    }
+    g_lastPresentQpc = now;
+    g_havePresentQpc = true;
+}
+
+// Percentiles over the frame-time ring, for the report (SS30: average FPS,
+// 1% low, 0.1% low, variance, maximum).
+static void frameTimeStats(double *avg, double *p99, double *p999,
+                           double *worst, double *var)
+{
+    *avg = *p99 = *p999 = *worst = *var = 0.0;
+    if (!g_ftN) return;
+    std::vector<double> v(g_ftRing, g_ftRing + g_ftN);
+    std::sort(v.begin(), v.end());
+    double sum = 0;
+    for (int i = 0; i < g_ftN; ++i) sum += v[i];
+    *avg = sum / g_ftN;
+    *p99   = v[(int)((g_ftN - 1) * 0.99)];
+    *p999  = v[(int)((g_ftN - 1) * 0.999)];
+    *worst = v[g_ftN - 1];
+    double s2 = 0;
+    for (int i = 0; i < g_ftN; ++i) s2 += (v[i] - *avg) * (v[i] - *avg);
+    *var = s2 / g_ftN;
 }
 
 static void zoneUpdate()
 {
-    // Projected usage: what is resident now plus what the last frame's uploads
-    // suggest is arriving. Cheap, monotone with real pressure, and computable
-    // without a single readback.
+    // Projected usage (SS27): what is resident now, plus what the last frame's
+    // uploads suggest is arriving, plus what the governor is holding and will
+    // release - minus the recycle pool, which is reclaimable the instant it is
+    // needed. Cheap, monotone with real pressure, no readbacks.
     double basis = filteredBudget > 0 ? filteredBudget : (double)heapSize;
     if (basis <= 0) return;
-    double projected = (double)rawUsage + (double)upBytesLast * 2.0;
+    double projected = (double)rawUsage + (double)upBytesLast * 2.0 +
+                       (double)heldBytesNow - (double)g_poolBytes;
+    if (projected < 0) projected = 0;
     double f = projected / basis;
 
     static const double enter[5] = { 0.0, 0.80, 0.88, 0.94, 0.98 };
@@ -870,7 +1165,22 @@ static void onPresent(float camDeltaMeters)
         g_frameUploadSpent = 0;
         upBytesLast = upBytesFrame.exchange(0);
         if (upBytesLast > upBytesPeak) upBytesPeak = upBytesLast;
+        g_upSeen.clear();                       // per-frame dup detection
     }
+
+    frameTimeTick();
+
+    // Per-frame peaks for the stutter telemetry.
+    {
+        uint64_t pf = pipesFrame.exchange(0);
+        if (pf > pipesFramePeak) { pipesFramePeak = pf; pipesFramePeakAt = fi; }
+        uint64_t du = descUpdFrame.exchange(0);
+        if (du > descUpdPeak) descUpdPeak = du;
+        uint64_t da = descAllocFrame.exchange(0);
+        if (da > descAllocPeak) descAllocPeak = da;
+    }
+
+    if (fi % 3600 == 0) stateSave();            // SS77: survive the session
 
     // Predictor: speed for telemetry, teleports for policy. The camera delta
     // arrives from the layer's own per-frame snapshot - nothing here reads the
@@ -992,6 +1302,44 @@ static void onPresent(float camDeltaMeters)
         trace("  camera: %.2f m/frame EMA, %llu teleports;  sparse binds %llu",
               camSpeedEma, (unsigned long long)teleports,
               (unsigned long long)sparseBinds);
+        {
+            double avg, p99, p999, worst, var;
+            frameTimeStats(&avg, &p99, &p999, &worst, &var);
+            trace("  frame time: avg %.2f ms  1%%low %.2f ms  0.1%%low %.2f ms "
+                  " worst %.2f ms  var %.2f  (upload notch 1/%d)",
+                  avg, p99, p999, worst, var, 1 << uploadNotch);
+        }
+        trace("  pipelines: %llu total (%.0f ms), %llu created IN FLIGHT, "
+              "worst frame %llu at frame %llu",
+              (unsigned long long)pipesTotal.load(),
+              pipeUsTotal.load() / 1000.0,
+              (unsigned long long)pipesLive.load(),
+              (unsigned long long)pipesFramePeak,
+              (unsigned long long)pipesFramePeakAt);
+        trace("  descriptors: peak %llu updates / %llu allocs in one frame;  "
+              "duplicate uploads %llu;  churn cycles %llu (%llu hot shapes)",
+              (unsigned long long)descUpdPeak,
+              (unsigned long long)descAllocPeak,
+              (unsigned long long)dupUploads,
+              (unsigned long long)churnCycles,
+              (unsigned long long)g_hotImgs.size());
+        trace("  render targets: %.1f MB RT+depth+storage - the upper bound "
+              "transient aliasing could ever reclaim (SS34 investigation)",
+              rtBytesNow / 1048576.0);
+        {
+            // Top churners - the shapes cycling through residency (SS51).
+            int printed = 0;
+            for (std::map<ChurnKey, ChurnRec>::iterator it = g_churn.begin();
+                 it != g_churn.end() && printed < 5; ++it) {
+                if (it->second.cycles < 2) continue;
+                trace("  churner: %ux%u fmt=%u mips=%u - %u cycles, %u creates, "
+                      "%.1f MB each",
+                      it->first.w, it->first.h, it->first.fmt, it->first.mips,
+                      it->second.cycles, it->second.creates,
+                      it->second.bytes / 1048576.0);
+                ++printed;
+            }
+        }
         trace("-----------------------------------------------------------------");
     }
 
@@ -1004,11 +1352,23 @@ static void onPresent(float camDeltaMeters)
               (unsigned long long)allocFails.load());
 }
 
-// Device teardown: everything held goes back before the device dies.
+// Device teardown: everything held goes back before the device dies, the
+// session's learning is saved, and what remains allocated is reported - the
+// plan's SS67 leak check, stated rather than assumed.
 static void shutdown()
 {
     flushAll(&flushOnDep);
     poolTrim(true);
+    stateSave();
+    std::lock_guard<std::mutex> g(m);
+    uint64_t remBytes = 0;
+    for (std::map<VkDeviceMemory, AllocRec>::iterator it = g_allocs.begin();
+         it != g_allocs.end(); ++it)
+        remBytes += it->second.size;
+    trace("VRAMSYS: shutdown - %llu allocations still live (%.1f MB). "
+          "Driver-owned and swapchain blocks are expected here; a large or "
+          "growing figure across device recreations is a leak.",
+          (unsigned long long)g_allocs.size(), remBytes / 1048576.0);
 }
 
 } // namespace vram
