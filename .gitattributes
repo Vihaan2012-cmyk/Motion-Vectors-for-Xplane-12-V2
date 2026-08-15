@@ -1,0 +1,12 @@
+# Keep the language statistics about OUR code, not what we ship alongside it.
+#
+# The SDK is Laminar's X-Plane SDK, vendored verbatim - its CHeaders are most of
+# the repo's C and its Delphi bindings are where the mysterious "Pascal 23.8%"
+# came from. Nothing in it is ours to maintain, so none of it belongs in the
+# language bar.
+SDK/** linguist-vendored
+
+# Generated from src/shaders/taa.comp by build.ps1 every build. It is C++ only
+# in the sense that a hex dump is - counting it inflates C++ by thousands of
+# lines that nobody wrote.
+src/vklayer/taa_spv.h linguist-generated
