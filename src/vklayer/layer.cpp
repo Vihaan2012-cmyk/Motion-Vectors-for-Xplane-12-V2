@@ -315,6 +315,7 @@ struct DeviceData {
     PFN_vkCmdDispatch           cmdDispatch;
     PFN_vkCmdPipelineBarrier    cmdPipelineBarrier;
     PFN_vkCmdCopyImageToBuffer  cmdCopyImageToBuffer;
+    PFN_vkCmdFillBuffer         cmdFillBuffer;
     PFN_vkCmdCopyImage          cmdCopyImage;   // resolve result -> scene colour
     PFN_vkCmdClearColorImage    cmdClearColorImage;  // TAA_PROVE_OUTPUT probe
     PFN_vkCmdBlitImage          cmdBlitImage;        // FSR2 output -> swapchain
@@ -9579,6 +9580,7 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     GD(cmdBindPipeline, CmdBindPipeline);             GD(cmdBindDescriptorSets, CmdBindDescriptorSets);
     GD(cmdPushConstants, CmdPushConstants);            GD(cmdDispatch, CmdDispatch);
     GD(cmdPipelineBarrier, CmdPipelineBarrier);          GD(cmdCopyImageToBuffer, CmdCopyImageToBuffer);
+    GD(cmdFillBuffer, CmdFillBuffer);
     GD(cmdCopyImage, CmdCopyImage);                   GD(deviceWaitIdle, DeviceWaitIdle);
     GD(cmdClearColorImage, CmdClearColorImage);
     GD(cmdBlitImage, CmdBlitImage);

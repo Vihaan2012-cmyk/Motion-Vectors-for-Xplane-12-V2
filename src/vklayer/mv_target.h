@@ -66,6 +66,17 @@ struct MvTarget {
     VkDeviceMemory readbackMem = VK_NULL_HANDLE;
     void          *readbackPtr = nullptr;
     VkDeviceSize   readbackSize = 0;
+    // The proof the copy actually executed. mvRecordReadback stamps a
+    // monotonically increasing id into the tail of the readback buffer AFTER
+    // the pixel copy, on the GPU; mvReport refuses to interpret the pixels
+    // until the stamp matches. The previous design waited a guessed number of
+    // presents and hoped - and when the GPU ran further behind than the guess,
+    // the CPU scored the PREVIOUS dump against the current matrix. That is the
+    // exact anatomy of the constant-tail readings (p95 identical to three
+    // decimals across five dumps) that spent a day impersonating a broken
+    // field while the texture, sampled directly by the visualiser, was clean.
+    uint32_t       dumpWaitId  = 0;
+    uint32_t       dumpLate    = 0;
     bool           wantDump = false;    // set by the interval; cleared on record
     // COUNTDOWN, not a flag. The copy is recorded during the frame; the read
     // happens in QueuePresentKHR - and the present that ENDS the recording
@@ -257,7 +268,8 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
     // Sized from kMvBytes rather than a literal, because a copy into a buffer
     // half the size it needs is not a validation error on every driver - it is
     // a truncated dump that reads as the bottom half of the screen being empty.
-    m.readbackSize = (VkDeviceSize)w * h * kMvBytes;
+    // +16: room for the GPU-written completion stamp after the pixels.
+    m.readbackSize = (VkDeviceSize)w * h * kMvBytes + 16;
     VkBufferCreateInfo bci;
     memset(&bci, 0, sizeof(bci));
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -354,6 +366,33 @@ static void mvRecordReadback(DeviceData &dd, VkCommandBuffer cb,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                           0, nullptr, 0, nullptr, 1, &b);
 
+    // ---- STAMP THE BUFFER, ON THE GPU, AFTER THE PIXELS.
+    //
+    // The stamp is ordered after the copy by a transfer-to-transfer barrier on
+    // the buffer, so a stamp that matches PROVES every pixel before it is this
+    // dump's data. The CPU side then has a fact to check instead of a delay to
+    // trust.
+    if (dd.cmdFillBuffer) {
+        VkBufferMemoryBarrier bb;
+        memset(&bb, 0, sizeof(bb));
+        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = m.readback;
+        bb.offset = 0;
+        bb.size   = VK_WHOLE_SIZE;
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                              0, nullptr, 1, &bb, 0, nullptr);
+        static uint32_t s_dumpId = 0;
+        m.dumpWaitId = ++s_dumpId;
+        m.dumpLate   = 0;
+        dd.cmdFillBuffer(cb, m.readback,
+                         (VkDeviceSize)m.w * m.h * kMvBytes, 4, m.dumpWaitId);
+    }
+
     // EIGHT presents, not two.
     //
     // Two was chosen to put one frame boundary between the copy and the read.
@@ -376,6 +415,28 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
     MvTarget &m = g_mv;
     if (!m.dumpPending || !m.readbackPtr) return;
     if (--m.dumpPending > 0) return;
+
+    // ---- ONLY INTERPRET A BUFFER THE GPU HAS FINISHED WRITING.
+    //
+    // If the stamp does not match, the copy has not executed yet - keep waiting
+    // a frame at a time rather than scoring stale pixels against a current
+    // matrix. Give up after ~10 seconds and say so; a surrendered dump is a
+    // fact, a silently stale one is a day of wrong conclusions.
+    if (m.dumpWaitId) {
+        const uint32_t got = *(const uint32_t *)
+            ((const char *)m.readbackPtr + (size_t)m.w * m.h * kMvBytes);
+        if (got != m.dumpWaitId) {
+            if (++m.dumpLate < 600) { m.dumpPending = 1; return; }
+            trace("MV DUMP: abandoned - the GPU never completed copy %u "
+                  "(buffer holds %u). No statistics reported; stale ones are "
+                  "worse than none.", m.dumpWaitId, got);
+            return;
+        }
+        if (m.dumpLate)
+            trace("MV DUMP: copy %u landed %u present(s) later than the "
+                  "delay guessed - every earlier build would have scored the "
+                  "previous dump here.", m.dumpWaitId, m.dumpLate);
+    }
 
     // Taken from the record, not from now. See dumpReproj.
     const float *reproj       = m.dumpReproj;
