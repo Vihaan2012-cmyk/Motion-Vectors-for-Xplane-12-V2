@@ -84,7 +84,47 @@ layout(push_constant) uniform Params {
     // With the camera still, zero means static and history is perfect; with the
     // camera moving, zero means unknown.
     int   cameraMoved;
+    // ---- LOOK AT IT, AND REMOVE ONE INPUT AT A TIME.
+    //
+    // All live-editable while the sim runs. One picture settled what twenty
+    // statistics could not when the velocity field was in doubt, and the cost of
+    // that lesson was roughly twenty relaunches - so the ability to draw the
+    // intermediate quantities, and to switch between them without restarting, is
+    // not a convenience here. It is the method.
+    int   viz;
+    float vizScale;
+    float gain;         // how hard a rejected sample pushes alpha toward 1
+    float varClip;      // variance box half-width, in standard deviations
+    int   flags;
 } pc;
+
+const int FLAG_FREEZE_HISTORY = 1;
+const int FLAG_NO_MOTION      = 2;
+const int FLAG_NO_ACCUM       = 4;
+
+const int VIZ_OFF       = 0;
+const int VIZ_MOTION    = 1;   // direction as colour
+const int VIZ_MAGNITUDE = 2;   // speed as a heatmap
+const int VIZ_INVALID   = 3;   // which pixels were rejected, and why
+const int VIZ_HISTORY   = 4;   // the history buffer itself
+const int VIZ_WEIGHT    = 5;   // the blend weight actually used
+const int VIZ_CLAMP     = 6;   // how far the clamp moved history, in sigma
+
+// A perceptually ordered ramp for the scalar views: black -> blue -> green ->
+// yellow -> red. Ordered so that "more" always reads as "hotter" without a
+// legend, and so that zero is unambiguously black rather than dark blue - the
+// distinction between "no motion" and "a little motion" is exactly the one these
+// views exist to make.
+vec3 heat(float t)
+{
+    t = clamp(t, 0.0, 1.0);
+    vec3 c;
+    if      (t < 0.25) c = mix(vec3(0,0,0),   vec3(0,0,1),   t / 0.25);
+    else if (t < 0.50) c = mix(vec3(0,0,1),   vec3(0,1,0),  (t - 0.25) / 0.25);
+    else if (t < 0.75) c = mix(vec3(0,1,0),   vec3(1,1,0),  (t - 0.50) / 0.25);
+    else               c = mix(vec3(1,1,0),   vec3(1,0,0),  (t - 0.75) / 0.25);
+    return c;
+}
 
 const int MODE_PASSTHROUGH = 0;
 const int MODE_REPROJECT   = 1;
@@ -174,7 +214,31 @@ void main()
     // d(uv_y) = -vel_y while d(uv_x) = +vel_x. The same sign that took the
     // field's own diagnostic from 4.8 px to 0.0015 px applies here.
     vec2 vel  = texture(uVelocity, vec3(uv, float(layer))).xy;
+    if ((pc.flags & FLAG_NO_MOTION) != 0) vel = vec2(0.0);
     vec2 hUv  = uv + vec2(vel.x, -vel.y);
+
+    // ---- THE VIEWS THAT DO NOT DEPEND ON HISTORY.
+    //
+    // Drawn before any rejection so they describe the FIELD rather than what
+    // survived the tests below - which is the whole point of looking at it.
+    if (pc.viz == VIZ_MOTION) {
+        // Vectors in PIXELS, then to colour around a grey zero. Sky and cloud
+        // should be flat grey: they have no vectors, and if they are not grey
+        // something wrote there that should not have.
+        vec2 px2 = vel * vec2(size) ;
+        vec3 c = vec3(0.5) + vec3(px2.x, px2.y, 0.0) * 0.02 * pc.vizScale;
+        imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
+        return;
+    }
+    if (pc.viz == VIZ_MAGNITUDE) {
+        // Log scale, because the interesting range spans 0.1 px at the horizon
+        // to 60+ px underfoot and a linear ramp shows one or the other. Marks:
+        // blue 1 px, green 4, yellow 16, red 64.
+        float m = length(vel * vec2(size));
+        imageStore(uHistory, ivec3(px, layer),
+                   vec4(heat(log2(1.0 + m * pc.vizScale) / 6.0), 1.0));
+        return;
+    }
 
     // Off-screen history cannot be reprojected. Falling back to the current
     // frame is correct and visible as a thin band of aliasing at the leading
@@ -211,7 +275,29 @@ void main()
     // pixel. That is precisely the set we cannot reproject - sky, clouds, and
     // any draw whose shader we failed to patch, which is the right set for all
     // three reasons.
-    bool noVector = pc.cameraMoved != 0 && vel == vec2(0.0);
+    bool noVector = pc.cameraMoved != 0 && vel == vec2(0.0)
+                 && (pc.flags & FLAG_NO_MOTION) == 0;
+
+    // ---- WHICH PIXELS WERE REJECTED, AND WHY.
+    //
+    // The single most useful view here, because it is the only one that can
+    // falsify the cloud and sky rejection above. That test claims to select
+    // exactly the pixels no patched shader wrote; this draws the set it actually
+    // selected, so the claim can be checked by looking instead of argued about.
+    //
+    //   RED    no vector was written and the camera moved - sky, cloud, or a
+    //          shader we failed to patch. Should cover the sky and the clouds
+    //          and NOTHING ELSE. Red on terrain means a patching hole.
+    //   BLUE   history reprojected off screen. Should be a thin band at the
+    //          leading edge, thickening with speed.
+    //   GREEN  accepted, reprojected, blended.
+    if (pc.viz == VIZ_INVALID) {
+        vec3 c = noVector ? vec3(1.0, 0.0, 0.0)
+               : !valid   ? vec3(0.0, 0.0, 1.0)
+                          : vec3(0.0, 1.0, 0.0);
+        imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
+        return;
+    }
 
     if (pc.reset != 0 || !valid || noVector) {
         imageStore(uHistory, ivec3(px, layer), vec4(curr, 1.0));
@@ -219,6 +305,24 @@ void main()
     }
 
     vec3 hist = texture(uHistorySampler, vec3(hUv, float(layer))).rgb;
+
+    // History straight to screen, before anything is done to it. If this does
+    // not smear along motion when frozen, what is displayed is not the history
+    // and no amount of tuning the blend will change that.
+    if (pc.viz == VIZ_HISTORY) {
+        imageStore(uHistory, ivec3(px, layer), vec4(hist, 1.0));
+        return;
+    }
+
+    // Keep every binding, barrier and dispatch live while removing exactly one
+    // thing. FREEZE_HISTORY writes nothing at all, so the buffer retains what it
+    // had; NO_ACCUM writes the current frame, so accumulation stops but the
+    // pipeline does not.
+    if ((pc.flags & FLAG_FREEZE_HISTORY) != 0) return;
+    if ((pc.flags & FLAG_NO_ACCUM) != 0) {
+        imageStore(uHistory, ivec3(px, layer), vec4(curr, 1.0));
+        return;
+    }
 
     // ---- STAGE 1: reprojection only, no rejection.
     //
@@ -279,8 +383,8 @@ void main()
     // term narrows it where the neighbourhood actually agrees.
     vec3 mu    = m1 / 9.0;
     vec3 sigma = sqrt(max(m2 / 9.0 - mu * mu, vec3(0.0)));
-    vec3 lo    = max(mu - 1.25 * sigma, nmin);
-    vec3 hi    = min(mu + 1.25 * sigma, nmax);
+    vec3 lo    = max(mu - pc.varClip * sigma, nmin);
+    vec3 hi    = min(mu + pc.varClip * sigma, nmax);
 
     vec3 hRaw = rgb2ycocg(tm(hist));
     vec3 hy   = clamp(hRaw, lo, hi);
@@ -328,7 +432,25 @@ void main()
     // Everything here is a multiply, an add and a clamp - nothing divides by a
     // quantity that can vanish, so there is no configuration of inputs that
     // produces a firefly or a black pixel.
-    float a = clamp(pc.alpha + 4.0 * moved * pc.alpha, pc.alpha, 1.0);
+    float a = clamp(pc.alpha + pc.gain * moved * pc.alpha, pc.alpha, 1.0);
+
+    // How far the clamp had to move history, in standard deviations. Edges under
+    // motion should light up and flat interiors should stay black; a frame that
+    // is bright everywhere means the box is too tight, and one that is black
+    // everywhere means it is not constraining anything.
+    if (pc.viz == VIZ_CLAMP) {
+        imageStore(uHistory, ivec3(px, layer),
+                   vec4(heat(moved * 0.5 * pc.vizScale), 1.0));
+        return;
+    }
+    // The weight actually used. Black is full accumulation, white is the current
+    // frame only, so disocclusion edges glow and everything static stays dark.
+    // This is the view that says whether alpha is doing what the number says.
+    if (pc.viz == VIZ_WEIGHT) {
+        imageStore(uHistory, ivec3(px, layer),
+                   vec4(heat(a * pc.vizScale), 1.0));
+        return;
+    }
 
     // The negative-component floor stays. Those were the black dots along
     // high-contrast edges, and flooring costs nothing.

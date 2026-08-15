@@ -49,6 +49,10 @@ Source: "build\vklayer\VkLayer_mv.json";  DestDir: "{app}\MotionVectors";       
 ; imageformat and tls plugin folders windeployqt produced - Qt will not start
 ; without platforms\qwindows.dll, and a missing plugin folder fails at run time
 ; rather than at install time, which is the worse place to find out.
+; This directory carries BOTH applications - the public launcher and the debug
+; console - because they share one Qt runtime. Shipping them separately would
+; mean two ~40 MB copies of Qt for two executables that differ by a few hundred
+; kilobytes.
 Source: "build\qtlauncher\*"; DestDir: "{app}\MotionVectors\launcher"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Kept as a fallback: no dependencies, works even if the Qt runtime is broken.
 Source: "build\MotionVectorsLauncher.exe"; DestDir: "{app}\MotionVectors";                    Flags: ignoreversion
@@ -61,9 +65,16 @@ Source: "README.md";                      DestDir: "{app}\MotionVectors";       
 ; EXPLICIT - loaded only here, never in any other Vulkan application.
 Name: "{autoprograms}\X-Plane 12 with Motion Vectors"; Filename: "{app}\MotionVectors\launcher\MotionVectors.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\X-Plane 12 with Motion Vectors";  Filename: "{app}\MotionVectors\launcher\MotionVectors.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+; The debug console. Separate shortcut because it is used at a different TIME -
+; the launcher's job ends when the sim starts, and the console's begins there.
+; It edits the live control file, so every change it makes reaches a sim that is
+; already flying and nothing it does requires a restart.
+Name: "{autoprograms}\Motion Vectors Debug Console"; Filename: "{app}\MotionVectors\launcher\MotionVectorsDebug.exe"; WorkingDir: "{app}"; Tasks: debugconsole
+Name: "{autodesktop}\Motion Vectors Debug Console";  Filename: "{app}\MotionVectors\launcher\MotionVectorsDebug.exe"; WorkingDir: "{app}"; Tasks: debugconsole and desktopicon
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
+Name: "desktopicon";   Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
+Name: "debugconsole";  Description: "Add the Debug Console (tune and diagnose while the sim runs)"; GroupDescription: "Shortcuts:"
 
 [Run]
 Filename: "{app}\MotionVectors\launcher\MotionVectors.exe"; Description: "Start X-Plane 12 with motion vectors now"; Flags: nowait postinstall skipifsilent

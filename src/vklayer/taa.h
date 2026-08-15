@@ -96,25 +96,56 @@ struct TaaPush {
     // means static and history is perfect; with it moving, zero means the pixel
     // cannot be reprojected at all. Same word, opposite treatment.
     int32_t cameraMoved;
+    // Debug visualisation, and the switches that remove one input at a time.
+    // Packed as a bitmask rather than four ints because the block is pushed
+    // every frame and 16 bytes of padding is 16 bytes of nothing.
+    int32_t viz;
+    float   vizScale;
+    float   gain;
+    float   varClip;
+    int32_t flags;      // see kTaaFlag* below
 };
 
-static bool taaEnabled()
-{
-    static const bool on = (getenv("TAA_RESOLVE") != nullptr);
-    return on;
-}
+enum {
+    kTaaFlagFreezeHistory = 1 << 0,
+    kTaaFlagNoMotion      = 1 << 1,
+    kTaaFlagNoAccum       = 1 << 2,
+};
 
-static int taaMode()
-{
-    static const int m = getenv("TAA_MODE") ? atoi(getenv("TAA_MODE")) : 0;
-    return m;
-}
+// ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
+//
+// They used to be `static const` initialised from getenv, which is why changing
+// the alpha meant restarting the sim. Reading them per frame costs a map lookup
+// against a table that is only rebuilt when the control file's timestamp moves,
+// and buys the ability to answer a question in the ten seconds it takes to save
+// a file instead of the four minutes it takes to relaunch.
+static bool  taaEnabled()  { return live::onoff("taa.enable", "TAA_RESOLVE", false); }
+static int   taaMode()     { return live::i("taa.mode",  "TAA_MODE",  0); }
+static float taaAlpha()    { return live::f("taa.alpha", "TAA_ALPHA", 0.1f); }
+static float taaGain()     { return live::f("taa.gain",  "TAA_GAIN",  4.0f); }
+static float taaVarClip()  { return live::f("taa.varclip", "TAA_VARCLIP", 1.25f); }
+static int   taaViz()      { return live::i("taa.viz",   "TAA_VIZ",   0); }
+static float taaVizScale() { return live::f("taa.viz_scale", nullptr, 1.0f); }
 
-static float taaAlpha()
-{
-    static const float a = getenv("TAA_ALPHA") ? (float)atof(getenv("TAA_ALPHA")) : 0.1f;
-    return a;
-}
+// ---- REMOVE ONE INPUT AT A TIME.
+//
+// The generalisation of MODE_PASSTHROUGH to every stage, and the reason it is
+// worth having as separate switches rather than one debug mode: each one makes a
+// DIFFERENT prediction, so the observation attributes the fault rather than
+// merely changing the picture.
+//
+//   freeze_history   the image should freeze and smear along motion. If it does
+//                    not, what is on screen is not the history.
+//   no_motion        every vector reads zero, so reprojection is a same-pixel
+//                    fetch. Ghosting that SURVIVES this is not the vectors.
+//   no_accum         current frame out, every binding and barrier still live.
+//   force_reset      same output as no_accum but reached through the reset path,
+//                    so the pair separates "reset is broken" from "accumulation
+//                    is broken" - which looked identical for two builds.
+static bool taaFreezeHistory() { return live::onoff("taa.freeze_history", nullptr, false); }
+static bool taaNoMotion()      { return live::onoff("taa.no_motion",      nullptr, false); }
+static bool taaNoAccum()       { return live::onoff("taa.no_accum",       nullptr, false); }
+static bool taaForceReset()    { return live::onoff("taa.force_reset",    nullptr, false); }
 
 static uint32_t taaFindMemory(DeviceData &dd, uint32_t typeBits, VkMemoryPropertyFlags want)
 {
@@ -564,8 +595,15 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.jitterY = jitterY;
     pcv.alpha = taaAlpha();
     pcv.mode = taaMode();
-    pcv.reset = reset ? 1 : 0;
+    pcv.reset = (reset || taaForceReset()) ? 1 : 0;
     pcv.cameraMoved = cameraMoved ? 1 : 0;
+    pcv.viz      = taaViz();
+    pcv.vizScale = taaVizScale();
+    pcv.gain     = taaGain();
+    pcv.varClip  = taaVarClip();
+    pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
+                 | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
+                 | (taaNoAccum()       ? kTaaFlagNoAccum       : 0);
     dd.cmdPushConstants(cb, g_taa.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                         0, sizeof(pcv), &pcv);
 

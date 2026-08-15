@@ -85,6 +85,10 @@ static void trace(const char *fmt, ...)
                  // per line, which cost 63 MB of file I/O and most of the fps.
 }
 
+// Live controls. Included here rather than with the other headers because it
+// calls trace(), which is defined directly above.
+#include "mv_live.h"
+
 // ------------------------------------------------------- shared memory
 
 static HANDLE    g_shareHandle = nullptr;
@@ -1048,6 +1052,11 @@ static std::map<VkImage, ColorTarget> g_colorImages;   // every colour image mad
 // image-identification work lives. Declared here because the colour-image census
 // runs long before it.
 static void noteGbufferVelCandidate(const ColorTarget &c);
+
+// Defined with the injector plumbing much further down; the full-state report
+// calls them and sits above it.
+static void mvLogInjectReasons();
+static uint64_t g_layoutPatched, g_layoutSkipped;
 static ColorTarget g_sceneColor;                       // the 3D one, this frame
 static bool        g_sceneColorReported = false;
 static uint32_t    g_sceneResolveMode   = 0;
@@ -4664,6 +4673,117 @@ static void noteGbufferVelCandidate(const ColorTarget &c)
           c.arrayLayers, (unsigned)c.samples);
 }
 
+// ---- ONE COMMAND THAT ANSWERS EVERYTHING.
+//
+// Set `report=1` in the live file and the next frame writes the complete state
+// of the layer to the log, then clears the key back to 0 so it fires once.
+//
+// The point is not that any single line here is new. It is that they are all in
+// ONE place at ONE instant, so a question like "did it pick the right pass, and
+// was that target arrayed, and were the vectors bound, and how many shaders got
+// patched" is answered by one keystroke rather than by four launches each
+// looking for one number. Almost every dead end in this project's history was a
+// fact that was already knowable and simply had not been printed next to the
+// fact it contradicted.
+static void mvFullReport(const char *why, uint64_t frames)
+{
+    trace("");
+    trace("================ MOTION VECTORS - FULL STATE (%s, frame %llu) ============",
+          why, (unsigned long long)frames);
+
+    // ---- what the live file is currently forcing
+    trace("-- LIVE CONTROLS (%s, %llu reload(s))",
+          live::path(), (unsigned long long)live::reloads());
+    trace("   enable=%d mode=%d alpha=%.4f gain=%.2f varclip=%.2f viz=%d scale=%.2f",
+          taaEnabled() ? 1 : 0, taaMode(), taaAlpha(), taaGain(),
+          taaVarClip(), taaViz(), taaVizScale());
+    trace("   freeze_history=%d no_motion=%d no_accum=%d force_reset=%d",
+          taaFreezeHistory() ? 1 : 0, taaNoMotion() ? 1 : 0,
+          taaNoAccum() ? 1 : 0, taaForceReset() ? 1 : 0);
+
+    // ---- the injector: how much of the scene actually carries vectors
+    trace("-- SPIR-V INJECTION");
+    trace("   varyings at Location %u/%u, velocity at attachment %u, push offset %u",
+          spvinj::currClipLocation(), spvinj::prevClipLocation(),
+          spvinj::mvAttachmentIndex(), spvinj::pushConstantOffset());
+    trace("   device locations=%u  safe=%s  multi-return modules=%llu",
+          spvinj::deviceLocationCount(),
+          spvinj::locationsAreSafe() ? "yes" : "NO",
+          (unsigned long long)spvinj::multiReturnModules());
+    mvLogInjectReasons();
+    trace("   layouts: %llu extended, %llu skipped",
+          (unsigned long long)g_layoutPatched,
+          (unsigned long long)g_layoutSkipped);
+
+    // ---- the velocity target
+    trace("-- VELOCITY TARGET");
+    trace("   ready=%d %ux%u image=%p view=%p viewArray=%p binds last frame=%u",
+          g_mv.ready ? 1 : 0, g_mv.w, g_mv.h, (void*)g_mv.image,
+          (void*)g_mv.view, (void*)g_mv.viewArray, g_diagBoundPasses);
+    trace("   gbuffer_vel candidate (X-Plane's own flags image): %p",
+          (void*)g_gbufferVelCandidate);
+
+    // ---- the resolve
+    trace("-- TAA RESOLVE");
+    trace("   ready=%d %ux%u x%u layer(s) fmt=%d dispatches=%llu scene targets=%llu",
+          g_taa.ready ? 1 : 0, g_taa.w, g_taa.h, g_taa.layers, (int)g_taa.format,
+          (unsigned long long)g_taa.dispatches,
+          (unsigned long long)g_taa.sceneViews.size());
+    trace("   HDR candidate passes: %u this frame, %u last frame (the resolve "
+          "runs on the LAST one)", g_hdrPassesThisFrame, g_hdrPassesLastFrame);
+    trace("   wrote into %p this frame", (void*)g_taaWroteImageThisFrame);
+    {
+        temporal::BackendInfo bi = g_taaBackend.info();
+        trace("   backend '%s': upscaling=%d framegen=%d native=%d arrays=%d msaa=%d",
+              bi.name, bi.supportsUpscaling ? 1 : 0,
+              bi.supportsFrameGeneration ? 1 : 0,
+              bi.supportsNativeResolution ? 1 : 0,
+              bi.supportsArrayLayers ? 1 : 0, bi.supportsMultisample ? 1 : 0);
+    }
+
+    // ---- every colour image we know about, with its SHAPE.
+    //
+    // The shape is the column that matters and the one that was missing for
+    // weeks: layers and samples are what decide whether the resolve can touch a
+    // target at all, and a census that printed only format and size could not
+    // have shown why the picture depended on the camera view.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        trace("-- COLOUR IMAGE CENSUS (%llu tracked)",
+              (unsigned long long)g_colorImages.size());
+        int n = 0;
+        for (std::map<VkImage, ColorTarget>::iterator it = g_colorImages.begin();
+             it != g_colorImages.end() && n < 64; ++it, ++n)
+            trace("   %p %-22s %5ux%-5u layers=%u samples=%u usage=0x%x%s",
+                  (void*)it->first, formatName(it->second.format),
+                  it->second.w, it->second.h, it->second.arrayLayers,
+                  (unsigned)it->second.samples, it->second.usage,
+                  it->first == g_taaWroteImageThisFrame ? "   <== TAA WROTE HERE" :
+                  it->first == g_gbufferVelCandidate    ? "   <== gbuffer_vel?" : "");
+    }
+
+    trace("-- CAMERA");
+    trace("   viewType=%d jitter=(%.5f %.5f) camDelta=%.5f",
+          g_velSnap.viewType, g_velSnap.jitterX, g_velSnap.jitterY,
+          g_velSnap.camDelta);
+
+    trace("================ END FULL STATE ==========================================");
+    trace("");
+}
+
+static void mvMaybeReport(uint64_t frames)
+{
+    // One-shot: fires once and clears its own key, so leaving it set in the file
+    // by accident costs one report rather than one per frame forever.
+    if (live::i("report", nullptr, 0)) {
+        mvFullReport("requested", frames);
+        live::clearOneShot("report");
+    }
+    int every = live::i("report.every", nullptr, 0);
+    if (every > 0 && (frames % (uint64_t)every) == 0)
+        mvFullReport("periodic", frames);
+}
+
 // ---- WHO WRITES THE PRESENTED IMAGE?
 //
 // The scene-target census answered a question that had been unanswerable: no
@@ -6018,6 +6138,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             g_mv.wantDump = true;
     }
 
+    // Re-read the live control file. One GetFileAttributesEx and a 64-bit
+    // compare in the common case; a reparse only when the timestamp moves.
+    live::poll();
+    mvMaybeReport(frames);
+
     g_velInjectedThisFrame = false;
     g_taaResolvedThisFrame = false;
     g_sceneEndsLastFrame   = g_sceneEndsThisFrame;
@@ -7042,7 +7167,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateComputePipelines(
 // Pipelines built from it keep their original shaders - a hole in the velocity
 // buffer rather than a dead sim.
 static std::map<VkPipelineLayout, bool> g_layoutHasOurPC;
-static uint64_t g_layoutPatched = 0, g_layoutSkipped = 0;
+
 
 
 static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreatePipelineLayout(

@@ -129,9 +129,34 @@ if (Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) {
       -m64 -O2 -std=c++17 -mwindows "-DMV_VERSION=\`"$mvVersion\`"" `
       "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network -lQt6Network
     if ($LASTEXITCODE -ne 0) { throw "Qt launcher build failed" }
+    # ---- THE DEBUG CONSOLE.
+    #
+    # Built into the SAME directory as the public app, deliberately: they share
+    # a Qt runtime, and windeployqt only has to run once for both. Two
+    # directories would mean two ~40 MB copies of Qt for two executables that
+    # differ by a few hundred kilobytes.
+    #
+    # It is a separate EXECUTABLE rather than a tab in the launcher because it
+    # runs while the sim is flying, and the launcher's job ends the moment the
+    # sim starts.
+    Write-Host "Building debug console..."
+    & g++ -o (Join-Path $qtOut "MotionVectorsDebug.exe") "$src\qtdebug\main.cpp" `
+      "-I$qtRoot\include" "-I$qtRoot\include\QtCore" "-I$qtRoot\include\QtGui" `
+      "-I$qtRoot\include\QtWidgets" `
+      -m64 -O2 -std=c++17 -mwindows "-DMV_VERSION=\`"$mvVersion\`"" `
+      "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core
+    if ($LASTEXITCODE -ne 0) { throw "debug console build failed" }
+
     & (Join-Path $qtRoot "bin\windeployqt.exe") --release --no-translations `
       (Join-Path $qtOut "MotionVectors.exe") | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+    # Again for the console: it links QtWidgets/Gui/Core like the launcher, so
+    # this adds nothing new today - but running it means a future dependency in
+    # only one of the two cannot be missed, which is precisely the failure the
+    # stale-launcher comment above records.
+    & (Join-Path $qtRoot "bin\windeployqt.exe") --release --no-translations `
+      (Join-Path $qtOut "MotionVectorsDebug.exe") | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "windeployqt failed for the debug console" }
 } else {
     Write-Host "Qt not found at $qtRoot - skipping the Qt launcher" -ForegroundColor Yellow
 }
