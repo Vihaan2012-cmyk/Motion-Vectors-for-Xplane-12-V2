@@ -37,6 +37,56 @@ Write-Host "Building plugin..."
   -L"$root\SDK\Libraries\Win" -lXPLM_64
 if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
 
+# ---- THE TAA SHADER, COMPILED FROM ITS SOURCE EVERY BUILD.
+#
+# src/vklayer/taa_spv.h opens with "Generated from src/shaders/taa.comp by
+# build.ps1 - do not edit", and until now this script did no such thing. The
+# header was produced by hand once and every later edit to taa.comp changed
+# nothing at all, because the layer compiles the HEADER. A source file that is
+# not built is worse than one that does not exist: it reads as the truth.
+#
+# This is the same failure as the Qt launcher two blocks down - shipped from a
+# directory nothing regenerated - and the same fix. Regenerating costs a
+# fraction of a second.
+Write-Host "Compiling TAA shader..."
+$glslang = Join-Path $vksdk "Bin\glslangValidator.exe"
+if (-not (Test-Path $glslang)) { throw "glslangValidator not found at $glslang" }
+$spvTmp = Join-Path $env:TEMP "taa_resolve.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src\shaders\taa.comp" -o $spvTmp
+if ($LASTEXITCODE -ne 0) { throw "TAA shader compile failed" }
+
+# spirv-val separately: glslangValidator accepts things the validator rejects,
+# and a module that fails validation fails at pipeline creation instead - inside
+# the sim, as a crash with no shader named.
+$spvval = Join-Path $vksdk "Bin\spirv-val.exe"
+if (Test-Path $spvval) {
+    & $spvval $spvTmp
+    if ($LASTEXITCODE -ne 0) { throw "TAA shader failed spirv-val" }
+}
+
+$bytes = [System.IO.File]::ReadAllBytes($spvTmp)
+if ($bytes.Length % 4) { throw "TAA SPIR-V is not a whole number of words" }
+$words = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $bytes.Length; $i += 4) {
+    $w = [System.BitConverter]::ToUInt32($bytes, $i)
+    $words.Add(("0x{0:x8}u" -f $w))
+}
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.AppendLine("// Generated from src/shaders/taa.comp by build.ps1 - do not edit.")
+[void]$sb.AppendLine("#pragma once")
+[void]$sb.AppendLine("#include <stdint.h>")
+[void]$sb.AppendLine("")
+[void]$sb.AppendLine("static const uint32_t kTaaResolveSpv[] = {")
+for ($i = 0; $i -lt $words.Count; $i += 8) {
+    $n = [Math]::Min(8, $words.Count - $i)
+    [void]$sb.AppendLine("    " + (($words.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$sb.AppendLine("};")
+[void]$sb.AppendLine("")
+[void]$sb.AppendLine("static const size_t kTaaResolveSpvWords = $($words.Count);")
+Set-Content -Path "$src\vklayer\taa_spv.h" -Value $sb.ToString() -Encoding utf8 -NoNewline
+Write-Host "  taa_spv.h: $($words.Count) words"
+
 Write-Host "Building Vulkan layer..."
 & g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
   -I"$vksdk\Include" -m64 -O2 -std=c++17 `

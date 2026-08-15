@@ -1043,6 +1043,11 @@ struct ColorTarget {
     VkImageLayout  layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 static std::map<VkImage, ColorTarget> g_colorImages;   // every colour image made
+
+// Defined further down, next to the transfer census where the rest of the
+// image-identification work lives. Declared here because the colour-image census
+// runs long before it.
+static void noteGbufferVelCandidate(const ColorTarget &c);
 static ColorTarget g_sceneColor;                       // the 3D one, this frame
 static bool        g_sceneColorReported = false;
 static uint32_t    g_sceneResolveMode   = 0;
@@ -1124,6 +1129,15 @@ static bool     g_velInjectedThisFrame = false;
 static bool     g_taaResolvedThisFrame = false;
 static uint32_t g_sceneEndsThisFrame   = 0;
 static uint32_t g_sceneEndsLastFrame   = 0;
+// Candidate HDR passes seen so far this frame, and how many the LAST frame had.
+// The resolve has to run on the final one - see the block that increments this
+// - and the final one is only identifiable in arrears.
+static uint32_t g_hdrPassesThisFrame   = 0;
+static uint32_t g_hdrPassesLastFrame   = 0;
+// The image our resolve wrote into this frame, watched for the rest of it by
+// noteSsrFeedbackCheck - if it becomes the source of a half-resolution transfer,
+// our output is feeding SSR's reflection pyramid and the loop is closed.
+static VkImage  g_taaWroteImageThisFrame = VK_NULL_HANDLE;
 static int      dumpEvery = 0;   // frames between dumps; 0 = off, set at runtime
 
 // Per-command-buffer record of whether it rendered into OUR depth image, and in
@@ -2009,10 +2023,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
         c.w       = ci->extent.width;
         c.h       = ci->extent.height;
         c.samples = ci->samples;
-    c.arrayLayers = ci->arrayLayers;
+        c.arrayLayers = ci->arrayLayers;
         c.usage   = ci->usage;
         std::lock_guard<std::mutex> g(g_lock);
         if (g_colorImages.size() < 256) g_colorImages[*out] = c;
+        noteGbufferVelCandidate(c);
     }
 
     return r;
@@ -4141,47 +4156,6 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                         litSamples = lci->second.samples;
                     }
                 }
-                // ---- THE TARGET'S SHAPE, NOT JUST ITS HANDLE.
-                //
-                // The shader corpus settles what gbuffer_lit actually is. It
-                // appears in THREE shapes, and this resolve handles one:
-                //
-                //   2D 0 0 0 1   plain 2D, 1 sample        288 permutations
-                //   2D 0 1 0 1   ARRAYED, 1 sample         288
-                //   2D 0 1 1 1   ARRAYED + MULTISAMPLED    576
-                //
-                // fix_hdr confirms it independently: fix_hdr_0 binds the HDR
-                // image as Image(%float 2D 0 1 0 2 Rgba16f) - an arrayed storage
-                // image - and fix_hdr_1 has MS=1.
-                //
-                // taaInit and taaBindScene build VK_IMAGE_VIEW_TYPE_2D views
-                // with samples=1. A 2D view of a two-layer stereo target reaches
-                // layer 0 and leaves the other eye untouched; a 2D view of a
-                // multisampled image is not valid at all. That is why the result
-                // depended on the camera view - "full black in some camera views
-                // and some in this" is this mismatch, not the algorithm.
-                //
-                // Declining is the fix, not approximating. A pass we cannot
-                // handle must be left alone rather than half-written: every
-                // black frame in this project came from a component proceeding
-                // on a target it did not understand. Say so once per shape so a
-                // refusal is visible instead of silent.
-                if (litLayers != 1 || litSamples != VK_SAMPLE_COUNT_1_BIT) {
-                    static uint32_t lastLayers = 0;
-                    static VkSampleCountFlagBits lastSamples = VK_SAMPLE_COUNT_1_BIT;
-                    if (litLayers != lastLayers || litSamples != lastSamples) {
-                        lastLayers = litLayers; lastSamples = litSamples;
-                        trace("TAA: DECLINED %p - %u array layer(s), %u sample(s). "
-                              "The resolve builds single-layer single-sample 2D "
-                              "views; stereo and MSAA targets need 2D_ARRAY views "
-                              "and a per-layer dispatch. Skipping is correct - "
-                              "writing through the wrong view is what made this "
-                              "black in some camera views.",
-                              (void*)passInfo.color0, litLayers,
-                              (unsigned)litSamples);
-                    }
-                    break;
-                }
                 // ---- THE TARGET MUST BE THE HDR SCENE IMAGE, NOT MERELY A
                 //      FULL-SIZE SINGLE-ATTACHMENT PASS.
                 //
@@ -4210,20 +4184,136 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     }
                 }
                 if (litFmt == VK_FORMAT_UNDEFINED) break;
+
+                // ---- THE LAST HDR PASS OF THE FRAME, NOT THE FIRST.
+                //
+                // Everything above only establishes that this pass is a
+                // CANDIDATE. Several passes qualify, and the shader corpus says
+                // exactly which:
+                //
+                //   deferred_gbuf   the deferred LIGHTING pass, writes the lit
+                //                   HDR attachment
+                //   light           sprite/billboard lights, additive, SAME
+                //                   attachment
+                //   volumetric_apply  fog + cloud composite, same attachment
+                //   rain, particle, dome, atmosphere, ocean_shading
+                //                   all forward-composited into it too
+                //
+                // Latching on the first match resolved straight after lighting,
+                // so every one of those was painted ON TOP of the TAA output,
+                // un-antialiased, and never entered the history. The
+                // accumulation was built from a picture that is not the one on
+                // screen.
+                //
+                // The last candidate cannot be known until it has happened, so
+                // count them and use the previous frame's total: the pass order
+                // does not change between frames of the same configuration, and
+                // when it does change - a camera cut, a settings change - the
+                // count moves by one frame and self-corrects. The identical
+                // trick already drives lastScenePass above.
+                //
+                // Frame 1 has no previous count, so nothing resolves; frame 2
+                // onward does. That is one frame without TAA at startup, which
+                // is invisible and strictly better than a frame resolved into
+                // the wrong pass.
+                const uint32_t hdrIdx = ++g_hdrPassesThisFrame;
+                if (g_hdrPassesLastFrame == 0 || hdrIdx != g_hdrPassesLastFrame)
+                    break;
+
+                // ---- DESCRIBE THE FRAME, THEN ASK THE BACKEND.
+                //
+                // Everything the resolve needs is assembled into one
+                // temporal::TemporalFrame and the backend decides for itself
+                // whether it can act. That is the whole point of the split: the
+                // layer knows HOW TO OBTAIN these resources and nothing about
+                // what any consumer does with them, and the backend knows what
+                // they mean and nothing about X-Plane.
+                //
+                // It also puts the shape check where it belongs. The target's
+                // layer count and sample count travel WITH the image rather than
+                // being looked up beside it, which is precisely the information
+                // that was missing when a plain 2D view of an arrayed target
+                // silently reached one eye.
+                temporal::TemporalFrame tf;
+                tf.color.image   = passInfo.color0;
+                tf.color.format  = litFmt;
+                tf.color.w       = passInfo.w;
+                tf.color.h       = passInfo.h;
+                tf.color.layers  = litLayers;
+                tf.color.samples = litSamples;
+                tf.motion.image  = g_mv.image;
+                tf.motion.view   = g_mv.viewArray;   // array-typed; see MvTarget
+                tf.motion.w      = g_mv.w;
+                tf.motion.h      = g_mv.h;
+                tf.motion.layers = 1;
+                // Our convention, declared rather than assumed. The 0.5 the
+                // vertex shader applies IS the NDC-to-UV conversion, the stored
+                // value is prev minus curr, and jitter is applied after the
+                // varyings are written so it is not baked in.
+                tf.motion.coordinateSpace      = temporal::COORD_UV;
+                tf.motion.direction            = temporal::DIR_PREVIOUS_TO_CURRENT;
+                tf.motion.jitterIncluded       = false;
+                tf.motion.cameraMotionIncluded = true;
+                tf.motion.objectMotionIncluded = true;
+                tf.renderW = tf.outputW = passInfo.w;
+                tf.renderH = tf.outputH = passInfo.h;
+                tf.jitter.x = g_velSnap.jitterX;
+                tf.jitter.y = g_velSnap.jitterY;
+                memcpy(tf.camera.reproj, g_velSnap.reproj, sizeof(tf.camera.reproj));
+                // Not camDelta: that is translation only, and a camera rotating
+                // in place moves every pixel while translating zero. The
+                // reprojection matrix is the identity exactly when nothing
+                // moved, whatever the motion was made of.
+                for (int mi = 0; mi < 16 && !tf.camera.moved; ++mi) {
+                    const float ident = (mi % 5) == 0 ? 1.0f : 0.0f;
+                    if (fabsf(g_velSnap.reproj[mi] - ident) > 1e-6f)
+                        tf.camera.moved = true;
+                }
+
+                const char *why = "";
+                if (!g_taaBackend.accepts(tf, &why)) {
+                    // Say WHY, once per distinct reason. A backend silently
+                    // absent is indistinguishable from a backend silently
+                    // broken, and this project has already paid for that once.
+                    static const char *lastWhy = nullptr;
+                    if (why != lastWhy) {
+                        lastWhy = why;
+                        trace("TAA: DECLINED %p (%ux%u, %u layer(s), %u sample(s)) "
+                              "- %s. Leaving the frame untouched is correct; "
+                              "writing through a descriptor that does not match "
+                              "the target is what made this black in some camera "
+                              "views.",
+                              (void*)passInfo.color0, passInfo.w, passInfo.h,
+                              litLayers, (unsigned)litSamples, why);
+                    }
+                    break;
+                }
+
                 const bool needInit = !g_taa.ready ||
                                       g_taa.w != passInfo.w ||
                                       g_taa.h != passInfo.h ||
+                                      g_taa.layers != litLayers ||
                                       g_taa.format != litFmt;
-                if (needInit)
+                if (needInit) {
+                    // A shape change is a history discontinuity in its own right.
+                    tf.reset |= temporal::RESET_RESOLUTION;
                     taaInit(tdd, tci->second, passInfo.color0, litFmt,
-                            passInfo.w, passInfo.h, g_mv.view);
-                else if (!taaBindScene(tdd, passInfo.color0))
+                            passInfo.w, passInfo.h, litLayers, g_mv.viewArray);
+                } else if (!taaBindScene(tdd, passInfo.color0)) {
                     break;
+                }
                 // A target swap is a history discontinuity: the accumulated
                 // image belongs to the old one and reprojecting into it would
                 // drag a whole frame of the wrong picture forward.
-                taaRecordResolve(tdd, cb, g_velSnap.jitterX, g_velSnap.jitterY, needInit);
+                // A target swap is a history discontinuity: the accumulated
+                // image belongs to the old one, and reprojecting into it would
+                // drag a whole frame of the wrong picture forward.
+                if (needInit) tf.reset |= temporal::RESET_TARGET_SWAP;
+                g_taaDevice = &tdd;
+                g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
+                // Watched by noteSsrFeedbackCheck for the rest of the frame.
+                g_taaWroteImageThisFrame = passInfo.color0;
             }
         }
     } while (0);
@@ -4511,6 +4601,69 @@ static void armLayerOnce()
 // compare against it - or eventually to present our own upscaled result - the
 // layer has to know which images belong to the swapchain, and it never asked.
 
+// ---- X-PLANE'S OWN gbuffer_vel: FIND IT, NAME IT, DO NOT YET READ IT.
+//
+// The corpus is unambiguous about what it is. In ssr_deferred, and nowhere else
+// in 6855 modules:
+//
+//     %244 = OpTypeImage %uint 2D 0 1 1 1 Unknown     ; set 0, binding 4
+//     %13174 = OpImageFetch %v4uint %21460 %12832 Sample|ZeroExtend %int_0
+//     %12255 = OpBitwiseAnd %uint %22474 %uint_4
+//     %21876 = OpIEqual %bool %12255 %uint_4
+//     ... OpPhi selects u_local_reproj when set, u_reproj when clear
+//
+// So it is a MULTISAMPLED UNSIGNED-INTEGER 2D ARRAY image storing FLAGS, and bit
+// 2 means "this pixel is local/ownship geometry rather than world-static". That
+// makes bit 2 the only per-pixel motion classification X-Plane provides, and it
+// is exactly the signal our epipolar residual needs - that residual is valid
+// only for world-static geometry, so a per-pixel "do not trust this here" flag
+// is precisely the missing input.
+//
+// WHAT THIS DOES AND DOES NOT DO. It identifies the image by shape and reports
+// it. It does not bind it, and deliberately: consuming it needs the right view
+// type for an arrayed multisampled uint image, a sample index, and a decision
+// about what to do at pixels where the flag disagrees with our vectors - and
+// none of that can be checked without watching a frame. Guessing all three at
+// once and shipping it is how the velocity field acquired six weeks of wrong
+// explanations.
+//
+// Naming the image is the part that needed the corpus. The rest needs a sim.
+static VkImage g_gbufferVelCandidate = VK_NULL_HANDLE;
+
+static bool velFormatIsUint(VkFormat f)
+{
+    switch (f) {
+        case VK_FORMAT_R8_UINT:        case VK_FORMAT_R8G8_UINT:
+        case VK_FORMAT_R8G8B8A8_UINT:  case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16G16_UINT:    case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R32_UINT:       case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32B32A32_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Called from the colour-image census, under g_lock.
+static void noteGbufferVelCandidate(const ColorTarget &c)
+{
+    if (g_gbufferVelCandidate != VK_NULL_HANDLE) return;
+    if (!velFormatIsUint(c.format)) return;
+    // Scene-sized. The G-buffer attachments share the scene's dimensions, and a
+    // uint image of some other size is a histogram or a tile buffer.
+    if (!g_mv.w || !g_mv.h || c.w != g_mv.w || c.h != g_mv.h) return;
+    g_gbufferVelCandidate = c.image;
+    trace("GBUFFER_VEL: candidate %p fmt=%s %ux%u layers=%u samples=%u. "
+          "ssr_deferred reads a uint flags image at set 0 binding 4 and tests "
+          "bit 2 to choose u_local_reproj over u_reproj, so bit 2 is X-Plane's "
+          "own per-pixel moving-geometry flag - the only one it has. NOT bound "
+          "yet: reading it needs a view type for an arrayed multisampled uint "
+          "image and a sample index, neither of which can be verified without "
+          "watching a frame.",
+          (void*)c.image, formatName(c.format), c.w, c.h,
+          c.arrayLayers, (unsigned)c.samples);
+}
+
 // ---- WHO WRITES THE PRESENTED IMAGE?
 //
 // The scene-target census answered a question that had been unanswerable: no
@@ -4530,9 +4683,55 @@ static VkImage g_presentSource = VK_NULL_HANDLE;
 // Guessing one candidate per launch is the expensive way to search a space this
 // small, so this prints the whole transfer graph in a single run and the
 // swapchain handles beside it.
+// ---- DOES OUR OUTPUT BECOME THE SSR REFLECTION SOURCE?
+//
+// ssr_deferred reads `tex_ssr` at set 0 binding 8 - the PREVIOUS frame's
+// rendered colour, sampled as a 2D array with an explicit LOD, and
+// `u_half_ssr_history_res` is consumed only to turn a screen-space ray footprint
+// into a mip level. So tex_ssr is a HALF-RESOLUTION, MIPPED pyramid of last
+// frame's picture.
+//
+// That pyramid has to be built from something, and if it is built from the HDR
+// target AFTER our resolve has written into it, reflections inherit our history
+// and close a multi-frame temporal feedback loop through SSR. It is a plausible
+// contributor to the "giant reflection glare" symptom, and it would not look
+// like a feedback loop - it would look like a quality problem in the reflections.
+//
+// This cannot be settled by reading the shaders: they say what ssr_deferred
+// consumes, not which Vulkan image X-Plane fills it from. But the transfer graph
+// says it exactly. If the image we wrote this frame becomes the SOURCE of a
+// transfer into a smaller destination, that is the pyramid being built from our
+// output. Detect it and say so, rather than guess.
+static void noteSsrFeedbackCheck(const char *how, VkImage src, VkImage dst,
+                                 const ColorTarget *cs, const ColorTarget *cd)
+{
+    if (src == VK_NULL_HANDLE || src != g_taaWroteImageThisFrame) return;
+    if (!cs || !cd) return;
+    // Half resolution or smaller, in both axes: the shape of a pyramid base, not
+    // of a present blit.
+    if (cd->w > cs->w / 2 || cd->h > cs->h / 2) return;
+    static bool said = false;
+    if (said) return;
+    said = true;
+    trace("TAA: *** FEEDBACK RISK - the image our resolve wrote (%p %ux%u) is the "
+          "SOURCE of a %s into %p (%ux%u), which is half resolution or smaller. "
+          "That is the shape of the tex_ssr pyramid, and ssr_deferred samples "
+          "tex_ssr as the previous frame's colour. If so, reflections inherit our "
+          "history and close a temporal feedback loop through SSR. Feed SSR the "
+          "PRE-TAA colour instead. ***",
+          (void*)src, cs->w, cs->h, how, (void*)dst, cd->w, cd->h);
+}
+
 static void noteTransfer(const char *how, VkImage src, VkImage dst)
 {
     std::lock_guard<std::mutex> g(g_lock);
+    {
+        std::map<VkImage, ColorTarget>::iterator fs = g_colorImages.find(src);
+        std::map<VkImage, ColorTarget>::iterator fd = g_colorImages.find(dst);
+        noteSsrFeedbackCheck(how, src, dst,
+                             fs != g_colorImages.end() ? &fs->second : nullptr,
+                             fd != g_colorImages.end() ? &fd->second : nullptr);
+    }
     static std::set<std::pair<VkImage,VkImage> > seen;
     std::pair<VkImage,VkImage> k(src,dst);
     if (seen.size() < 24 && !seen.count(k)) {
@@ -5823,6 +6022,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     g_taaResolvedThisFrame = false;
     g_sceneEndsLastFrame   = g_sceneEndsThisFrame;
     g_sceneEndsThisFrame   = 0;
+    // Report a change rather than only carrying it: the count moving means the
+    // frame's pass structure moved, and one frame's TAA landed on the pass that
+    // used to be last. Rare and self-correcting, but it should be visible.
+    if (g_hdrPassesLastFrame && g_hdrPassesThisFrame != g_hdrPassesLastFrame)
+        trace("TAA: HDR candidate passes %u -> %u. The resolve targets the last "
+              "one, so this frame's resolve used the previous count and the next "
+              "frame corrects itself.",
+              g_hdrPassesLastFrame, g_hdrPassesThisFrame);
+    g_hdrPassesLastFrame   = g_hdrPassesThisFrame;
+    g_hdrPassesThisFrame   = 0;
     g_prevLastDepthPassIdx = g_lastDepthPassIdx;   // predicts where to inject next frame
     g_lastDepthPassIdx     = -1;
     g_passesThisFrame      = 0;
@@ -7120,6 +7329,11 @@ static uint64_t g_pushCount = 0;
 // Keyed on the module alone, unlike the fragment variants: the vertex locations
 // are fixed device-wide, so one patched copy serves every pipeline.
 static std::map<VkShaderModule, VkShaderModule> g_vertVariant;
+// The patched handles themselves, so a pipeline stage can be recognised as
+// carrying injected code whether it names the original (about to be
+// substituted) or the substituted module. Used only by the layout-mismatch
+// check in TAA_CreateGraphicsPipelines.
+static std::set<VkShaderModule> g_patchedVertModules;
 static uint64_t g_vertVariants = 0, g_vertPatchFail = 0;
 
 // Choose the varying pair from what X-Plane actually uses, once.
@@ -7258,6 +7472,7 @@ static void mvPickLocationsOnce()
             flushedV = g_vertVariant.size();
             flushedF = g_fragVariant.size();
             g_vertVariant.clear();
+            g_patchedVertModules.clear();
             g_fragVariant.clear();
             // The refusal tally described the OLD pair. Keeping it would blend
             // two different experiments into one number.
@@ -7300,7 +7515,12 @@ static void mvMaybeDumpSpirv(const std::vector<uint32_t> &code, const char *what
     int &n = isVert ? nVert : nFrag;
     if (n >= 2) return;
     char path[512];
-    snprintf(path, sizeof(path), "%s\mv_%s_%d.spv", dir, what, n++);
+    // "%s\mv_..." - `\m` is not an escape sequence, so the compiler dropped the
+    // backslash and every dump landed as <dir>mv_vert_0.spv: a sibling of the
+    // directory rather than a file inside it, or nothing at all if <dir> had no
+    // trailing separator. The dumps this writes are the only way to read back
+    // what was actually injected, so a silent misplacement is expensive.
+    snprintf(path, sizeof(path), "%s\\mv_%s_%d.spv", dir, what, n++);
     FILE *f = fopen(path, "wb");
     if (!f) return;
     fwrite(code.data(), 4, code.size(), f);
@@ -7345,6 +7565,7 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
 
     std::lock_guard<std::mutex> g(g_lock);
     g_vertVariant[orig] = out;
+    g_patchedVertModules.insert(out);
     if (out == VK_NULL_HANDLE) {
         ++g_vertPatchFail;
         // Report the breakdown on a schedule tied to failures, so a run that
@@ -7469,6 +7690,64 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                   (unsigned long long)g_gfxPipelines,
                   (unsigned long long)g_shaderModules,
                   (unsigned long long)g_inlineModules);
+
+        // ---- A PATCHED SHADER ON A LAYOUT WITHOUT OUR RANGE READS GARBAGE.
+        //
+        // This is the one remaining explanation for a measurement that has never
+        // been accounted for: a per-pixel dump of matrix element 12 returns
+        // 110.9375, 161.0 and 179.875 where the layer pushed -0.024233. A
+        // constant attribute interpolates to itself, so those are per-draw
+        // constants, not noise. prevNDC.x - u is about M[12]/d, and 179/180 is
+        // 0.6 NDC or roughly 1150 px - exactly the flow the exact-mode
+        // diagnostic reports on pixels whose measured depth cannot produce it.
+        //
+        // Foreign pushes were ruled out by watch counts, offset ordering by
+        // construction, and per-thread push state by test. The shader corpus
+        // then removed the last external candidate: the string "PushConstant"
+        // appears in ZERO of 6855 X-Plane modules, so nothing of X-Plane's is
+        // writing that memory. Whatever is wrong is ours.
+        //
+        // And this is the shape it would take. TAA_CreatePipelineLayout can
+        // decline to extend a layout - it falls back deliberately, because a
+        // layout we cannot extend is a velocity hole while a layout we fail to
+        // create is a crash. But the SHADER is patched independently, so a
+        // patched vertex module bound to an unextended layout declares a push
+        // constant block that the layout does not provide, and reads whatever
+        // is there. That produces exactly this: stable per-draw values,
+        // unrelated to anything we pushed.
+        //
+        // Detect the combination rather than continue to reason about it.
+        for (uint32_t i = 0; i < count; ++i) {
+            if (ci[i].layout == VK_NULL_HANDLE) continue;
+            bool patchedVert = false;
+            {
+                std::lock_guard<std::mutex> g(g_lock);
+                for (uint32_t s = 0; s < ci[i].stageCount && !patchedVert; ++s) {
+                    if (!(ci[i].pStages[s].stage & VK_SHADER_STAGE_VERTEX_BIT))
+                        continue;
+                    VkShaderModule m = ci[i].pStages[s].module;
+                    // Either the original that is about to be substituted, or
+                    // the substituted handle itself.
+                    if (g_vertVariant.count(m) || g_patchedVertModules.count(m))
+                        patchedVert = true;
+                }
+                if (!patchedVert) continue;
+                std::map<VkPipelineLayout, bool>::iterator lt =
+                    g_layoutHasOurPC.find(ci[i].layout);
+                if (lt != g_layoutHasOurPC.end() && lt->second) continue;
+            }
+            static uint64_t nMismatch = 0;
+            if (++nMismatch <= 3 || (nMismatch % 500) == 0)
+                trace("SPIRV INJECT: *** MISMATCH - a PATCHED vertex module is "
+                      "bound to layout %p, which does NOT carry our push "
+                      "constant range (%llu so far). The shader declares the "
+                      "block and reads memory the layout never provided, so "
+                      "uReproj is whatever happens to be there. X-Plane uses no "
+                      "push constants anywhere in 6855 modules, so this is the "
+                      "only way a foreign matrix can reach that shader - and it "
+                      "is the shape of the M[12]=111/161/180 readings. ***",
+                      (void*)ci[i].layout, (unsigned long long)nMismatch);
+        }
     }
     // EVERY graphics pipeline gains the velocity attachment format, not just
     // the ones we patched.

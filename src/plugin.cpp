@@ -950,8 +950,83 @@ static float g_scaleStep    = 0.5f;   // what the pager multiplies by, after pat
 // or a scene loads, and another plugin may be holding the same value -
 // XPVRAMUnlock already holds downscale_cooldown, so whichever writes last wins
 // and it has to be re-checked every frame.
+// ---- X-PLANE'S OWN ANTIALIASING, TURNED OFF WHILE OURS RUNS.
+//
+// The shader corpus settles what these actually do. The `hdr` family is a single
+// pass doing TONEMAP + BLOOM COMPOSITE + FXAA together - `u_hdr_data` is
+// {u_offset, u_y_offset, u_bloom_start_mip, u_bloom_end_mip, u_bloom_coef,
+// u_sample_count, u_sample_count_inv, u_fxaa_stencil} with an optional
+// `u_fxaa_stencil_mask` - and it runs AFTER our resolve. So FXAA blurs an image
+// that is already antialiased, which costs time and destroys exactly the
+// sub-pixel detail temporal accumulation exists to recover.
+//
+// MSAA is worse than merely redundant. `fix_hdr_1` binds the lit HDR image as a
+// MULTISAMPLED storage image, and 576 of the 1152 gbuffer_lit permutations are
+// `2D 0 1 1 1` - arrayed and multisampled. That shape is the one the resolve
+// declines outright, so leaving MSAA on does not degrade TAA, it disables it.
+//
+// Both are saved and restored, and both are overridable: TAA_KEEP_FXAA=1 and
+// TAA_KEEP_MSAA=1 leave X-Plane's setting alone. Nothing here fires unless the
+// layer's resolve is actually enabled - turning off a user's antialiasing to
+// replace it with nothing would be strictly worse than doing nothing.
+struct PostAAControl {
+    const char *path;
+    const char *envKeep;
+    XPLMDataRef ref;
+    int         saved;
+    bool        held;
+};
+
+static PostAAControl g_postAA[] = {
+    { "sim/private/controls/hdr/use_post_aa", "TAA_KEEP_FXAA", nullptr, 0, false },
+    { "sim/private/controls/hdr/msaa_hw",     "TAA_KEEP_MSAA", nullptr, 0, false },
+};
+
+static void suppressXPlanePostAA()
+{
+    // Only while our resolve is running. TAA_RESOLVE is what the layer gates on
+    // (taaEnabled()), so the two cannot disagree.
+    if (!getenv("TAA_RESOLVE")) return;
+
+    for (size_t i = 0; i < sizeof(g_postAA)/sizeof(g_postAA[0]); ++i) {
+        PostAAControl &c = g_postAA[i];
+        if (c.held) {
+            // Re-assert: X-Plane rewrites these from its own settings when the
+            // rendering options change, and a value that silently comes back is
+            // the same failure as one that never applied.
+            if (c.ref && XPLMGetDatai(c.ref) != 0) XPLMSetDatai(c.ref, 0);
+            continue;
+        }
+        if (getenv(c.envKeep)) continue;
+        if (!c.ref) {
+            c.ref = taaFind(c.path);
+            if (!c.ref) continue;      // taaFind already recorded the miss
+        }
+        c.saved = XPLMGetDatai(c.ref);
+        if (c.saved != 0) {
+            XPLMSetDatai(c.ref, 0);
+            xlog("post-aa: %s %d -> 0. X-Plane's own pass runs AFTER our resolve, "
+                 "so it would blur a frame that is already antialiased. "
+                 "%s=1 keeps it.", c.path, c.saved, c.envKeep);
+        }
+        c.held = true;
+    }
+}
+
+static void restoreXPlanePostAA()
+{
+    for (size_t i = 0; i < sizeof(g_postAA)/sizeof(g_postAA[0]); ++i) {
+        PostAAControl &c = g_postAA[i];
+        if (!c.held || !c.ref) continue;
+        XPLMSetDatai(c.ref, c.saved);
+        xlog("post-aa: restored %s = %d", c.path, c.saved);
+        c.held = false;
+    }
+}
+
 static void holdArtControls()
 {
+    suppressXPlanePostAA();
     // Applied immediately. Raising the FLOOR only bounds how far the pager may
     // cut, so it is harmless early and useless late - the collapse happened 86
     // seconds in, and anything that waits that long arrives after the damage.
@@ -3965,6 +4040,11 @@ PLUGIN_API void XPluginDisable(void)
 {
     XPLMUnregisterFlightLoopCallback(matrixCallback, nullptr);
     XPLMUnregisterDrawCallback(autoStartDrawCb, xplm_Phase_Window, 0, nullptr);
+
+    // Give the user their antialiasing settings back. Leaving FXAA and MSAA
+    // switched off after the plugin unloads would look like the plugin broke
+    // them, and the setting would survive into every later session.
+    restoreXPlanePostAA();
 
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
     unregisterDatarefs();

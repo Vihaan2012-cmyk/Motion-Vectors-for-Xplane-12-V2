@@ -22,6 +22,7 @@
 #include <string.h>
 #include <map>
 #include "taa_spv.h"
+#include "temporal.h"
 
 struct TaaState {
     VkDevice        device      = VK_NULL_HANDLE;
@@ -70,6 +71,10 @@ struct TaaState {
     uint32_t        nextSet = 0;
 
     uint32_t w = 0, h = 0;
+    // Array layers of the scene target, and therefore of our history. One for a
+    // plain target, two for stereo. Every view is created as 2D_ARRAY over this
+    // many layers, so the single-layer case needs no separate path.
+    uint32_t layers = 1;
     VkFormat format = VK_FORMAT_UNDEFINED;
     bool     ready = false;
     bool     historyCleared = false;
@@ -84,7 +89,13 @@ struct TaaPush {
     float alpha;
     int32_t mode;
     int32_t reset;
-    int32_t pad;
+    // Whether the camera moved this frame. The shader needs it to read a ZERO
+    // velocity correctly: our attachment is cleared and written only by the
+    // vertex shaders we patched, so at a sky or cloud pixel zero means "nothing
+    // wrote here", not "this pixel is stationary". With the camera still, zero
+    // means static and history is perfect; with it moving, zero means the pixel
+    // cannot be reprojected at all. Same word, opposite treatment.
+    int32_t cameraMoved;
 };
 
 static bool taaEnabled()
@@ -144,12 +155,13 @@ static void taaDestroy(DeviceData &dd)
 // Build everything that depends on the scene target's size and format. Called
 // again whenever either changes, which is why teardown comes first.
 static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
-                    uint32_t w, uint32_t h, VkImageView velView)
+                    uint32_t w, uint32_t h, uint32_t layers, VkImageView velView)
 {
     g_taa.device = dev;
     taaDestroy(dd);
     g_taa.device = dev;
     g_taa.w = w; g_taa.h = h; g_taa.format = fmt;
+    g_taa.layers = layers ? layers : 1;
     g_taa.sceneImage = scene;
     g_taa.velView = VK_NULL_HANDLE;
 
@@ -160,7 +172,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = fmt;
     ici.extent.width = w; ici.extent.height = h; ici.extent.depth = 1;
-    ici.mipLevels = 1; ici.arrayLayers = 1;
+    ici.mipLevels = 1; ici.arrayLayers = g_taa.layers;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -192,11 +204,11 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     VkImageViewCreateInfo ivci;
     memset(&ivci, 0, sizeof(ivci));
     ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     ivci.format = fmt;
     ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     ivci.subresourceRange.levelCount = 1;
-    ivci.subresourceRange.layerCount = 1;
+    ivci.subresourceRange.layerCount = g_taa.layers;
     for (int hi = 0; hi < 2; ++hi) {
         ivci.image = g_taa.history[hi];
         if (dd.createImageView(dev, &ivci, nullptr, &g_taa.historyView[hi]) != VK_SUCCESS) return false;
@@ -299,8 +311,9 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     g_taa.velView = velView;
     g_taa.ready = true;
     g_taa.historyCleared = false;
-    trace("TAA: ready - %ux%u fmt=%d, mode %d, alpha %.3f, %u descriptor sets",
-          w, h, (int)fmt, taaMode(), taaAlpha(), TaaState::kSets);
+    trace("TAA: ready - %ux%u x%u layer(s) fmt=%d, mode %d, alpha %.3f, "
+          "%u descriptor sets",
+          w, h, g_taa.layers, (int)fmt, taaMode(), taaAlpha(), TaaState::kSets);
     return true;
 }
 
@@ -318,11 +331,11 @@ static bool taaBindScene(DeviceData &dd, VkImage scene)
     VkImageViewCreateInfo ivci;
     memset(&ivci, 0, sizeof(ivci));
     ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     ivci.format = g_taa.format;
     ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     ivci.subresourceRange.levelCount = 1;
-    ivci.subresourceRange.layerCount = 1;
+    ivci.subresourceRange.layerCount = g_taa.layers;
     ivci.image = scene;
     VkImageView v = VK_NULL_HANDLE;
     if (dd.createImageView(g_taa.device, &ivci, nullptr, &v) != VK_SUCCESS) {
@@ -338,13 +351,97 @@ static bool taaBindScene(DeviceData &dd, VkImage scene)
     return true;
 }
 
+// ---- THE TAA BACKEND.
+//
+// The first implementation of temporal::IBackend, and for now the whole of it.
+// It is written against the shared contract rather than against layer.cpp so
+// that FSR, DLSS, XeSS and frame generation can be added beside it without any
+// of them reaching into the interception code - and so that the questions each
+// of them will ask (what shape is the target, which convention are the vectors
+// in, why was history reset) are already answered in one place.
+//
+// The conversion table for this backend, stated rather than assumed:
+//
+//   coordinateSpace       UV        the stored 0.5 IS the NDC->UV conversion
+//   direction             prev-curr we store prev minus curr
+//   jitterIncluded        false     jitter is applied AFTER the varyings
+//   cameraMotionIncluded  true
+//   objectMotionIncluded  true      via the injected per-draw matrices
+//
+// This backend consumes those directly, so nothing converts. That is exactly
+// what makes it the wrong place to discover a convention bug, and exactly why
+// the declaration is written down for the backends that WILL convert.
+class TaaBackend : public temporal::IBackend {
+public:
+    temporal::BackendInfo info() const override
+    {
+        temporal::BackendInfo i;
+        i.name = "TAA";
+        i.vendor = temporal::VENDOR_ANY;      // ours; always available
+        i.supportsUpscaling = false;          // TAAU is a separate backend
+        i.supportsNativeResolution = true;
+        i.supportsArrayLayers = true;         // 2D_ARRAY views, dispatch z=layers
+        i.supportsMultisample = false;        // see accepts()
+        return i;
+    }
+
+    // Report WHY, not just no. A backend silently absent is indistinguishable
+    // from a backend silently broken, which is how a dead code path once hid
+    // through two crashes and a wrong diagnosis.
+    bool accepts(const temporal::TemporalFrame &f, const char **why) const override
+    {
+        if (f.color.image == VK_NULL_HANDLE) {
+            if (why) *why = "no colour target";
+            return false;
+        }
+        if (f.color.samples != VK_SAMPLE_COUNT_1_BIT) {
+            // 576 of the 1152 gbuffer_lit permutations are multisampled, and
+            // fix_hdr_1 binds the HDR image as a multisampled storage image, so
+            // this is a real configuration rather than a theoretical one. It
+            // needs a per-sample resolve, which this shader does not do.
+            // Declining leaves the frame untouched; pretending would corrupt it.
+            if (why) *why = "multisampled target - needs a per-sample resolve";
+            return false;
+        }
+        if (f.motion.image == VK_NULL_HANDLE || f.motion.view == VK_NULL_HANDLE) {
+            if (why) *why = "no motion vectors this frame";
+            return false;
+        }
+        if (f.motion.coordinateSpace != temporal::COORD_UV ||
+            f.motion.direction != temporal::DIR_PREVIOUS_TO_CURRENT) {
+            // The shader hard-codes this convention. If the core ever produces
+            // vectors in another one, this must fail rather than reinterpret
+            // them - a silently misread field is the failure mode the
+            // MotionVectors metadata exists to prevent.
+            if (why) *why = "motion vectors are not UV / previous-minus-current";
+            return false;
+        }
+        if (f.motion.jitterIncluded) {
+            if (why) *why = "motion vectors have jitter baked in";
+            return false;
+        }
+        return true;
+    }
+
+    bool record(VkCommandBuffer cb, const temporal::TemporalFrame &f) override;
+};
+
+static TaaBackend g_taaBackend;
+
+// The device dispatch the backend records through. It lives here rather than in
+// TemporalFrame because it is a property of the LAYER's Vulkan plumbing, not of
+// the frame - and TemporalFrame is meant to describe a frame to a consumer that
+// knows nothing about how we intercepted it.
+static DeviceData *g_taaDevice = nullptr;
+
 // ---- RECORD THE RESOLVE.
 //
 // Called from vkCmdEndRendering once the scene pass has finished, which is the
 // only point where the colour target holds a complete frame and the velocity
 // target beside it describes that same frame.
 static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
-                             float jitterX, float jitterY, bool reset)
+                             float jitterX, float jitterY, bool reset,
+                             bool cameraMoved)
 {
     if (!g_taa.ready || !taaEnabled()) return;
 
@@ -356,7 +453,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         bar[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bar[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         bar[i].subresourceRange.levelCount = 1;
-        bar[i].subresourceRange.layerCount = 1;
+        bar[i].subresourceRange.layerCount = g_taa.layers;
     }
     bar[0].image = g_taa.sceneImage;
     bar[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -398,7 +495,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         VkImageSubresourceRange r;
         memset(&r, 0, sizeof(r));
         r.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        r.levelCount = 1; r.layerCount = 1;
+        r.levelCount = 1; r.layerCount = g_taa.layers;
         VkImageMemoryBarrier tb[2];
         for (int hi = 0; hi < 2; ++hi) {
             tb[hi] = bar[1];
@@ -468,11 +565,12 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.alpha = taaAlpha();
     pcv.mode = taaMode();
     pcv.reset = reset ? 1 : 0;
-    pcv.pad = 0;
+    pcv.cameraMoved = cameraMoved ? 1 : 0;
     dd.cmdPushConstants(cb, g_taa.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                         0, sizeof(pcv), &pcv);
 
-    dd.cmdDispatch(cb, (g_taa.w + 7) / 8, (g_taa.h + 7) / 8, 1);
+    // z = layers, matching gl_GlobalInvocationID.z in the shader.
+    dd.cmdDispatch(cb, (g_taa.w + 7) / 8, (g_taa.h + 7) / 8, g_taa.layers);
 
     // ---- COPY THE RESULT INTO THE SCENE TARGET.
     //
@@ -499,7 +597,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         VkImageCopy cp;
         memset(&cp, 0, sizeof(cp));
         cp.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        cp.srcSubresource.layerCount = 1;
+        cp.srcSubresource.layerCount = g_taa.layers;
         cp.dstSubresource = cp.srcSubresource;
         cp.extent.width = g_taa.w; cp.extent.height = g_taa.h; cp.extent.depth = 1;
         dd.cmdCopyImage(cb, g_taa.history[hw_], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -533,7 +631,18 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     g_taa.historyWrite ^= 1u;
 
     if ((++g_taa.dispatches % 600) == 1)
-        trace("TAA: dispatch %llu - mode %d alpha %.3f reset %d (%ux%u)",
+        trace("TAA: dispatch %llu - mode %d alpha %.3f reset %d (%ux%u x%u)",
               (unsigned long long)g_taa.dispatches, taaMode(), taaAlpha(),
-              pcv.reset, g_taa.w, g_taa.h);
+              pcv.reset, g_taa.w, g_taa.h, g_taa.layers);
+}
+
+// The IBackend entry point. Thin on purpose: everything above it is the
+// contract, everything below is this backend's own business, and the only job
+// here is to translate one into the other.
+inline bool TaaBackend::record(VkCommandBuffer cb, const temporal::TemporalFrame &f)
+{
+    if (!g_taaDevice) return false;
+    taaRecordResolve(*g_taaDevice, cb, f.jitter.x, f.jitter.y,
+                     f.reset != temporal::RESET_NONE, f.camera.moved);
+    return true;
 }

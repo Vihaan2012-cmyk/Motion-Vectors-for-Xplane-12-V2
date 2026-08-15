@@ -39,6 +39,19 @@ struct MvTarget {
     VkImage        image  = VK_NULL_HANDLE;
     VkDeviceMemory mem    = VK_NULL_HANDLE;
     VkImageView    view   = VK_NULL_HANDLE;
+    // A SECOND view of the same image, VK_IMAGE_VIEW_TYPE_2D_ARRAY, for the TAA
+    // resolve to sample through.
+    //
+    // The resolve declares every binding as an array so that the stereo and
+    // non-stereo cases share one code path, and a sampler's view type must match
+    // what the shader declares. `view` above is bound as a COLOUR ATTACHMENT, so
+    // it is left exactly as it is: changing the type of a view that X-Plane's own
+    // draws render into, to satisfy a compute shader that merely reads it, would
+    // put the risk in the wrong place entirely.
+    //
+    // Two views over one image cost nothing - a view is a descriptor, not
+    // storage - and each is then the natural type for its own use.
+    VkImageView    viewArray = VK_NULL_HANDLE;
     VkImageLayout  layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 
@@ -135,7 +148,8 @@ static void mvDestroy(DeviceData &dd)
     if (m.readbackPtr) dd.unmapMemory(m.device, m.readbackMem);
     if (m.readback)    dd.destroyBuffer(m.device, m.readback, nullptr);
     if (m.readbackMem) dd.freeMemory(m.device, m.readbackMem, nullptr);
-    if (m.view)  dd.destroyImageView(m.device, m.view, nullptr);
+    if (m.view)      dd.destroyImageView(m.device, m.view, nullptr);
+    if (m.viewArray) dd.destroyImageView(m.device, m.viewArray, nullptr);
     if (m.image) dd.destroyImage(m.device, m.image, nullptr);
     if (m.mem)   dd.freeMemory(m.device, m.mem, nullptr);
     m = MvTarget();
@@ -226,6 +240,15 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
         trace("MV: image view creation failed");
         m.failed = true;
         return false;
+    }
+
+    // The array-typed twin, for the TAA resolve. See MvTarget::viewArray.
+    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    if (dd.createImageView(device, &ivci, nullptr, &m.viewArray) != VK_SUCCESS) {
+        trace("MV: array image view creation failed - the TAA resolve samples "
+              "the velocity target through an array view, so it will decline "
+              "rather than bind a mismatched descriptor");
+        m.viewArray = VK_NULL_HANDLE;
     }
 
 
