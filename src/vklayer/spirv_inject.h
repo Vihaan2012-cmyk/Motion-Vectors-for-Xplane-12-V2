@@ -56,7 +56,7 @@ enum {
     OpCompositeInsert = 82, OpConvertSToF = 111, OpISub = 130,
     OpFSub = 131, OpFDiv = 136, OpVectorTimesScalar = 142,
     OpFNegate = 127, OpFAdd = 129, OpFMul = 133,
-    OpSelect = 169, OpFOrdLessThan = 184,
+    OpSelect = 169, OpFOrdLessThan = 184, OpFOrdGreaterThanEqual = 190,
     OpReturn = 253
 };
 enum { SC_Input = 1, SC_Output = 3, SC_PushConstant = 9 };
@@ -1257,12 +1257,19 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     uint32_t idFloat = 0, idV4 = 0, idV2 = 0;
     uint32_t idPtrOutV4 = 0, idPtrInV4 = 0;
     uint32_t idConstHalf = 0, idConstZero = 0;
+    uint32_t idBool = 0, idConstOneF = 0;
     size_t   entryAt = 0;
     bool     isFragment = false;
     uint32_t maxOutLocation = 0;
     bool     locationTaken = false;
     size_t   annotationsEnd = 0, globalsEnd = 0, entryReturnAt = 0;
     std::vector<uint32_t> outputVars;
+    // (var, its pointer type) and (pointer type, pointee) for Output-class
+    // declarations, so the Location-0 colour output can be identified AND
+    // verified to be a vec4 before anything loads through it - some X-Plane
+    // fragments write uint outputs, and loading those as vec4 is invalid.
+    std::vector<std::pair<uint32_t,uint32_t> > outputVarTypes;
+    std::vector<std::pair<uint32_t,uint32_t> > outputPtrPointees;
 
     for (size_t k = 0; k < ins.size(); ++k) {
         const Ins &d = ins[k];
@@ -1276,15 +1283,21 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
             if (d.len >= 4 && p[2] == idFloat && p[3] == 4) idV4 = p[1];
             if (d.len >= 4 && p[2] == idFloat && p[3] == 2) idV2 = p[1];
             break;
+        case OpTypeBool:
+            if (d.len >= 2) idBool = p[1];
+            break;
         case OpTypePointer:
             if (d.len >= 4 && p[3] == idV4 && p[2] == SC_Output && !idPtrOutV4) idPtrOutV4 = p[1];
             if (d.len >= 4 && p[3] == idV4 && p[2] == SC_Input  && !idPtrInV4)  idPtrInV4  = p[1];
+            if (d.len >= 4 && p[2] == SC_Output)
+                outputPtrPointees.push_back(std::make_pair(p[1], p[3]));
             break;
         case OpConstant:
             if (d.len >= 4 && p[1] == idFloat) {
                 float v; memcpy(&v, &p[3], 4);
                 if (v == 0.5f && !idConstHalf) idConstHalf = p[2];
                 if (v == 0.0f && !idConstZero) idConstZero = p[2];
+                if (v == 1.0f && !idConstOneF) idConstOneF = p[2];
             }
             break;
         case OpDecorate:
@@ -1301,7 +1314,10 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
             }
             break;
         case OpVariable:
-            if (d.len >= 4 && p[3] == SC_Output) outputVars.push_back(p[2]);
+            if (d.len >= 4 && p[3] == SC_Output) {
+                outputVars.push_back(p[2]);
+                outputVarTypes.push_back(std::make_pair(p[2], p[1]));
+            }
             break;
         default: break;
         }
@@ -1362,6 +1378,31 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     if (!annotationsEnd) annotationsEnd = globalsEnd;
     if (!globalsEnd) return INJ_MALFORMED;
 
+    // ---- THE SHADER'S OWN COLOUR OUTPUT, FOR THE TRANSPARENCY GATE.
+    //
+    // The velocity of a visually transparent texel is not this draw's to
+    // write - the prop disc stamping blade velocity over the scenery behind it
+    // is C13. The gate needs the fragment's own final alpha, which lives in
+    // its Location-0 colour output; output variables are loadable, so the same
+    // load-at-the-exit trick that fixed light_vis reads it here. Only accepted
+    // when the output really is a vec4 - some fragments write uint outputs,
+    // and loading those as vec4 is invalid SPIR-V, which the corpus test
+    // would catch but the driver would punish first.
+    uint32_t idOut0Var = 0;
+    for (size_t k = 0; k < ins.size() && !idOut0Var; ++k) {
+        if (ins[k].op != OpDecorate || ins[k].len < 4) continue;
+        const uint32_t *p = &w[ins[k].at];
+        if (p[2] != Deco_Location || p[3] != 0) continue;
+        for (size_t v = 0; v < outputVarTypes.size(); ++v) {
+            if (outputVarTypes[v].first != p[1]) continue;
+            for (size_t t = 0; t < outputPtrPointees.size(); ++t)
+                if (outputPtrPointees[t].first == outputVarTypes[v].second &&
+                    outputPtrPointees[t].second == idV4)
+                    idOut0Var = p[1];
+            break;
+        }
+    }
+
     // Insert before the LAST OpReturn, so the write happens whatever the shader
     // did on the way there - including early-out branches, which a discard-heavy
     // fragment shader is full of.
@@ -1371,6 +1412,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
 
     uint32_t bound = w[3];
     uint32_t newV2 = 0, newPtrOutV4 = 0, newPtrInV4 = 0, newHalf = 0, newZero = 0;
+    uint32_t newBool = 0, newOneF = 0;
     // ---- A PER-PIPELINE TAG, SO THE BAD DRAWS CAN BE NAMED.
     //
     // The exact-depth prediction agrees with the epipolar metric (176.0 px
@@ -1394,6 +1436,8 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     if (!idPtrInV4)   { newPtrInV4  = bound++; idPtrInV4   = newPtrInV4; }
     if (!idConstHalf) { newHalf     = bound++; idConstHalf = newHalf; }
     if (!idConstZero) { newZero     = bound++; idConstZero = newZero; }
+    if (!idBool)      { newBool     = bound++; idBool      = newBool; }
+    if (!idConstOneF) { newOneF     = bound++; idConstOneF = newOneF; }
     uint32_t idConstPid = 0;
     if (getenv("TAA_MV_PID")) { newPid = bound++; idConstPid = newPid; }
 
@@ -1416,6 +1460,9 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     if (newPtrInV4)  { globals.push_back(head(OpTypePointer, 4)); globals.push_back(newPtrInV4);  globals.push_back(SC_Input);  globals.push_back(idV4); }
     if (newHalf)     { uint32_t bits; float h = 0.5f; memcpy(&bits, &h, 4);
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newHalf); globals.push_back(bits); }
+    if (newBool)     { globals.push_back(head(OpTypeBool, 2)); globals.push_back(newBool); }
+    if (newOneF)     { uint32_t bits; float o = 1.0f; memcpy(&bits, &o, 4);
+                       globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newOneF); globals.push_back(bits); }
     if (newZero)     { uint32_t bits; float z = 0.0f; memcpy(&bits, &z, 4);
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newZero); globals.push_back(bits); }
     if (newPid)      { uint32_t bits; float pv = (float)myPid; memcpy(&bits, &pv, 4);
@@ -1543,6 +1590,33 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat);
         body.push_back(idVsTag); body.push_back(idLc); body.push_back(2);
         idCh3 = idVsTag;
+    }
+    // ---- THE TRANSPARENCY GATE (C13), in the output alpha.
+    //
+    // The fragment's own colour alpha, thresholded at 0.5 into a hard 0-or-1.
+    // The pipeline side enables SRC_ALPHA blending on the velocity attachment
+    // for alpha-blended pipelines only, and blending with a binary source
+    // alpha is a SELECT: opaque texels replace the velocity underneath,
+    // transparent texels keep it. The prop disc stops stamping blade velocity
+    // over the scenery it barely occludes.
+    //
+    // Emitted only in the plain channel layout - every debug mode owns .w for
+    // its own diagnostics, and the layer skips the blend enable in those modes
+    // for the same reason. On opaque pipelines the gate value is written and
+    // ignored (blending stays off), which costs nothing and keeps ONE shader
+    // variant per module instead of two.
+    {
+        const bool anyDebug = writeDepth || wantRGBA || fieldChk || matDump ||
+                              rawClip || idConstPid;
+        if (!anyDebug && idOut0Var) {
+            const uint32_t idA = bound++, idAw = bound++;
+            const uint32_t idGE = bound++, idGate = bound++;
+            body.push_back(head(OpLoad, 4)); body.push_back(idV4); body.push_back(idA); body.push_back(idOut0Var);
+            body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idAw); body.push_back(idA); body.push_back(3);
+            body.push_back(head(OpFOrdGreaterThanEqual, 5)); body.push_back(idBool); body.push_back(idGE); body.push_back(idAw); body.push_back(idConstHalf);
+            body.push_back(head(OpSelect, 6)); body.push_back(idFloat); body.push_back(idGate); body.push_back(idGE); body.push_back(idConstOneF); body.push_back(idConstZero);
+            idCh3 = idGate;
+        }
     }
     body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult);
     body.push_back(fieldChk ? idMx : (rawClip ? idRawPy : idCh0));

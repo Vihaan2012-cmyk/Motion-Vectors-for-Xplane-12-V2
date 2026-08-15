@@ -8272,6 +8272,42 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
                 : (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT);
             mvBlend.colorWriteMask = fragPatched ? mvMaskOn : 0;
+            // ---- ALPHA-BLENDED PIPELINES GET A PER-PIXEL SELECT, NOT A STAMP.
+            //
+            // With blending off, the propeller disc and the canopy glass write
+            // their velocity across their entire quad footprint - including
+            // texels that are visually transparent - overwriting the correct
+            // vector of whatever is behind them (C13).
+            //
+            // Velocities must never be MIXED, but they can be SELECTED: the
+            // patched fragment puts a hard 0-or-1 in its output alpha (its own
+            // colour alpha thresholded at 0.5), and SRC_ALPHA blending with a
+            // binary source is a select - opaque texels replace the velocity,
+            // transparent texels keep the one underneath. The blend stage reads
+            // source alpha from the shader output, so this works on the
+            // two-channel RG16F attachment; the format merely has nowhere to
+            // STORE alpha, which is fine because nothing reads it back.
+            //
+            // Only for pipelines whose OWN attachment 0 blends - opaque draws
+            // keep the plain replace - and only outside the debug channel
+            // modes, where .w carries diagnostics rather than a 0-or-1 gate and
+            // "blending" it would corrupt both.
+            {
+                static const bool debugChannels =
+                    getenv("TAA_MV_WRITE_DEPTH") || getenv("TAA_MV_RGBA") ||
+                    getenv("TAA_MV_FIELDCHK")   || getenv("TAA_MV_MATDUMP") ||
+                    getenv("TAA_MV_RAWCLIP")    || getenv("TAA_MV_PID");
+                if (fragPatched && !debugChannels &&
+                    sb->attachmentCount > 0 && sb->pAttachments[0].blendEnable) {
+                    mvBlend.blendEnable         = VK_TRUE;
+                    mvBlend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+                    mvBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                    mvBlend.colorBlendOp        = VK_BLEND_OP_ADD;
+                    mvBlend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                    mvBlend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                    mvBlend.alphaBlendOp        = VK_BLEND_OP_ADD;
+                }
+            }
             blendAtt[i].push_back(mvBlend);
 
             blends[i] = *sb;

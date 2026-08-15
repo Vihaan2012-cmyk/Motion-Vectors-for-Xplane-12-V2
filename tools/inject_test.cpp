@@ -169,6 +169,7 @@ int main(int argc, char **argv)
     fs::create_directories(tmp);
 
     size_t nTotal = 0, nVertex = 0, nPatched = 0, nValFail = 0;
+    size_t nFragment = 0, nFragPatched = 0, nFragValFail = 0;
     std::map<int, size_t> reasons;
     std::vector<std::string> failures, multiStore;
 
@@ -182,7 +183,54 @@ int main(int argc, char **argv)
         std::vector<uint32_t> in;
         if (!readSpv(p, in)) continue;
         ++nTotal;
-        if (entryModel(in) != 0 /* Vertex */) continue;
+        const int model = entryModel(in);
+        // ---- FRAGMENT MODULES GO THROUGH THE FRAGMENT PATCHER.
+        //
+        // The vertex patcher had corpus validation from the day the corpus
+        // existed; the fragment patcher - the half that writes the velocity,
+        // relocates colliding outputs, and now emits the transparency gate -
+        // never did. Same method: patch every one, validate every result.
+        // The attachment index mimics the layer: one past the highest output
+        // Location the module already uses.
+        if (model == 4 /* Fragment */) {
+            ++nFragment;
+            uint32_t maxLoc = 0;
+            {
+                size_t i2 = 5;
+                while (i2 < in.size()) {
+                    uint16_t op = (uint16_t)(in[i2] & 0xFFFF), ln = (uint16_t)(in[i2] >> 16);
+                    if (!ln || i2 + ln > in.size()) break;
+                    if (op == 71 /* OpDecorate */ && ln >= 4 && in[i2+2] == 30 /* Location */
+                        && in[i2+3] < 16 && in[i2+3] + 1 > maxLoc)
+                        maxLoc = in[i2+3] + 1;
+                    i2 += ln;
+                }
+            }
+            std::vector<uint32_t> fout;
+            spvinj::Result fr = spvinj::injectFragment(in.data(), in.size() * 4,
+                                                       fout, maxLoc);
+            if (fr != spvinj::INJ_OK) continue;
+            ++nFragPatched;
+            fs::path o = tmp / ("f_" + p.filename().string());
+            if (!writeSpv(o, fout)) continue;
+            std::string cmd = std::string("\"\"") + val + "\" \"" +
+                              o.string() + "\" 2>&1\"";
+            FILE *pipe = _popen(cmd.c_str(), "r");
+            std::string msg;
+            if (pipe) {
+                char buf[512];
+                while (fgets(buf, sizeof(buf), pipe)) msg += buf;
+                int rc = _pclose(pipe);
+                if (rc != 0) {
+                    ++nFragValFail;
+                    if (failures.size() < 40)
+                        failures.push_back("FRAG " + p.filename().string() + ": " + msg);
+                }
+            }
+            fs::remove(o);
+            continue;
+        }
+        if (model != 0 /* Vertex */) continue;
         ++nVertex;
 
         size_t stores = countPositionStores(in);
@@ -232,7 +280,10 @@ int main(int argc, char **argv)
     printf("modules scanned      %zu\n", nTotal);
     printf("vertex modules       %zu\n", nVertex);
     printf("patched              %zu\n", nPatched);
-    printf("spirv-val FAILURES   %zu\n\n", nValFail);
+    printf("spirv-val FAILURES   %zu\n", nValFail);
+    printf("fragment modules     %zu\n", nFragment);
+    printf("frag patched         %zu\n", nFragPatched);
+    printf("frag val FAILURES    %zu\n\n", nFragValFail);
     for (auto &kv : reasons)
         if (kv.first >= 0 && kv.first <= 5)
             printf("  %-26s %zu\n", kName[kv.first], kv.second);
@@ -249,5 +300,5 @@ int main(int argc, char **argv)
         printf("\n---- VALIDATION FAILURES ----\n");
         for (auto &s : failures) printf("%s\n", s.c_str());
     }
-    return nValFail ? 1 : 0;
+    return (nValFail || nFragValFail) ? 1 : 0;
 }
