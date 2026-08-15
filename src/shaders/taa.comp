@@ -96,6 +96,19 @@ layout(push_constant) uniform Params {
     float gain;         // how hard a rejected sample pushes alpha toward 1
     float varClip;      // variance box half-width, in standard deviations
     int   flags;
+    // ---- THE CONVENTION, FALSIFIABLE AT LAST.
+    //
+    // The Y sign and the overall scale of the reprojection offset have been
+    // constants reasoned from the negative-viewport analysis - and a wrong sign
+    // or scale survives every test run so far: the field LOOKS right in the
+    // magnitude view (shape and smoothness carry no sign), and the stop test
+    // passes (zero is zero under any convention). What a wrong convention DOES
+    // produce is exactly the reported artifact: history fetched near-but-not-at
+    // the right spot every frame of motion, edges doubling, texture smearing,
+    // none of it while still. So both are live knobs now, and one orbit of the
+    // camera per combination replaces an afternoon of reasoning about them.
+    float velScale;     // multiplies the fetched vector; 1.0 = shipping belief
+    float velYSign;     // -1.0 = shipping belief (negative viewport), +1.0 = flipped
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -213,9 +226,9 @@ void main()
     // ndc_y = +1 is at the TOP and uv_y = 0.5 - 0.5 * ndc_y. That makes
     // d(uv_y) = -vel_y while d(uv_x) = +vel_x. The same sign that took the
     // field's own diagnostic from 4.8 px to 0.0015 px applies here.
-    vec2 vel  = texture(uVelocity, vec3(uv, float(layer))).xy;
+    vec2 vel  = texture(uVelocity, vec3(uv, float(layer))).xy * pc.velScale;
     if ((pc.flags & FLAG_NO_MOTION) != 0) vel = vec2(0.0);
-    vec2 hUv  = uv + vec2(vel.x, -vel.y);
+    vec2 hUv  = uv + vec2(vel.x, pc.velYSign * vel.y);
 
     // ---- THE VIEWS THAT DO NOT DEPEND ON HISTORY.
     //

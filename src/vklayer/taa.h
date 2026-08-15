@@ -104,6 +104,9 @@ struct TaaPush {
     float   gain;
     float   varClip;
     int32_t flags;      // see kTaaFlag* below
+    // Live A/B knobs for the reprojection convention - see the shader's note.
+    float   velScale;
+    float   velYSign;
 };
 
 enum {
@@ -142,6 +145,9 @@ static float taaVizScale() { return live::f("taa.viz_scale", nullptr, 1.0f); }
 //   force_reset      same output as no_accum but reached through the reset path,
 //                    so the pair separates "reset is broken" from "accumulation
 //                    is broken" - which looked identical for two builds.
+static float taaVelScale() { return live::f("taa.vel_scale", nullptr, 1.0f); }
+// -1.0 is the shipping belief (negative-height viewport => d(uv_y) = -vel_y).
+static float taaVelYSign() { return live::onoff("taa.vel_ypos", nullptr, false) ? 1.0f : -1.0f; }
 static bool taaFreezeHistory() { return live::onoff("taa.freeze_history", nullptr, false); }
 static bool taaNoMotion()      { return live::onoff("taa.no_motion",      nullptr, false); }
 static bool taaNoAccum()       { return live::onoff("taa.no_accum",       nullptr, false); }
@@ -604,6 +610,26 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0);
+    pcv.velScale = taaVelScale();
+    pcv.velYSign = taaVelYSign();
+    // ---- A CHANGED KNOB IS A CHANGED HISTORY.
+    //
+    // Every one of these redefines what the accumulated image MEANS: a
+    // different viz draws a different picture into the history buffer, a
+    // different sign or scale reprojects it differently, and blending across
+    // the change drags the old regime's pixels into the new one. That is not
+    // hypothetical - leaving the heatmap view without a reset visibly dissolved
+    // the heatmap into the scene, and it read as scene corruption for half a
+    // session. Any change forces one clean frame.
+    {
+        static int   lastViz   = -1;
+        static float lastScale = 0.0f, lastSign = 0.0f;
+        if (pcv.viz != lastViz || pcv.velScale != lastScale ||
+            pcv.velYSign != lastSign) {
+            if (lastViz != -1) pcv.reset = 1;
+            lastViz = pcv.viz; lastScale = pcv.velScale; lastSign = pcv.velYSign;
+        }
+    }
     dd.cmdPushConstants(cb, g_taa.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                         0, sizeof(pcv), &pcv);
 
