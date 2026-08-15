@@ -89,6 +89,11 @@ static void trace(const char *fmt, ...)
 // calls trace(), which is defined directly above.
 #include "mv_live.h"
 
+// The VRAM system - zones, budget shaping, recycle pool, memory priorities,
+// upload governor, predictor, emergency ladder. Same placement logic: it
+// calls trace() and live::, both defined above.
+#include "vram.h"
+
 // ------------------------------------------------------- shared memory
 
 static HANDLE    g_shareHandle = nullptr;
@@ -578,6 +583,7 @@ static bool pagerShouldEngage()
 static uint64_t g_allocCount = 0, g_allocBytes = 0;
 static uint64_t g_allocFailed = 0, g_allocRescued = 0;
 static bool     g_memoryPriority = false;   // VK_EXT_memory_priority usable
+static bool     g_pageableMemory = false;   // pageable_device_local feature on
 static bool     g_overcommit = false;
 
 // ======================================================== THE VRAM LEDGER
@@ -734,18 +740,30 @@ struct VramEntry { int cat; uint64_t bytes; };
 static std::map<VkImage,  VramEntry> g_vramImg;
 static std::map<VkBuffer, VramEntry> g_vramBuf;
 
+// Ledger total, maintained incrementally and fed to the VRAM system so its
+// budget shaper can see the app's own trend (the monotone-under-free clamp
+// needs to know whether the app is currently releasing memory).
+static uint64_t g_vramTotalBytes = 0;
+
 static void vramAdd(int cat, uint64_t bytes)
 {
     g_vram[cat].count++;
     g_vram[cat].bytes += bytes;
     if (g_vram[cat].bytes > g_vram[cat].peak) g_vram[cat].peak = g_vram[cat].bytes;
+    g_vramTotalBytes += bytes;
+    vram::ledgerTotal(g_vramTotalBytes);
 }
 
 static void vramRemove(int cat, uint64_t bytes)
 {
     if (g_vram[cat].count) g_vram[cat].count--;
     g_vram[cat].bytes = (g_vram[cat].bytes > bytes) ? (g_vram[cat].bytes - bytes) : 0;
+    g_vramTotalBytes = (g_vramTotalBytes > bytes) ? (g_vramTotalBytes - bytes) : 0;
+    vram::ledgerTotal(g_vramTotalBytes);
 }
+
+// The bind hooks' category lookups are defined with the VRAM system hooks,
+// below the g_lock they need.
 
 static int vramCatOfImage(const VkImageCreateInfo *ci, bool depthFmt)
 {
@@ -918,6 +936,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueueSubmit(
             trace("QUEUE: app submits on %p (%u distinct so far)",
                   (void*)queue, (unsigned)g_submitQueues.size());
     }
+    // The upload governor. It handles the call entirely when the queue is the
+    // transfer-only family - pacing under pressure, holding whole submissions
+    // FIFO - and it also flushes anything held whose signals this submission
+    // waits on, whatever the queue. Deadlock-proofing is documented in vram.h.
+    {
+        VkResult vr = VK_SUCCESS;
+        if (vram::onSubmit(queue, count, submits, fence, &vr)) return vr;
+    }
     // Serialised against the frame generation present worker. VkQueue is
     // externally synchronised and that worker uses one from another thread, so
     // without this the two race - which is what took the sim down the first
@@ -925,6 +951,193 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueueSubmit(
     // so the layer is what provides the guarantee.
     return g_nextQueueSubmit ? g_nextQueueSubmit(queue, count, submits, fence)
                              : VK_SUCCESS;
+}
+
+// ============================================================ VRAM SYSTEM HOOKS
+//
+// The interception surface the VRAM system runs on. Each hook is a thin
+// passthrough that feeds vram:: and forwards; every decision lives in vram.h.
+
+static PFN_vkFreeMemory        g_nextFreeMemory        = nullptr;
+static PFN_vkBindImageMemory   g_nextBindImageMemory   = nullptr;
+static PFN_vkBindImageMemory2  g_nextBindImageMemory2  = nullptr;
+static PFN_vkBindBufferMemory  g_nextBindBufferMemory  = nullptr;
+static PFN_vkBindBufferMemory2 g_nextBindBufferMemory2 = nullptr;
+static PFN_vkGetDeviceQueue    g_nextGetDeviceQueue    = nullptr;
+static PFN_vkWaitForFences     g_nextWaitForFences     = nullptr;
+static PFN_vkGetFenceStatus    g_nextGetFenceStatus    = nullptr;
+static PFN_vkResetFences       g_nextResetFences       = nullptr;
+static PFN_vkWaitSemaphores    g_nextWaitSemaphores    = nullptr;
+static PFN_vkQueueWaitIdle     g_nextQueueWaitIdle     = nullptr;
+static PFN_vkDeviceWaitIdle    g_nextDeviceWaitIdle    = nullptr;
+static PFN_vkQueueBindSparse   g_nextQueueBindSparse   = nullptr;
+static PFN_vkCmdCopyBuffer     g_nextCmdCopyBuffer     = nullptr;
+
+// Category of a live handle, for the bind hooks. -1 when the handle is not in
+// the ledger (created before the layer attached, or the ledger is off).
+static int vramCatOfImageHandle(VkImage img)
+{
+    std::lock_guard<std::mutex> g(g_lock);
+    std::map<VkImage, VramEntry>::iterator it = g_vramImg.find(img);
+    return it == g_vramImg.end() ? -1 : it->second.cat;
+}
+
+static int vramCatOfBufferHandle(VkBuffer buf)
+{
+    std::lock_guard<std::mutex> g(g_lock);
+    std::map<VkBuffer, VramEntry>::iterator it = g_vramBuf.find(buf);
+    return it == g_vramBuf.end() ? -1 : it->second.cat;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Vram_FreeMemory(
+    VkDevice device, VkDeviceMemory mem, const VkAllocationCallbacks *alloc)
+{
+    if (!g_nextFreeMemory) return;
+    if (mem == VK_NULL_HANDLE) { g_nextFreeMemory(device, mem, alloc); return; }
+    // The pool may keep the block; if it does, the driver never sees this free
+    // and a later identical allocation is answered without a driver call.
+    if (vram::poolHold(mem)) return;
+    vram::noteFreeGone(mem);
+    g_nextFreeMemory(device, mem, alloc);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindImageMemory(
+    VkDevice device, VkImage image, VkDeviceMemory mem, VkDeviceSize offset)
+{
+    int cat = vramCatOfImageHandle(image);
+    if (cat >= 0)
+        vram::onBind(mem, cat, g_share && g_share->valid);
+    return g_nextBindImageMemory
+         ? g_nextBindImageMemory(device, image, mem, offset)
+         : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindImageMemory2(
+    VkDevice device, uint32_t count, const VkBindImageMemoryInfo *infos)
+{
+    for (uint32_t i = 0; i < count && infos; ++i) {
+        int cat = vramCatOfImageHandle(infos[i].image);
+        if (cat >= 0)
+            vram::onBind(infos[i].memory, cat, g_share && g_share->valid);
+    }
+    return g_nextBindImageMemory2
+         ? g_nextBindImageMemory2(device, count, infos)
+         : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindBufferMemory(
+    VkDevice device, VkBuffer buffer, VkDeviceMemory mem, VkDeviceSize offset)
+{
+    int cat = vramCatOfBufferHandle(buffer);
+    if (cat >= 0)
+        vram::onBind(mem, cat, g_share && g_share->valid);
+    return g_nextBindBufferMemory
+         ? g_nextBindBufferMemory(device, buffer, mem, offset)
+         : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindBufferMemory2(
+    VkDevice device, uint32_t count, const VkBindBufferMemoryInfo *infos)
+{
+    for (uint32_t i = 0; i < count && infos; ++i) {
+        int cat = vramCatOfBufferHandle(infos[i].buffer);
+        if (cat >= 0)
+            vram::onBind(infos[i].memory, cat, g_share && g_share->valid);
+    }
+    return g_nextBindBufferMemory2
+         ? g_nextBindBufferMemory2(device, count, infos)
+         : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Vram_GetDeviceQueue(
+    VkDevice device, uint32_t family, uint32_t index, VkQueue *out)
+{
+    if (!g_nextGetDeviceQueue) return;
+    g_nextGetDeviceQueue(device, family, index, out);
+    if (out && *out) vram::noteQueue(family, *out);
+}
+
+// Every wait path releases held submissions first - the deadlock-proofing.
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_WaitForFences(
+    VkDevice device, uint32_t count, const VkFence *fences,
+    VkBool32 waitAll, uint64_t timeout)
+{
+    vram::touchFences(count, fences);
+    return g_nextWaitForFences
+         ? g_nextWaitForFences(device, count, fences, waitAll, timeout)
+         : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_GetFenceStatus(
+    VkDevice device, VkFence fence)
+{
+    vram::touchFences(1, &fence);
+    return g_nextGetFenceStatus ? g_nextGetFenceStatus(device, fence)
+                                : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_ResetFences(
+    VkDevice device, uint32_t count, const VkFence *fences)
+{
+    vram::touchFences(count, fences);
+    return g_nextResetFences ? g_nextResetFences(device, count, fences)
+                             : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_WaitSemaphores(
+    VkDevice device, const VkSemaphoreWaitInfo *info, uint64_t timeout)
+{
+    if (info)
+        vram::touchSemaphores(info->semaphoreCount, info->pSemaphores,
+                              info->pValues);
+    return g_nextWaitSemaphores
+         ? g_nextWaitSemaphores(device, info, timeout)
+         : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_QueueWaitIdle(VkQueue queue)
+{
+    vram::flushAll(&vram::flushOnWait);
+    return g_nextQueueWaitIdle ? g_nextQueueWaitIdle(queue)
+                               : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_DeviceWaitIdle(VkDevice device)
+{
+    vram::flushAll(&vram::flushOnWait);
+    return g_nextDeviceWaitIdle ? g_nextDeviceWaitIdle(device)
+                                : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_QueueBindSparse(
+    VkQueue queue, uint32_t count, const VkBindSparseInfo *infos, VkFence fence)
+{
+    ++vram::sparseBinds;
+    // A sparse bind can wait on semaphores a held submission signals.
+    for (uint32_t i = 0; i < count && infos; ++i) {
+        const VkTimelineSemaphoreSubmitInfo *tl = nullptr;
+        for (const VkBaseInStructure *p =
+                 (const VkBaseInStructure*)infos[i].pNext; p; p = p->pNext)
+            if (p->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
+                tl = (const VkTimelineSemaphoreSubmitInfo*)p;
+        vram::touchSemaphores(infos[i].waitSemaphoreCount,
+                              infos[i].pWaitSemaphores,
+                              tl ? tl->pWaitSemaphoreValues : nullptr);
+    }
+    return g_nextQueueBindSparse
+         ? g_nextQueueBindSparse(queue, count, infos, fence)
+         : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Vram_CmdCopyBuffer(
+    VkCommandBuffer cb, VkBuffer src, VkBuffer dst,
+    uint32_t count, const VkBufferCopy *regions)
+{
+    if (!g_nextCmdCopyBuffer) return;
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < count && regions; ++i) bytes += regions[i].size;
+    if (bytes) vram::chargeCopy(cb, bytes);
+    g_nextCmdCopyBuffer(cb, src, dst, count, regions);
 }
 static PFN_vkCreateSampler      g_nextCreateSampler = nullptr;
 static PFN_vkCmdSetViewport     g_nextCmdSetViewport = nullptr;
@@ -1780,6 +1993,19 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdCopyBufferToImage(
     uint32_t count, const VkBufferImageCopy *regions)
 {
     if (!g_nextCmdCopyBufferToImage) return;
+
+    // Upload accounting for the VRAM system. 4 bytes per texel is an estimate
+    // - BC-compressed textures are 8x smaller - but pacing needs a consistent
+    // figure, not an audit, and the governor's budgets are tuned against this
+    // same estimate.
+    {
+        uint64_t bytes = 0;
+        for (uint32_t i = 0; i < count && regions; ++i)
+            bytes += (uint64_t)regions[i].imageExtent.width *
+                     regions[i].imageExtent.height *
+                     (regions[i].imageExtent.depth ? regions[i].imageExtent.depth : 1) * 4ull;
+        if (bytes) vram::chargeCopy(cb, bytes);
+    }
 
     uint32_t drop = 0, origW = 0, origH = 0;
     {
@@ -6304,6 +6530,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // Re-read the live control file. One GetFileAttributesEx and a 64-bit
     // compare in the common case; a reparse only when the timestamp moves.
     live::poll();
+
+    // The VRAM system's frame tick: fresh heap sample, zone update, governor
+    // release, recycle trim, priority walk. The camera delta feeds the
+    // teleport detector; garbage (pre-flight, unset snapshot) is passed as -1
+    // so it can never fake a teleport.
+    vram::onPresent((snap.camDelta >= 0.0f && snap.camDelta < 100000.0f)
+                        ? snap.camDelta : -1.0f);
     mvMaybeReport(frames);
     // The near-field threshold, live. Read ONCE per frame here rather than in
     // the push path - the push runs millions of times a frame and a mutexed
@@ -6557,6 +6790,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSampler(
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
     VkDevice device, const VkAllocationCallbacks *alloc)
 {
+    // The VRAM system first: every held upload submission goes down the chain
+    // and every pooled block is genuinely freed, while the device and its
+    // queues still exist to accept them.
+    vram::shutdown();
+
     // ---- RELEASE THE VELOCITY TARGET.
     //
     // mvDestroy had no caller at all, so the target and its readback buffer -
@@ -6748,6 +6986,8 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
                                  nextGIPA(*out, "vkGetPhysicalDeviceProperties");
         g_nextEnumDeviceExt = (PFN_vkEnumerateDeviceExtensionProperties)
                                  nextGIPA(*out, "vkEnumerateDeviceExtensionProperties");
+        g_getPhysQueueFamProps = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)
+                                 nextGIPA(*out, "vkGetPhysicalDeviceQueueFamilyProperties");
         g_nextMemProps2    = (PFN_vkGetPhysicalDeviceMemoryProperties2)
                                  nextGIPA(*out, "vkGetPhysicalDeviceMemoryProperties2");
         // The KHR fallback belongs INSIDE the guard. Left outside it, a probe
@@ -6884,41 +7124,22 @@ static VKAPI_ATTR void VKAPI_CALL TAA_GetPhysicalDeviceMemoryProperties2(
         }
     }
 
-    if (g_vramBudgetScale > 1.0f) {
+    // ---- THE BUDGET SHAPER. This one number is X-Plane's whole view of VRAM:
+    // VMA's vmaGetHeapBudgets reads it, the memory controller averages it, and
+    // the texture pager's evaluate() spends it. The shaper low-passes the
+    // driver's figure, holds it monotone while the app is freeing (the
+    // measured "available fell as it freed" spiral), withholds a zone-scaled
+    // reserve so the engine adapts BEFORE the wall, and deflates hard after an
+    // allocation failure so the engine's own pager performs the eviction the
+    // memory controller cannot. The legacy TAA_VRAM_BUDGET scale still applies
+    // inside it.
+    {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT *b = nullptr;
         for (VkBaseOutStructure *p = (VkBaseOutStructure*)props->pNext; p; p = p->pNext)
             if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT)
                 b = (VkPhysicalDeviceMemoryBudgetPropertiesEXT*)p;
-
-        if (b) {
-            const VkPhysicalDeviceMemoryProperties &mp0 = props->memoryProperties;
-            for (uint32_t i = 0; i < mp0.memoryHeapCount; ++i) {
-                if (!(mp0.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
-                VkDeviceSize want = (VkDeviceSize)(b->heapBudget[i] * g_vramBudgetScale);
-                if (want > mp0.memoryHeaps[i].size) want = mp0.memoryHeaps[i].size;
-                if (want > b->heapBudget[i]) {
-                    static bool said = false;
-                    if (!said) {
-                        said = true;
-                        trace("VRAM: reporting heap%u budget %.2f -> %.2f GB (x%.2f, "
-                              "capped at the %.2f GB heap). Watch X-Plane's own "
-                              "\"available\" figure: if it does not move, the pager "
-                              "is not reading this.", i,
-                              b->heapBudget[i] / 1073741824.0, want / 1073741824.0,
-                              g_vramBudgetScale, mp0.memoryHeaps[i].size / 1073741824.0);
-                    }
-                    b->heapBudget[i] = want;
-                }
-            }
-        } else {
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                trace("VRAM: budget override requested but the application did not "
-                      "chain VK_EXT_memory_budget - so it is NOT reading a live "
-                      "budget, and its texture limit comes from somewhere else.");
-            }
-        }
+        if (b)
+            vram::shapeReport(&props->memoryProperties, b, g_vramBudgetScale);
     }
 
     // Report the first few, then every few hundred: a pager queries this every
@@ -9241,7 +9462,39 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_AllocateMemory(
 {
     if (!g_nextAllocateMemory) return VK_ERROR_INITIALIZATION_FAILED;
 
-    VkResult r = g_nextAllocateMemory(device, ai, alloc, out);
+    // ---- RECYCLE FIRST. A pooled identical block answers without a driver
+    // call at all - the plan's deferred-free retire queue paying out. Contents
+    // of a fresh allocation are undefined by spec, so handing back a used
+    // block is legal; only never-mapped device-local blocks enter the pool.
+    if (ai && out && vram::poolTake(ai, out)) {
+        vram::noteAlloc(*out, ai);
+        ++g_allocCount;
+        g_allocBytes += ai->allocationSize;
+        return VK_SUCCESS;
+    }
+
+    // ---- PRIORITY TAG. Neutral 0.5 at allocation; the first bind names what
+    // the block holds and raises or lowers it. Ignored by the driver unless
+    // the memoryPriority feature was enabled at device creation, which the
+    // CreateDevice hook takes care of.
+    vram::PrioChain pc;
+    const VkMemoryAllocateInfo *use = ai;
+    if (ai && vram::prioTag(ai, &pc)) use = &pc.ai;
+
+    LARGE_INTEGER t0, t1, fq;
+    QueryPerformanceCounter(&t0);
+    VkResult r = g_nextAllocateMemory(device, use, alloc, out);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&fq);
+    if (fq.QuadPart > 0) {
+        uint64_t us = (uint64_t)((t1.QuadPart - t0.QuadPart) * 1000000ll /
+                                 fq.QuadPart);
+        uint64_t worst = vram::allocLatWorstUs.load();
+        while (us > worst &&
+               !vram::allocLatWorstUs.compare_exchange_weak(worst, us)) {}
+    }
+
+    if (r == VK_SUCCESS && ai && out) vram::noteAlloc(*out, ai);
 
     if (ai) {
         ++g_allocCount;
@@ -9261,6 +9514,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_AllocateMemory(
     trace("ALLOC: OUT OF DEVICE MEMORY for %.1f MB (type %u) - this is the "
           "moment X-Plane's pager is trying to avoid",
           ai->allocationSize / 1048576.0, ai->memoryTypeIndex);
+
+    // ---- EMERGENCY LADDER, before overcommit. Flush the recycle pool (real
+    // bytes returned to the driver), release every held upload, deflate the
+    // shaped budget so the engine's own pager evicts on its next evaluate -
+    // then retry the allocation once.
+    if (vram::emergency()) {
+        r = g_nextAllocateMemory(device, use, alloc, out);
+        if (r == VK_SUCCESS) {
+            vram::noteAlloc(*out, ai);
+            trace("ALLOC: emergency reclaim rescued the %.1f MB allocation on "
+                  "retry", ai->allocationSize / 1048576.0);
+            return r;
+        }
+    }
 
     if (!g_overcommit) return r;
 
@@ -9292,6 +9559,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_AllocateMemory(
         ai2.memoryTypeIndex = i;
         VkResult r2 = g_nextAllocateMemory(device, &ai2, alloc, out);
         if (r2 == VK_SUCCESS) {
+            vram::noteAlloc(*out, &ai2);
             ++g_allocRescued;
             trace("ALLOC: rescued %.1f MB into host memory type %u - it will "
                   "stream over PCIe rather than fail",
@@ -9619,6 +9887,48 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
                   "before X-Plane's textures");
         }
 
+        // ---- THE VRAM SYSTEM'S EXTENSIONS, added defensively if the driver
+        // offers them and nobody asked. X-Plane requests both itself when it
+        // sees them, so these adds are normally no-ops - but the priority
+        // engine must not depend on the engine's mood.
+        {
+            const char *vramWanted[] = {
+                "VK_EXT_memory_priority",
+                "VK_EXT_pageable_device_local_memory",
+            };
+            for (int k = 0; k < 2; ++k) {
+                bool supported = false;
+                for (size_t i = 0; i < have.size(); ++i)
+                    if (!strcmp(have[i].extensionName, vramWanted[k])) { supported = true; break; }
+                bool already = false;
+                for (size_t i = 0; i < exts.size(); ++i)
+                    if (!strcmp(exts[i], vramWanted[k])) { already = true; break; }
+                if (supported && !already) {
+                    exts.push_back(vramWanted[k]);
+                    trace("DEVICE: adding %s (VRAM system)", vramWanted[k]);
+                }
+            }
+        }
+
+        // The pageable feature is what makes vkSetDeviceMemoryPriorityEXT
+        // legal - the priority engine's live re-prioritisation runs on it.
+        // Feature struct static for the same lifetime reason as the others.
+        static VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageFeat;
+        bool havePageable = false;
+        for (size_t i = 0; i < exts.size(); ++i)
+            if (!strcmp(exts[i], "VK_EXT_pageable_device_local_memory"))
+                havePageable = true;
+        if (havePageable) {
+            memset(&pageFeat, 0, sizeof(pageFeat));
+            pageFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT;
+            pageFeat.pageableDeviceLocalMemory = VK_TRUE;
+            pageFeat.pNext = (void*)ci2.pNext;
+            ci2.pNext = &pageFeat;
+            g_pageableMemory = true;
+            trace("DEVICE: pageableDeviceLocalMemory feature requested - "
+                  "vkSetDeviceMemoryPriorityEXT becomes legal and the priority "
+                  "engine can re-rank live blocks");
+        }
 
         ci2.enabledExtensionCount   = (uint32_t)exts.size();
         ci2.ppEnabledExtensionNames = exts.data();
@@ -9901,6 +10211,58 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     g_nextQueueSubmit        = dd.queueSubmit;
     g_nextQueuePresent       = dd.queuePresent;
 
+    // ---- THE VRAM SYSTEM'S DOWN-CHAIN POINTERS AND DEVICE BINDING.
+    g_nextFreeMemory        = (PFN_vkFreeMemory)nextGDPA(*out, "vkFreeMemory");
+    g_nextBindImageMemory   = (PFN_vkBindImageMemory)nextGDPA(*out, "vkBindImageMemory");
+    g_nextBindImageMemory2  = (PFN_vkBindImageMemory2)nextGDPA(*out, "vkBindImageMemory2");
+    if (!g_nextBindImageMemory2)
+        g_nextBindImageMemory2 = (PFN_vkBindImageMemory2)nextGDPA(*out, "vkBindImageMemory2KHR");
+    g_nextBindBufferMemory  = (PFN_vkBindBufferMemory)nextGDPA(*out, "vkBindBufferMemory");
+    g_nextBindBufferMemory2 = (PFN_vkBindBufferMemory2)nextGDPA(*out, "vkBindBufferMemory2");
+    if (!g_nextBindBufferMemory2)
+        g_nextBindBufferMemory2 = (PFN_vkBindBufferMemory2)nextGDPA(*out, "vkBindBufferMemory2KHR");
+    g_nextGetDeviceQueue    = (PFN_vkGetDeviceQueue)nextGDPA(*out, "vkGetDeviceQueue");
+    g_nextWaitForFences     = (PFN_vkWaitForFences)nextGDPA(*out, "vkWaitForFences");
+    g_nextGetFenceStatus    = (PFN_vkGetFenceStatus)nextGDPA(*out, "vkGetFenceStatus");
+    g_nextResetFences       = (PFN_vkResetFences)nextGDPA(*out, "vkResetFences");
+    g_nextWaitSemaphores    = (PFN_vkWaitSemaphores)nextGDPA(*out, "vkWaitSemaphores");
+    if (!g_nextWaitSemaphores)
+        g_nextWaitSemaphores = (PFN_vkWaitSemaphores)nextGDPA(*out, "vkWaitSemaphoresKHR");
+    g_nextQueueWaitIdle     = (PFN_vkQueueWaitIdle)nextGDPA(*out, "vkQueueWaitIdle");
+    g_nextDeviceWaitIdle    = (PFN_vkDeviceWaitIdle)nextGDPA(*out, "vkDeviceWaitIdle");
+    g_nextQueueBindSparse   = (PFN_vkQueueBindSparse)nextGDPA(*out, "vkQueueBindSparse");
+    g_nextCmdCopyBuffer     = (PFN_vkCmdCopyBuffer)nextGDPA(*out, "vkCmdCopyBuffer");
+    PFN_vkSetDeviceMemoryPriorityEXT setPrio =
+        (PFN_vkSetDeviceMemoryPriorityEXT)nextGDPA(*out, "vkSetDeviceMemoryPriorityEXT");
+
+    // The transfer-ONLY family, if the device exposes one among the families
+    // X-Plane created queues on. Only queues from that family are governed -
+    // pacing the graphics queue would pace the frame itself.
+    uint32_t transferOnly = ~0u;
+    if (g_getPhysQueueFamProps) {
+        uint32_t n = 0;
+        g_getPhysQueueFamProps(phys, &n, nullptr);
+        std::vector<VkQueueFamilyProperties> qf(n);
+        if (n) g_getPhysQueueFamProps(phys, &n, qf.data());
+        for (size_t i = 0; i < g_deviceFamilies.size(); ++i) {
+            uint32_t fam = g_deviceFamilies[i];
+            if (fam < n && (qf[fam].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
+                !(qf[fam].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
+                transferOnly = fam;
+                break;
+            }
+        }
+    }
+
+    {
+        VkPhysicalDeviceMemoryProperties vmp;
+        memset(&vmp, 0, sizeof(vmp));
+        if (g_getPhysMemProps) g_getPhysMemProps(phys, &vmp);
+        vram::bindDevice(*out, phys, g_nextMemProps2, g_nextFreeMemory,
+                         g_nextQueueSubmit, setPrio, g_memoryPriority,
+                         g_pageableMemory, &vmp, transferOnly);
+    }
+
 
     // ---- FINISH dd AND REGISTER THE DEVICE, BEFORE ANYTHING CAN ASK ABOUT IT.
     //
@@ -10015,6 +10377,23 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkCmdEndRenderingKHR",   Layer_CmdEndRendering)
     RETURN_IF("vkCmdSetViewport",       Layer_CmdSetViewport)
     RETURN_IF("vkAllocateMemory",      TAA_AllocateMemory)
+    RETURN_IF("vkFreeMemory",          Vram_FreeMemory)
+    RETURN_IF("vkBindImageMemory",     Vram_BindImageMemory)
+    RETURN_IF("vkBindImageMemory2",    Vram_BindImageMemory2)
+    RETURN_IF("vkBindImageMemory2KHR", Vram_BindImageMemory2)
+    RETURN_IF("vkBindBufferMemory",    Vram_BindBufferMemory)
+    RETURN_IF("vkBindBufferMemory2",   Vram_BindBufferMemory2)
+    RETURN_IF("vkBindBufferMemory2KHR", Vram_BindBufferMemory2)
+    RETURN_IF("vkGetDeviceQueue",      Vram_GetDeviceQueue)
+    RETURN_IF("vkWaitForFences",       Vram_WaitForFences)
+    RETURN_IF("vkGetFenceStatus",      Vram_GetFenceStatus)
+    RETURN_IF("vkResetFences",         Vram_ResetFences)
+    RETURN_IF("vkWaitSemaphores",      Vram_WaitSemaphores)
+    RETURN_IF("vkWaitSemaphoresKHR",   Vram_WaitSemaphores)
+    RETURN_IF("vkQueueWaitIdle",       Vram_QueueWaitIdle)
+    RETURN_IF("vkDeviceWaitIdle",      Vram_DeviceWaitIdle)
+    RETURN_IF("vkQueueBindSparse",     Vram_QueueBindSparse)
+    RETURN_IF("vkCmdCopyBuffer",       Vram_CmdCopyBuffer)
     RETURN_IF("vkCmdCopyBufferToImage", TAA_CmdCopyBufferToImage)
     RETURN_IF("vkCmdPipelineBarrier",  TAA_CmdPipelineBarrier)
     RETURN_IF("vkCmdPipelineBarrier2", TAA_CmdPipelineBarrier2)
