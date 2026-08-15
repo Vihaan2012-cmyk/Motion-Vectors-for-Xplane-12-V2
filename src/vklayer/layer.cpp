@@ -6214,6 +6214,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // compare in the common case; a reparse only when the timestamp moves.
     live::poll();
     mvMaybeReport(frames);
+    // The near-field threshold, live. Read ONCE per frame here rather than in
+    // the push path - the push runs millions of times a frame and a mutexed
+    // map lookup there would be the layer becoming the bottleneck it wraps.
+    //
+    // This is the cockpit-shake fix that has been BUILT AND OFF all along: the
+    // injected select replaces prevClip with currClip (velocity zero) for
+    // geometry closer than this many metres, which is CORRECT for the panel -
+    // it rides the camera, so its true screen motion is zero - and the pushed
+    // threshold has been 0 the whole time, so the select never fired and the
+    // panel got the scenery's world reprojection instead. That is the shake.
+    {
+        float nf = live::f("taa.nearfield_m", "TAA_NEARFIELD_M", g_nearFieldM);
+        if (nf < 0.0f)  nf = 0.0f;
+        if (nf > 50.0f) nf = 50.0f;
+        if (nf != g_nearFieldM) {
+            trace("NEAR FIELD: %.2f -> %.2f m (live)", g_nearFieldM, nf);
+            g_nearFieldM = nf;
+        }
+    }
 
     g_velInjectedThisFrame = false;
     g_taaResolvedThisFrame = false;
