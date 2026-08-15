@@ -42,7 +42,12 @@ rem Measure the velocity field every N frames. This is the acceptance gate for
 rem the whole project, so it is on for debugging - but it reads back 31.9 MB at
 rem 4K, which is why it stays off in a release build rather than defaulting on
 rem like the injection does.
-set "TAA_VELOCITY_DUMP=60"
+rem The velocity readback: 63.7 MB over PCIe plus an 8-megapixel CPU scoring
+rem pass per dump - one visibly hitched frame each interval, measured at 19 fps
+rem for that frame. It was the calibration campaign's instrument, and the field
+rem passed acceptance, so it is OFF. Re-arm for a measurement session by
+rem uncommenting, or at runtime: echo 60 > "%%TEMP%%	aa_dump_every.txt".
+rem set "TAA_VELOCITY_DUMP=60"
 
 rem ---- VRAM pager, restored to the settings V1 shipped and proved.
 rem

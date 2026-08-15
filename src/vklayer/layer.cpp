@@ -2744,6 +2744,9 @@ static float g_jitterScale = 0.0f;
 // three orders of magnitude and one axis convention wrong, which is why the
 // value is stored at the single site that knows what was applied.
 static float g_appliedJitX = 0.0f, g_appliedJitY = 0.0f;
+// Reads the jitter out of THIS command buffer's pending-push slot - defined
+// below the slot machinery it needs, used above it by the resolve.
+static bool mvPendingJitter(VkCommandBuffer cb, float *jx, float *jy);
 static uint64_t g_jitterApplied = 0;
 
 // Did a resolve actually happen this frame, and how often does it not.
@@ -4264,12 +4267,17 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 if (litFmt != VK_FORMAT_R16G16B16A16_SFLOAT &&
                     litFmt != VK_FORMAT_R32G32B32A32_SFLOAT) break;
                 {
+                    // CANDIDATE, not chosen: this fires BEFORE the last-pass
+                    // filter below, so a frame with two qualifying passes
+                    // prints both and reads as the target alternating every
+                    // frame - which is exactly the false alarm it produced.
+                    // The CHOSEN line after the filter is the one that means
+                    // what this one used to claim.
                     static VkImage lastPick = VK_NULL_HANDLE;
                     if (passInfo.color0 != lastPick) {
                         lastPick = passInfo.color0;
-                        trace("TAA TARGET: resolving into %p fmt=%d %ux%u "
-                              "(colour=%u depthLoad=%d) - changes here mean the "
-                              "pass choice moved with the camera view",
+                        trace("TAA CANDIDATE: %p fmt=%d %ux%u "
+                              "(colour=%u depthLoad=%d)",
                               (void*)passInfo.color0, (int)litFmt,
                               passInfo.w, passInfo.h, passInfo.colorCount,
                               passInfo.depthLoad ? 1 : 0);
@@ -4312,6 +4320,21 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 if (g_hdrPassesLastFrame == 0 || hdrIdx != g_hdrPassesLastFrame)
                     break;
 
+                {
+                    static VkImage lastChosen = VK_NULL_HANDLE;
+                    if (passInfo.color0 != lastChosen) {
+                        lastChosen = passInfo.color0;
+                        trace("TAA CHOSEN: resolving into %p (hdr %u of %u, "
+                              "sceneEnds=%u mvBinds=%d) - alternation HERE is "
+                              "real: either X-Plane double-buffers the lit "
+                              "target (benign, history still carries) or the "
+                              "pick is drifting between two different passes",
+                              (void*)passInfo.color0, hdrIdx,
+                              g_hdrPassesLastFrame, g_sceneEndsThisFrame,
+                              (int)g_mvBindsThisFrame);
+                    }
+                }
+
                 // ---- DESCRIBE THE FRAME, THEN ASK THE BACKEND.
                 //
                 // Everything the resolve needs is assembled into one
@@ -4349,11 +4372,19 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 tf.motion.objectMotionIncluded = true;
                 tf.renderW = tf.outputW = passInfo.w;
                 tf.renderH = tf.outputH = passInfo.h;
-                // The APPLIED NDC values, not g_velSnap's pixel-unit request - the
-                // shader adds pc.jitter as an NDC offset, so it must be told the
-                // same number the vertex splice consumed.
-                tf.jitter.x = g_appliedJitX;
-                tf.jitter.y = g_appliedJitY;
+                // The APPLIED NDC values, not g_velSnap's pixel-unit request -
+                // the shader adds pc.jitter as an NDC offset, so it must be
+                // told the same number the vertex splice consumed. And from
+                // THIS command buffer's pending-push slot, not the globals:
+                // X-Plane records several frames on several threads at once,
+                // so by the time this resolve records, the globals can already
+                // hold the NEXT frame's offset - the same straddle MV PUSH
+                // RACE counts. The slot is thread-local and keyed by this cb,
+                // which is the recording the raster was actually displaced in.
+                if (!mvPendingJitter(cb, &tf.jitter.x, &tf.jitter.y)) {
+                    tf.jitter.x = g_appliedJitX;
+                    tf.jitter.y = g_appliedJitY;
+                }
                 memcpy(tf.camera.reproj, g_velSnap.reproj, sizeof(tf.camera.reproj));
                 // Not camDelta: that is translation only, and a camera rotating
                 // in place moves every pixel while translating zero. The
@@ -7633,6 +7664,15 @@ struct PushSlots {
 };
 static thread_local PushSlots g_tlPushSlots;
 static thread_local PendingPush g_tlPush = { VK_NULL_HANDLE, VK_NULL_HANDLE, {0}, false };
+
+static bool mvPendingJitter(VkCommandBuffer cb, float *jx, float *jy)
+{
+    PendingPush *pp = g_tlPushSlots.find(cb);
+    if (!pp) return false;
+    *jx = pp->block[16];
+    *jy = pp->block[17];
+    return true;
+}
 
 // Does this pipeline draw geometry from vertex buffers, and how many of each
 // kind exist. Filled at pipeline creation; read at bind time to decide whether
