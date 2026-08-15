@@ -1,0 +1,213 @@
+#version 450
+
+// TEMPORAL ANTIALIASING, REBUILT FROM SCRATCH.
+//
+// The previous resolve was removed because it could corrupt an entire frame and
+// nobody could say which half was wrong - the Vulkan plumbing or the algorithm.
+// This one is written so those two can be tested separately: MODE_PASSTHROUGH
+// exercises every binding, barrier and dispatch while computing nothing, so a
+// clean frame in that mode proves the plumbing before a single history sample
+// is taken.
+//
+// The velocity field underneath is now verified: field against its own clip
+// values fails 0 of 386511 pixels, the emitted SPIR-V is spirv-val clean, and
+// the rendered field is smooth, zero in the sky, and scales as 1/depth. That
+// was never true when the last resolve was written.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ---- THE SCENE IS READ-ONLY. THE DISPATCH WRITES HISTORY AND NOTHING ELSE.
+//
+// The first version bound the scene as a storage image and wrote the result
+// back in place, while the neighbourhood clamp read imageLoad(uScene, px+d)
+// from the SAME dispatch. Neighbouring workgroups were writing those pixels as
+// this one read them, so the 3x3 min/max was computed partly over finished
+// output and partly over the original frame - the same race that destroyed the
+// single-buffer history, and just as invisible.
+//
+// Writing only to history removes it: nothing this dispatch reads is anything
+// this dispatch writes. The layer then copies history into the scene target
+// afterwards, in a separate command where the ordering is explicit.
+//
+// It also means the scene never needs STORAGE usage. X-Plane creates it with
+// SAMPLED and TRANSFER_DST already (usage 0x17), so binding it as a sampler and
+// copying into it needs no patched image usage at all - and the vkCreateImage
+// interception that added STORAGE_BIT, which crashed the sim once, can go.
+layout(binding = 0)          uniform sampler2D uScene;   // current frame, read only
+layout(binding = 1, rgba16f) uniform image2D  uHistory;  // the only thing written
+layout(binding = 2)          uniform sampler2D uVelocity;
+layout(binding = 3)          uniform sampler2D uHistorySampler;
+
+layout(push_constant) uniform Params {
+    vec2  invSize;      // 1 / target size
+    vec2  jitter;       // current frame's jitter, in NDC
+    float alpha;        // weight of the current frame
+    int   mode;         // 0 passthrough, 1 reproject, 2 full
+    int   reset;        // 1 = ignore history this frame
+    int   pad;
+} pc;
+
+const int MODE_PASSTHROUGH = 0;
+const int MODE_REPROJECT   = 1;
+const int MODE_FULL        = 2;
+
+// RGB to YCoCg. The neighbourhood clamp is done in YCoCg because clamping in
+// RGB clips hue as well as luminance, which is what turns a rejected sample
+// into a coloured speckle rather than a slightly wrong grey.
+vec3 rgb2ycocg(vec3 c)
+{
+    return vec3( 0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+                 0.5  * c.r             - 0.5  * c.b,
+                -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+vec3 ycocg2rgb(vec3 c)
+{
+    return vec3(c.x + c.y - c.z,
+                c.x        + c.z,
+                c.x - c.y - c.z);
+}
+
+// ---- WEIGHT IN TONEMAPPED SPACE, NOT RAW HDR.
+//
+// The scene is HDR: a specular highlight can be fifty times the neighbourhood
+// mean. Computing the variance box on those values makes sigma enormous, so the
+// clamp barely constrains history and bright areas keep smearing - which reads
+// as a glare that grows as you move. It also lets the clamped YCoCg value
+// invert back to NEGATIVE rgb, which appears as black dots along high-contrast
+// edges exactly when the camera moves.
+//
+// Karis' reversible weighting solves both: blend where a bright pixel counts
+// once rather than fifty times, then undo it. Nothing is lost - tm and untm are
+// exact inverses - but every statistic in between is computed on values of
+// comparable size.
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+vec3  tm(vec3 c)   { return c / (1.0 + luma(c)); }
+
+// The inverse is exact only for values that really are tonemapped, where
+// luma < 1 by construction. The blend does not guarantee that: hy is clamped
+// PER CHANNEL in YCoCg, and per-channel clamping can leave the RGB hull, so
+// luma can reach or exceed 1. Then 1 - luma hits the epsilon floor and that
+// pixel is multiplied by ten thousand - white fireflies across the whole frame,
+// which is what the last build produced.
+//
+// Rescaling to just under 1 keeps the inverse finite and the hue intact; it
+// only touches samples the clamp had already pushed out of range.
+vec3 untm(vec3 c)
+{
+    float y = luma(c);
+    if (y > 0.98) c *= 0.98 / max(y, 1e-6);
+    return c / max(1.0 - luma(c), 1e-3);
+}
+
+void main()
+{
+    ivec2 px   = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = textureSize(uScene, 0);
+    if (px.x >= size.x || px.y >= size.y) return;
+
+    vec3 curr = texelFetch(uScene, px, 0).rgb;
+
+    // ---- STAGE 0: prove the plumbing, compute nothing.
+    //
+    // Every binding is declared and the dispatch covers the whole image, but
+    // the output is the input. If the frame changes at all in this mode the
+    // fault is in the wiring - the wrong image bound, a bad barrier, a layout
+    // mismatch, the dispatch size - and not in any of the maths below.
+    if (pc.mode == MODE_PASSTHROUGH) {
+        imageStore(uHistory, px, vec4(curr, 1.0));
+        return;
+    }
+
+    vec2 uv = (vec2(px) + 0.5) * pc.invSize;
+
+    // ---- THE STORED VALUE IS ALREADY A UV OFFSET.
+    //
+    // The field holds (prevNDC - currNDC) * 0.5. Since uv = ndc * 0.5 + 0.5,
+    // that 0.5 IS the NDC-to-UV conversion - it is not a factor to undo. An
+    // earlier version multiplied by 2 and fetched history twice as far as it
+    // should, which showed up as horizontal streaking across the whole frame.
+    //
+    // Y is negated because X-Plane renders with a NEGATIVE viewport height, so
+    // ndc_y = +1 is at the TOP and uv_y = 0.5 - 0.5 * ndc_y. That makes
+    // d(uv_y) = -vel_y while d(uv_x) = +vel_x. The same sign that took the
+    // field's own diagnostic from 4.8 px to 0.0015 px applies here.
+    vec2 vel  = texture(uVelocity, uv).xy;
+    vec2 hUv  = uv + vec2(vel.x, -vel.y);
+
+    // Off-screen history cannot be reprojected. Falling back to the current
+    // frame is correct and visible as a thin band of aliasing at the leading
+    // edge, which is the honest artifact - inventing a sample would smear.
+    bool valid = all(greaterThanEqual(hUv, vec2(0.0))) &&
+                 all(lessThanEqual(hUv, vec2(1.0)));
+
+    if (pc.reset != 0 || !valid) {
+        imageStore(uHistory, px, vec4(curr, 1.0));
+        return;
+    }
+
+    vec3 hist = texture(uHistorySampler, hUv).rgb;
+
+    // ---- STAGE 1: reprojection only, no rejection.
+    //
+    // Ghosting here is expected and diagnostic: it means history is being
+    // fetched and blended, and that the velocity is steering it. A frame that
+    // ghosts along motion is a frame whose reprojection works.
+    if (pc.mode == MODE_REPROJECT) {
+        vec3 outc = mix(hist, curr, pc.alpha);
+        imageStore(uHistory, px, vec4(outc, 1.0));
+        return;
+    }
+
+    // ---- STAGE 2: neighbourhood clamp.
+    //
+    // History that falls outside the range of the current 3x3 neighbourhood is
+    // stale - a disocclusion, or a shading change the vectors cannot express.
+    // Clamping to that range keeps the sample that is still valid and discards
+    // the part that is not, which is what stops ghosting without giving up
+    // accumulation everywhere.
+    vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+    vec3 nmin = vec3( 1e30), nmax = vec3(-1e30);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 q = clamp(px + ivec2(dx, dy), ivec2(0), size - 1);
+            vec3  c = rgb2ycocg(texelFetch(uScene, q, 0).rgb);
+            m1 += c;
+            m2 += c * c;
+            nmin = min(nmin, c);
+            nmax = max(nmax, c);
+        }
+    }
+
+    // Variance clipping, tightened against the hard min/max. The box alone is
+    // too permissive on noisy content and lets fireflies persist; the variance
+    // term narrows it where the neighbourhood actually agrees.
+    vec3 mu    = m1 / 9.0;
+    vec3 sigma = sqrt(max(m2 / 9.0 - mu * mu, vec3(0.0)));
+    vec3 lo    = max(mu - 1.25 * sigma, nmin);
+    vec3 hi    = min(mu + 1.25 * sigma, nmax);
+
+    vec3 hRaw = rgb2ycocg(hist);
+    vec3 hy   = clamp(hRaw, lo, hi);
+
+    // Widen the current-frame weight when the clamp had to move the sample a
+    // long way: a large correction means history was wrong, and trusting it
+    // less is cheaper than a second rejection heuristic.
+    float moved = length(hy - hRaw) / max(length(sigma), 1e-4);
+    float a     = clamp(pc.alpha + 0.5 * moved * pc.alpha, pc.alpha, 1.0);
+
+    // ---- TONEMAPPED WEIGHTING REVERTED.
+    //
+    // Weighting in c/(1+luma) is the textbook answer to HDR fireflies, and it
+    // turned the screen black. The pre-tonemap version of this clamp WORKED -
+    // ghosting gone, with glare and black dots left to fix - so replacing it
+    // with a black frame was a straight regression, and the honest move is to
+    // go back to the version that produced an image and fix its two defects
+    // directly rather than defend the clever one.
+    //
+    // The black dots were negative components surviving the YCoCg round trip,
+    // so they are floored here, which costs nothing and needs no inverse.
+    vec3 outc = max(mix(ycocg2rgb(hy), curr, a), vec3(0.0));
+
+    imageStore(uHistory, px, vec4(outc, 1.0));
+}

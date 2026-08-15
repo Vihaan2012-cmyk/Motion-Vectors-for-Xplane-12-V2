@@ -229,6 +229,27 @@ inline void chooseAttachment(uint32_t maxColorAttachments)
 // `fragmentComponents` are maxVertexOutputComponents and
 // maxFragmentInputComponents; the pair has to fit inside BOTH, since the same
 // two locations are written by one stage and read by the other.
+// How many Locations this device actually offers, and whether that is enough to
+// sit clear of X-Plane. Set by chooseLocations(); read by placeLocations() and
+// by the layer, so that a device we have never run on says something specific
+// instead of failing silently.
+inline uint32_t &deviceLocationCount() { static uint32_t n = 0; return n; }
+inline bool     &locationsAreSafe()    { static bool ok = true; return ok; }
+
+// X-PLANE'S CEILING, MEASURED, NOT GUESSED.
+//
+// Every Location decoration in the shader corpus, resolved against its storage
+// class: the highest is 16, in both vertex-output and fragment-input, and
+// nothing reaches 17. Every Location-decorated variable is a scalar or a vector
+// occupying exactly one slot - there are no mat4s silently consuming L..L+3 -
+// so the highest CONSUMED slot is 16 as well. Locations 17..31 are free in all
+// 6855 modules.
+//
+// A pair placed at 17 or above therefore cannot collide with anything X-Plane
+// ships. Below it, collision is not a risk but a certainty in the busy range:
+// Location 13 is read by 2352 fragment shaders and Location 14 by 2784.
+static const uint32_t kXPlaneMaxLocation = 16;
+
 // Every Location this module decorates, into a caller-supplied bitmap.
 //
 // Used to pick our varying pair from EVIDENCE rather than from the device
@@ -267,11 +288,34 @@ inline void scanUsedLocations(const uint32_t *code, size_t sizeBytes,
 // far more likely to be claimed by some shader we have not seen yet.
 inline bool placeLocations(const bool *used, uint32_t nLoc)
 {
+    // ---- THE CENSUS MUST NOT EXCEED WHAT THE DEVICE OFFERS.
+    //
+    // This scanned the full 32-slot bitmap regardless of the device, so on an
+    // implementation reporting 64 components (16 Locations) it would happily
+    // return 30/31 - free in every X-Plane module, and past the end of what the
+    // stage can carry. Nothing rejects that: the pipeline builds, the module
+    // validates, and the varying reads zero. Location 31 already taught us this
+    // once, on a card with 32 slots, by delivering exactly 0.000 for a value
+    // known to survive Location 30.
+    //
+    // deviceLocationCount() is 0 until chooseLocations() has run, in which case
+    // the caller's bound is all we have.
+    uint32_t devLocs = deviceLocationCount();
+    if (devLocs && devLocs < nLoc) nLoc = devLocs;
+    // One slot of headroom below the ceiling: built-ins consume output
+    // components too, so the last slot the arithmetic allows is not necessarily
+    // a slot that links.
+    if (nLoc >= 3) nLoc -= 1;
+
     for (uint32_t L = nLoc; L >= 2; --L) {
         uint32_t a = L - 1, b = L - 2;
         if (!used[a] && !used[b]) {
             prevClipLocation() = a;
             currClipLocation() = b;
+            // Evidence beats the corpus-wide constant: if the census found this
+            // pair free across every module X-Plane has handed us, it is safe
+            // wherever it landed.
+            locationsAreSafe() = true;
             return true;
         }
     }
@@ -283,6 +327,25 @@ inline void chooseLocations(uint32_t vertexComponents, uint32_t fragmentComponen
     uint32_t comps = vertexComponents < fragmentComponents
                    ? vertexComponents : fragmentComponents;
     uint32_t locs = comps / 4;
+    deviceLocationCount() = locs;
+    // ---- IS THERE ROOM ABOVE X-PLANE AT ALL?
+    //
+    // Vulkan's guaranteed minimum is 64 components = 16 Locations. X-Plane's own
+    // ceiling is also 16. So on a minimum-specification implementation there is
+    // NO free pair above it, and the arithmetic below would happily hand back
+    // 13/14 - two of the most heavily used slots in the corpus - with the
+    // pipeline building, the module validating, and the varyings reading
+    // whatever X-Plane wrote there.
+    //
+    // We need our pair plus one slot of headroom below the ceiling (see the
+    // Location-31 note below), so 19 Locations is the floor.
+    //
+    // This does not fire on the hardware we develop on - real desktop GPUs
+    // report 128 components = 32 Locations - which is exactly why it has to be
+    // checked rather than assumed. It is the same failure shape as the varying
+    // limit taken from a sample of forty modules: a limit that happens to hold
+    // where you are looking is not a limit.
+    locationsAreSafe() = (locs >= kXPlaneMaxLocation + 3);
     if (locs < 4) locs = 4;               // absurdly small device; stay in range
 
     // ---- HEADROOM BELOW THE CEILING, and why.
@@ -309,6 +372,13 @@ inline void chooseLocations(uint32_t vertexComponents, uint32_t fragmentComponen
     prevClipLocation() = top;
     currClipLocation() = top - 1;
 }
+
+// Vertex modules with more than one OpReturn, which is the single case the
+// exit-block splice cannot cover. Counted rather than silently tolerated: if
+// this is ever non-zero the affected shaders fall back to the first-store
+// placement, which is the assumption light_vis proved wrong, and the log has to
+// say so rather than leave it to be rediscovered.
+inline uint64_t &multiReturnModules() { static uint64_t n = 0; return n; }
 
 struct Ins { uint16_t op, len; size_t at; };
 
@@ -448,22 +518,23 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     if (!annotationsEnd) annotationsEnd = globalsEnd;
     if (!globalsEnd) return INJ_MALFORMED;
 
-    size_t   storeEnd = 0;
-    uint32_t storedValue = 0;
-    // The POINTER the shader stored gl_Position through, kept so the jittered
-    // position can be written back to the same place. Whichever of the two
-    // forms this shader uses - a gl_PerVertex member or a standalone variable -
-    // the pointer is what OpStore took, so storing through it again needs no
-    // knowledge of which form it was.
-    uint32_t storePtr = 0;
+    // ---- DOES THIS SHADER WRITE gl_Position AT ALL?
+    //
+    // That is the ONLY question asked here now. The value it stored and the
+    // pointer it stored through used to be captured as well, and both are gone:
+    // the injected code re-loads the position through its own access chain at
+    // the exit block, so the shader's own store is evidence that a position
+    // exists and nothing more. See the OpLoad block below.
+    //
+    // storeEnd doubles as the fallback splice point for the multiple-return
+    // case, which is why the position of the store is still recorded.
+    size_t storeEnd = 0;
 
     if (idDirectPosVar) {
         for (size_t k = 0; k < ins.size(); ++k) {
             if (ins[k].op != OpStore || ins[k].len < 3) continue;
             if (w[ins[k].at + 1] != idDirectPosVar) continue;
-            storedValue = w[ins[k].at + 2];
-            storePtr    = w[ins[k].at + 1];
-            storeEnd    = ins[k].at + ins[k].len;
+            storeEnd = ins[k].at + ins[k].len;
             break;
         }
     }
@@ -476,31 +547,44 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         for (size_t j = k + 1; j < ins.size(); ++j) {
             if (ins[j].op != OpStore || ins[j].len < 3) continue;
             if (w[ins[j].at + 1] != chainId) continue;
-            storedValue = w[ins[j].at + 2];
-            storePtr    = chainId;
-            storeEnd    = ins[j].at + ins[j].len;
+            storeEnd = ins[j].at + ins[j].len;
             break;
         }
     }
     if (!storeEnd) return INJ_NO_STORE;
 
-    // ---- WITH THE EYE PATH THE BODY MUST GO AT THE END, NOT AT THE STORE.
+    // ---- SPLICE AT THE EXIT, NOT AT THE STORE. See the OpLoad block for why
+    //      the VALUE has to be re-loaded there; this is where it is loaded.
     //
-    // storeEnd sits immediately after the gl_Position write. In the offending
-    // shader that is instruction 318, while v_position_eye_* is written at
-    // 328-336 - AFTER. Reading the varying at storeEnd therefore reads an
-    // output nothing has written yet, and the first attempt duly produced a
-    // median of 978 px against 4.8 px on the old path. The idea was sound and
-    // the placement was not.
+    // Two independent reasons converge on the same placement:
     //
-    // Moving the splice to the last OpReturn fixes it: gl_Position and the eye
-    // varying are both stored by then, and every id used is still live, since
-    // each is defined before the return that it dominates.
+    //   1. The eye path. storeEnd sits immediately after the gl_Position write,
+    //      but in the offending shader that is instruction 318 while
+    //      v_position_eye_* is written at 328-336 - AFTER. Reading the varying
+    //      at storeEnd reads an output nothing has written yet, and the first
+    //      attempt duly produced a median of 978 px against 4.8 px on the old
+    //      path. The idea was sound and the placement was not.
+    //
+    //   2. light_vis. gl_Position is written from 6-7 mutually exclusive
+    //      branches with no unconditional write, so there is no single store
+    //      whose operand is the final position. Only the exit sees it.
+    //
+    // Every id we use is still live at the return: each is defined before the
+    // return it dominates, and the pointer we load through is module scope.
+    //
+    // MULTIPLE RETURNS ARE THE ONE CASE THIS CANNOT COVER. Patching the last
+    // OpReturn in program order is only correct if control actually reaches it;
+    // a shader with an early return would take a path with no varyings written,
+    // which is undefined data feeding the motion vectors - worse than the old
+    // behaviour rather than better. glslang emits a single return for main, so
+    // this is expected to be empty, but "expected" is what the first-store
+    // assumption was too. Fall back to the old placement and count it.
     size_t injectAt = storeEnd;
-    if (getenv("TAA_MV_EYE")) {
-        for (size_t k = 0; k < ins.size(); ++k)
-            if (ins[k].op == OpReturn) injectAt = ins[k].at;
-    }
+    size_t nReturns = 0, lastReturn = 0;
+    for (size_t k = 0; k < ins.size(); ++k)
+        if (ins[k].op == OpReturn) { ++nReturns; lastReturn = ins[k].at; }
+    if (nReturns == 1) injectAt = lastReturn;
+    else ++multiReturnModules();
 
     uint32_t bound = w[3];
     uint32_t idStructPC    = bound++;
@@ -589,6 +673,11 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     uint32_t idPrevClip  = bound++;
     uint32_t idPosX = bound++, idPosY = bound++, idPosZ = bound++, idPosW = bound++;
     uint32_t idNegY = bound++, idFlipped = bound++;
+    // Our own access chain to gl_Position, and the value LOADED through it at
+    // the injection point. See the OpLoad block below for why the shader's own
+    // stored value and its own pointer cannot be reused.
+    uint32_t idPosChain  = bound++;
+    uint32_t idLoadedPos = bound++;
 
     // Jitter: the pointer type, the access chain, the loaded vec4, its two
     // useful components, the two w-scaled offsets, the two summed coordinates,
@@ -648,10 +737,46 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // Flipping here rather than in the fragment shader keeps the difference
     // symmetric: both varyings leave in the same space, and the fragment stays
     // a plain subtraction with nothing asymmetric to get backwards later.
-    body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idPosX); body.push_back(storedValue); body.push_back(0);
-    body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idPosY); body.push_back(storedValue); body.push_back(1);
-    body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idPosZ); body.push_back(storedValue); body.push_back(2);
-    body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idPosW); body.push_back(storedValue); body.push_back(3);
+    // ---- LOAD gl_Position. DO NOT REUSE THE SHADER'S STORED VALUE.
+    //
+    // This used `storedValue` - the operand of the first OpStore to gl_Position
+    // - and that assumption holds for 488 of X-Plane's 494 vertex shaders and
+    // semantically for 492. It breaks in one family, and the corpus names it:
+    //
+    //   light_vis_0.txt   6 stores to gl_Position, NONE unconditional
+    //   light_vis_2.txt   7 stores to gl_Position, NONE unconditional
+    //
+    // Their whole body sits inside OpSelectionMerge / OpSwitch %uint_0, and
+    // gl_Position is written from one branch per light shape. Taking the first
+    // store picks an arbitrary shape; at runtime that branch is taken for one
+    // value of the light-type uniform, so for every other value we would carry a
+    // value that was never written - or an OpUndef.
+    //
+    // (The two-store cases in `particle` and `deferred_gbuf_3` are benign: the
+    // second store is a conditional cull writing vec4(0), so the first store is
+    // the real transform. Loading at the end is correct for those too - it just
+    // carries the cull value for a vertex that rasterises nothing.)
+    //
+    // gl_Position is an Output variable, so it is loadable, and its value at the
+    // return is by definition the final one however many branches wrote it.
+    // Correct for all 494, and it deletes the store-scanning special cases
+    // rather than adding another one.
+    //
+    // The chain is OURS rather than the shader's `storePtr`. In light_vis the
+    // shader's OpAccessChain results are defined inside those same branches and
+    // do not dominate the exit block, so reusing one would not even be valid
+    // SPIR-V. gl_PerVertex is module scope and always available.
+    uint32_t idPosPtr = idDirectPosVar;
+    if (!idPosPtr) {
+        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrOutV4); body.push_back(idPosChain); body.push_back(idPerVertexVar); body.push_back(idConst0);
+        idPosPtr = idPosChain;
+    }
+    body.push_back(head(OpLoad, 4)); body.push_back(idV4); body.push_back(idLoadedPos); body.push_back(idPosPtr);
+
+    body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idPosX); body.push_back(idLoadedPos); body.push_back(0);
+    body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idPosY); body.push_back(idLoadedPos); body.push_back(1);
+    body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idPosZ); body.push_back(idLoadedPos); body.push_back(2);
+    body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idPosW); body.push_back(idLoadedPos); body.push_back(3);
     body.push_back(head(OpFNegate, 4)); body.push_back(idFloat); body.push_back(idNegY); body.push_back(idPosY);
     body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idFlipped); body.push_back(idPosX); body.push_back(idNegY); body.push_back(idPosZ); body.push_back(idPosW);
 
@@ -804,7 +929,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     }
 
     body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4);  body.push_back(idPrevClip); body.push_back(idLoadedMat);
-    body.push_back(clipToClip ? (flipForMatrix ? idFlipped : storedValue) : idViewVec);
+    body.push_back(clipToClip ? (flipForMatrix ? idFlipped : idLoadedPos) : idViewVec);
 
     // ---- NEAR FIELD: THE COCKPIT'S CORRECT MOTION VECTOR IS ZERO.
     //
@@ -923,7 +1048,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // velocity it produced. No inference left.
     const uint32_t idMatM5 = idMatRow1a;
 
-    uint32_t idCurrOut = flipForMatrix ? idFlipped : storedValue;
+    uint32_t idCurrOut = flipForMatrix ? idFlipped : idLoadedPos;
     if (idMatM5) {
         const uint32_t idCurrTag = bound++;
         body.push_back(head(OpCompositeInsert, 6)); body.push_back(idV4);
@@ -985,7 +1110,8 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     body.push_back(head(OpFAdd, 5)); body.push_back(idFloat); body.push_back(idJitPosX); body.push_back(idPosX); body.push_back(idOffX);
     body.push_back(head(OpFAdd, 5)); body.push_back(idFloat); body.push_back(idJitPosY); body.push_back(idPosY); body.push_back(idOffY);
     body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idJittered); body.push_back(idJitPosX); body.push_back(idJitPosY); body.push_back(idPosZ); body.push_back(idPosW);
-    body.push_back(head(OpStore, 3)); body.push_back(storePtr); body.push_back(idJittered);
+    // Through OUR pointer, for the same dominance reason as the load above.
+    body.push_back(head(OpStore, 3)); body.push_back(idPosPtr); body.push_back(idJittered);
 
     out.clear();
     out.reserve(w.size() + annos.size() + globals.size() + body.size() + 4);

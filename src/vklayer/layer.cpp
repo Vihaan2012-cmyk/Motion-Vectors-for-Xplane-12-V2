@@ -950,6 +950,7 @@ static VkImageLayout g_sceneDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "mv_target.h"
 #include "spirv_inject.h"
+#include "taa.h"
 
 
 // FSR2 is optional at BUILD time as well as run time. Its static library takes
@@ -1027,6 +1028,17 @@ struct ColorTarget {
     VkFormat       format = VK_FORMAT_UNDEFINED;
     uint32_t       w = 0, h = 0;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    // ---- ARRAY LAYERS WERE NEVER RECORDED, AND THAT IS THE TAA BUG.
+    //
+    // The shader corpus says gbuffer_lit exists in three shapes: plain 2D (288
+    // permutations), 2D ARRAY (288), and 2D array MULTISAMPLED (576). The array
+    // layer is the stereo eye. Our resolve builds a plain VK_IMAGE_VIEW_TYPE_2D
+    // single-sample view and copies with layerCount 1 no matter which shape the
+    // target really is - so in exactly the configurations that use an arrayed or
+    // multisampled target, the view does not describe the image. That is the
+    // black-in-some-camera-views symptom, and no amount of refining WHICH pass
+    // we pick could ever have fixed it, because it is not a pass-choice fault.
+    uint32_t       arrayLayers = 1;
     VkImageUsageFlags usage = 0;
     VkImageLayout  layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
@@ -1045,6 +1057,12 @@ struct DepthCandidate {
     VkFormat          format;
     uint32_t          w, h;
     VkSampleCountFlagBits samples;
+    // Depth is array-layered for the same reason colour is - one layer per eye.
+    // Tracked here as well as on ColorTarget because a consumer needs an
+    // image's SHAPE, not just its handle: binding a plain 2D view of a
+    // two-layer target silently reaches one eye, which is how the black
+    // camera views went unexplained for so long.
+    uint32_t          arrayLayers;
     VkImageUsageFlags usage;
     bool              sampled;    // usage has SAMPLED_BIT
 };
@@ -1084,6 +1102,28 @@ static Snapshot g_velSnap;
 static const bool g_usePluginReproj = (getenv("TAA_MV_PLUGIN_REPROJ") != nullptr);
 static bool     g_velArmed  = false;
 static bool     g_velInjectedThisFrame = false;
+
+// ---- ONCE A FRAME, ON THE LAST SCENE PASS.
+//
+// Two fixes that were each made once and lost when the resolve block was moved
+// out of the render pass. Kept together so they travel together.
+//
+// ONCE A FRAME: X-Plane records 27 passes and several end with the scene flag
+// set. Resolving at each applied mix(history, current, 0.1) repeatedly inside
+// one frame - 0.1^k - crushing terrain to black and leaving only the very
+// bright HDR sky. Accumulation is a temporal operator; applying it more than
+// once per frame is a different operator, not a mis-tuning.
+//
+// LAST, NOT FIRST: the first flagged pass catches the frame half drawn, so the
+// aircraft, cockpit and overlays are written into history as black. History
+// feeds itself, so that black then bleeds outward a pixel a frame through the
+// bilinear fetch - it climbs the gear strut and eventually takes the screen.
+//
+// Which pass is last is unknowable while recording it, so the previous frame's
+// count is used. A wrong guess costs one frame of history, not a corrupt image.
+static bool     g_taaResolvedThisFrame = false;
+static uint32_t g_sceneEndsThisFrame   = 0;
+static uint32_t g_sceneEndsLastFrame   = 0;
 static int      dumpEvery = 0;   // frames between dumps; 0 = off, set at runtime
 
 // Per-command-buffer record of whether it rendered into OUR depth image, and in
@@ -1172,6 +1212,7 @@ static void noteDepthImage(const VkImageCreateInfo *ci, VkImage img)
     c.w       = ci->extent.width;
     c.h       = ci->extent.height;
     c.samples = ci->samples;
+    c.arrayLayers = ci->arrayLayers;
     c.usage   = ci->usage;
     c.sampled = (ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
 
@@ -1353,6 +1394,7 @@ static uint32_t g_pagerMaxDrop = 1;       // levels a single texture may lose
 // and load-time images keep the conservative behaviour that protects the
 // aircraft. 0 disables it and restores a single policy for everything.
 static uint32_t g_pagerAutogenTo = 0;     // target longest side for streamed textures
+
 static uint64_t g_pagerSaved = 0;         // bytes not allocated
 static uint64_t g_pagerImages = 0;
 
@@ -1426,6 +1468,7 @@ static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
 
     uint32_t big = ci->extent.width > ci->extent.height
                  ? ci->extent.width : ci->extent.height;
+
     if (big <= g_pagerDropAbove) return 0;
 
     // ONE level by default, not two, and the difference is the aircraft.
@@ -1817,6 +1860,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
         addedDst = true;
     }
 
+    // ---- NO USAGE PATCH ANY MORE.
+    //
+    // This used to add STORAGE_BIT to every HDR colour target so the resolve
+    // could write the scene in place. It crashed the sim the first time it ran,
+    // and it was only needed because the shader wrote its output back into the
+    // scene image.
+    //
+    // The resolve now writes only its own history and the layer copies that
+    // into the scene afterwards. X-Plane already creates the target with
+    // TRANSFER_DST and SAMPLED (usage 0x17), so nothing needs patching: we read
+    // it through a sampler and write it through a copy, both of which its own
+    // flags already permit. Removing an interception is worth more than making
+    // one work.
+
     VkResult r = next(device, (drop || addedDst) ? &ci2 : ci, alloc, out);
     if (r != VK_SUCCESS) return r;
 
@@ -1952,6 +2009,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
         c.w       = ci->extent.width;
         c.h       = ci->extent.height;
         c.samples = ci->samples;
+    c.arrayLayers = ci->arrayLayers;
         c.usage   = ci->usage;
         std::lock_guard<std::mutex> g(g_lock);
         if (g_colorImages.size() < 256) g_colorImages[*out] = c;
@@ -2253,6 +2311,30 @@ static uint32_t g_passesThisFrame = 0;
 // which would explain a field that is sometimes correct, sometimes uniformly
 // wrong, and sometimes a mixture, while the matrix stays constant.
 static uint32_t g_mvBindsThisFrame = 0;
+// Set when the pass currently being recorded on this command buffer has the
+// velocity target attached; cleared when that pass ends.
+static std::map<VkCommandBuffer, bool> g_cbMvBoundPass;
+
+// ---- THE LIT PASS, NOT THE G-BUFFER PASS.
+//
+// X-Plane is DEFERRED: the pass carrying the velocity target has colour=5 -
+// five attachments of material data. That is the right place to PRODUCE motion
+// vectors and the wrong place to consume them, because its colour attachment is
+// albedo/normal, not a lit image. Resolving there blends G-buffer data across
+// frames and feeds it into lighting, which is the corruption along the top of
+// the frame.
+//
+// Lighting runs afterwards into a single full-size attachment: after shading,
+// before tonemap, before the cockpit overlays (which reload depth). That is the
+// HDR image TAA is for, and its colour attachment has to be looked up from the
+// pass itself - g_sceneColor tracks something else.
+struct CbPassInfo {
+    uint32_t colorCount = 0;
+    uint32_t w = 0, h = 0;
+    VkImage  color0 = VK_NULL_HANDLE;
+    bool     depthLoad = false;
+};
+static std::map<VkCommandBuffer, CbPassInfo> g_cbPassInfo;
 // Which qualifying pass is currently open, counted from 0 in submission order,
 // and how many patched GEOMETRY pipelines get bound inside each. The world pass
 // is the one that draws the world; that is a thing to measure, not to guess at
@@ -2975,6 +3057,19 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
     }
 
     if (isScene) {
+        // ---- THIS is the pass to resolve after.
+        //
+        // Resolving on the FIRST scene pass caught the frame half drawn and
+        // wrote black where the aircraft had not been rendered yet. Moving it
+        // to the LAST scene pass overshot the other way: the flag marks any
+        // full-viewport pass with depth, which includes the cockpit pass AFTER
+        // tonemapping, so the result was written into an HDR target X-Plane had
+        // already consumed - invisible, and paying a 63 MB copy per frame for
+        // nothing.
+        //
+        // The pass that binds the velocity target is the one where the 3D scene
+        // and its vectors are both complete and neither post-processing nor the
+        // cockpit has run. That is the only correct boundary.
         uint32_t n = ++g_mvBindsThisFrame;
         if (n > g_mvBindsMax) {
             g_mvBindsMax = n;
@@ -3687,9 +3782,30 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
 
     // Append the velocity attachment slot. The vectors have to outlive the
     // call, so they are declared here rather than inside the helper.
+    // Record what this pass looks like so vkCmdEndRendering can tell the
+    // G-buffer pass from the lit pass without re-deriving it.
+    if (info) {
+        std::lock_guard<std::mutex> g(g_lock);
+        CbPassInfo pi;
+        pi.colorCount = info->colorAttachmentCount;
+        pi.w = info->renderArea.extent.width;
+        pi.h = info->renderArea.extent.height;
+        if (info->colorAttachmentCount >= 1 && info->pColorAttachments) {
+            std::map<VkImageView, VkImage>::iterator vi =
+                g_viewToImage.find(info->pColorAttachments[0].imageView);
+            if (vi != g_viewToImage.end()) pi.color0 = vi->second;
+        }
+        if (info->pDepthAttachment)
+            pi.depthLoad = (info->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD);
+        g_cbPassInfo[cb] = pi;
+    }
+
     std::vector<VkRenderingAttachmentInfo> mvAtts;
     VkRenderingInfo info2;
     if (mvAppendAttachment(info, mvAtts, info2)) {
+        // The velocity target is attached to THIS pass on THIS command buffer.
+        // Recorded here rather than inside the helper, which has no cb.
+        { std::lock_guard<std::mutex> g(g_lock); g_cbMvBoundPass[cb] = true; }
         static uint64_t nlog = 0;
         if (++nlog <= 3 || (nlog % 100000) == 0)
             trace("MV: pass with %u colour attachments -> %u (velocity %s)",
@@ -3916,9 +4032,17 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
 {
     VkImage       swapTarget = VK_NULL_HANDLE;
     VkImageLayout swapLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    bool          wasScenePass = false;
+    bool          mvBoundPass  = false;
+    CbPassInfo    passInfo;
     {
         std::lock_guard<std::mutex> g(g_lock);
+        wasScenePass = g_cbInScenePass[cb];
         g_cbInScenePass[cb] = false;
+        std::map<VkCommandBuffer, bool>::iterator mb = g_cbMvBoundPass.find(cb);
+        if (mb != g_cbMvBoundPass.end()) { mvBoundPass = mb->second; mb->second = false; }
+        std::map<VkCommandBuffer, CbPassInfo>::iterator pit = g_cbPassInfo.find(cb);
+        if (pit != g_cbPassInfo.end()) { passInfo = pit->second; g_cbPassInfo.erase(pit); }
         std::map<VkCommandBuffer, CbSwapTarget>::iterator st = g_cbSwapTarget.find(cb);
         if (st != g_cbSwapTarget.end()) {
             swapTarget = st->second.image;
@@ -3927,6 +4051,183 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
         }
     }
     if (g_nextCmdEndRendering) g_nextCmdEndRendering(cb);
+
+    // ---- TAA RESOLVE, AFTER THE PASS HAS ACTUALLY ENDED.
+    //
+    // This was recorded BEFORE vkCmdEndRendering, which put a vkCmdDispatch and
+    // several layout transitions inside an active render pass. Both are illegal
+    // - compute cannot be dispatched inside a render pass and images cannot
+    // change layout while attached - so the result was undefined and varied
+    // from frame to frame, which is what "the blackness changes per frame"
+    // describes.
+    //
+    // This is the only point where the colour target holds a finished frame and
+    // the velocity target beside it describes that same frame. Running it at
+    // present time instead would resolve a composited image whose HUD and panel
+    // have no vectors, which is what makes UI ghost.
+    if (wasScenePass) ++g_sceneEndsThisFrame;
+    // Why the resolve is or is not running. Two crashes have now been blamed on
+    // TAA while the log showed it never initialised, which is not a diagnosis.
+    if (taaEnabled()) {
+        static uint64_t gateLog = 0;
+        if ((gateLog++ % 600) == 0)
+            trace("TAA GATE: scenePass=%d mvBinds=%d resolved=%d ends=%u/%u "
+                  "ready=%d mvReady=%d mvView=%p sceneImg=%p %ux%u",
+                  wasScenePass ? 1 : 0, (int)g_mvBindsThisFrame,
+                  g_taaResolvedThisFrame ? 1 : 0,
+                  g_sceneEndsThisFrame, g_sceneEndsLastFrame,
+                  g_taa.ready ? 1 : 0, g_mv.ready ? 1 : 0,
+                  (void*)g_mv.view, (void*)g_sceneColor.image,
+                  g_sceneColor.w, g_sceneColor.h);
+    }
+    const bool lastScenePass =
+        g_sceneEndsLastFrame == 0 || g_sceneEndsThisFrame >= g_sceneEndsLastFrame;
+    // Resolve on the LIT pass: one full-size colour attachment, no depth
+    // reload, and only after the velocity target has been bound this frame.
+    // That excludes the G-buffer pass (colour=5, material data) and the cockpit
+    // overlays (depthLoad=1, they run after tonemap).
+    const bool litPass = passInfo.colorCount == 1 && !passInfo.depthLoad &&
+                         passInfo.color0 != VK_NULL_HANDLE &&
+                         passInfo.w == g_mv.w && passInfo.h == g_mv.h;
+    // ---- STAND ASIDE ON DUMP FRAMES.
+    //
+    // The resolve samples the velocity target, so it transitions g_mv.image to
+    // SHADER_READ_ONLY and back. mvRecordReadback records its own barrier and
+    // copy on the same image in the same command buffer with no coordination
+    // between them - which is why the accuracy panel began reading BROKEN the
+    // moment TAA was switched on while the picture itself stayed correct. The
+    // vectors were never affected; the measurement of them was.
+    //
+    // The dump runs one frame in twenty (TAA_VELOCITY_DUMP), so yielding those
+    // frames costs nothing visible and leaves one owner of the image per frame.
+    // ---- BAIL OUT OF THE RESOLVE, NOT OUT OF THE FUNCTION.
+    //
+    // These guards used plain `return`, which returns from vkCmdEndRendering
+    // itself and skips everything after it, including the swapchain capture.
+    // Once the HDR-format check was added it fired on most passes, so the
+    // function bailed nearly every frame and the screen went fully black. A
+    // guard that rejects a pass must skip the RESOLVE only.
+    do if (litPass && taaEnabled() && !g_taaResolvedThisFrame && !g_mv.wantDump &&
+        // Gate on a flag something actually SETS. This read
+        // g_velInjectedThisFrame, which is declared and reset at present but
+        // never assigned true anywhere in the layer - a leftover from V1 that
+        // nothing in V2 maintains. The resolve could therefore never run, and
+        // two crashes were blamed on TAA while the log showed it had never
+        // initialised. g_mvBindsThisFrame counts velocity-target binds and is
+        // incremented where the bind happens, so non-zero means this frame
+        // really does have vectors to reproject with.
+        g_mvBindsThisFrame > 0) {
+        std::map<VkCommandBuffer, VkDevice>::iterator tci = g_cbToDevice.find(cb);
+        if (tci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator tdi = g_devices.find(dispatchKey(tci->second));
+            if (tdi != g_devices.end() && g_mv.ready && g_mv.view != VK_NULL_HANDLE) {
+                DeviceData &tdd = tdi->second;
+                // Re-init only on a real change of shape. The scene IMAGE
+                // alternates every frame between two targets, and keying on it
+                // rebuilt everything each frame and destroyed objects still in
+                // use - only the view needs to follow.
+                // This pass's OWN attachment, resolved through the view it
+                // was bound with. g_sceneColor points at a different image.
+                VkFormat litFmt = VK_FORMAT_UNDEFINED;
+                uint32_t litLayers = 1;
+                VkSampleCountFlagBits litSamples = VK_SAMPLE_COUNT_1_BIT;
+                {
+                    std::lock_guard<std::mutex> g(g_lock);
+                    std::map<VkImage, ColorTarget>::iterator lci =
+                        g_colorImages.find(passInfo.color0);
+                    if (lci != g_colorImages.end()) {
+                        litFmt     = lci->second.format;
+                        litLayers  = lci->second.arrayLayers;
+                        litSamples = lci->second.samples;
+                    }
+                }
+                // ---- THE TARGET'S SHAPE, NOT JUST ITS HANDLE.
+                //
+                // The shader corpus settles what gbuffer_lit actually is. It
+                // appears in THREE shapes, and this resolve handles one:
+                //
+                //   2D 0 0 0 1   plain 2D, 1 sample        288 permutations
+                //   2D 0 1 0 1   ARRAYED, 1 sample         288
+                //   2D 0 1 1 1   ARRAYED + MULTISAMPLED    576
+                //
+                // fix_hdr confirms it independently: fix_hdr_0 binds the HDR
+                // image as Image(%float 2D 0 1 0 2 Rgba16f) - an arrayed storage
+                // image - and fix_hdr_1 has MS=1.
+                //
+                // taaInit and taaBindScene build VK_IMAGE_VIEW_TYPE_2D views
+                // with samples=1. A 2D view of a two-layer stereo target reaches
+                // layer 0 and leaves the other eye untouched; a 2D view of a
+                // multisampled image is not valid at all. That is why the result
+                // depended on the camera view - "full black in some camera views
+                // and some in this" is this mismatch, not the algorithm.
+                //
+                // Declining is the fix, not approximating. A pass we cannot
+                // handle must be left alone rather than half-written: every
+                // black frame in this project came from a component proceeding
+                // on a target it did not understand. Say so once per shape so a
+                // refusal is visible instead of silent.
+                if (litLayers != 1 || litSamples != VK_SAMPLE_COUNT_1_BIT) {
+                    static uint32_t lastLayers = 0;
+                    static VkSampleCountFlagBits lastSamples = VK_SAMPLE_COUNT_1_BIT;
+                    if (litLayers != lastLayers || litSamples != lastSamples) {
+                        lastLayers = litLayers; lastSamples = litSamples;
+                        trace("TAA: DECLINED %p - %u array layer(s), %u sample(s). "
+                              "The resolve builds single-layer single-sample 2D "
+                              "views; stereo and MSAA targets need 2D_ARRAY views "
+                              "and a per-layer dispatch. Skipping is correct - "
+                              "writing through the wrong view is what made this "
+                              "black in some camera views.",
+                              (void*)passInfo.color0, litLayers,
+                              (unsigned)litSamples);
+                    }
+                    break;
+                }
+                // ---- THE TARGET MUST BE THE HDR SCENE IMAGE, NOT MERELY A
+                //      FULL-SIZE SINGLE-ATTACHMENT PASS.
+                //
+                // "first full-size colour=1 pass after the G-buffer" matched a
+                // different pass depending on the camera view, and in the views
+                // where it matched something else - a reflection or an LDR
+                // composite - the TAA result was written over that buffer and
+                // whatever consumed it produced black. Hence black in some
+                // views and not others.
+                //
+                // Requiring the HDR float format excludes the LDR targets, and
+                // logging the choice makes a wrong pick visible instead of
+                // silent.
+                if (litFmt != VK_FORMAT_R16G16B16A16_SFLOAT &&
+                    litFmt != VK_FORMAT_R32G32B32A32_SFLOAT) break;
+                {
+                    static VkImage lastPick = VK_NULL_HANDLE;
+                    if (passInfo.color0 != lastPick) {
+                        lastPick = passInfo.color0;
+                        trace("TAA TARGET: resolving into %p fmt=%d %ux%u "
+                              "(colour=%u depthLoad=%d) - changes here mean the "
+                              "pass choice moved with the camera view",
+                              (void*)passInfo.color0, (int)litFmt,
+                              passInfo.w, passInfo.h, passInfo.colorCount,
+                              passInfo.depthLoad ? 1 : 0);
+                    }
+                }
+                if (litFmt == VK_FORMAT_UNDEFINED) break;
+                const bool needInit = !g_taa.ready ||
+                                      g_taa.w != passInfo.w ||
+                                      g_taa.h != passInfo.h ||
+                                      g_taa.format != litFmt;
+                if (needInit)
+                    taaInit(tdd, tci->second, passInfo.color0, litFmt,
+                            passInfo.w, passInfo.h, g_mv.view);
+                else if (!taaBindScene(tdd, passInfo.color0))
+                    break;
+                // A target swap is a history discontinuity: the accumulated
+                // image belongs to the old one and reprojecting into it would
+                // drag a whole frame of the wrong picture forward.
+                taaRecordResolve(tdd, cb, g_velSnap.jitterX, g_velSnap.jitterY, needInit);
+                g_taaResolvedThisFrame = true;
+            }
+        }
+    } while (0);
+
 
     // Capture whatever is on screen, whether or not any of our delivery ran.
     if (swapTarget != VK_NULL_HANDLE) {
@@ -4145,6 +4446,21 @@ static void armLayerOnce()
             // SPIR-V injection is NOT armed here - see TAA_CreateShaderModule.
             // Shader modules are created during load, before any present,
             // so anything armed in this function arrives too late for them.
+
+            // ---- HEADROOM WAS LOST IN THE PORT FROM V1.
+            //
+            // V1 ran with TAA_PAGER_HEADROOM_MB=200 but the port never parsed
+            // it, leaving the 1024 MB default. That is a five-fold difference
+            // in when the pager engages: at 1024 it trips almost at once, at
+            // 200 only under real pressure. The rest of V1's settings were
+            // carried over as code but never set in V2's run script, so the
+            // whole mip-drop path has been dormant here since the port.
+            if (const char *hm = getenv("TAA_PAGER_HEADROOM_MB")) {
+                g_pagerHeadroomMB = (uint64_t)atoll(hm);
+                trace("PAGER: headroom reserve set to %llu MB - paging engages "
+                      "below this and releases above 1.5x it",
+                      (unsigned long long)g_pagerHeadroomMB);
+            }
 
             if (const char *md = getenv("TAA_PAGER_MAX_DROP")) {
                 int v = atoi(md);
@@ -5504,6 +5820,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     }
 
     g_velInjectedThisFrame = false;
+    g_taaResolvedThisFrame = false;
+    g_sceneEndsLastFrame   = g_sceneEndsThisFrame;
+    g_sceneEndsThisFrame   = 0;
     g_prevLastDepthPassIdx = g_lastDepthPassIdx;   // predicts where to inject next frame
     g_lastDepthPassIdx     = -1;
     g_passesThisFrame      = 0;
@@ -6863,6 +7182,18 @@ static void mvLogInjectReasons()
               "and write NO motion vectors. Those draws reproject from depth "
               "only, which is what shimmers on moving geometry.",
               (unsigned long long)g_injReason[spvinj::INJ_LOCATION_TAKEN]);
+    // The injected body is spliced at the module's single OpReturn, which is
+    // what makes it correct for shaders that write gl_Position from several
+    // mutually exclusive branches. A module with more than one return has no
+    // single exit to splice at, so it falls back to the first-store placement -
+    // the assumption light_vis disproved. Zero is the expected value; anything
+    // else names a real gap rather than a theoretical one.
+    if (spvinj::multiReturnModules())
+        trace("SPIRV INJECT: %llu vertex modules have MORE THAN ONE OpReturn and "
+              "fell back to splicing at the first gl_Position store. That is the "
+              "assumption light_vis breaks - if any of these write gl_Position "
+              "from several branches, their vectors are wrong.",
+              (unsigned long long)spvinj::multiReturnModules());
 }
 
 // Re-run until it has a big enough sample, then commit once.
@@ -8064,22 +8395,6 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         block[18] = g_nearFieldM;
     g_diagLastBlock18 = block[18];
 
-    // ---- CALIBRATE THE Y ROW: perturb M[5] and watch what the field does.
-    //
-    // The raw pixel rows say the field's X matches the prediction to every
-    // printed digit while its Y behaves as though M[5] were about -0.70, with
-    // 1.00000 pushed. X and Y share the matrix, the input vector and the divide
-    // by prev.w, so the difference is in the Y row alone.
-    //
-    // Reading more code has not settled it. Multiplying M[5] by a known factor
-    // and measuring the response does: if prev.y scales with it the shader
-    // honours the element and the fault is in what we compute; if prev.y does
-    // not move, the element never reaches the multiply and the fault is in the
-    // patch.
-    if (const char *e5 = getenv("TAA_MV_M5")) {
-        static const float k5 = (float)atof(e5);
-        block[5] *= k5;
-    }
 
     // ---- HOW MANY DIFFERENT MATRICES ONE FRAME PUSHES.
     //
@@ -8793,6 +9108,30 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
               spvinj::mvAttachmentIndex(),
               pp.limits.maxVertexOutputComponents,
               pp.limits.maxColorAttachments);
+        // ---- FAIL LOUDLY, NOT SILENTLY, ON A DEVICE WITH NO ROOM.
+        //
+        // X-Plane's highest varying Location is 16, measured across all 6855
+        // shader modules. Vulkan's guaranteed minimum is also 16. So a
+        // minimum-specification implementation has no free pair above X-Plane
+        // at all, and the fallback arithmetic would return 13/14 - Locations
+        // read by 2352 and 2784 fragment shaders respectively.
+        //
+        // Nothing rejects that. The pipeline builds, the module validates, and
+        // the varyings quietly carry X-Plane's own interpolants into our
+        // velocity computation. Say so at full volume; the module census runs
+        // later and may still rescue it, which is the only reason this is a
+        // warning rather than a hard stop.
+        if (!spvinj::locationsAreSafe())
+            trace("SPIRV INJECT: *** THIS DEVICE REPORTS ONLY %u VARYING "
+                  "LOCATIONS. X-Plane's own ceiling is %u, so there is no free "
+                  "pair above it and Locations %u/%u may already be in use - "
+                  "Location 13 is read by 2352 shaders and Location 14 by 2784. "
+                  "Motion vectors from those draws would be X-Plane's own "
+                  "interpolants. The module census may still find a free pair; "
+                  "if it does not, this build cannot produce correct vectors on "
+                  "this device. ***",
+                  spvinj::deviceLocationCount(), spvinj::kXPlaneMaxLocation,
+                  spvinj::currClipLocation(), spvinj::prevClipLocation());
     } else {
         trace("SPIRV INJECT: could not read device limits - varyings stay at "
               "Location %u/%u, which some shaders may already use",
