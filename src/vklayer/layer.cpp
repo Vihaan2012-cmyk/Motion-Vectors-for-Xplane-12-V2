@@ -1874,6 +1874,8 @@ struct ShapeKey {
     }
 };
 static std::map<ShapeKey, uint32_t> g_shapeDrop;
+// Shapes this pager has PRODUCED - see the double-drop note below.
+static std::set<ShapeKey> g_shapeMade;
 
 static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
 {
@@ -1886,6 +1888,23 @@ static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
     k.fmt    = (uint32_t)ci->format;
     {
         std::lock_guard<std::mutex> g(g_lock);
+        // ---- NEVER SHRINK OUR OWN OUTPUT.
+        //
+        // Caching one answer per shape was not enough, and the way it failed
+        // named the rest of the mechanism: the violation flipped from dstOffset
+        // to srcOffset, so the SOURCE had become the smaller of the pair.
+        //
+        // The defragmenter does not replay the texture's original create info -
+        // it recreates the image as it exists NOW, which is the shape WE already
+        // reduced. That request is a different shape key, so it was evaluated
+        // fresh and reduced a second time, and the new destination came out half
+        // the source instead of matching it.
+        //
+        // A shape we produced is therefore already paged and must be reproduced
+        // verbatim. The cost is that a texture whose natural size coincides with
+        // one of our outputs is never paged; the benefit is that recreating any
+        // image we touched returns exactly what it replaced.
+        if (g_shapeMade.count(k)) return 0;
         std::map<ShapeKey, uint32_t>::iterator it = g_shapeDrop.find(k);
         if (it != g_shapeDrop.end()) return it->second;
     }
@@ -1896,6 +1915,17 @@ static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
         // stale entry costs one texture's worth of quality, never correctness.
         if (g_shapeDrop.size() < 4096) g_shapeDrop[k] = drop;
         else if (drop) return drop;
+        // Record what this drop will actually create, so a later recreation of
+        // that image - by the defragmenter or anyone else - is left alone.
+        if (drop && g_shapeMade.size() < 4096) {
+            ShapeKey out;
+            out.w      = k.w >> drop; if (!out.w) out.w = 1;
+            out.h      = k.h >> drop; if (!out.h) out.h = 1;
+            out.mips   = k.mips - drop;
+            out.layers = k.layers;
+            out.fmt    = k.fmt;
+            g_shapeMade.insert(out);
+        }
     }
     return drop;
 }
