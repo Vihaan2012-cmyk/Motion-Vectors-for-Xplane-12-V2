@@ -151,7 +151,7 @@ static size_t countReturns(const std::vector<uint32_t> &w)
 
 int main(int argc, char **argv)
 {
-    const char *root = argc > 1 ? argv[1] : "D:\\local-study\\shaders\\spv";
+    const char *root = argc > 1 ? argv[1] : "D:\\shaders\\spv";
     const char *val  = argc > 2 ? argv[2]
                                 : "C:\\VulkanSDK\\1.4.357.0\\Bin\\spirv-val.exe";
 
