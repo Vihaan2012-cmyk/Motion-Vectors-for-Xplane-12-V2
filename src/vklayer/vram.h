@@ -2,7 +2,7 @@
 
 // ============================================================ THE VRAM SYSTEM
 //
-// The Engineering Plan (VRAM_STUDY.md maps it against the studied engine),
+// The Engineering Plan (VRAM_STUDY.md, local doc, maps it against the engine),
 // implemented in the layer. X-Plane HAS the mechanisms - VMA, a budget query,
 // a defragmenter, a global-scale texture pager - but it does not DO the plan:
 // no zones, no hysteresis worth the name (measured: scale 1.0 -> 2.0 -> 1.0 in

@@ -15,7 +15,7 @@
 // happen to hit does not.
 //
 //   build: g++ -O2 -std=c++17 -o inject_test.exe tools/inject_test.cpp
-//   run:   inject_test.exe "D:\local-study\shaders\spv" [spirv-val path]
+//   run:   inject_test.exe "D:\shaders\spv" [spirv-val path]
 
 #include <cstdio>
 #include <cstdlib>

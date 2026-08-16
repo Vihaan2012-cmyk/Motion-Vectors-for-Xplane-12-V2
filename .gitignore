@@ -9,3 +9,8 @@ tools/*.exe
 patched_*.spv
 
 captures/*.rdc
+
+# Study material stays local, never published.
+VRAM_STUDY.md
+FIXES.md
+tools/inject_test.exe
