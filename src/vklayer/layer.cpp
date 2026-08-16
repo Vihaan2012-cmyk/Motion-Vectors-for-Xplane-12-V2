@@ -10242,6 +10242,16 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         for (size_t i = 0; i < exts.size(); ++i)
             if (!strcmp(exts[i], "VK_EXT_pageable_device_local_memory"))
                 havePageable = true;
+        // ---- OFF BY DEFAULT: prime suspect in three identical DEVICE_LOST
+        // crashes at flight start (0:01:26-0:02:15), the third with every
+        // VRAM actuator live-disabled - which leaves device creation as the
+        // delta, and this feature is the one bit never flown before. It
+        // changes the driver's residency machinery globally. TAA_VRAM_PAGEABLE=1
+        // re-arms it for an A/B once the system is otherwise proven.
+        {
+            const char *pg = getenv("TAA_VRAM_PAGEABLE");
+            if (!pg || atoi(pg) == 0) havePageable = false;
+        }
         if (havePageable) {
             memset(&pageFeat, 0, sizeof(pageFeat));
             pageFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT;
