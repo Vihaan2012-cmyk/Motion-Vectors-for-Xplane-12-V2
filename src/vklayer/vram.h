@@ -444,6 +444,8 @@ struct HeldSubmit {
 static std::vector<HeldSubmit> g_heldSubmits;                 // FIFO
 static std::set<VkFence>     g_heldFences;                    // fast trigger check
 static std::map<VkSemaphore, uint64_t> g_heldSignals;         // sem -> max value (0=binary)
+static std::set<VkSemaphore> g_everWaited;    // any wait list, ever - see the
+                                              // wait-before-signal rule below
 static std::map<VkCommandBuffer, uint64_t> g_cbBytes;         // recorded copy bytes
 static std::map<VkCommandBuffer, uint8_t>  g_cbProt;          // max protection seen
 static uint64_t governorBypassed = 0;                          // protected uploads
@@ -1553,6 +1555,8 @@ static void touchSemaphores(uint32_t count, const VkSemaphore *sems,
     bool hit = false;
     {
         std::lock_guard<std::mutex> g(m);
+        for (uint32_t i = 0; i < count; ++i)
+            if (g_everWaited.size() < 4096) g_everWaited.insert(sems[i]);
         if (g_heldSignals.empty()) return;
         hit = anyHeldSignalLocked(count, sems, values);
     }
@@ -1573,6 +1577,13 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
         bool dep = false;
         {
             std::lock_guard<std::mutex> g(m);
+            // Record every wait semaphore ever seen - the structural input to
+            // the never-hold-a-waited-signal rule (bounded: the engine reuses
+            // a fixed set of semaphores).
+            for (uint32_t s = 0; s < count; ++s)
+                for (uint32_t w = 0; w < submits[s].waitSemaphoreCount; ++w)
+                    if (g_everWaited.size() < 4096)
+                        g_everWaited.insert(submits[s].pWaitSemaphores[w]);
             if (!g_heldSignals.empty())
                 for (uint32_t s = 0; s < count && !dep; ++s) {
                     const VkTimelineSemaphoreSubmitInfo *tl = nullptr;
@@ -1638,6 +1649,25 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
         bool overCap = heldBytesNow + bytes >
                        (uint64_t)cfg.holdMaxMB * 1048576ull;
         bool over = (g_frameUploadSpent + bytes) > budget;
+        // ---- THE WAIT-BEFORE-SIGNAL HOLE, measured as a GPU crash on the
+        // first flight (VK_ERROR_DEVICE_LOST at 0:02:15, TDR profile).
+        // Timeline semaphores allow the WAITER to be submitted before the
+        // SIGNALER: graphics waits value N, then the transfer signaling N
+        // arrives - and holding it stalls the GPU on a wait nothing will
+        // satisfy, presents stop, the present-driven release never runs, and
+        // Windows resets the device. The dependency scan cannot see waits
+        // already on the GPU, so the rule is structural: a submission that
+        // signals any semaphore ever seen in ANY wait list is NEVER held.
+        // In practice X-Plane reuses its transfer timelines every frame, so
+        // holds now apply only to fence-only submissions - the governor is
+        // observe-and-bypass for everything else, which is the correct
+        // failure direction. vram.governor=2 was the hold mode; it now also
+        // obeys this rule.
+        if (holdable)
+            for (uint32_t s = 0; s < count && holdable; ++s)
+                for (uint32_t k = 0; k < submits[s].signalSemaphoreCount; ++k)
+                    if (g_everWaited.count(submits[s].pSignalSemaphores[k]))
+                        { holdable = false; break; }
         // Upload class CRITICAL/HIGH (protection >= 2): cockpit, aircraft
         // and render-infrastructure uploads are never paced - only order
         // (mustQueueBehind) can delay them, and only until the flush below.
@@ -1897,6 +1927,12 @@ static void frameTimeTick()
             frameAvgMs += (ms - frameAvgMs) * 0.05;
             if (frameAvgMs < frameBestMs) frameBestMs = frameAvgMs;
             frameBestMs *= 1.0001;         // decays upward: "recent" best
+            // Measured on the first flight: loading screens present at ~1 ms
+            // and seeded an absurd baseline, so every load hitch read as a
+            // 50x regression and notched the budget. No real in-world frame
+            // is under 4 ms on any target hardware; the floor removes the
+            // poisoning without touching genuine regressions.
+            if (frameBestMs < 4.0) frameBestMs = 4.0;
             if (cfg.adaptive) {
                 bool uploadsFlowing = upBytesLast > (4ull << 20);
                 if (frameAvgMs > frameBestMs * 1.30 && uploadsFlowing) {
@@ -1963,6 +1999,13 @@ static void zoneUpdate()
         usageTrendBytes += (delta - usageTrendBytes) * 0.05;
     double trendTerm = usageTrendBytes > 0
                      ? usageTrendBytes * (double)cfg.lookaheadFrames : 0.0;
+    // Measured on the first flight: the load ramp's delta EMA times the
+    // lookahead projected 6 GB of demand at 0.37 GB of usage and pushed the
+    // zone to YELLOW on the menu. The trend is a PRESSURE refinement, not a
+    // pressure source: capped at a quarter of the basis, and ignored
+    // entirely until real usage crosses half the budget.
+    if (trendTerm > basis * 0.25) trendTerm = basis * 0.25;
+    if ((double)rawUsage < basis * 0.5) trendTerm = 0.0;
     double projected = (double)rawUsage + (double)upBytesLast * 2.0 +
                        (double)heldBytesNow + trendTerm - (double)g_poolBytes;
     if (projected < 0) projected = 0;
