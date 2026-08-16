@@ -1751,7 +1751,7 @@ static PagerBucket g_pagerLoad, g_pagerFlight;
 // and lose the least perceptually, while small UI and instrument textures are
 // left completely alone - those are the ones a global scale slider ruins first,
 // and they are cheap to keep.
-static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
+static uint32_t pagerDropLevelsRaw(const VkImageCreateInfo *ci)
 {
     if (!g_pagerDropAbove) return 0;
     if (!pagerShouldEngage()) return 0;
@@ -1826,6 +1826,76 @@ static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
            (ci->mipLevels - drop) > 1) {
         big >>= 1;
         ++drop;
+    }
+    return drop;
+}
+
+// ---- ONE ANSWER PER SHAPE, FOR THE LIFE OF THE PROCESS.
+//
+// X-Plane's VMA DEFRAGMENTER relocates an image by creating a new one from the
+// same create info and copying the old into it, with copy regions sized for the
+// ORIGINAL. That is only sound if both images came out the same size - and ours
+// did not, because the answer above moves with the pressure zone: an image
+// created in GREEN keeps every level, its defragment replacement created in
+// CRITICAL loses two, and the copy then describes a source twice the size of
+// the destination.
+//
+// Validation caught it exactly, in a command buffer named [Defragment]:
+//   VUID-vkCmdCopyImage-dstOffset-00150
+//     "extent.width (256) exceeds miplevel 0 which has a width of 128"
+//     src Resources/bitmaps/runways/taxi_LIT.dds  256x128, 9 mips
+//     dst                                         128x64,  8 mips
+//   VUID-vkCmdCopyImage-dstSubresource-07967
+//     "dstSubresource.mipLevel is 8, but has only 8 mip levels"
+// Every region overruns and the last names a level that does not exist, which
+// is a GPU fault, and the defragmenter runs during load - the crash window.
+// A baseline run under validation shows none of these, so this is ours.
+//
+// Fixing the copy hooks cannot solve it: by the time the defragmenter records,
+// the two images already have different shapes and the data genuinely does not
+// fit. The decision itself has to be stable, so it is cached per SHAPE - the
+// same key the engine's own create info produces - and reused unchanged
+// afterwards. The cost is that a texture class settles on the first answer it
+// is given; the benefit is that source and destination agree by construction,
+// for the defragmenter and for anything else that assumes a recreated image
+// matches the one it replaced.
+//
+// The zero answers are cached too, and must be: a shape that kept all its
+// levels in GREEN must keep them later, or the mismatch simply runs the other
+// way.
+struct ShapeKey {
+    uint32_t w, h, mips, layers, fmt;
+    bool operator<(const ShapeKey &o) const {
+        if (w != o.w) return w < o.w;
+        if (h != o.h) return h < o.h;
+        if (mips != o.mips) return mips < o.mips;
+        if (layers != o.layers) return layers < o.layers;
+        return fmt < o.fmt;
+    }
+};
+static std::map<ShapeKey, uint32_t> g_shapeDrop;
+
+static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
+{
+    if (!ci) return 0;
+    ShapeKey k;
+    k.w      = ci->extent.width;
+    k.h      = ci->extent.height;
+    k.mips   = ci->mipLevels;
+    k.layers = ci->arrayLayers;
+    k.fmt    = (uint32_t)ci->format;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<ShapeKey, uint32_t>::iterator it = g_shapeDrop.find(k);
+        if (it != g_shapeDrop.end()) return it->second;
+    }
+    const uint32_t drop = pagerDropLevelsRaw(ci);
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        // Bounded: the engine's distinct texture shapes are a small set, and a
+        // stale entry costs one texture's worth of quality, never correctness.
+        if (g_shapeDrop.size() < 4096) g_shapeDrop[k] = drop;
+        else if (drop) return drop;
     }
     return drop;
 }
