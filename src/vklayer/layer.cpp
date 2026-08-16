@@ -7042,24 +7042,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     vram::onPresent((snap.camDelta >= 0.0f && snap.camDelta < 100000.0f)
                         ? snap.camDelta : -1.0f, rotDeg);
 
-    // Retired TAA states (teardown = park, not destroy) whose 8-present
-    // safety window has passed are destroyed here, GPU provably done.
-    {
-        VkDevice gd = g_taa.device;
-        if (gd == VK_NULL_HANDLE && !g_taaGraves.empty())
-            gd = g_taaGraves[0].s.device;
-        if (gd == VK_NULL_HANDLE && !g_mvGraves.empty())
-            gd = g_mvGraves[0].t.device;
-        if (gd != VK_NULL_HANDLE) {
-            std::lock_guard<std::mutex> g(g_lock);
-            std::map<void*, DeviceData>::iterator gi =
-                g_devices.find(dispatchKey(gd));
-            if (gi != g_devices.end()) {
-                taaGraveFlush(gi->second, g_frameCount);
-                mvGraveFlush(gi->second, g_frameCount);
-            }
-        }
-    }
+    // Graves are NOT flushed mid-flight. The 8-present window assumed the
+    // engine submits recorded work within 8 frames; during scenery churn it
+    // holds command buffers far longer, and destroying a parked target under
+    // one of them was the deterministic 1:28 DEVICE_LOST. Retired states now
+    // stay allocated until DestroyDevice drains them - a bounded VRAM cost
+    // (recreations are throttled) bought for absolute lifetime correctness.
 
     // Flush deferred image destroys whose safety window has passed, and
     // prune stale lifetime-ledger entries so the map stays bounded.
