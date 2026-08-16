@@ -14,3 +14,12 @@ captures/*.rdc
 VRAM_STUDY.md
 FIXES.md
 tools/inject_test.exe
+
+# Private notes and helpers - never published.
+learnings.md
+VRAM_INTELLIGENCE_MAP.md
+captures/
+resume-flight.ps1
+stop-xp.ps1
+xp-shot.ps1
+*.bundle
