@@ -57,6 +57,12 @@
 
 #include "../share.h"
 
+// RenderDoc's in-application API (header shipped with the install, MIT). Only
+// live when the sim was launched under RenderDoc - GetModuleHandle finds the
+// injected dll - and gives us the one thing the CLI cannot: multi-frame
+// captures, triggered from inside via the live file instead of F12.
+#include "renderdoc_app.h"
+
 // ---------------------------------------------------------------- tracing
 
 static std::mutex g_traceLock;
@@ -1407,6 +1413,20 @@ static uint32_t g_sceneEndsLastFrame   = 0;
 // - and the final one is only identifiable in arrears.
 static uint32_t g_hdrPassesThisFrame   = 0;
 static uint32_t g_hdrPassesLastFrame   = 0;
+// How far down the resolve gate chain the frame got, as a high-water mark:
+//   0 no candidate lit pass matched at all (pass identification is the fault)
+//   1 candidate lit pass seen        2 entered resolve body (fresh bind, no dump)
+//   3 device + velocity target ready 4 HDR float format confirmed
+//   5 chosen as last HDR pass        6 backend accepted the frame
+//   7 quiesce clear                  8 scene target bound
+//   9 RESOLVED
+// resolved=0 on the GATE line says THAT it never ran; this says WHERE it died.
+static std::atomic<uint32_t> g_gateDepthThisFrame{0};
+static std::atomic<uint32_t> g_gateDepthLastFrame{0};
+static inline void gateReach(uint32_t d) {
+    uint32_t cur = g_gateDepthThisFrame.load(std::memory_order_relaxed);
+    while (cur < d && !g_gateDepthThisFrame.compare_exchange_weak(cur, d)) {}
+}
 // The image our resolve wrote into this frame, watched for the rest of it by
 // noteSsrFeedbackCheck - if it becomes the source of a half-resolution transfer,
 // our output is feeding SSR's reflection pyramid and the loop is closed.
@@ -4640,10 +4660,12 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
             // episodes hard to see. An age over 1 is stale regardless of where
             // in the frame it is read.
             trace("TAA GATE: scenePass=%d mvBinds=%d bindAge=%llu resolved=%d "
-                  "ends=%u/%u ready=%d mvReady=%d mvView=%p sceneImg=%p %ux%u",
+                  "gateDepth=%u ends=%u/%u ready=%d mvReady=%d mvView=%p "
+                  "sceneImg=%p %ux%u",
                   wasScenePass ? 1 : 0, (int)g_mvBindsThisFrame,
                   (unsigned long long)(g_frameCount - g_mvLastBindFrame.load()),
                   g_taaResolvedThisFrame ? 1 : 0,
+                  g_gateDepthLastFrame.load(),
                   g_sceneEndsThisFrame, g_sceneEndsLastFrame,
                   g_taa.ready ? 1 : 0, g_mv.ready ? 1 : 0,
                   (void*)g_mv.view, (void*)g_sceneColor.image,
@@ -4658,6 +4680,22 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     const bool litPass = passInfo.colorCount == 1 && !passInfo.depthLoad &&
                          passInfo.color0 != VK_NULL_HANDLE &&
                          passInfo.w == g_mv.w && passInfo.h == g_mv.h;
+    if (taaEnabled()) {
+        if (litPass) gateReach(1);
+        else if (passInfo.colorCount == 1 && !passInfo.depthLoad &&
+                 passInfo.color0 != VK_NULL_HANDLE &&
+                 (passInfo.w != g_mv.w || passInfo.h != g_mv.h)) {
+            // A pass that fails ONLY on dimensions is the silent way the whole
+            // chain dies with every telemetry flag still reading healthy.
+            static uint32_t lastW = 0, lastH = 0;
+            if (passInfo.w != lastW || passInfo.h != lastH) {
+                lastW = passInfo.w; lastH = passInfo.h;
+                trace("TAA GATE: candidate rejected on SIZE alone - pass %ux%u "
+                      "vs velocity target %ux%u",
+                      passInfo.w, passInfo.h, g_mv.w, g_mv.h);
+            }
+        }
+    }
     // ---- STAND ASIDE ON DUMP FRAMES.
     //
     // The resolve samples the velocity target, so it transitions g_mv.image to
@@ -4710,10 +4748,12 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     }
     do if (litPass && taaEnabled() && !g_taaResolvedThisFrame && !g_mv.wantDump &&
         mvBindAge <= 1) {
+        gateReach(2);
         std::map<VkCommandBuffer, VkDevice>::iterator tci = g_cbToDevice.find(cb);
         if (tci != g_cbToDevice.end()) {
             std::map<void*, DeviceData>::iterator tdi = g_devices.find(dispatchKey(tci->second));
             if (tdi != g_devices.end() && g_mv.ready && g_mv.view != VK_NULL_HANDLE) {
+                gateReach(3);
                 DeviceData &tdd = tdi->second;
                 // Re-init only on a real change of shape. The scene IMAGE
                 // alternates every frame between two targets, and keying on it
@@ -4749,6 +4789,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // silent.
                 if (litFmt != VK_FORMAT_R16G16B16A16_SFLOAT &&
                     litFmt != VK_FORMAT_R32G32B32A32_SFLOAT) break;
+                gateReach(4);
                 {
                     // CANDIDATE, not chosen: this fires BEFORE the last-pass
                     // filter below, so a frame with two qualifying passes
@@ -4802,6 +4843,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 const uint32_t hdrIdx = ++g_hdrPassesThisFrame;
                 if (g_hdrPassesLastFrame == 0 || hdrIdx != g_hdrPassesLastFrame)
                     break;
+                gateReach(5);
 
                 {
                     static VkImage lastChosen = VK_NULL_HANDLE;
@@ -4897,6 +4939,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     }
                     break;
                 }
+                gateReach(6);
 
                 // Quiesce after any scene-sized destruction (the view-snap
                 // crash): skip the resolve entirely and resume with a reset.
@@ -4905,6 +4948,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     g_taaStaleResume = true;
                     break;
                 }
+                gateReach(7);
                 const bool needInit = !g_taa.ready ||
                                       g_taa.w != passInfo.w ||
                                       g_taa.h != passInfo.h ||
@@ -4918,6 +4962,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 } else if (!taaBindScene(tdd, passInfo.color0)) {
                     break;
                 }
+                gateReach(8);
                 // A target swap is a history discontinuity: the accumulated
                 // image belongs to the old one and reprojecting into it would
                 // drag a whole frame of the wrong picture forward.
@@ -4985,6 +5030,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 }
                 g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
+                gateReach(9);
                 // Watched by noteSsrFeedbackCheck for the rest of the frame.
                 g_taaWroteImageThisFrame = passInfo.color0;
             }
@@ -6832,6 +6878,47 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // compare in the common case; a reparse only when the timestamp moves.
     live::poll();
 
+    // ---- RENDERDOC MULTI-FRAME CAPTURE, FROM THE INSIDE.
+    //
+    // renderdoccmd has no frame-count option and F12 takes exactly one frame;
+    // the in-app API is the only scriptable path to an N-frame capture. Edge-
+    // triggered on the live key changing to a positive value, so the file can
+    // sit at rd.capture=3 without re-firing every present; captures land on
+    // D: beside the project instead of filling the C: scratchpad.
+    {
+        static RENDERDOC_API_1_1_2 *rdApi = nullptr;
+        static bool rdTried = false;
+        static int rdLast = 0;
+        const int rdN = live::i("rd.capture", "TAA_RD_CAPTURE", 0);
+        if (rdN != rdLast) {
+            rdLast = rdN;
+            if (rdN > 0) {
+                if (!rdTried) {
+                    rdTried = true;
+                    if (HMODULE m = GetModuleHandleA("renderdoc.dll")) {
+                        pRENDERDOC_GetAPI get = (pRENDERDOC_GetAPI)
+                            GetProcAddress(m, "RENDERDOC_GetAPI");
+                        if (get && get(eRENDERDOC_API_Version_1_1_2,
+                                       (void **)&rdApi) == 1 && rdApi) {
+                            rdApi->SetCaptureFilePathTemplate(
+                                "d:\\Steam Games\\steamapps\\common\\"
+                                "X-Plane 12\\MotionVectors\\captures\\xpcap");
+                            trace("RD: in-app API live, captures go to "
+                                  "MotionVectors\\captures");
+                        } else rdApi = nullptr;
+                    }
+                    if (!rdApi)
+                        trace("RD: rd.capture set but renderdoc.dll is not in "
+                              "this process - launch the sim under RenderDoc");
+                }
+                if (rdApi) {
+                    rdApi->TriggerMultiFrameCapture((uint32_t)rdN);
+                    trace("RD: triggered %d-frame capture", rdN);
+                }
+            }
+        }
+    }
+
     // The VRAM system's frame tick: fresh heap sample, zone update, governor
     // release, recycle trim, priority walk, frame-time feedback. The camera
     // delta feeds the teleport detector; garbage (pre-flight, unset snapshot)
@@ -7011,6 +7098,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
               g_hdrPassesLastFrame, g_hdrPassesThisFrame);
     g_hdrPassesLastFrame   = g_hdrPassesThisFrame;
     g_hdrPassesThisFrame   = 0;
+    g_gateDepthLastFrame.store(g_gateDepthThisFrame.load());
+    g_gateDepthThisFrame.store(0);
     g_prevLastDepthPassIdx = g_lastDepthPassIdx;   // predicts where to inject next frame
     g_lastDepthPassIdx     = -1;
     g_passesThisFrame      = 0;
