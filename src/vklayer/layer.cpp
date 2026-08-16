@@ -2652,6 +2652,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImageView(
 // instead of the device.
 static std::atomic<int> g_taaQuiesce(0);
 
+// ---- THE RESOLVE LIFETIME FIX (the view-snap DEVICE_LOST, root-caused).
+// Our resolve's descriptors reference engine images - the scene target and
+// gbuffer_vel. The engine's deferred destruction waits for ITS OWN GPU work,
+// not ours, so a view change could destroy an image while our dispatch,
+// recorded a frame or two earlier, was still in flight. Any image the
+// resolve bound within the last four frames has its down-chain destroy
+// DEFERRED four presents; the app treats the handle as dead immediately,
+// the driver sees the destroy only after our dispatch provably drained.
+// X-Plane's allocation callbacks are a process-lifetime static (measured:
+// g_vk_allocation_callbacks), so storing the pointer is sound.
+static std::map<VkImage, uint64_t> g_taaBoundImgs;          // img -> frame
+struct DeferredImgKill {
+    VkDevice dev; VkImage img; const VkAllocationCallbacks *alloc;
+    uint64_t due;
+};
+static std::vector<DeferredImgKill> g_deferredImgKills;
+
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
     VkDevice device, VkImage img, const VkAllocationCallbacks *alloc)
 {
@@ -2763,6 +2780,30 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
                 g_depthCandidates.erase(g_depthCandidates.begin() + i);
                 break;
             }
+    }
+    // The resolve lifetime fix: an image the resolve bound recently is
+    // destroyed LATE, after our in-flight dispatches have provably drained.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkImage, uint64_t>::iterator bi = g_taaBoundImgs.find(img);
+        if (bi != g_taaBoundImgs.end()) {
+            uint64_t boundAt = bi->second;
+            bool recent = g_frameCount - boundAt <= 4;
+            g_taaBoundImgs.erase(bi);
+            if (recent && next) {
+                DeferredImgKill k;
+                k.dev = device; k.img = img; k.alloc = alloc;
+                k.due = g_frameCount + 4;
+                g_deferredImgKills.push_back(k);
+                static uint64_t said = 0;
+                if (++said <= 8)
+                    trace("TAA LIFETIME: image %p destroy deferred 4 presents "
+                          "- the resolve referenced it %llu frame(s) ago",
+                          (void*)img,
+                          (unsigned long long)(g_frameCount - boundAt));
+                return;                       // driver sees it later
+            }
+        }
     }
     if (next) next(device, img, alloc);
 }
@@ -4925,6 +4966,17 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                         }
                     }
                     taaBindFlags(tdd, fi, ff, fl, fsm);
+                    // Lifetime ledger for the deferred-destroy protection:
+                    // this engine image is now referenced by a dispatch that
+                    // may execute up to a few frames from now.
+                    if (fi != VK_NULL_HANDLE) {
+                        std::lock_guard<std::mutex> g(g_lock);
+                        g_taaBoundImgs[fi] = g_frameCount;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> g(g_lock);
+                    g_taaBoundImgs[passInfo.color0] = g_frameCount;
                 }
                 g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
@@ -6811,6 +6863,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     }
     vram::onPresent((snap.camDelta >= 0.0f && snap.camDelta < 100000.0f)
                         ? snap.camDelta : -1.0f, rotDeg);
+
+    // Flush deferred image destroys whose safety window has passed, and
+    // prune stale lifetime-ledger entries so the map stays bounded.
+    {
+        std::vector<DeferredImgKill> due;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            for (size_t i = 0; i < g_deferredImgKills.size();) {
+                if (g_frameCount >= g_deferredImgKills[i].due) {
+                    due.push_back(g_deferredImgKills[i]);
+                    g_deferredImgKills.erase(g_deferredImgKills.begin() + (long)i);
+                } else ++i;
+            }
+            for (std::map<VkImage, uint64_t>::iterator it = g_taaBoundImgs.begin();
+                 it != g_taaBoundImgs.end();) {
+                if (g_frameCount - it->second > 120) g_taaBoundImgs.erase(it++);
+                else ++it;
+            }
+        }
+        for (size_t i = 0; i < due.size(); ++i) {
+            PFN_vkDestroyImage nd = nullptr;
+            {
+                std::lock_guard<std::mutex> g(g_lock);
+                std::map<void*, DeviceData>::iterator it =
+                    g_devices.find(dispatchKey(due[i].dev));
+                if (it != g_devices.end()) nd = it->second.destroyImage;
+            }
+            if (nd) nd(due[i].dev, due[i].img, due[i].alloc);
+        }
+    }
 
     // Zone-driven texture quality caps (SS25/43/47): the create-time pager's
     // thresholds follow the zone unless the environment pinned them - an env
