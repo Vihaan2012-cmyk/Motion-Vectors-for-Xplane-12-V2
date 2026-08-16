@@ -6960,8 +6960,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // stops the jitter - jitter with nothing accumulating it is deliberate
     // edge crawl. TAA_JITTER still forces it for measurement.
     g_jitterArmed = taaEnabled() || (getenv("TAA_JITTER") != nullptr);
-    g_jitterScale = live::f("taa.jitter_scale", "TAA_JITTER_SCALE",
-                            taaEnabled() ? 1.0f : 0.0f);
+    // Jitter defaults OFF even with the resolve on: the unjitter
+    // cancellation has never been verified on screen, and the first flight
+    // that ran it showed exactly what uncancelled jitter looks like - a
+    // trembling panel and crawling smear in motion. Sub-pixel AA returns
+    // via taa.jitter_scale=1 only after a run proves the cancellation
+    // (static scene, jitter on: the image must not move AT ALL).
+    g_jitterScale = live::f("taa.jitter_scale", "TAA_JITTER_SCALE", 0.0f);
     {
         float nf = live::f("taa.nearfield_m", "TAA_NEARFIELD_M", g_nearFieldM);
         if (nf < 0.0f)  nf = 0.0f;
