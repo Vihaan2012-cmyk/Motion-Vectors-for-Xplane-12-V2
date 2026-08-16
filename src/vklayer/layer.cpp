@@ -2672,11 +2672,16 @@ static std::vector<DeferredImgKill> g_deferredImgKills;
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
     VkDevice device, VkImage img, const VkAllocationCallbacks *alloc)
 {
+    // MEASURED IN THE CAPTURE: the blanket scene-sized quiesce was firing on
+    // every streamed-texture destruction, so the resolve NEVER RAN - frame
+    // 3595 contains no uVelocity dispatch at all - and the frames where it
+    // lapsed alternated blended output with raw passthrough, which IS the
+    // cockpit shake and the motion crawl. The quiesce now fires only when a
+    // destroyed image is one the resolve actually bound (the lifetime
+    // ledger), which is the only destruction that ever threatened it.
     {
         std::lock_guard<std::mutex> g(g_lock);
-        std::map<VkImage, VramEntry>::iterator ve = g_vramImg.find(img);
-        if (ve != g_vramImg.end() && ve->second.w >= 1280 &&
-            ve->second.h >= 720)
+        if (g_taaBoundImgs.count(img))
             g_taaQuiesce.store(3);
     }
     vram::noteImageDestroy(img);
