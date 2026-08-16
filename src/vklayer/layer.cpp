@@ -2242,7 +2242,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
     // extra level under pressure before small ones are touched.
     VkImageCreateInfo ci2 = *ci;
     uint32_t drop = pagerDropLevels(ci);
-    if (ci)
+    // THE CRASH: refineDrop could RAISE a refused 0 to extra cuts with none
+    // of pagerDropLevels' guards - under ORANGE+ during a load burst it
+    // could shrink a render target, storage image or layered texture that
+    // the engine then renders to or copies from at original size. Device
+    // fault, intermittent by zone timing, matching every crashed run and
+    // both survivals. The refinement now runs ONLY for images that pass the
+    // exact eligibility pagerDropLevels enforces.
+    if (ci &&
+        (ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        !(ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                       VK_IMAGE_USAGE_STORAGE_BIT)) &&
+        ci->imageType == VK_IMAGE_TYPE_2D &&
+        ci->arrayLayers == 1 && ci->mipLevels >= 2 &&
+        (ci->extent.width  & (ci->extent.width  - 1)) == 0 &&
+        (ci->extent.height & (ci->extent.height - 1)) == 0)
         drop = vram::refineDrop(drop, ci->extent.width, ci->extent.height,
                                 (uint32_t)ci->format, ci->mipLevels,
                                 g_share && g_share->valid);
