@@ -2067,7 +2067,10 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdCopyBufferToImage(
             vram::noteUploadRegion((uint64_t)(uintptr_t)dst,
                                    regions[i].imageSubresource.mipLevel);
         }
-        if (bytes) vram::chargeCopy(cb, bytes);
+        // The charge carries the destination's protection class, so the
+        // governor can let cockpit/aircraft/infrastructure uploads bypass
+        // pacing (upload priority classes, task SS9).
+        if (bytes) vram::chargeCopy(cb, bytes, vram::protectionOf(dst));
     }
 
     uint32_t drop = 0, origW = 0, origH = 0;
@@ -2334,12 +2337,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
                 e.fmt = (uint32_t)ci->format; e.mips = ci->mipLevels;
                 g_vramImg[*out] = e;
             }
-            // Churn tracking (SS50): the shape is the identity, because a
-            // pager reload creates a NEW handle for the same texture.
+            // Registry + churn (task SS2/3): the shape is the identity,
+            // because a pager reload creates a NEW handle for the same
+            // texture; usage/type/layers feed the classification.
             bool hot = false;
             vram::noteImageCreate(*out, ci->extent.width, ci->extent.height,
                                   (uint32_t)ci->format, ci->mipLevels,
-                                  req.size, &hot);
+                                  req.size, cat, ci->usage, ci->arrayLayers,
+                                  ci->imageType == VK_IMAGE_TYPE_3D,
+                                  drop, &hot);
             if (hot) {
                 static uint64_t hotSaid = 0;
                 if (++hotSaid <= 20)

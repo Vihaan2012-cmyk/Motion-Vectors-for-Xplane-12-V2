@@ -190,9 +190,64 @@ struct ChurnRec {
     uint64_t lastDestroyFrame = 0, bytes = 0;
 };
 static std::map<ChurnKey, ChurnRec> g_churn;
-static std::map<VkImage, ChurnKey>  g_imgKey;
-static std::set<VkImage>            g_hotImgs;
 static uint64_t churnCycles = 0;
+
+// ---- THE RESOURCE REGISTRY. One record per tracked image - the old shape
+// map absorbed rather than duplicated - carrying the intelligence layer's
+// whole view: a stable ResourceID that survives nothing (the SHAPE survives,
+// via g_churn), classification, protection, residency state, and the last
+// computed score. The ledger (layer-side) stays the byte-accounting truth;
+// this is the decision-making truth.
+enum ResClass {
+    RC_UNKNOWN = 0, RC_RENDER_TARGET, RC_DEPTH, RC_SHADOW, RC_STORAGE,
+    RC_CLOUD_VOLUME, RC_AIRCRAFT_COCKPIT, RC_SCENERY_STREAMED,
+    RC_TERRAIN_ARRAY, RC_UI_SMALL
+};
+static const char *resClassName(int c)
+{
+    switch (c) {
+        case RC_RENDER_TARGET:    return "render-target";
+        case RC_DEPTH:            return "depth";
+        case RC_SHADOW:           return "shadow";
+        case RC_STORAGE:          return "storage";
+        case RC_CLOUD_VOLUME:     return "cloud-volume";
+        case RC_AIRCRAFT_COCKPIT: return "aircraft/cockpit";
+        case RC_SCENERY_STREAMED: return "scenery-streamed";
+        case RC_TERRAIN_ARRAY:    return "terrain-array";
+        case RC_UI_SMALL:         return "ui-small";
+        default:                  return "unknown";
+    }
+}
+enum ResState {
+    RS_FULL = 0,            // full-quality physical representation resident
+    RS_REDUCED_AT_CREATE,   // pager capped its mips at creation
+    RS_DEMOTED,             // zone walk pushed its priority down
+    RS_AGED,                // aging walk decayed it for disuse
+    RS_DESTROYED            // logical identity lives on in g_churn/g_deadContent
+};
+static const char *resStateName(int s)
+{
+    switch (s) {
+        case RS_REDUCED_AT_CREATE: return "REDUCED";
+        case RS_DEMOTED:           return "DEMOTED";
+        case RS_AGED:              return "AGED";
+        default:                   return "FULL";
+    }
+}
+struct ResRec {
+    uint64_t id;            // stable within the handle's lifetime
+    ChurnKey shape;         // identity that survives reloads (keys g_churn)
+    uint64_t bytes;
+    uint64_t createdFrame;
+    uint8_t  cls;           // ResClass
+    uint8_t  state;         // ResState
+    uint8_t  protection;    // 0 expendable .. 3 never touch
+    bool     streamed;
+    float    score;         // last computed unified score
+};
+static std::map<VkImage, ResRec> g_registry;
+static uint64_t g_nextResId = 1;
+static std::set<VkImage> g_hotImgs;
 
 // ---- pipeline creation (SS59): JIT pipeline compiles are a classic stutter
 // source. Counted and timed; creations after the first present are "live"
@@ -335,6 +390,8 @@ static std::vector<HeldSubmit> g_heldSubmits;                 // FIFO
 static std::set<VkFence>     g_heldFences;                    // fast trigger check
 static std::map<VkSemaphore, uint64_t> g_heldSignals;         // sem -> max value (0=binary)
 static std::map<VkCommandBuffer, uint64_t> g_cbBytes;         // recorded copy bytes
+static std::map<VkCommandBuffer, uint8_t>  g_cbProt;          // max protection seen
+static uint64_t governorBypassed = 0;                          // protected uploads
 static uint64_t g_frameUploadSpent = 0;                       // released this frame
 
 // ------------------------------------------------------------------ helpers
@@ -387,9 +444,97 @@ static uint64_t zoneUploadBudget()
     return b >> (uploadNotch > 3 ? 3 : uploadNotch);
 }
 
-// ============================================================ churn tracking
+// ==================================================== registry + churn
+// Classification (task SS3): observable Vulkan behaviour only, probabilistic
+// where uncertain, conservative for unknowns. No filenames exist to read.
+static uint8_t classify(int cat, VkImageUsageFlags usage, uint32_t layers,
+                        bool is3D, bool streamed, uint32_t w, uint32_t h)
+{
+    switch (cat) {
+        case 1: /*RT*/      return RC_RENDER_TARGET;
+        case 2: /*DEPTH*/
+            // A sampled square depth image is a shadow map; the scene depth
+            // is screen-shaped and rarely square.
+            return (usage & VK_IMAGE_USAGE_SAMPLED_BIT) && w == h && w >= 1024
+                 ? RC_SHADOW : RC_DEPTH;
+        case 3: /*STORAGE*/ return is3D ? RC_CLOUD_VOLUME : RC_STORAGE;
+        case 0: /*TEX*/
+            if (w <= 256 && h <= 256) return RC_UI_SMALL;
+            return streamed ? RC_SCENERY_STREAMED : RC_AIRCRAFT_COCKPIT;
+        case 4: /*IMG_OTHER*/
+            if (is3D) return RC_CLOUD_VOLUME;
+            if (layers > 1 && (usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+                return RC_TERRAIN_ARRAY;
+            return RC_UNKNOWN;
+        default:            return RC_UNKNOWN;
+    }
+}
+
+// Protection (task SS8): 3 = never touch, 0 = expendable. Unknown is 2 -
+// "when uncertain, keep the resource resident."
+static uint8_t protectionOfClass(uint8_t cls)
+{
+    switch (cls) {
+        case RC_RENDER_TARGET: case RC_DEPTH: case RC_STORAGE:
+        case RC_CLOUD_VOLUME:                       return 3;
+        case RC_AIRCRAFT_COCKPIT: case RC_SHADOW:
+        case RC_UI_SMALL:                           return 2;
+        case RC_TERRAIN_ARRAY:                      return 1;
+        case RC_SCENERY_STREAMED:                   return 0;
+        default:                                    return 2;
+    }
+}
+
+// The unified score (task SS4): higher = keep. Weights live-configurable.
+// Consumers rank by it; the actuation values (priority anchors, pager caps)
+// are unchanged - the score decides ORDER and the log explains WHY.
+static float scoreOf(const ResRec &r, uint64_t lastUse, uint32_t useCount,
+                     uint32_t churnCyclesOfShape)
+{
+    float wCat  = live::f("vram.w_category",  nullptr, 0.40f);
+    float wRec  = live::f("vram.w_recency",   nullptr, 0.25f);
+    float wFreq = live::f("vram.w_frequency", nullptr, 0.15f);
+    float wCost = live::f("vram.w_recreate",  nullptr, 0.10f);
+    float wSize = live::f("vram.w_size",      nullptr, 0.10f);
+
+    float cat = (float)r.protection / 3.0f;
+    float rec = 0.0f;
+    if (lastUse) {
+        uint64_t age = frameIndex > lastUse ? frameIndex - lastUse : 0;
+        rec = age < 60 ? 1.0f : age < 600 ? 0.6f : age < 3600 ? 0.25f : 0.0f;
+    }
+    float freq = useCount > 200 ? 1.0f : (float)useCount / 200.0f;
+    float cost = churnCyclesOfShape >= 3 ? 1.0f
+               : (float)churnCyclesOfShape / 3.0f;   // churners are expensive
+    float sizePen = r.bytes > (64ull << 20) ? 1.0f
+                  : (float)r.bytes / (float)(64ull << 20);
+    return wCat * cat + wRec * rec + wFreq * freq + wCost * cost
+         - wSize * sizePen;
+}
+
+// The decision engine (task SS19): every residency decision names its
+// resource, fields and reason. vram.explain=0 silences, 1 traces decisions,
+// 2 adds restores.
+static uint64_t decisionsDemote = 0, decisionsRestore = 0;
+static void decide(const ResRec &r, const char *action, const char *reason)
+{
+    int verb = live::i("vram.explain", nullptr, 1);
+    bool isRestore = action[0] == 'R' || action[0] == 'r';
+    if (isRestore) ++decisionsRestore; else ++decisionsDemote;
+    if (verb < 1 || (isRestore && verb < 2)) return;
+    static uint64_t said = 0;
+    if (++said > 2000 && verb < 2) return;          // never spam forever
+    trace("VRAMSYS DECIDE #%llu %s: %s %ux%u fmt=%u %.1f MB score=%.2f "
+          "state=%s prot=%u zone=%s - %s",
+          (unsigned long long)r.id, action, resClassName(r.cls),
+          r.shape.w, r.shape.h, r.shape.fmt, r.bytes / 1048576.0, r.score,
+          resStateName(r.state), r.protection, zoneName(zone), reason);
+}
+
 static void noteImageCreate(VkImage img, uint32_t w, uint32_t h, uint32_t fmt,
-                            uint32_t mips, uint64_t bytes, bool *hotOut)
+                            uint32_t mips, uint64_t bytes,
+                            int cat, VkImageUsageFlags usage, uint32_t layers,
+                            bool is3D, uint32_t droppedMips, bool *hotOut)
 {
     if (hotOut) *hotOut = false;
     if (!cfg.enable || !img) return;
@@ -404,7 +549,18 @@ static void noteImageCreate(VkImage img, uint32_t w, uint32_t h, uint32_t fmt,
         ++r.cycles;
         ++churnCycles;
     }
-    g_imgKey[img] = k;
+    bool streamed = frameIndex > 900;   // in-flight creation
+    ResRec rec;
+    rec.id = g_nextResId++;
+    rec.shape = k;
+    rec.bytes = bytes;
+    rec.createdFrame = frameIndex;
+    rec.cls = classify(cat, usage, layers, is3D, streamed, w, h);
+    rec.protection = protectionOfClass(rec.cls);
+    rec.state = droppedMips ? RS_REDUCED_AT_CREATE : RS_FULL;
+    rec.streamed = streamed;
+    rec.score = 0.0f;
+    g_registry[img] = rec;
     if (r.cycles >= 3) {
         g_hotImgs.insert(img);
         if (hotOut) *hotOut = true;
@@ -415,9 +571,9 @@ static void noteImageDestroy(VkImage img)
 {
     if (!img) return;
     std::lock_guard<std::mutex> g(m);
-    std::map<VkImage, ChurnKey>::iterator it = g_imgKey.find(img);
-    if (it != g_imgKey.end()) {
-        ChurnRec &r = g_churn[it->second];
+    std::map<VkImage, ResRec>::iterator it = g_registry.find(img);
+    if (it != g_registry.end()) {
+        ChurnRec &r = g_churn[it->second.shape];
         ++r.destroys;
         r.lastDestroyFrame = frameIndex;
         // Content identity outlives the handle (SS24's L2): the destroyed
@@ -430,8 +586,9 @@ static void noteImageDestroy(VkImage img)
                  g_liveContent.lower_bound(from);
              ci != g_liveContent.end() && ci->first.img == base;) {
             if (g_deadContent.size() < 65536) {
-                ShapeMip s; s.w = it->second.w; s.h = it->second.h;
-                s.fmt = it->second.fmt; s.mip = ci->first.mip;
+                ShapeMip s; s.w = it->second.shape.w;
+                s.h = it->second.shape.h;
+                s.fmt = it->second.shape.fmt; s.mip = ci->first.mip;
                 g_deadContent[s] = ci->second;
             }
             g_liveContent.erase(ci++);
@@ -439,9 +596,9 @@ static void noteImageDestroy(VkImage img)
         // A burst of large preload-class destructions is an aircraft or
         // livery change (SS76). Score decays at present; the threshold fires
         // the same protective response as a teleport.
-        if (it->second.w >= 2048 && frameIndex > 900)
+        if (it->second.shape.w >= 2048 && frameIndex > 900)
             bigDestroyScore += 1.0;
-        g_imgKey.erase(it);
+        g_registry.erase(it);
     }
     g_hotImgs.erase(img);
     g_imgLastUse.erase(img);
@@ -566,10 +723,10 @@ static bool cacheUpload(VkImage img, uint32_t mip, uint64_t hash,
     }
     g_liveContent[k] = hash;
     // Did the engine just reload from disk what a destroyed image held?
-    std::map<VkImage, ChurnKey>::iterator ck = g_imgKey.find(img);
-    if (ck != g_imgKey.end()) {
-        ShapeMip s; s.w = ck->second.w; s.h = ck->second.h;
-        s.fmt = ck->second.fmt; s.mip = mip;
+    std::map<VkImage, ResRec>::iterator ck = g_registry.find(img);
+    if (ck != g_registry.end()) {
+        ShapeMip s; s.w = ck->second.shape.w; s.h = ck->second.shape.h;
+        s.fmt = ck->second.shape.fmt; s.mip = mip;
         std::map<ShapeMip, uint64_t>::iterator dc = g_deadContent.find(s);
         if (dc != g_deadContent.end() && dc->second == hash) {
             ++reloadIdenticalCount;
@@ -710,12 +867,27 @@ static void noteQueue(uint32_t family, VkQueue q)
 static void ledgerTotal(uint64_t bytes) { ledgerBytesNow.store(bytes); }
 
 // ============================================================ upload charge
-static void chargeCopy(VkCommandBuffer cb, uint64_t bytes)
+static void chargeCopy(VkCommandBuffer cb, uint64_t bytes, uint8_t prot = 0)
 {
     if (!cfg.enable) return;
     upBytesFrame.fetch_add(bytes);
     std::lock_guard<std::mutex> g(m);
     g_cbBytes[cb] += bytes;
+    // Upload priority classes (task SS9): the command buffer carries the
+    // highest protection of anything it uploads to. Protected-class uploads
+    // (cockpit, aircraft, render infrastructure) bypass the governor -
+    // CRITICAL never waits behind autogen.
+    uint8_t &p = g_cbProt[cb];
+    if (prot > p) p = prot;
+}
+
+// Protection of a live image, for the copy hook. 0 when unknown - unknown
+// uploads pace normally, which is the conservative direction here.
+static uint8_t protectionOf(VkImage img)
+{
+    std::lock_guard<std::mutex> g(m);
+    std::map<VkImage, ResRec>::iterator it = g_registry.find(img);
+    return it == g_registry.end() ? 0 : it->second.protection;
 }
 
 // ============================================================ recycle pool
@@ -879,25 +1051,51 @@ static void prioZoneWalk()
     std::vector<std::pair<VkDeviceMemory, float> > moves;
     {
         std::lock_guard<std::mutex> g(m);
-        // Candidates first, size-ordered, THEN the per-frame budget - so the
-        // budget is spent on the blocks whose demotion frees the most.
-        std::vector<std::pair<uint64_t, VkDeviceMemory> > cand;
+        // Candidates ranked by the UNIFIED SCORE (eviction engine, task SS8):
+        // worst score demoted first, best score restored first. The score
+        // already weighs importance, recency, frequency, recreation cost and
+        // size, so this one ordering realises the whole eviction policy.
+        // The block-level view maps to resources through g_imgMem/g_registry;
+        // a block with no registry image keeps the old size-only ranking via
+        // score 0.
+        std::map<VkDeviceMemory, float> blockScore;
+        for (std::map<VkImage, VkDeviceMemory>::iterator im = g_imgMem.begin();
+             im != g_imgMem.end(); ++im) {
+            std::map<VkImage, ResRec>::iterator rr = g_registry.find(im->first);
+            if (rr == g_registry.end()) continue;
+            uint64_t lastUse = 0; uint32_t useCount = 0;
+            std::map<VkImage, UseRec>::iterator ur = g_imgLastUse.find(im->first);
+            if (ur != g_imgLastUse.end()) { lastUse = ur->second.last;
+                                            useCount = ur->second.count; }
+            uint32_t cyc = 0;
+            std::map<ChurnKey, ChurnRec>::iterator cr =
+                g_churn.find(rr->second.shape);
+            if (cr != g_churn.end()) cyc = cr->second.cycles;
+            float s = scoreOf(rr->second, lastUse, useCount, cyc);
+            rr->second.score = s;
+            std::map<VkDeviceMemory, float>::iterator bs =
+                blockScore.find(im->second);
+            if (bs == blockScore.end() || s > bs->second)
+                blockScore[im->second] = s;      // block keeps its BEST score
+        }
+        std::vector<std::pair<float, VkDeviceMemory> > cand;
         for (std::map<VkDeviceMemory, BlockPrio>::iterator it = g_blockPrio.begin();
              it != g_blockPrio.end(); ++it) {
-            if (!it->second.streamedTexOnly) continue;
+            if (!it->second.streamedTexOnly) continue;   // protection >= 1
             bool wantDemote  = zone >= RED  && !it->second.demoted;
             bool wantRestore = zone == GREEN && it->second.demoted;
             if (!wantDemote && !wantRestore) continue;
-            uint64_t sz = 0;
-            std::map<VkDeviceMemory, AllocRec>::iterator ar = g_allocs.find(it->first);
-            if (ar != g_allocs.end()) sz = ar->second.size;
-            cand.push_back(std::make_pair(sz, it->first));
+            std::map<VkDeviceMemory, float>::iterator bs = blockScore.find(it->first);
+            float s = bs != blockScore.end() ? bs->second : 0.0f;
+            cand.push_back(std::make_pair(wantDemote ? s : -s, it->first));
         }
+        // Ascending: demotions see worst-score first, restores see best first
+        // (negated), and the per-frame budget is spent where it matters most.
         std::sort(cand.begin(), cand.end());
         int budget = 64;
-        for (size_t i = cand.size(); i > 0 && budget > 0; --i, --budget) {
+        for (size_t i = 0; i < cand.size() && budget > 0; ++i, --budget) {
             std::map<VkDeviceMemory, BlockPrio>::iterator it =
-                g_blockPrio.find(cand[i - 1].second);
+                g_blockPrio.find(cand[i].second);
             if (it == g_blockPrio.end()) continue;
             if (zone >= RED && !it->second.demoted) {
                 it->second.demoted = true;
@@ -906,6 +1104,20 @@ static void prioZoneWalk()
                 it->second.demoted = false;
                 moves.push_back(std::make_pair(it->first,
                     it->second.aged ? 0.25f : it->second.best));
+            }
+        }
+        // Registry state + decision log for every image on a moved block.
+        for (size_t i = 0; i < moves.size(); ++i) {
+            bool demote = moves[i].second <= 0.21f;
+            for (std::map<VkImage, VkDeviceMemory>::iterator im = g_imgMem.begin();
+                 im != g_imgMem.end(); ++im) {
+                if (im->second != moves[i].first) continue;
+                std::map<VkImage, ResRec>::iterator rr = g_registry.find(im->first);
+                if (rr == g_registry.end()) continue;
+                rr->second.state = demote ? RS_DEMOTED : RS_FULL;
+                decide(rr->second, demote ? "DEMOTE" : "RESTORE",
+                       demote ? "zone pressure, lowest score in walk budget"
+                              : "pressure cleared");
             }
         }
     }
@@ -944,10 +1156,21 @@ static void agingWalk()
                 bp->second.aged = true;
                 moves.push_back(std::make_pair(im->second, 0.25f));
                 ++agedDemotions;
+                std::map<VkImage, ResRec>::iterator rr = g_registry.find(cursor);
+                if (rr != g_registry.end()) {
+                    rr->second.state = RS_AGED;
+                    decide(rr->second, "DEMOTE",
+                           "unused past the age window (frequency-weighted)");
+                }
             } else if (!stale && bp->second.aged && !bp->second.demoted) {
                 bp->second.aged = false;
                 moves.push_back(std::make_pair(im->second, bp->second.best));
                 ++agedRestores;
+                std::map<VkImage, ResRec>::iterator rr = g_registry.find(cursor);
+                if (rr != g_registry.end()) {
+                    rr->second.state = RS_FULL;
+                    decide(rr->second, "RESTORE", "used again after aging");
+                }
             }
         }
         if (it == g_imgLastUse.end()) cursor = VK_NULL_HANDLE;
@@ -1135,6 +1358,7 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
     // would accumulate stale charges. Unknown buffers count zero - pacing
     // needs an estimate, not an audit.
     uint64_t bytes = 0;
+    uint8_t  maxProt = 0;
     bool holdable = true;
     for (uint32_t s = 0; s < count && submits; ++s) {
         for (uint32_t c = 0; c < submits[s].commandBufferCount; ++c) {
@@ -1142,6 +1366,12 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
             std::map<VkCommandBuffer, uint64_t>::iterator it =
                 g_cbBytes.find(submits[s].pCommandBuffers[c]);
             if (it != g_cbBytes.end()) { bytes += it->second; g_cbBytes.erase(it); }
+            std::map<VkCommandBuffer, uint8_t>::iterator pt =
+                g_cbProt.find(submits[s].pCommandBuffers[c]);
+            if (pt != g_cbProt.end()) {
+                if (pt->second > maxProt) maxProt = pt->second;
+                g_cbProt.erase(pt);
+            }
         }
         // Only a bare chain or a single timeline struct is understood well
         // enough to reconstruct. Anything else must not be held.
@@ -1171,6 +1401,10 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
         bool overCap = heldBytesNow + bytes >
                        (uint64_t)cfg.holdMaxMB * 1048576ull;
         bool over = (g_frameUploadSpent + bytes) > budget;
+        // Upload class CRITICAL/HIGH (protection >= 2): cockpit, aircraft
+        // and render-infrastructure uploads are never paced - only order
+        // (mustQueueBehind) can delay them, and only until the flush below.
+        if (maxProt >= 2) { over = false; ++governorBypassed; }
         if ((!over && !mustQueueBehind) || !holdable || overCap ||
             zone < ORANGE) {
             // Passes now. If order requires it, everything held for this queue
@@ -1794,6 +2028,39 @@ static void onPresent(float camDeltaMeters)
               (unsigned long long)g_imgLastUse.size(),
               (unsigned long long)agedDemotions,
               (unsigned long long)agedRestores, cfg.ageFrames);
+        {
+            // The registry census: resources by class and residency state -
+            // the intelligence layer's whole view in two lines.
+            uint64_t byClass[10] = {0}, clsBytes[10] = {0};
+            uint64_t st[5] = {0};
+            for (std::map<VkImage, ResRec>::iterator it = g_registry.begin();
+                 it != g_registry.end(); ++it) {
+                if (it->second.cls < 10) {
+                    ++byClass[it->second.cls];
+                    clsBytes[it->second.cls] += it->second.bytes;
+                }
+                if (it->second.state < 5) ++st[it->second.state];
+            }
+            trace("  registry: %llu resources (next id %llu) - states: "
+                  "%llu FULL, %llu REDUCED, %llu DEMOTED, %llu AGED",
+                  (unsigned long long)g_registry.size(),
+                  (unsigned long long)g_nextResId,
+                  (unsigned long long)st[RS_FULL],
+                  (unsigned long long)st[RS_REDUCED_AT_CREATE],
+                  (unsigned long long)st[RS_DEMOTED],
+                  (unsigned long long)st[RS_AGED]);
+            for (int c = 0; c < 10; ++c)
+                if (byClass[c])
+                    trace("    class %-18s %6llu  %8.1f MB", resClassName(c),
+                          (unsigned long long)byClass[c],
+                          clsBytes[c] / 1048576.0);
+            trace("  decisions: %llu demote, %llu restore (vram.explain=%d); "
+                  "governor bypassed %llu protected uploads",
+                  (unsigned long long)decisionsDemote,
+                  (unsigned long long)decisionsRestore,
+                  live::i("vram.explain", nullptr, 1),
+                  (unsigned long long)governorBypassed);
+        }
         {
             // Top churners - the shapes cycling through residency (SS51).
             int printed = 0;
