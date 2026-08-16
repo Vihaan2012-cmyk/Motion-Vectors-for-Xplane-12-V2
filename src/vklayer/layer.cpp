@@ -498,7 +498,13 @@ static void armSpirvInject()
         const char *v = getenv(name);
         return !v || atoi(v) != 0;      // absent means ON
     };
-    g_spirvInject = envOn("TAA_SPIRV_INJECT");
+    // Gated on the velocity master switch: with TAA_VELOCITY off the probe
+    // parsed EVERY shader module anyway - thousands per complex aircraft -
+    // for statistics nobody would read. Dormant now means dormant: the
+    // Felis-load crash lived somewhere in that pointless work.
+    const char *velEnv = getenv("TAA_VELOCITY");
+    const bool velArmed = velEnv && velEnv[0] == '1' && velEnv[1] == '\0';
+    g_spirvInject = velArmed && envOn("TAA_SPIRV_INJECT");
     g_spirvLive   = envOn("TAA_SPIRV_LIVE") && g_spirvInject;
     if (g_spirvInject)
         trace("SPIRV INJECT: armed - %s",
