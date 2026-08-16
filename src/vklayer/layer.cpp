@@ -1908,7 +1908,31 @@ static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
         std::map<ShapeKey, uint32_t>::iterator it = g_shapeDrop.find(k);
         if (it != g_shapeDrop.end()) return it->second;
     }
-    const uint32_t drop = pagerDropLevelsRaw(ci);
+    uint32_t drop = pagerDropLevelsRaw(ci);
+    // ---- THE REFINEMENT HAS TO BE INSIDE THE CACHE, NOT AFTER IT.
+    //
+    // refineDrop consults live churn and zone state, so it answers differently
+    // for the same shape at different moments - which is precisely the property
+    // the cache exists to remove. Applied at the call site it silently reopened
+    // the defragmenter mismatch: two images of one shape, two sizes, and a copy
+    // between them sized for neither. It runs here, once, and its answer is
+    // what gets remembered. The eligibility guard is the one from the call site
+    // (see the note there): refinement may only touch images that pass exactly
+    // the tests pagerDropLevelsRaw enforces, or it can shrink a render target.
+    if ((ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        !(ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                       VK_IMAGE_USAGE_STORAGE_BIT)) &&
+        ci->imageType == VK_IMAGE_TYPE_2D &&
+        ci->arrayLayers == 1 && ci->mipLevels >= 2 &&
+        (ci->extent.width  & (ci->extent.width  - 1)) == 0 &&
+        (ci->extent.height & (ci->extent.height - 1)) == 0)
+        drop = vram::refineDrop(drop, ci->extent.width, ci->extent.height,
+                                (uint32_t)ci->format, ci->mipLevels,
+                                g_share && g_share->valid);
+    // Cache what will ACTUALLY be applied, including this clamp, or the
+    // remembered answer and the created image disagree.
+    if (drop && (ci->mipLevels - drop) < 1) drop = 0;
     {
         std::lock_guard<std::mutex> g(g_lock);
         // Bounded: the engine's distinct texture shapes are a small set, and a
@@ -2382,26 +2406,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
     // what caused their reload cycling), and large streamed shapes take an
     // extra level under pressure before small ones are touched.
     VkImageCreateInfo ci2 = *ci;
+    // One call, one answer. The refinement that used to run here now lives
+    // inside pagerDropLevels so the cached decision covers it - applying it
+    // afterwards made the same shape resolve to different sizes at different
+    // moments, which is exactly what the defragmenter cannot survive. The
+    // eligibility guard moved with it: refinement may only touch images that
+    // pass the same tests, or it can shrink a render target under load.
     uint32_t drop = pagerDropLevels(ci);
-    // THE CRASH: refineDrop could RAISE a refused 0 to extra cuts with none
-    // of pagerDropLevels' guards - under ORANGE+ during a load burst it
-    // could shrink a render target, storage image or layered texture that
-    // the engine then renders to or copies from at original size. Device
-    // fault, intermittent by zone timing, matching every crashed run and
-    // both survivals. The refinement now runs ONLY for images that pass the
-    // exact eligibility pagerDropLevels enforces.
-    if (ci &&
-        (ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
-        !(ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                       VK_IMAGE_USAGE_STORAGE_BIT)) &&
-        ci->imageType == VK_IMAGE_TYPE_2D &&
-        ci->arrayLayers == 1 && ci->mipLevels >= 2 &&
-        (ci->extent.width  & (ci->extent.width  - 1)) == 0 &&
-        (ci->extent.height & (ci->extent.height - 1)) == 0)
-        drop = vram::refineDrop(drop, ci->extent.width, ci->extent.height,
-                                (uint32_t)ci->format, ci->mipLevels,
-                                g_share && g_share->valid);
     if (drop) {
         ci2.extent.width  = ci->extent.width  >> drop;
         ci2.extent.height = ci->extent.height >> drop;
@@ -2460,16 +2471,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
                   (unsigned)ci->usage, (unsigned)ci2.usage);
     }
 
-    if (drop) {
-        // Remember the original dimensions: the upload remap needs to know how
-        // many levels were removed to renumber what is left.
+    // ---- WRITE THE POLICY FOR EVERY IMAGE, INCLUDING THE UNTOUCHED ONES.
+    //
+    // This used to be written only when the image was shrunk, which left the
+    // undropped ones relying on the destroy hook having erased whatever the
+    // last owner of their handle recorded. Vulkan handles are recycled freely
+    // and the two events happen on different threads, so a create can land
+    // before the matching destroy's erase - and then an untouched full-size
+    // image carries a previous texture's drop. Every upload region for it is
+    // renumbered and its top level discarded, and a full-size copy lands in a
+    // level that is not the one the data describes. Silent, timing-dependent,
+    // and invisible to validation because each individual call is legal.
+    //
+    // An unconditional write makes the handle's policy always the current
+    // image's own, so nothing can be inherited and the erase on destroy
+    // becomes an optimisation rather than a correctness requirement.
+    {
         TexPolicy p;
-        p.dropMips = drop;
+        p.dropMips = drop;                  // 0 for anything we left alone
         p.origW = ci->extent.width;
         p.origH = ci->extent.height;
         std::lock_guard<std::mutex> g(g_lock);
         g_texPolicy[*out] = p;
+    }
 
+    if (drop) {
+        std::lock_guard<std::mutex> g(g_lock);
         double before = (double)ci->extent.width * ci->extent.height;
         double after  = (double)ci2.extent.width * ci2.extent.height;
         uint64_t saved = (uint64_t)((before - after)
@@ -7209,7 +7236,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // caps streamed scenery harder while the preload set (aircraft, cockpit)
     // keeps a gentler ceiling, which is SS47's "autogen degrades first" made
     // concrete.
-    if (!g_pagerEnvLocked) {
+    // ---- THE ZONE NO LONGER ARMS THE CREATE-TIME PAGER. (2026-08-16)
+    //
+    // Shrinking an image at creation is a lie told to the application, and
+    // X-Plane checks. Four separate faults were found and fixed here in one
+    // night - an unstable per-shape answer, a double drop when the defragmenter
+    // recreates an already-reduced image, a refinement that escaped the cached
+    // decision, and a policy inherited through a recycled handle - and the load
+    // still dies about two minutes in with the pager active, while it is stable
+    // for eight-plus minutes with the pager off. Validation reports nothing
+    // illegal and the fault vanishes under instrumentation, so what remains is
+    // a race we have not yet named.
+    //
+    // A texture-memory optimisation that ends the session is worth less than
+    // the memory it saves, so pressure alone must not turn it on. It stays
+    // available for the hunt through TAA_PAGER_DROP_ABOVE / vram.tex_drop_above,
+    // which is how every run above armed it; what changes is that a CRITICAL
+    // zone can no longer arm it behind the user's back. The rest of the VRAM
+    // system - shaping, recycling, priority, the governor, the upload cache -
+    // is untouched and still zone-driven, and none of it rewrites a resource.
+    static const bool pagerOptIn =
+        getenv("TAA_PAGER_DROP_ABOVE") || getenv("TAA_PAGER_AUTOGEN_TO") ||
+        live::i("vram.tex_drop_above", nullptr, 0) > 0 ||
+        live::i("vram.tex_streamed_to", nullptr, 0) > 0;
+    if (!g_pagerEnvLocked && pagerOptIn) {
         struct { uint32_t dropAbove, maxDrop, autogenTo; } zp;
         switch (vram::zone) {
             case vram::GREEN: case vram::YELLOW: zp.dropAbove = 0; zp.maxDrop = 1; zp.autogenTo = 0;    break;
