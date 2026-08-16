@@ -248,7 +248,19 @@ struct ResRec {
     uint8_t  protection;    // 0 expendable .. 3 never touch
     bool     streamed;
     float    score;         // last computed unified score
+    // SPATIAL MAPPING: a resource is born where the camera was when its
+    // region loaded - the one world-position signal a layer can observe.
+    // Burst id groups resources created in the same loading wave: one
+    // scenery tile's textures arrive together.
+    float    birthX, birthY, birthZ;
+    uint32_t burst;
 };
+// Camera state for the spatial terms, fed per present from the shared block.
+static float  g_camX = 0, g_camY = 0, g_camZ = 0;
+static float  g_camVX = 0, g_camVY = 0, g_camVZ = 0;   // m/frame EMA
+static bool   g_camValid = false;
+static uint32_t g_burstId = 0;
+static uint64_t g_lastCreateFrame = 0;
 static std::map<VkImage, ResRec> g_registry;
 static uint64_t g_nextResId = 1;
 static std::set<VkImage> g_hotImgs;
@@ -411,7 +423,7 @@ static std::map<VkDeviceMemory, BlockPrio> g_blockPrio;
 // unused decay to a lower priority so the driver demotes exactly the stale
 // ones. Frequently-used resources age at half speed - a texture touched every
 // two seconds outranks one touched once a second ago, which is SS87 verbatim.
-struct UseRec { uint64_t last; uint32_t count; };
+struct UseRec { uint64_t last; uint32_t count; uint32_t sceneCount; };
 static std::map<VkImage, UseRec>         g_imgLastUse;
 static std::map<VkImage, VkDeviceMemory> g_imgMem;
 static uint64_t agedDemotions = 0, agedRestores = 0;
@@ -543,13 +555,15 @@ static uint8_t protectionOfClass(uint8_t cls)
 // Consumers rank by it; the actuation values (priority anchors, pager caps)
 // are unchanged - the score decides ORDER and the log explains WHY.
 static float scoreOf(const ResRec &r, uint64_t lastUse, uint32_t useCount,
-                     uint32_t churnCyclesOfShape)
+                     uint32_t churnCyclesOfShape, uint32_t sceneCount = 0)
 {
     float wCat  = live::f("vram.w_category",  nullptr, 0.40f);
     float wRec  = live::f("vram.w_recency",   nullptr, 0.25f);
     float wFreq = live::f("vram.w_frequency", nullptr, 0.15f);
     float wCost = live::f("vram.w_recreate",  nullptr, 0.10f);
     float wSize = live::f("vram.w_size",      nullptr, 0.10f);
+
+    float wSpat = live::f("vram.w_spatial", nullptr, 0.20f);
 
     float cat = (float)r.protection / 3.0f;
     float rec = 0.0f;
@@ -558,12 +572,58 @@ static float scoreOf(const ResRec &r, uint64_t lastUse, uint32_t useCount,
         rec = age < 60 ? 1.0f : age < 600 ? 0.6f : age < 3600 ? 0.25f : 0.0f;
     }
     float freq = useCount > 200 ? 1.0f : (float)useCount / 200.0f;
+    // Screen-space importance: the fraction of samples that came from the
+    // scene pass. A shadow-only texture is half as valuable per use.
+    if (useCount)
+        freq = 0.5f * freq + 0.5f * ((float)sceneCount / (float)useCount);
+
+    // FORWARD-LOOKING SPATIAL TERM: distance from the resource's birth
+    // position to where the camera WILL BE (velocity projected three
+    // seconds out). Resources along the path score high - prefetched
+    // protection; resources behind the camera decay toward eviction. Only
+    // meaningful for streamed scenery with a valid camera.
+    float spat = 0.5f;
+    if (g_camValid && r.streamed) {
+        float px = g_camX + g_camVX * 180.0f;     // ~3 s at 60 fps
+        float py = g_camY + g_camVY * 180.0f;
+        float pz = g_camZ + g_camVZ * 180.0f;
+        float dx = r.birthX - px, dy = r.birthY - py, dz = r.birthZ - pz;
+        float d = sqrtf(dx*dx + dy*dy + dz*dz);
+        spat = d < 5000.0f ? 1.0f : d < 20000.0f ? 0.6f
+             : d < 60000.0f ? 0.3f : 0.0f;
+    }
     float cost = churnCyclesOfShape >= 3 ? 1.0f
                : (float)churnCyclesOfShape / 3.0f;   // churners are expensive
     float sizePen = r.bytes > (64ull << 20) ? 1.0f
                   : (float)r.bytes / (float)(64ull << 20);
     return wCat * cat + wRec * rec + wFreq * freq + wCost * cost
-         - wSize * sizePen;
+         + wSpat * spat - wSize * sizePen;
+}
+
+// ============================================== TRUE-RESIDENCY SCAFFOLD
+// The appImage -> physImage indirection table the migration executor will
+// write. Identity (absent = itself) until then, so wiring it through the
+// hooks is provably zero-change - the soak the map's slice plan requires.
+static std::map<VkImage, VkImage> g_physOf;
+static VkImage phys(VkImage app)
+{
+    std::lock_guard<std::mutex> g(m);
+    std::map<VkImage, VkImage>::iterator it = g_physOf.find(app);
+    return it == g_physOf.end() ? app : it->second;
+}
+
+static void noteCamera(float x, float y, float z)
+{
+    if (g_camValid) {
+        float vx = x - g_camX, vy = y - g_camY, vz = z - g_camZ;
+        if (vx*vx + vy*vy + vz*vz < 1e8f) {      // ignore teleports here
+            g_camVX += (vx - g_camVX) * 0.1f;
+            g_camVY += (vy - g_camVY) * 0.1f;
+            g_camVZ += (vz - g_camVZ) * 0.1f;
+        }
+    }
+    g_camX = x; g_camY = y; g_camZ = z;
+    g_camValid = true;
 }
 
 // The decision engine (task SS19): every residency decision names its
@@ -620,6 +680,12 @@ static void noteImageCreate(VkImage img, uint32_t w, uint32_t h, uint32_t fmt,
     rec.state = droppedMips ? RS_REDUCED_AT_CREATE : RS_FULL;
     rec.streamed = streamed;
     rec.score = 0.0f;
+    // Spatial stamp: birth position and load burst. A gap of two seconds
+    // between creations starts a new burst - the next scenery tile.
+    if (frameIndex - g_lastCreateFrame > 120) ++g_burstId;
+    g_lastCreateFrame = frameIndex;
+    rec.birthX = g_camX; rec.birthY = g_camY; rec.birthZ = g_camZ;
+    rec.burst = g_burstId;
     g_registry[img] = rec;
     if (r.cycles >= 3) {
         g_hotImgs.insert(img);
@@ -723,12 +789,17 @@ static void noteDescriptorUpdates(uint32_t n) { descUpdFrame.fetch_add(n); }
 static void noteDescriptorAllocs(uint32_t n)  { descAllocFrame.fetch_add(n); }
 static void notePipelineBind()                { pipeBindsFrame.fetch_add(1); }
 
-static void noteImageUse(VkImage img)
+static void noteImageUse(VkImage img, bool inScenePass = false)
 {
     std::lock_guard<std::mutex> g(m);
     UseRec &r = g_imgLastUse[img];
     r.last = frameIndex;
     if (r.count < 0xFFFFFFFFu) ++r.count;
+    // SCREEN-SPACE IMPORTANCE, the observable form: a resource sampled by
+    // the SCENE pass contributes to the frame the user sees; one sampled
+    // only by shadow/reflection/utility passes does not. The ratio is the
+    // visibility weight the score consumes.
+    if (inScenePass && r.sceneCount < 0xFFFFFFFFu) ++r.sceneCount;
 }
 
 static void noteImageMem(VkImage img, VkDeviceMemory mem)
@@ -1171,7 +1242,9 @@ static void prioZoneWalk()
             std::map<ChurnKey, ChurnRec>::iterator cr =
                 g_churn.find(rr->second.shape);
             if (cr != g_churn.end()) cyc = cr->second.cycles;
-            float s = scoreOf(rr->second, lastUse, useCount, cyc);
+            uint32_t sceneN = 0;
+            if (ur != g_imgLastUse.end()) sceneN = ur->second.sceneCount;
+            float s = scoreOf(rr->second, lastUse, useCount, cyc, sceneN);
             rr->second.score = s;
             std::map<VkDeviceMemory, float>::iterator bs =
                 blockScore.find(im->second);
@@ -1253,8 +1326,13 @@ static void agingWalk()
             // seconds of its life, whatever its use count says.
             {
                 std::map<VkImage, ResRec>::iterator rg = g_registry.find(cursor);
-                if (rg != g_registry.end() &&
-                    frameIndex - rg->second.createdFrame < 600) continue;
+                if (rg != g_registry.end()) {
+                    if (frameIndex - rg->second.createdFrame < 600) continue;
+                    // Spatial protection: a resource on the predicted flight
+                    // path never ages out, whatever its recent use - the
+                    // camera is about to need it.
+                    if (rg->second.score > 0.6f) continue;
+                }
             }
             uint64_t window = (uint64_t)cfg.ageFrames + (uint64_t)ageBiasFrames;
             if (it->second.count > 100) window *= 2;       // frequency (SS87)
@@ -2108,6 +2186,12 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
               "%llu teleports;  sparse binds %llu",
               camSpeedEma, camRotEma, (unsigned long long)teleports,
               (unsigned long long)sparseBinds);
+        trace("  spatial: %u load bursts, camera velocity (%.1f, %.1f, %.1f) "
+              "m/frame - streamed resources score against the position 3 s "
+              "ahead;  indirection table %llu entries (identity until the "
+              "migration executor writes it)",
+              g_burstId, g_camVX, g_camVY, g_camVZ,
+              (unsigned long long)g_physOf.size());
         {
             // Pool composition - the fragmentation-adjacent view (SS8 of the
             // NEXT list): how many blocks, and how uneven their sizes are.

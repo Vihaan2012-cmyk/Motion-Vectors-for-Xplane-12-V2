@@ -5610,6 +5610,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
     {
         std::lock_guard<std::mutex> g(g_lock);
         if (sampleUse && sets) {
+            std::map<VkCommandBuffer, bool>::iterator sc = g_cbInScenePass.find(cb);
+            bool inScene = sc != g_cbInScenePass.end() && sc->second;
             for (uint32_t s = 0; s < n; ++s) {
                 std::map<VkDescriptorSet, std::vector<VkImageView> >::iterator
                     sv = g_setViews.find(sets[s]);
@@ -5618,7 +5620,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                     std::map<VkImageView, VkImage>::iterator im =
                         g_viewToImage.find(sv->second[v]);
                     if (im != g_viewToImage.end())
-                        vram::noteImageUse(im->second);
+                        vram::noteImageUse(im->second, inScene);
                 }
             }
         }
@@ -6752,6 +6754,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // zone on.
     float rotDeg = -1.0f;
     if (g_share && g_share->valid) {
+        // Camera position feeds the spatial mapping: resources are stamped
+        // with where the camera was at their creation, and scored against
+        // where it will be.
+        vram::noteCamera(g_share->camX, g_share->camY, g_share->camZ);
         static float pf[3] = {0, 0, 0};
         static bool havePf = false;
         const float *mv = g_share->modelview;
