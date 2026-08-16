@@ -166,6 +166,8 @@ inline void writeTemplate()
 "# vram.warmup_mb 512        starting this much extra reserve, decaying to 0.\n"
 "# vram.hold_max_mb 512      governor backpressure: past this, pass through.\n"
 "# vram.lookahead 300        frames of usage-trend projection (predict peaks).\n"
+"# vram.age_frames 1800      unused-resource window before priority decay;\n"
+"#                           doubled for frequently-used resources.\n"
 "# vram.bench=1 / =0         open / close a measurement window; closing dumps\n"
 "#                           avg, 1%% low, 0.1%% low, VRAM peak, uploads,\n"
 "#                           allocs, JIT pipelines, zone residency.\n"

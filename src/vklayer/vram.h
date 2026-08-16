@@ -89,12 +89,13 @@ struct Config {
     int   warmupMB;          // vram.warmup_mb          extra reserve at frame 0
     int   holdMaxMB;         // vram.hold_max_mb        governor backpressure
     int   lookaheadFrames;   // vram.lookahead          SS85 trend horizon
+    int   ageFrames;         // vram.age_frames         SS86 staleness window
 };
 static Config cfg = { true, true, true, true, true,
                       0.02f, {128,256,384,512,768}, 512, 600,
                       256, 180, {0,0,64,24,8}, 2,
                       2000.0f, 900, 600, 0.01f, true,
-                      true, 900, 512, 512, 300 };
+                      true, 900, 512, 512, 300, 1800 };
 
 // ------------------------------------------------------------------ zones
 enum Zone { GREEN = 0, YELLOW, ORANGE, RED, CRITICAL };
@@ -303,8 +304,19 @@ struct AllocRec { uint64_t size; uint32_t type; bool plain; };  // plain: pNext=
 static std::map<VkDeviceMemory, AllocRec> g_allocs;
 
 // ---- priority engine
-struct BlockPrio { float best; bool streamedTexOnly; bool demoted; };
+struct BlockPrio { float best; bool streamedTexOnly; bool demoted; bool aged; };
 static std::map<VkDeviceMemory, BlockPrio> g_blockPrio;
+
+// ---- per-resource aging (SS21's age weight, SS86/87 recency AND frequency).
+// Usage is sampled at descriptor-bind time (1 in 64 binds - aging needs "used
+// this minute", not "used this draw"), and blocks whose images have gone
+// unused decay to a lower priority so the driver demotes exactly the stale
+// ones. Frequently-used resources age at half speed - a texture touched every
+// two seconds outranks one touched once a second ago, which is SS87 verbatim.
+struct UseRec { uint64_t last; uint32_t count; };
+static std::map<VkImage, UseRec>         g_imgLastUse;
+static std::map<VkImage, VkDeviceMemory> g_imgMem;
+static uint64_t agedDemotions = 0, agedRestores = 0;
 
 // ---- upload governor
 struct HeldOne {
@@ -427,6 +439,8 @@ static void noteImageDestroy(VkImage img)
         g_imgKey.erase(it);
     }
     g_hotImgs.erase(img);
+    g_imgLastUse.erase(img);
+    g_imgMem.erase(img);
 }
 
 static bool churnHot(VkImage img)
@@ -449,6 +463,20 @@ static void notePipelines(uint32_t count, uint64_t us)
 static void noteDescriptorUpdates(uint32_t n) { descUpdFrame.fetch_add(n); }
 static void noteDescriptorAllocs(uint32_t n)  { descAllocFrame.fetch_add(n); }
 static void notePipelineBind()                { pipeBindsFrame.fetch_add(1); }
+
+static void noteImageUse(VkImage img)
+{
+    std::lock_guard<std::mutex> g(m);
+    UseRec &r = g_imgLastUse[img];
+    r.last = frameIndex;
+    if (r.count < 0xFFFFFFFFu) ++r.count;
+}
+
+static void noteImageMem(VkImage img, VkDeviceMemory mem)
+{
+    std::lock_guard<std::mutex> g(m);
+    g_imgMem[img] = mem;
+}
 
 // ============================================================ map + bind maps
 static void noteMap(VkDeviceMemory mem, VkDeviceSize offset, VkDeviceSize size,
@@ -837,32 +865,90 @@ static void onBind(VkDeviceMemory mem, int cat, bool streamed, bool hot = false)
 }
 
 // Zone modulation: in RED and worse, push streamed-texture-only blocks further
-// down so the driver demotes THOSE first; lift them again in GREEN. Bounded
-// per call so a zone flip never stalls a present.
+// down so the driver demotes THOSE first - LARGEST blocks first (SS21's size
+// weight, SS22: the most memory back per priority move); lift them again in
+// GREEN. Bounded per call so a zone flip never stalls a present.
 static void prioZoneWalk()
 {
     if (!cfg.enable || !cfg.priority || !dev.pageableExt || !dev.dev) return;
     std::vector<std::pair<VkDeviceMemory, float> > moves;
     {
         std::lock_guard<std::mutex> g(m);
-        int budget = 64;
+        // Candidates first, size-ordered, THEN the per-frame budget - so the
+        // budget is spent on the blocks whose demotion frees the most.
+        std::vector<std::pair<uint64_t, VkDeviceMemory> > cand;
         for (std::map<VkDeviceMemory, BlockPrio>::iterator it = g_blockPrio.begin();
-             it != g_blockPrio.end() && budget > 0; ++it) {
+             it != g_blockPrio.end(); ++it) {
             if (!it->second.streamedTexOnly) continue;
+            bool wantDemote  = zone >= RED  && !it->second.demoted;
+            bool wantRestore = zone == GREEN && it->second.demoted;
+            if (!wantDemote && !wantRestore) continue;
+            uint64_t sz = 0;
+            std::map<VkDeviceMemory, AllocRec>::iterator ar = g_allocs.find(it->first);
+            if (ar != g_allocs.end()) sz = ar->second.size;
+            cand.push_back(std::make_pair(sz, it->first));
+        }
+        std::sort(cand.begin(), cand.end());
+        int budget = 64;
+        for (size_t i = cand.size(); i > 0 && budget > 0; --i, --budget) {
+            std::map<VkDeviceMemory, BlockPrio>::iterator it =
+                g_blockPrio.find(cand[i - 1].second);
+            if (it == g_blockPrio.end()) continue;
             if (zone >= RED && !it->second.demoted) {
                 it->second.demoted = true;
                 moves.push_back(std::make_pair(it->first, 0.2f));
-                --budget;
             } else if (zone == GREEN && it->second.demoted) {
                 it->second.demoted = false;
-                moves.push_back(std::make_pair(it->first, it->second.best));
-                --budget;
+                moves.push_back(std::make_pair(it->first,
+                    it->second.aged ? 0.25f : it->second.best));
             }
         }
     }
     for (size_t i = 0; i < moves.size(); ++i)
         dev.setPriority(dev.dev, moves[i].first, moves[i].second);
     prioZoneMoves += moves.size();
+}
+
+// The aging walk (SS86-88): a rotating cursor visits sampled-use records, 64
+// a frame. A streamed-texture block whose images have gone unused for the age
+// window decays to 0.25; the window DOUBLES for frequently-used resources
+// (SS87 - recency alone is the wrong statistic). First use after decay
+// restores the class priority. Hysteresis is inherent: the window is minutes,
+// the restore is immediate on use.
+static void agingWalk()
+{
+    if (!cfg.enable || !cfg.priority || !dev.pageableExt || !dev.dev) return;
+    static VkImage cursor = VK_NULL_HANDLE;
+    std::vector<std::pair<VkDeviceMemory, float> > moves;
+    {
+        std::lock_guard<std::mutex> g(m);
+        std::map<VkImage, UseRec>::iterator it = g_imgLastUse.upper_bound(cursor);
+        int budget = 64;
+        for (; it != g_imgLastUse.end() && budget > 0; ++it, --budget) {
+            cursor = it->first;
+            std::map<VkImage, VkDeviceMemory>::iterator im = g_imgMem.find(it->first);
+            if (im == g_imgMem.end()) continue;
+            std::map<VkDeviceMemory, BlockPrio>::iterator bp =
+                g_blockPrio.find(im->second);
+            if (bp == g_blockPrio.end() || !bp->second.streamedTexOnly) continue;
+            uint64_t window = (uint64_t)cfg.ageFrames;
+            if (it->second.count > 100) window *= 2;       // frequency (SS87)
+            bool stale = frameIndex > it->second.last &&
+                         frameIndex - it->second.last > window;
+            if (stale && !bp->second.aged && !bp->second.demoted) {
+                bp->second.aged = true;
+                moves.push_back(std::make_pair(im->second, 0.25f));
+                ++agedDemotions;
+            } else if (!stale && bp->second.aged && !bp->second.demoted) {
+                bp->second.aged = false;
+                moves.push_back(std::make_pair(im->second, bp->second.best));
+                ++agedRestores;
+            }
+        }
+        if (it == g_imgLastUse.end()) cursor = VK_NULL_HANDLE;
+    }
+    for (size_t i = 0; i < moves.size(); ++i)
+        dev.setPriority(dev.dev, moves[i].first, moves[i].second);
 }
 
 // ============================================================ upload governor
@@ -1312,6 +1398,7 @@ static void refreshConfig()
     cfg.warmupMB       = live::i("vram.warmup_mb",       nullptr, 512);
     cfg.holdMaxMB      = live::i("vram.hold_max_mb",     nullptr, 512);
     cfg.lookaheadFrames = live::i("vram.lookahead",      nullptr, 300);
+    cfg.ageFrames      = live::i("vram.age_frames",      nullptr, 1800);
 }
 
 // Frame-time sample and the adaptive upload notch (SS29/58). If the rolling
@@ -1626,6 +1713,7 @@ static void onPresent(float camDeltaMeters)
 
     poolTrim(false);
     prioZoneWalk();
+    agingWalk();
 
     if (live::i("vram.report", nullptr, 0)) {
         live::clearOneShot("vram.report");
@@ -1696,6 +1784,11 @@ static void onPresent(float camDeltaMeters)
               (unsigned long long)pipeBindsPeak,
               usageTrendBytes * 60.0 / 1048576.0,
               (unsigned long long)aircraftChanges);
+        trace("  aging: %llu tracked images, %llu decayed, %llu restored "
+              "(window %d frames, doubled for frequent users)",
+              (unsigned long long)g_imgLastUse.size(),
+              (unsigned long long)agedDemotions,
+              (unsigned long long)agedRestores, cfg.ageFrames);
         {
             // Top churners - the shapes cycling through residency (SS51).
             int printed = 0;

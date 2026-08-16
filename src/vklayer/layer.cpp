@@ -1009,6 +1009,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindImageMemory(
     if (cat >= 0)
         vram::onBind(mem, cat, g_share && g_share->valid,
                      vram::churnHot(image));
+    vram::noteImageMem(image, mem);
     return g_nextBindImageMemory
          ? g_nextBindImageMemory(device, image, mem, offset)
          : VK_ERROR_INITIALIZATION_FAILED;
@@ -1022,6 +1023,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindImageMemory2(
         if (cat >= 0)
             vram::onBind(infos[i].memory, cat, g_share && g_share->valid,
                          vram::churnHot(infos[i].image));
+        vram::noteImageMem(infos[i].image, infos[i].memory);
     }
     return g_nextBindImageMemory2
          ? g_nextBindImageMemory2(device, count, infos)
@@ -5558,9 +5560,29 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
     uint32_t first, uint32_t n, const VkDescriptorSet *sets,
     uint32_t nd, const uint32_t *dyn)
 {
+    // Sampled per-resource usage for the aging walk (SS86): 1 in 64 binds
+    // resolves this set's sampled images and stamps their last-use frame.
+    // Aging needs "used this minute", not "used this draw", so sampling costs
+    // nothing it needs.
+    static std::atomic<uint32_t> useSample(0);
+    bool sampleUse = (useSample.fetch_add(1) & 63) == 0;
+
     PFN_vkCmdBindDescriptorSets next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
+        if (sampleUse && sets) {
+            for (uint32_t s = 0; s < n; ++s) {
+                std::map<VkDescriptorSet, std::vector<VkImageView> >::iterator
+                    sv = g_setViews.find(sets[s]);
+                if (sv == g_setViews.end()) continue;
+                for (size_t v = 0; v < sv->second.size(); ++v) {
+                    std::map<VkImageView, VkImage>::iterator im =
+                        g_viewToImage.find(sv->second[v]);
+                    if (im != g_viewToImage.end())
+                        vram::noteImageUse(im->second);
+                }
+            }
+        }
         std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
         if (ci != g_cbToDevice.end()) {
             std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
