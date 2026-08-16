@@ -2210,9 +2210,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
     // below. It is idempotent and latched, so calling it here costs nothing.
     openShare();
 
-    // ---- custom pager: shrink the texture before it is ever created.
+    // ---- custom pager: shrink the texture before it is ever created. The
+    // global zone policy chooses a base drop; the registry refines it PER
+    // RESOURCE - churn-hot shapes are protected from any cut (cutting them is
+    // what caused their reload cycling), and large streamed shapes take an
+    // extra level under pressure before small ones are touched.
     VkImageCreateInfo ci2 = *ci;
     uint32_t drop = pagerDropLevels(ci);
+    if (ci)
+        drop = vram::refineDrop(drop, ci->extent.width, ci->extent.height,
+                                (uint32_t)ci->format, ci->mipLevels,
+                                g_share && g_share->valid);
     if (drop) {
         ci2.extent.width  = ci->extent.width  >> drop;
         ci2.extent.height = ci->extent.height >> drop;
@@ -6713,8 +6721,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         vram::ledgerRt(g_vram[VRAM_RT].bytes + g_vram[VRAM_DEPTH].bytes +
                        g_vram[VRAM_STORAGE].bytes);
     }
+    // Camera rotation rate from the view matrix the plugin already
+    // publishes: the forward axis's frame-to-frame angle. A fast sustained
+    // turn is the "new scenery incoming" signal the predictor floors the
+    // zone on.
+    float rotDeg = -1.0f;
+    if (g_share && g_share->valid) {
+        static float pf[3] = {0, 0, 0};
+        static bool havePf = false;
+        const float *mv = g_share->modelview;
+        float f0 = mv[8], f1 = mv[9], f2 = mv[10];
+        float len = sqrtf(f0*f0 + f1*f1 + f2*f2);
+        if (len > 1e-6f) {
+            f0 /= len; f1 /= len; f2 /= len;
+            if (havePf) {
+                float d = f0*pf[0] + f1*pf[1] + f2*pf[2];
+                if (d > 1.0f) d = 1.0f; if (d < -1.0f) d = -1.0f;
+                rotDeg = acosf(d) * 57.29578f;
+            }
+            pf[0] = f0; pf[1] = f1; pf[2] = f2; havePf = true;
+        }
+    }
     vram::onPresent((snap.camDelta >= 0.0f && snap.camDelta < 100000.0f)
-                        ? snap.camDelta : -1.0f);
+                        ? snap.camDelta : -1.0f, rotDeg);
 
     // Zone-driven texture quality caps (SS25/43/47): the create-time pager's
     // thresholds follow the zone unless the environment pinned them - an env

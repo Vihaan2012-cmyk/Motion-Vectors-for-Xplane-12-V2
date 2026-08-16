@@ -188,7 +188,11 @@ struct ChurnKey {
 struct ChurnRec {
     uint32_t creates = 0, destroys = 0, cycles = 0;
     uint64_t lastDestroyFrame = 0, bytes = 0;
+    uint8_t  lastDrop = 0;      // mips the pager cut at the last creation
 };
+static uint64_t mipRestorations = 0;   // shapes re-created at full quality
+static uint64_t perResProtected = 0, perResExtraCut = 0;
+static uint64_t zoneFlips = 0;         // transitions, for thrash learning
 static std::map<ChurnKey, ChurnRec> g_churn;
 static uint64_t churnCycles = 0;
 
@@ -277,6 +281,8 @@ static uint64_t rtBytesNow = 0;
 // machine that has hit the wall keeps more margin from the next launch on.
 static int      reserveBiasMB = 0;
 static uint64_t failsEver = 0;
+static int      ageBiasFrames = 0;   // learned: restores soon after decay
+static double   camRotEma = 0.0;     // deg/frame, scene-turn signal
 
 // ---- host-pointer and binding tracking, the legal route into upload
 // contents. VMA maps its staging blocks through vkMapMemory, which passes
@@ -447,8 +453,14 @@ static uint64_t zoneUploadBudget()
 // ==================================================== registry + churn
 // Classification (task SS3): observable Vulkan behaviour only, probabilistic
 // where uncertain, conservative for unknowns. No filenames exist to read.
+static bool fmtIsCompressed(uint32_t f)
+{   // BC1..BC7 block range - disk-authored artwork
+    return f >= 131 && f <= 146;
+}
+
 static uint8_t classify(int cat, VkImageUsageFlags usage, uint32_t layers,
-                        bool is3D, bool streamed, uint32_t w, uint32_t h)
+                        bool is3D, bool streamed, uint32_t w, uint32_t h,
+                        uint32_t fmt)
 {
     switch (cat) {
         case 1: /*RT*/      return RC_RENDER_TARGET;
@@ -459,7 +471,12 @@ static uint8_t classify(int cat, VkImageUsageFlags usage, uint32_t layers,
                  ? RC_SHADOW : RC_DEPTH;
         case 3: /*STORAGE*/ return is3D ? RC_CLOUD_VOLUME : RC_STORAGE;
         case 0: /*TEX*/
+            // Format as a class signal: block-compressed is disk-authored
+            // artwork; uncompressed sampled textures are generated surfaces
+            // (panels, overlays) and rank with UI up to 512px.
             if (w <= 256 && h <= 256) return RC_UI_SMALL;
+            if (!fmtIsCompressed(fmt) && w <= 512 && h <= 512)
+                return RC_UI_SMALL;
             return streamed ? RC_SCENERY_STREAMED : RC_AIRCRAFT_COCKPIT;
         case 4: /*IMG_OTHER*/
             if (is3D) return RC_CLOUD_VOLUME;
@@ -549,13 +566,19 @@ static void noteImageCreate(VkImage img, uint32_t w, uint32_t h, uint32_t fmt,
         ++r.cycles;
         ++churnCycles;
     }
+    // Dynamic mip restoration, observed: a shape the pager previously cut,
+    // re-created at full quality, is the engine's own reload loop restoring
+    // detail once the shaped budget widened. Counted, so the loop is visible.
+    if (r.lastDrop > 0 && droppedMips == 0) ++mipRestorations;
+    r.lastDrop = (uint8_t)droppedMips;
+
     bool streamed = frameIndex > 900;   // in-flight creation
     ResRec rec;
     rec.id = g_nextResId++;
     rec.shape = k;
     rec.bytes = bytes;
     rec.createdFrame = frameIndex;
-    rec.cls = classify(cat, usage, layers, is3D, streamed, w, h);
+    rec.cls = classify(cat, usage, layers, is3D, streamed, w, h, fmt);
     rec.protection = protectionOfClass(rec.cls);
     rec.state = droppedMips ? RS_REDUCED_AT_CREATE : RS_FULL;
     rec.streamed = streamed;
@@ -609,6 +632,43 @@ static bool churnHot(VkImage img)
 {
     std::lock_guard<std::mutex> g(m);
     return g_hotImgs.count(img) != 0;
+}
+
+// PER-RESOURCE QUALITY DECISION (the pager's global caps refined by what the
+// registry knows about THIS shape). Called at creation time with the base
+// drop the global policy chose; returns the final drop.
+//   - A churn-hot shape is PROTECTED: cutting it is what caused its reload
+//     cycling, so it keeps full quality whatever the zone.
+//   - Under pressure, LARGE streamed shapes take an extra cut before small
+//     ones are touched at all - the byte-weighted degradation the global
+//     scale cannot express.
+static uint32_t refineDrop(uint32_t baseDrop, uint32_t w, uint32_t h,
+                           uint32_t fmt, uint32_t mips, bool streamed)
+{
+    if (!cfg.enable) return baseDrop;
+    std::lock_guard<std::mutex> g(m);
+    ChurnKey k; k.w = w; k.h = h; k.fmt = fmt; k.mips = mips;
+    std::map<ChurnKey, ChurnRec>::iterator it = g_churn.find(k);
+    if (it != g_churn.end() && it->second.cycles >= 3) {
+        if (baseDrop) ++perResProtected;
+        return 0;                                   // churner: never cut
+    }
+    if (!streamed || zone < ORANGE) return baseDrop;
+    // The pager's non-power-of-two guard holds here too: X-Plane's own scale
+    // produces non-pow2 sizes whose BC block layout a further halving
+    // corrupts - measured as a crash, documented at pagerDropLevels. No
+    // extra cut for those, ever.
+    if ((w & (w - 1)) != 0 || (h & (h - 1)) != 0) return baseDrop;
+    uint64_t bytes = it != g_churn.end() && it->second.bytes
+                   ? it->second.bytes : (uint64_t)w * h * 4;
+    uint32_t extra = 0;
+    if (zone == ORANGE)      extra = bytes > (32ull << 20) ? 1 : 0;
+    else if (zone == RED)    extra = bytes > (16ull << 20) ? 1 : 0;
+    else /* CRITICAL */      extra = bytes > (8ull << 20) ? 2 : 1;
+    uint32_t total = baseDrop + extra;
+    if (total >= mips) total = mips > 1 ? mips - 1 : 0;
+    if (total > baseDrop) ++perResExtraCut;
+    return total;
 }
 
 // ============================================================ misc telemetry
@@ -786,6 +846,8 @@ static void stateLoad()
             reserveBiasMB = (int)(v > 256 ? 256 : v);
         else if (sscanf(line, "upload_peak_mb=%llu", &v) == 1)
             upBytesPeak = v * 1048576ull;
+        else if (sscanf(line, "age_bias_frames=%llu", &v) == 1)
+            ageBiasFrames = (int)(v > 3600 ? 3600 : v);
     }
     fclose(f);
     if (reserveBiasMB || failsEver)
@@ -801,9 +863,10 @@ static void stateSave()
     fprintf(f, "# VRAM system state - carried across sessions (plan SS77).\n"
                "fails_ever=%llu\n"
                "reserve_bias_mb=%d\n"
-               "upload_peak_mb=%llu\n",
+               "upload_peak_mb=%llu\n"
+               "age_bias_frames=%d\n",
             (unsigned long long)failsEver, reserveBiasMB,
-            (unsigned long long)(upBytesPeak / 1048576ull));
+            (unsigned long long)(upBytesPeak / 1048576ull), ageBiasFrames);
     fclose(f);
 }
 
@@ -1148,7 +1211,15 @@ static void agingWalk()
             std::map<VkDeviceMemory, BlockPrio>::iterator bp =
                 g_blockPrio.find(im->second);
             if (bp == g_blockPrio.end() || !bp->second.streamedTexOnly) continue;
-            uint64_t window = (uint64_t)cfg.ageFrames;
+            // Prediction grace: a freshly created resource is the streamer
+            // answering upcoming demand - aging never touches the first ten
+            // seconds of its life, whatever its use count says.
+            {
+                std::map<VkImage, ResRec>::iterator rg = g_registry.find(cursor);
+                if (rg != g_registry.end() &&
+                    frameIndex - rg->second.createdFrame < 600) continue;
+            }
+            uint64_t window = (uint64_t)cfg.ageFrames + (uint64_t)ageBiasFrames;
             if (it->second.count > 100) window *= 2;       // frequency (SS87)
             bool stale = frameIndex > it->second.last &&
                          frameIndex - it->second.last > window;
@@ -1740,20 +1811,20 @@ static void zoneUpdate()
 
     if (teleportLeft > 0 && want < YELLOW) want = YELLOW;      // predictive bias
 
-    if (want > zone) { zone = want; zoneDwell = 0;
+    if (want > zone) { zone = want; zoneDwell = 0; ++zoneFlips;
         trace("VRAMSYS: zone %s (%.0f%% of %.2f GB shaped basis, usage %.2f GB "
               "+ uploads %.1f MB/f)", zoneName(zone), f * 100.0,
               basis / 1073741824.0, rawUsage / 1073741824.0,
               upBytesLast / 1048576.0);
     } else if (want < zone) {
         if (++zoneDwell >= 60) {                                // 60-frame dwell
-            zone = want; zoneDwell = 0;
+            zone = want; zoneDwell = 0; ++zoneFlips;
             trace("VRAMSYS: zone %s (%.0f%%)", zoneName(zone), f * 100.0);
         }
     } else zoneDwell = 0;
 }
 
-static void onPresent(float camDeltaMeters)
+static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
 {
     refreshConfig();
     if (!cfg.enable) { flushAll(&flushOnPresent); return; }
@@ -1882,6 +1953,18 @@ static void onPresent(float camDeltaMeters)
     }
     if (teleportLeft == cfg.teleportFrames) poolTrim(true);
 
+    // Camera/scene integration: a sustained fast turn sweeps fresh scenery
+    // into the frustum - the same "demand is coming" signal as speed, from
+    // the view matrix the layer already receives. Floors the zone at YELLOW
+    // for two seconds per trigger, which pre-tightens the shaped budget.
+    if (camRotDeg >= 0.0f && camRotDeg < 45.0f) {
+        camRotEma += (camRotDeg - camRotEma) * 0.1;
+        if (camRotEma > live::f("vram.rot_floor_deg", nullptr, 1.0f)) {
+            std::lock_guard<std::mutex> g(m);
+            if (teleportLeft < 120) teleportLeft = 120;
+        }
+    }
+
     // A fresh heap sample, on our own cadence, through the down-chain query -
     // shaping happens in the report hook; this keeps zones honest even when
     // the app is not asking.
@@ -1984,9 +2067,21 @@ static void onPresent(float camDeltaMeters)
               (unsigned long long)prioBindSet,
               (unsigned long long)prioZoneMoves,
               dev.priorityExt ? "on" : "OFF", dev.pageableExt ? "on" : "OFF");
-        trace("  camera: %.2f m/frame EMA, %llu teleports;  sparse binds %llu",
-              camSpeedEma, (unsigned long long)teleports,
+        trace("  camera: %.2f m/frame EMA, %.2f deg/frame rotation EMA, "
+              "%llu teleports;  sparse binds %llu",
+              camSpeedEma, camRotEma, (unsigned long long)teleports,
               (unsigned long long)sparseBinds);
+        {
+            // Pool composition - the fragmentation-adjacent view (SS8 of the
+            // NEXT list): how many blocks, and how uneven their sizes are.
+            uint64_t largest = 0;
+            for (size_t i = 0; i < g_pool.size(); ++i)
+                if (g_pool[i].size > largest) largest = g_pool[i].size;
+            trace("  pool composition: %llu blocks, largest %.1f MB of %.1f "
+                  "MB held;  age bias %d frames (learned)",
+                  (unsigned long long)g_pool.size(), largest / 1048576.0,
+                  g_poolBytes / 1048576.0, ageBiasFrames);
+        }
         {
             double avg, p99, p999, worst, var;
             frameTimeStats(&avg, &p99, &p999, &worst, &var);
@@ -2023,6 +2118,13 @@ static void onPresent(float camDeltaMeters)
               (unsigned long long)pipeBindsPeak,
               usageTrendBytes * 60.0 / 1048576.0,
               (unsigned long long)aircraftChanges);
+        trace("  per-resource quality: %llu shapes protected from cuts "
+              "(churners), %llu extra cuts (large streamed under pressure), "
+              "%llu full-quality restorations observed; %llu zone flips",
+              (unsigned long long)perResProtected,
+              (unsigned long long)perResExtraCut,
+              (unsigned long long)mipRestorations,
+              (unsigned long long)zoneFlips);
         trace("  aging: %llu tracked images, %llu decayed, %llu restored "
               "(window %d frames, doubled for frequent users)",
               (unsigned long long)g_imgLastUse.size(),
@@ -2094,6 +2196,25 @@ static void shutdown()
 {
     flushAll(&flushOnDep);
     poolTrim(true);
+    // Automated tuning: a session that thrashed between zones teaches the
+    // next one to keep a wider margin - the same persistent-bias channel the
+    // allocation failures use, learned once per session at shutdown.
+    if (zoneFlips > 200 && reserveBiasMB < 256) {
+        reserveBiasMB += 32;
+        trace("VRAMSYS: %llu zone transitions this session - reserve bias "
+              "raised to +%d MB for future sessions",
+              (unsigned long long)zoneFlips, reserveBiasMB);
+    }
+    // Age-window tuning: many restores shortly after decay means the window
+    // was too short - the next session waits longer before decaying.
+    if (agedDemotions > 50 && agedRestores * 2 > agedDemotions &&
+        ageBiasFrames < 3600) {
+        ageBiasFrames += 600;
+        trace("VRAMSYS: %llu of %llu aged resources came back - age window "
+              "extended by %d frames for future sessions",
+              (unsigned long long)agedRestores,
+              (unsigned long long)agedDemotions, ageBiasFrames);
+    }
     stateSave();
     std::lock_guard<std::mutex> g(m);
     uint64_t remBytes = 0;
