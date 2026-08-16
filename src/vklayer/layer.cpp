@@ -10507,10 +10507,35 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         // omitting it from its own requirements is then deliberate, not an
         // oversight to be corrected.
 
+        // ---- THE `false &&` HERE CREATED AN INVALID DEVICE. (root cause of
+        //      the 4K Felis-load DEVICE_LOST, found by the validation layer)
+        //
+        // VK_NV_low_latency2 REQUIRES VK_KHR_present_id. We enabled the former
+        // and never the latter, so every device this layer created was invalid:
+        //   VUID-vkCreateDevice-ppEnabledExtensionNames-01387
+        //   "Missing extension required to enable device extension
+        //    VK_NV_low_latency2: VK_KHR_present_id"
+        // An invalid device is undefined behaviour, not a guaranteed failure -
+        // which is why it ran at all, why it was intermittent, and why it died
+        // under load rather than at creation. The whole block is gated on
+        // TAA_VRAM_HOOKS, which is exactly why hooks-off runs survived and
+        // hooks-on runs crashed: nothing to do with VRAM policy.
+        //
+        // These two exist for Streamline/DLSS-G, which this layer does not
+        // run. Not enabling them is strictly better than enabling them plus a
+        // dependency chain we have no use for. TAA_SL_LOW_LATENCY=1 re-arms
+        // both for anyone who takes the Streamline path up again - and that
+        // path must add VK_KHR_present_id with them.
+        static const bool wantLowLatency = getenv("TAA_SL_LOW_LATENCY") &&
+                                           atoi(getenv("TAA_SL_LOW_LATENCY")) != 0;
         for (size_t k = 0; k < sizeof(kWanted)/sizeof(kWanted[0]); ++k) {
-            if (false && (!strcmp(kWanted[k], "VK_NV_low_latency2") ||
-                         !strcmp(kWanted[k], "VK_NV_low_latency"))) {
-                trace("DEVICE: TAA_SL_NO_LL - deliberately NOT enabling %s", kWanted[k]);
+            if (!wantLowLatency &&
+                (!strcmp(kWanted[k], "VK_NV_low_latency2") ||
+                 !strcmp(kWanted[k], "VK_NV_low_latency"))) {
+                trace("DEVICE: NOT enabling %s - it requires VK_KHR_present_id, "
+                      "which nothing here provides, and an extension enabled "
+                      "without its dependency makes the DEVICE invalid",
+                      kWanted[k]);
                 continue;
             }
             bool supported = false;
@@ -10535,9 +10560,11 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
             // kSlDeviceExt carries VK_NV_low_latency2 as well, so filtering
             // only kWanted would leave the extension enabled by this loop and
             // the test would silently measure nothing.
-            if (false && (!strcmp(slWanted[k], "VK_NV_low_latency2") ||
-                         !strcmp(slWanted[k], "VK_NV_low_latency"))) {
-                trace("DEVICE: TAA_SL_NO_LL - deliberately NOT enabling %s (Streamline list)",
+            if (!wantLowLatency &&
+                (!strcmp(slWanted[k], "VK_NV_low_latency2") ||
+                 !strcmp(slWanted[k], "VK_NV_low_latency"))) {
+                trace("DEVICE: NOT enabling %s (Streamline list) - same missing "
+                      "VK_KHR_present_id dependency as above",
                       slWanted[k]);
                 continue;
             }
