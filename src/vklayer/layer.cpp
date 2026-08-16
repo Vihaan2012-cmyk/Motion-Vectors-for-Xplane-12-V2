@@ -10220,7 +10220,11 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
                 "VK_EXT_memory_priority",
                 "VK_EXT_pageable_device_local_memory",
             };
-            for (int k = 0; k < 2; ++k) {
+            // Total-kill also skips the defensive extension adds, so device
+            // creation matches the pre-VRAM build exactly.
+            const char *vhk = getenv("TAA_VRAM_HOOKS");
+            bool vramDead = vhk && atoi(vhk) == 0;
+            for (int k = vramDead ? 2 : 0; k < 2; ++k) {
                 bool supported = false;
                 for (size_t i = 0; i < have.size(); ++i)
                     if (!strcmp(have[i].extensionName, vramWanted[k])) { supported = true; break; }

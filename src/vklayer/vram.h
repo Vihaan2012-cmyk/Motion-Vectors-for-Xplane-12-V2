@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // ============================================================ THE VRAM SYSTEM
 //
@@ -102,6 +102,21 @@ static Config cfg = { true, false, false, false, false,
                       256, 180, {0,0,64,24,8}, 2,
                       2000.0f, 900, 600, 0.01f, true,
                       false, 900, 512, 512, 300, 1800 };
+
+// ---- TOTAL KILL: TAA_VRAM_HOOKS=0 makes every entry point in this file an
+// early-out - not just the dispatch hooks but the in-hook additions too, so
+// the layer's behavior is byte-equivalent to the pre-VRAM build. The bisect
+// demanded it: crashes survived dispatch-stripping, so the knife must cut
+// beneath it.
+static bool alive()
+{
+    static int a = -1;
+    if (a < 0) {
+        const char *vh = getenv("TAA_VRAM_HOOKS");
+        a = (!vh || atoi(vh) != 0) ? 1 : 0;
+    }
+    return a != 0;
+}
 
 // ------------------------------------------------------------------ zones
 enum Zone { GREEN = 0, YELLOW, ORANGE, RED, CRITICAL };
@@ -674,6 +689,7 @@ static void migrationTick()
 
 static void noteCamera(float x, float y, float z)
 {
+    if (!alive()) return;
     if (g_camValid) {
         float vx = x - g_camX, vy = y - g_camY, vz = z - g_camZ;
         if (vx*vx + vy*vy + vz*vz < 1e8f) {      // ignore teleports here
@@ -711,7 +727,7 @@ static void noteImageCreate(VkImage img, uint32_t w, uint32_t h, uint32_t fmt,
                             bool is3D, uint32_t droppedMips, bool *hotOut)
 {
     if (hotOut) *hotOut = false;
-    if (!cfg.enable || !img) return;
+    if (!alive() || !cfg.enable || !img) return;
     std::lock_guard<std::mutex> g(m);
     ChurnKey k; k.w = w; k.h = h; k.fmt = fmt; k.mips = mips;
     ChurnRec &r = g_churn[k];
@@ -755,7 +771,7 @@ static void noteImageCreate(VkImage img, uint32_t w, uint32_t h, uint32_t fmt,
 
 static void noteImageDestroy(VkImage img)
 {
-    if (!img) return;
+    if (!alive() || !img) return;
     std::lock_guard<std::mutex> g(m);
     std::map<VkImage, ResRec>::iterator it = g_registry.find(img);
     if (it != g_registry.end()) {
@@ -795,6 +811,7 @@ static void noteImageDestroy(VkImage img)
 
 static bool churnHot(VkImage img)
 {
+    if (!alive()) return false;
     std::lock_guard<std::mutex> g(m);
     return g_hotImgs.count(img) != 0;
 }
@@ -810,7 +827,7 @@ static bool churnHot(VkImage img)
 static uint32_t refineDrop(uint32_t baseDrop, uint32_t w, uint32_t h,
                            uint32_t fmt, uint32_t mips, bool streamed)
 {
-    if (!cfg.enable) return baseDrop;
+    if (!alive() || !cfg.enable) return baseDrop;
     std::lock_guard<std::mutex> g(m);
     ChurnKey k; k.w = w; k.h = h; k.fmt = fmt; k.mips = mips;
     std::map<ChurnKey, ChurnRec>::iterator it = g_churn.find(k);
@@ -839,6 +856,7 @@ static uint32_t refineDrop(uint32_t baseDrop, uint32_t w, uint32_t h,
 // ============================================================ misc telemetry
 static void notePipelines(uint32_t count, uint64_t us)
 {
+    if (!alive()) return;
     pipesTotal.fetch_add(count);
     pipeUsTotal.fetch_add(us);
     if (frameIndex > 0) {                 // after the first present = in flight
@@ -849,10 +867,11 @@ static void notePipelines(uint32_t count, uint64_t us)
 
 static void noteDescriptorUpdates(uint32_t n) { descUpdFrame.fetch_add(n); }
 static void noteDescriptorAllocs(uint32_t n)  { descAllocFrame.fetch_add(n); }
-static void notePipelineBind()                { pipeBindsFrame.fetch_add(1); }
+static void notePipelineBind()                { if (alive()) pipeBindsFrame.fetch_add(1); }
 
 static void noteImageUse(VkImage img, bool inScenePass = false)
 {
+    if (!alive()) return;
     std::lock_guard<std::mutex> g(m);
     UseRec &r = g_imgLastUse[img];
     r.last = frameIndex;
@@ -866,6 +885,7 @@ static void noteImageUse(VkImage img, bool inScenePass = false)
 
 static void noteImageMem(VkImage img, VkDeviceMemory mem)
 {
+    if (!alive()) return;
     std::lock_guard<std::mutex> g(m);
     g_imgMem[img] = mem;
 }
@@ -874,7 +894,7 @@ static void noteImageMem(VkImage img, VkDeviceMemory mem)
 static void noteMap(VkDeviceMemory mem, VkDeviceSize offset, VkDeviceSize size,
                     void *ptr)
 {
-    if (!ptr) return;
+    if (!alive() || !ptr) return;
     std::lock_guard<std::mutex> g(m);
     MapRec r; r.ptr = (uint8_t*)ptr; r.offset = offset;
     if (size == VK_WHOLE_SIZE) {
@@ -894,6 +914,7 @@ static void noteUnmap(VkDeviceMemory mem)
 
 static void noteBufBind(VkBuffer buf, VkDeviceMemory mem, VkDeviceSize offset)
 {
+    if (!alive()) return;
     std::lock_guard<std::mutex> g(m);
     BufBind b; b.mem = mem; b.offset = offset;
     g_bufBind[buf] = b;
@@ -977,7 +998,7 @@ static bool cacheUpload(VkImage img, uint32_t mip, uint64_t hash,
 // barrier hooks call this for every oldLayout==UNDEFINED image barrier.
 static void contentInvalidate(VkImage img)
 {
-    if (!img) return;
+    if (!alive() || !img) return;
     // Lock-free fast path: the barrier hooks call this from every recording
     // thread for every UNDEFINED transition, and a global mutex on that path
     // is the 9-fps mistake this project has already made once. The counter
@@ -996,6 +1017,7 @@ static void contentInvalidate(VkImage img)
 
 static void noteUploadRegion(uint64_t imgHandle, uint32_t mip)
 {
+    if (!alive()) return;
     std::lock_guard<std::mutex> g(m);
     if (!g_upSeen.insert(std::make_pair(imgHandle, mip)).second) ++dupUploads;
 }
@@ -1094,6 +1116,7 @@ static void bindDevice(VkDevice d, VkPhysicalDevice p,
 
 static void noteQueue(uint32_t family, VkQueue q)
 {
+    if (!alive()) return;
     if (family != dev.transferFamily || dev.transferFamily == ~0u) return;
     std::lock_guard<std::mutex> g(m);
     if (g_transferQueues.insert(q).second) {
@@ -1111,7 +1134,7 @@ static void ledgerTotal(uint64_t bytes) { ledgerBytesNow.store(bytes); }
 // ============================================================ upload charge
 static void chargeCopy(VkCommandBuffer cb, uint64_t bytes, uint8_t prot = 0)
 {
-    if (!cfg.enable) return;
+    if (!alive() || !cfg.enable) return;
     upBytesFrame.fetch_add(bytes);
     std::lock_guard<std::mutex> g(m);
     g_cbBytes[cb] += bytes;
@@ -1127,6 +1150,7 @@ static void chargeCopy(VkCommandBuffer cb, uint64_t bytes, uint8_t prot = 0)
 // uploads pace normally, which is the conservative direction here.
 static uint8_t protectionOf(VkImage img)
 {
+    if (!alive()) return 0;
     std::lock_guard<std::mutex> g(m);
     std::map<VkImage, ResRec>::iterator it = g_registry.find(img);
     return it == g_registry.end() ? 0 : it->second.protection;
@@ -1137,7 +1161,7 @@ static uint8_t protectionOf(VkImage img)
 // hit; the caller skips the driver entirely.
 static bool poolTake(const VkMemoryAllocateInfo *ai, VkDeviceMemory *out)
 {
-    if (!cfg.enable || !cfg.recycle || !ai || ai->pNext) return false;
+    if (!alive() || !cfg.enable || !cfg.recycle || !ai || ai->pNext) return false;
     std::lock_guard<std::mutex> g(m);
     for (size_t i = 0; i < g_pool.size(); ++i) {
         if (g_pool[i].type != ai->memoryTypeIndex) continue;
@@ -1165,7 +1189,7 @@ static bool poolTake(const VkMemoryAllocateInfo *ai, VkDeviceMemory *out)
 // safe: m is ours alone; the driver cannot re-enter the layer.)
 static bool poolHold(VkDeviceMemory mem)
 {
-    if (!cfg.enable || !cfg.recycle) return false;
+    if (!alive() || !cfg.enable || !cfg.recycle) return false;
     std::lock_guard<std::mutex> g(m);
     std::map<VkDeviceMemory, AllocRec>::iterator it = g_allocs.find(mem);
     if (it == g_allocs.end() || !it->second.plain) return false;
@@ -1230,7 +1254,7 @@ static void poolTrim(bool everything)
 struct PrioChain { VkMemoryPriorityAllocateInfoEXT info; VkMemoryAllocateInfo ai; };
 static bool prioTag(const VkMemoryAllocateInfo *ai, PrioChain *pc)
 {
-    if (!cfg.enable || !cfg.priority || !dev.priorityExt) return false;
+    if (!alive() || !cfg.enable || !cfg.priority || !dev.priorityExt) return false;
     pc->info.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
     pc->info.pNext = (void*)ai->pNext;
     pc->info.priority = 0.5f;        // neutral until a bind says what it holds
@@ -1242,6 +1266,7 @@ static bool prioTag(const VkMemoryAllocateInfo *ai, PrioChain *pc)
 
 static void noteAlloc(VkDeviceMemory mem, const VkMemoryAllocateInfo *ai)
 {
+    if (!alive()) return;
     allocsTotal.fetch_add(1);
     if (!ai) return;
     std::lock_guard<std::mutex> g(m);
@@ -1252,6 +1277,7 @@ static void noteAlloc(VkDeviceMemory mem, const VkMemoryAllocateInfo *ai)
 
 static void noteFreeGone(VkDeviceMemory mem)
 {
+    if (!alive()) return;
     freesTotal.fetch_add(1);
     std::lock_guard<std::mutex> g(m);
     g_allocs.erase(mem);
@@ -1538,7 +1564,7 @@ static void flushAll(uint64_t *counter)
 // Trigger: a fence the app is about to wait on / query / reset.
 static void touchFences(uint32_t count, const VkFence *fences)
 {
-    if (!count || !fences) return;
+    if (!alive() || !count || !fences) return;
     bool hit = false;
     {
         std::lock_guard<std::mutex> g(m);
@@ -1569,7 +1595,7 @@ static bool anyHeldSignalLocked(uint32_t count, const VkSemaphore *sems,
 static void touchSemaphores(uint32_t count, const VkSemaphore *sems,
                             const uint64_t *values)
 {
-    if (!count || !sems) return;
+    if (!alive() || !count || !sems) return;
     bool hit = false;
     {
         std::lock_guard<std::mutex> g(m);
@@ -1586,7 +1612,7 @@ static void touchSemaphores(uint32_t count, const VkSemaphore *sems,
 static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
                      VkFence fence, VkResult *result)
 {
-    if (!cfg.enable) return false;
+    if (!alive() || !cfg.enable) return false;
 
     // ANY submission's wait list can depend on a held signal - graphics
     // waiting on the transfer timeline is the normal case. Check first,
@@ -2053,6 +2079,7 @@ static void zoneUpdate()
 
 static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
 {
+    if (!alive()) return;
     refreshConfig();
     if (!cfg.enable) { flushAll(&flushOnPresent); return; }
 
