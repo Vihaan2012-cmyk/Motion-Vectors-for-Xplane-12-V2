@@ -56,12 +56,16 @@ rem the mip-drop path has been dormant in V2 since the port. DROP_ABOVE 2048
 rem with MAX_DROP 1 takes 4096 sheets to 2048 and leaves everything smaller
 rem alone; AUTOGEN_TO 1024 is the harder target for streamed scenery only;
 rem HEADROOM 200 MB is when it engages at all.
-set "TAA_PAGER_DROP_ABOVE=2048"
-set "TAA_PAGER_MAX_DROP=1"
+rem ---- V1 pager pins DISABLED: an env pin sets g_pagerEnvLocked and shuts
+rem the VRAM system's zone-driven per-resource policy out of the pager. The
+rem intelligence layer now owns these decisions; re-pin only to force a
+rem fixed policy for an A/B run.
+rem set "TAA_PAGER_DROP_ABOVE=2048"
+rem set "TAA_PAGER_MAX_DROP=1"
 rem set "TAA_PAGER_AUTOGEN_TO=1024"   (off: multi-level drop, and switching
 rem aircraft mid-flight makes the AIRCRAFT count as streamed - V1 assumed it
 rem always loaded before the flight and never hit this path)
-set "TAA_PAGER_HEADROOM_MB=200"
+rem set "TAA_PAGER_HEADROOM_MB=200"   (headroom engage remains, zone-driven)
 
 
 rem Drive the camera through a known yaw and pitch once the flight settles, and
