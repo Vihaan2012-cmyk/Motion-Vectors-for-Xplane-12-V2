@@ -5017,6 +5017,21 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                                       // while the descriptor points at a corpse.
                                       g_taa.velGen != g_mv.gen;
                 if (needInit) {
+                    // Re-init storms are the 19fps dips: each init rebuilds the
+                    // pipeline and views (a hitch) and parks a state in the
+                    // graveyard. One init per 60 frames is plenty - if the
+                    // trigger is real it still happens, just once; while
+                    // throttled the resolve skips rather than thrashes.
+                    static uint64_t lastInitFrame = 0;
+                    if (g_taa.ready && g_frameCount - lastInitFrame < 60) {
+                        static uint64_t thrLog = 0;
+                        if ((thrLog++ % 120) == 0)
+                            trace("TAA: re-init THROTTLED (last init %llu "
+                                  "frames ago) - resolve skipped this frame",
+                                  (unsigned long long)(g_frameCount - lastInitFrame));
+                        break;
+                    }
+                    lastInitFrame = g_frameCount;
                     // A shape change is a history discontinuity in its own right.
                     tf.reset |= temporal::RESET_RESOLUTION;
                     taaInit(tdd, tci->second, passInfo.color0, litFmt,
