@@ -1919,7 +1919,22 @@ static uint32_t pagerDropLevels(const VkImageCreateInfo *ci)
     // what gets remembered. The eligibility guard is the one from the call site
     // (see the note there): refinement may only touch images that pass exactly
     // the tests pagerDropLevelsRaw enforces, or it can shrink a render target.
-    if ((ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+    // ---- REFINEMENT REFINES; IT DOES NOT DECIDE.
+    //
+    // refineDrop can RAISE a drop, including raising the 0 that means "the
+    // pager is switched off" - so with g_pagerDropAbove at 0 and the VRAM
+    // actuators live, images were still being shrunk by a path nobody thought
+    // of as the pager. That is why the survivals and the crashes sorted by
+    // whether the actuators were on rather than by the pager flag, and why
+    // switching the pager off never stopped the ~2-minute death: the run that
+    // survived eight minutes had the actuators off, which left refineDrop's
+    // inputs inert, not the pager disabled.
+    //
+    // Requiring a pager that is genuinely enabled AND a base cut it already
+    // chose makes the refinement what its name claims - an adjustment to a
+    // decision, never the origin of one.
+    if (g_pagerDropAbove && drop &&
+        (ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
         !(ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                        VK_IMAGE_USAGE_STORAGE_BIT)) &&
