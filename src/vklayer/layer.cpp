@@ -2173,11 +2173,36 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdCopyBufferToImage(
         return;
     }
 
+    // Format for the retention path, once.
+    uint32_t dstFmt = 0;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkImage, VramEntry>::iterator ve = g_vramImg.find(dst);
+        if (ve != g_vramImg.end()) dstFmt = ve->second.fmt;
+    }
+
     std::vector<VkBufferImageCopy> kept;
     kept.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t lvl = regions[i].imageSubresource.mipLevel;
-        if (lvl < drop) continue;                 // this level no longer exists
+        if (lvl < drop) {
+            // The level the pager is discarding: retain its payload. This is
+            // the last moment these bytes exist outside the disk, and they
+            // are exactly what a future runtime restoration needs.
+            const VkBufferImageCopy &rg = regions[i];
+            uint32_t mw = origW >> lvl; if (!mw) mw = 1;
+            uint32_t mh = origH >> lvl; if (!mh) mh = 1;
+            if (dstFmt && rg.bufferRowLength == 0 && rg.bufferImageHeight == 0 &&
+                rg.imageSubresource.baseArrayLayer == 0 &&
+                rg.imageSubresource.layerCount == 1) {
+                uint64_t len = (uint64_t)((double)mw * mh *
+                               formatBytesPerPixel((VkFormat)dstFmt));
+                const uint8_t *p = len ? vram::bufferBytes(src, rg.bufferOffset,
+                                                           len) : nullptr;
+                if (p) vram::retainPayload(origW, origH, dstFmt, lvl, p, len);
+            }
+            continue;                             // this level no longer exists
+        }
         VkBufferImageCopy r = regions[i];
         r.imageSubresource.mipLevel = lvl - drop; // renumber what survives
         kept.push_back(r);

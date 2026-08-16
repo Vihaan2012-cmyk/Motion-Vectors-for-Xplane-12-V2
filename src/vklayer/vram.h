@@ -322,6 +322,43 @@ struct ShapeMip {
 };
 static std::map<MipKey, uint64_t>   g_liveContent;
 static std::map<ShapeMip, uint64_t> g_deadContent;
+// ---- THE SERVING CACHE'S STORAGE (runtime-restoration prerequisite). When
+// the pager drops a mip's upload, the payload the engine decoded is the LAST
+// time those bytes exist outside the disk - so they are retained here,
+// bounded, keyed by shape+mip. A REDUCED resource whose top mips are retained
+// is RESTORE-READY: the migration executor (next slice, see the map) can
+// rebuild full quality without any disk round trip. Until then this is real
+// stored data, not measurement.
+static std::map<ShapeMip, std::vector<uint8_t> > g_retained;
+static uint64_t retainedBytes = 0, retainStores = 0, retainRefused = 0;
+
+static void retainPayload(uint32_t w, uint32_t h, uint32_t fmt, uint32_t mip,
+                          const uint8_t *p, uint64_t len)
+{
+    if (!p || !len || len > (64ull << 20)) return;
+    std::lock_guard<std::mutex> g(m);
+    uint64_t cap = (uint64_t)live::i("vram.retain_max_mb", nullptr, 256)
+                 * 1048576ull;
+    ShapeMip k; k.w = w; k.h = h; k.fmt = fmt; k.mip = mip;
+    std::map<ShapeMip, std::vector<uint8_t> >::iterator it = g_retained.find(k);
+    if (it != g_retained.end()) {
+        retainedBytes -= it->second.size();
+        it->second.assign(p, p + len);
+        retainedBytes += len;
+        return;
+    }
+    if (retainedBytes + len > cap) { ++retainRefused; return; }
+    g_retained[k].assign(p, p + len);
+    retainedBytes += len;
+    ++retainStores;
+}
+
+static bool restoreReady(uint32_t w, uint32_t h, uint32_t fmt)
+{
+    ShapeMip k; k.w = w; k.h = h; k.fmt = fmt; k.mip = 0;
+    return g_retained.count(k) != 0;      // m held by caller (report path)
+}
+
 static uint64_t elidedUploads = 0, elidedBytes = 0;
 static uint64_t reloadIdenticalCount = 0, reloadIdenticalBytes = 0;
 static uint64_t hostRecycleUnmaps = 0;
@@ -2118,6 +2155,22 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
               (unsigned long long)pipeBindsPeak,
               usageTrendBytes * 60.0 / 1048576.0,
               (unsigned long long)aircraftChanges);
+        {
+            uint64_t ready = 0, reduced = 0;
+            for (std::map<VkImage, ResRec>::iterator it = g_registry.begin();
+                 it != g_registry.end(); ++it) {
+                if (it->second.state != RS_REDUCED_AT_CREATE) continue;
+                ++reduced;
+                if (restoreReady(it->second.shape.w, it->second.shape.h,
+                                 it->second.shape.fmt)) ++ready;
+            }
+            trace("  retention: %.1f MB in %llu payloads (%llu refused at "
+                  "cap); %llu of %llu REDUCED resources are RESTORE-READY - "
+                  "full quality is rebuildable without the disk",
+                  retainedBytes / 1048576.0, (unsigned long long)retainStores,
+                  (unsigned long long)retainRefused,
+                  (unsigned long long)ready, (unsigned long long)reduced);
+        }
         trace("  per-resource quality: %llu shapes protected from cuts "
               "(churners), %llu extra cuts (large streamed under pressure), "
               "%llu full-quality restorations observed; %llu zone flips",
