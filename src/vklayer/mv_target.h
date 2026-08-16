@@ -171,12 +171,11 @@ static bool mvWantRGBA()
 #define kMvHalves (4u)                               // RGBA16F = four halves
 #define kMvBytes  (kMvHalves * 2u)                   // ...four bytes
 
-static void mvDestroy(DeviceData &dd)
+// Destroy a PARKED target's objects for real - only called on targets that
+// left service 8+ presents ago, so nothing recorded can still reference them.
+static void mvDestroyState(DeviceData &dd, MvTarget &m)
 {
-    MvTarget &m = g_mv;
-    if (m.device == VK_NULL_HANDLE) { m = MvTarget(); return; }
-    // NO deviceWaitIdle here - see taaDestroy: idling the device from inside a
-    // hook races X-Plane's submitting threads and crashes within seconds.
+    if (m.device == VK_NULL_HANDLE) return;
     if (m.readbackPtr) dd.unmapMemory(m.device, m.readbackMem);
     if (m.readback)    dd.destroyBuffer(m.device, m.readback, nullptr);
     if (m.readbackMem) dd.freeMemory(m.device, m.readbackMem, nullptr);
@@ -184,7 +183,37 @@ static void mvDestroy(DeviceData &dd)
     if (m.viewArray) dd.destroyImageView(m.device, m.viewArray, nullptr);
     if (m.image) dd.destroyImage(m.device, m.image, nullptr);
     if (m.mem)   dd.freeMemory(m.device, m.mem, nullptr);
+}
+
+// Teardown = park, not destroy: recorded passes and resolves still reference
+// the image and views for a few frames (this immediate destroy was the last
+// remaining DEVICE_LOST). Same graveyard rule as taaDestroy; flushed at
+// present once the 8-frame window passes. No deviceWaitIdle - it races
+// X-Plane's submitting threads.
+struct MvGrave { MvTarget t; uint64_t frame; };
+static std::vector<MvGrave> g_mvGraves;
+static uint64_t g_mvGraveNow = 0;
+
+static void mvDestroy(DeviceData &dd)
+{
+    (void)dd;
+    MvTarget &m = g_mv;
+    if (m.device != VK_NULL_HANDLE && (m.image || m.readback)) {
+        MvGrave gr; gr.t = m; gr.frame = g_mvGraveNow;
+        g_mvGraves.push_back(gr);
+    }
     m = MvTarget();
+}
+
+static void mvGraveFlush(DeviceData &dd, uint64_t frame)
+{
+    g_mvGraveNow = frame;
+    for (size_t i = 0; i < g_mvGraves.size();) {
+        if (frame > g_mvGraves[i].frame + 8) {
+            mvDestroyState(dd, g_mvGraves[i].t);
+            g_mvGraves.erase(g_mvGraves.begin() + (long)i);
+        } else ++i;
+    }
 }
 
 // Built once the scene target's size is known, which is why this is not created

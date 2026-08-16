@@ -151,36 +151,11 @@ local function build(w, x, y)
         return
     end
 
-    local res     = get("taaimpl/mv_residual_px", -1.0)
-    local p95     = get("taaimpl/mv_residual_p95_px", -1.0)
-    local samples = get("taaimpl/mv_samples", 0)
-    local vcol, vtext = verdict(res)
-
-    text(AMBER, "MOTION VECTOR ACCURACY")
+    -- The MOTION VECTOR ACCURACY section is gone: its numbers only live while
+    -- the 63 MB readback dump runs, and that dump is a stutter machine kept
+    -- off in normal flying - a permanently-frozen headline row taught nothing.
+    text(AMBER, "MOTION VECTORS")
     imgui.Separator()
-    imgui.TextUnformatted("")
-
-    -- The headline figure, large-ish and alone. Everything else on this panel
-    -- is context for it.
-    text(LABEL, "  MEDIAN RESIDUAL")
-    same(190)
-    if res < 0.0 then
-        text(DIM, "waiting for a sampled frame")
-    else
-        text(vcol, string.format("%.3f px", res))
-        same(300)
-        text(vcol, vtext)
-    end
-
-    if res >= 0.0 then
-        row("95TH PERCENTILE", string.format("%.3f px", p95))
-        row("SAMPLES", string.format("%d px/frame", samples), DIM)
-    end
-
-    imgui.TextUnformatted("")
-    text(DIM, "  Distance between where the field says a pixel was and")
-    text(DIM, "  where the geometry says it could have been. Needs no")
-    text(DIM, "  depth, so it is valid under rotation and translation.")
 
     heading("INJECTION")
     local patched  = get("taaimpl/pipelines_patched", 0)

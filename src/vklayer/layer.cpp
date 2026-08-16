@@ -7048,11 +7048,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         VkDevice gd = g_taa.device;
         if (gd == VK_NULL_HANDLE && !g_taaGraves.empty())
             gd = g_taaGraves[0].s.device;
+        if (gd == VK_NULL_HANDLE && !g_mvGraves.empty())
+            gd = g_mvGraves[0].t.device;
         if (gd != VK_NULL_HANDLE) {
             std::lock_guard<std::mutex> g(g_lock);
             std::map<void*, DeviceData>::iterator gi =
                 g_devices.find(dispatchKey(gd));
-            if (gi != g_devices.end()) taaGraveFlush(gi->second, g_frameCount);
+            if (gi != g_devices.end()) {
+                taaGraveFlush(gi->second, g_frameCount);
+                mvGraveFlush(gi->second, g_frameCount);
+            }
         }
     }
 
