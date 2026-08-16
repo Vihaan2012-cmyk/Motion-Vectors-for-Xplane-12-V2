@@ -1034,6 +1034,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindBufferMemory(
     int cat = vramCatOfBufferHandle(buffer);
     if (cat >= 0)
         vram::onBind(mem, cat, g_share && g_share->valid);
+    vram::noteBufBind(buffer, mem, offset);
     return g_nextBindBufferMemory
          ? g_nextBindBufferMemory(device, buffer, mem, offset)
          : VK_ERROR_INITIALIZATION_FAILED;
@@ -1046,10 +1047,37 @@ static VKAPI_ATTR VkResult VKAPI_CALL Vram_BindBufferMemory2(
         int cat = vramCatOfBufferHandle(infos[i].buffer);
         if (cat >= 0)
             vram::onBind(infos[i].memory, cat, g_share && g_share->valid);
+        vram::noteBufBind(infos[i].buffer, infos[i].memory,
+                          infos[i].memoryOffset);
     }
     return g_nextBindBufferMemory2
          ? g_nextBindBufferMemory2(device, count, infos)
          : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+// The app's own mappings, recorded so upload payloads can be read through the
+// pointer the APP holds - the legal route into staging contents. Recording a
+// pointer is not mapping; the spec's one-map rule is untouched.
+static PFN_vkMapMemory   g_nextMapMemory   = nullptr;
+static PFN_vkUnmapMemory g_nextUnmapMemory = nullptr;
+
+static VKAPI_ATTR VkResult VKAPI_CALL Vram_MapMemory(
+    VkDevice device, VkDeviceMemory mem, VkDeviceSize offset,
+    VkDeviceSize size, VkMemoryMapFlags flags, void **ppData)
+{
+    VkResult r = g_nextMapMemory
+               ? g_nextMapMemory(device, mem, offset, size, flags, ppData)
+               : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS && ppData)
+        vram::noteMap(mem, offset, size, *ppData);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Vram_UnmapMemory(
+    VkDevice device, VkDeviceMemory mem)
+{
+    vram::noteUnmap(mem);
+    if (g_nextUnmapMemory) g_nextUnmapMemory(device, mem);
 }
 
 static VKAPI_ATTR void VKAPI_CALL Vram_GetDeviceQueue(
@@ -1880,8 +1908,13 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdPipelineBarrier(
 
     // Recorded before any early return - the tracker must see every barrier,
     // not only the ones the mip clamp happens to rewrite.
-    for (uint32_t i = 0; i < iCount && img; ++i)
+    for (uint32_t i = 0; i < iCount && img; ++i) {
         noteLayout(img[i].image, img[i].newLayout);
+        // UNDEFINED discards contents: the upload cache's identity for this
+        // image dies here, or an elision after it would leave garbage.
+        if (img[i].oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+            vram::contentInvalidate(img[i].image);
+    }
 
     if (!g_pagerDropAbove || iCount == 0 || !img) {
         g_nextCmdPipelineBarrier2(cb, src, dst, flags, mCount, mem, bCount, buf,
@@ -1920,9 +1953,13 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdPipelineBarrier2(
     // carrying most transitions. Tracking only the original would have left the
     // table describing an image the sim had since moved.
     if (info)
-        for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i)
+        for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
             noteLayout(info->pImageMemoryBarriers[i].image,
                        info->pImageMemoryBarriers[i].newLayout);
+            if (info->pImageMemoryBarriers[i].oldLayout ==
+                VK_IMAGE_LAYOUT_UNDEFINED)
+                vram::contentInvalidate(info->pImageMemoryBarriers[i].image);
+        }
 
     if (!g_pagerDropAbove || !info || !info->imageMemoryBarrierCount) {
         g_nextCmdPipelineBarrier2KHR(cb, info);
@@ -2041,6 +2078,66 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdCopyBufferToImage(
             origH = it->second.origH;
         }
     }
+    // ---- THE UPLOAD CONTENT CACHE (SS23/24), on the un-remapped path only.
+    //
+    // Every full-subresource upload to a sampled texture is hashed through
+    // the pointer the app's own vkMapMemory returned. Identical bytes going
+    // into the identical mip of the SAME image are elided - the texels are
+    // already resident and the PCIe transfer buys nothing. New content into a
+    // fresh image is compared against the dead-shape memory, which prices the
+    // engine's eviction-means-disk-reload behaviour in bytes.
+    if (!drop && regions && count && vram::cfg.enable && vram::cfg.uploadCache) {
+        uint32_t imgW = 0, imgH = 0, imgFmt = 0; int imgCat = -1;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<VkImage, VramEntry>::iterator it = g_vramImg.find(dst);
+            if (it != g_vramImg.end()) {
+                imgCat = it->second.cat;
+                imgW = it->second.w; imgH = it->second.h;
+                imgFmt = it->second.fmt;
+            }
+        }
+        if (imgCat == VRAM_TEX && imgW) {
+            std::vector<VkBufferImageCopy> kept;
+            bool any = false;
+            for (uint32_t i = 0; i < count; ++i) {
+                const VkBufferImageCopy &rg = regions[i];
+                uint32_t mip = rg.imageSubresource.mipLevel;
+                uint32_t mw = imgW >> mip; if (!mw) mw = 1;
+                uint32_t mh = imgH >> mip; if (!mh) mh = 1;
+                bool whole = rg.imageOffset.x == 0 && rg.imageOffset.y == 0 &&
+                             rg.imageOffset.z == 0 &&
+                             rg.bufferRowLength == 0 &&
+                             rg.bufferImageHeight == 0 &&
+                             rg.imageSubresource.baseArrayLayer == 0 &&
+                             rg.imageSubresource.layerCount == 1 &&
+                             rg.imageExtent.width == mw &&
+                             rg.imageExtent.height == mh;
+                bool elide = false;
+                if (whole) {
+                    uint64_t len = (uint64_t)((double)mw * mh *
+                                   formatBytesPerPixel((VkFormat)imgFmt));
+                    if (len) {
+                        const uint8_t *p =
+                            vram::bufferBytes(src, rg.bufferOffset, len);
+                        if (p)
+                            elide = vram::cacheUpload(dst, mip,
+                                        vram::contentHash(p, len), len);
+                    }
+                }
+                if (elide) { any = true; continue; }
+                kept.push_back(rg);
+            }
+            if (any) {
+                if (!kept.empty())
+                    g_nextCmdCopyBufferToImage(cb, src, dst, layout,
+                                               (uint32_t)kept.size(),
+                                               kept.data());
+                return;
+            }
+        }
+    }
+
     if (!drop || !regions || !count) {
         g_nextCmdCopyBufferToImage(cb, src, dst, layout, count, regions);
         return;
@@ -2419,6 +2516,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateBuffer(
         std::lock_guard<std::mutex> g(g_lock);
         vramAdd(cat, req.size);
         VramEntry e; e.cat = cat; e.bytes = req.size;
+        e.w = e.h = e.fmt = e.mips = 0;
         g_vramBuf[*out] = e;
 
         if (cat == VRAM_BUF_GEOM) {
@@ -2434,6 +2532,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateBuffer(
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
     VkDevice device, VkBuffer buf, const VkAllocationCallbacks *alloc)
 {
+    vram::noteBufferGone(buf);
     PFN_vkDestroyBuffer next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -9114,6 +9213,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     VkCommandBuffer cb, VkPipelineBindPoint bind, VkPipeline pipeline)
 {
     if (!g_nextCmdBindPipeline) return;
+    vram::notePipelineBind();
     g_nextCmdBindPipeline(cb, bind, pipeline);
 
     // Remember whether the compute pipeline now bound is X-Plane's upscaler.
@@ -10369,6 +10469,8 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     g_nextQueueBindSparse   = (PFN_vkQueueBindSparse)nextGDPA(*out, "vkQueueBindSparse");
     g_nextCmdCopyBuffer     = (PFN_vkCmdCopyBuffer)nextGDPA(*out, "vkCmdCopyBuffer");
     g_nextAllocDescSets     = (PFN_vkAllocateDescriptorSets)nextGDPA(*out, "vkAllocateDescriptorSets");
+    g_nextMapMemory         = (PFN_vkMapMemory)nextGDPA(*out, "vkMapMemory");
+    g_nextUnmapMemory       = (PFN_vkUnmapMemory)nextGDPA(*out, "vkUnmapMemory");
     PFN_vkSetDeviceMemoryPriorityEXT setPrio =
         (PFN_vkSetDeviceMemoryPriorityEXT)nextGDPA(*out, "vkSetDeviceMemoryPriorityEXT");
 
@@ -10396,8 +10498,18 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         memset(&vmp, 0, sizeof(vmp));
         if (g_getPhysMemProps) g_getPhysMemProps(phys, &vmp);
         vram::bindDevice(*out, phys, g_nextMemProps2, g_nextFreeMemory,
-                         g_nextQueueSubmit, setPrio, g_memoryPriority,
-                         g_pageableMemory, &vmp, transferOnly);
+                         g_nextUnmapMemory, g_nextQueueSubmit, setPrio,
+                         g_memoryPriority, g_pageableMemory, &vmp,
+                         transferOnly);
+        // The SS36 bindless verdict, performed rather than skipped: the
+        // corpus (6855 modules) uses fixed bindings and zero descriptor
+        // indexing; a bindless retrofit means rewriting every shader and the
+        // material system behind them - an engine change, not a layer one.
+        // The compatible parts of SS35 (recycling pressure, churn) are
+        // measured every frame instead.
+        trace("VRAMSYS: descriptor model - engine uses fixed bindings "
+              "corpus-wide; bindless (SS36) verdict: incompatible from a "
+              "layer, descriptor churn measured instead (SS35)");
     }
 
 
@@ -10532,6 +10644,8 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkQueueBindSparse",     Vram_QueueBindSparse)
     RETURN_IF("vkCmdCopyBuffer",       Vram_CmdCopyBuffer)
     RETURN_IF("vkAllocateDescriptorSets", Vram_AllocateDescriptorSets)
+    RETURN_IF("vkMapMemory",           Vram_MapMemory)
+    RETURN_IF("vkUnmapMemory",         Vram_UnmapMemory)
     RETURN_IF("vkCmdCopyBufferToImage", TAA_CmdCopyBufferToImage)
     RETURN_IF("vkCmdPipelineBarrier",  TAA_CmdPipelineBarrier)
     RETURN_IF("vkCmdPipelineBarrier2", TAA_CmdPipelineBarrier2)
