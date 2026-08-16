@@ -612,6 +612,57 @@ static VkImage phys(VkImage app)
     return it == g_physOf.end() ? app : it->second;
 }
 
+// ============================================== MIGRATION EXECUTOR, STAGE 1
+// vram.migrate: 0 = off, 1 = DRY RUN (default) - the selection engine runs
+// live, logs every migration it WOULD perform with the full reasoning, and
+// accounts the projected savings; 2 is reserved for execution, which lands
+// only after dry-run flight data proves the selections sound (the staged
+// gate this feature was specified with). Eligibility is the safest class
+// only: streamed sampled 2D textures, mips > 1, no protection.
+static uint64_t migCandidates = 0, migProjSaveBytes = 0, migRestoreProj = 0;
+static void decide(const ResRec &r, const char *action, const char *reason);
+static void migrationTick()
+{
+    int mode = live::i("vram.migrate", nullptr, 1);
+    if (!cfg.enable || mode < 1) return;
+    int every = live::i("vram.migrate_every", nullptr, 300);
+    if (every < 60) every = 60;
+    if (frameIndex % (uint64_t)every) return;
+
+    std::lock_guard<std::mutex> g(m);
+    // DEMOTE candidate: under pressure, the worst-scoring full-quality
+    // streamed texture - dropping its top mip frees 75% of its bytes.
+    // RESTORE candidate: in GREEN, the best-scoring REDUCED resource whose
+    // retained payloads make it rebuildable without the disk.
+    const ResRec *demote = nullptr, *restore = nullptr;
+    for (std::map<VkImage, ResRec>::const_iterator it = g_registry.begin();
+         it != g_registry.end(); ++it) {
+        const ResRec &r = it->second;
+        if (!r.streamed || r.protection >= 2 || r.shape.mips <= 1) continue;
+        if (r.cls != RC_SCENERY_STREAMED) continue;
+        if (zone >= ORANGE && r.state == RS_FULL) {
+            if (!demote || r.score < demote->score) demote = &r;
+        } else if (zone == GREEN && r.state == RS_REDUCED_AT_CREATE &&
+                   restoreReady(r.shape.w, r.shape.h, r.shape.fmt)) {
+            if (!restore || r.score > restore->score) restore = &r;
+        }
+    }
+    if (demote) {
+        ++migCandidates;
+        migProjSaveBytes += demote->bytes - demote->bytes / 4;
+        decide(*demote, "MIGRATE-DRY demote",
+               "worst score at pressure; top mip cut would free 75% "
+               "(execution stage pending dry-run flight data)");
+    }
+    if (restore) {
+        ++migCandidates;
+        ++migRestoreProj;
+        decide(*restore, "MIGRATE-DRY restore",
+               "best-scoring reduced resource, payloads retained - full "
+               "quality rebuildable with zero disk I/O");
+    }
+}
+
 static void noteCamera(float x, float y, float z)
 {
     if (g_camValid) {
@@ -2151,6 +2202,7 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
     poolTrim(false);
     prioZoneWalk();
     agingWalk();
+    migrationTick();
 
     if (live::i("vram.report", nullptr, 0)) {
         live::clearOneShot("vram.report");
@@ -2186,6 +2238,13 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
               "%llu teleports;  sparse binds %llu",
               camSpeedEma, camRotEma, (unsigned long long)teleports,
               (unsigned long long)sparseBinds);
+        trace("  migration (stage 1, %s): %llu candidates selected, %.1f MB "
+              "projected demote savings, %llu restores rebuildable from "
+              "retention - execution lands on this data",
+              live::i("vram.migrate", nullptr, 1) ? "DRY RUN" : "off",
+              (unsigned long long)migCandidates,
+              migProjSaveBytes / 1048576.0,
+              (unsigned long long)migRestoreProj);
         trace("  spatial: %u load bursts, camera velocity (%.1f, %.1f, %.1f) "
               "m/frame - streamed resources score against the position 3 s "
               "ahead;  indirection table %llu entries (identity until the "
