@@ -1872,11 +1872,21 @@ static void pagerClampRange(VkImage img, VkImageSubresourceRange *r)
     // baseMipLevel counts from the ORIGINAL top, so it shifts down by the
     // number of levels removed - and anything that pointed at a removed level
     // now points at the new level 0.
-    r->baseMipLevel = (r->baseMipLevel > drop) ? (r->baseMipLevel - drop) : 0;
+    const uint32_t oldBase = r->baseMipLevel;
+    r->baseMipLevel = (oldBase > drop) ? (oldBase - drop) : 0;
 
     if (r->levelCount != VK_REMAINING_MIP_LEVELS) {
-        r->levelCount = (r->levelCount > drop) ? (r->levelCount - drop) : 1;
-        if (r->levelCount < 1) r->levelCount = 1;
+        // Map the range by its END, not by subtracting drop from the count.
+        // Subtracting from both base and count shortens the range twice
+        // whenever base <= drop: a barrier for original levels [1, 12) became
+        // new levels [0, 11) instead of [0, 11]... one level short, so the
+        // tail level never received its layout transition and was read in
+        // whatever layout it happened to hold. Clamping by the end is exact
+        // for every base, and can only shrink a range to fit the image.
+        const uint32_t oldEnd = oldBase + r->levelCount;
+        const uint32_t newEnd = (oldEnd > drop) ? (oldEnd - drop) : 1;
+        r->levelCount = (newEnd > r->baseMipLevel)
+                      ? (newEnd - r->baseMipLevel) : 1;
     }
 }
 
