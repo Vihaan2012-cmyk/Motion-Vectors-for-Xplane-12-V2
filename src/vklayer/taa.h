@@ -198,12 +198,10 @@ static uint32_t taaFindMemory(DeviceData &dd, uint32_t typeBits, VkMemoryPropert
     return UINT32_MAX;
 }
 
-static void taaDestroy(DeviceData &dd)
+// Destroy a parked state's objects for real. Only ever called on states that
+// left service N presents ago - nothing in flight can still reference them.
+static void taaDestroyState(DeviceData &dd, TaaState &g_taa)
 {
-    // NO deviceWaitIdle here: X-Plane submits from several threads, and idling
-    // the device from inside a recording hook races them - it crashed within
-    // seconds of flight. In-flight protection has to come from deferral, not
-    // from a blocking wait on this thread.
     if (g_taa.pipeline)    dd.destroyPipeline(g_taa.device, g_taa.pipeline, nullptr);
     if (g_taa.pipeLayout)  dd.destroyPipelineLayout(g_taa.device, g_taa.pipeLayout, nullptr);
     if (g_taa.setLayout)   dd.destroyDescriptorSetLayout(g_taa.device, g_taa.setLayout, nullptr);
@@ -215,7 +213,8 @@ static void taaDestroy(DeviceData &dd)
          it != g_taa.sceneViews.end(); ++it)
         if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
     g_taa.sceneViews.clear();
-    if (g_taa.velView)     dd.destroyImageView(g_taa.device, g_taa.velView, nullptr);
+    // velView is g_mv.viewArray - g_mv owns and destroys it; destroying it
+    // here too was a latent double-destroy.
     for (std::map<VkImage, VkImageView>::iterator it = g_taa.flagsViews.begin();
          it != g_taa.flagsViews.end(); ++it)
         if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
@@ -230,6 +229,38 @@ static void taaDestroy(DeviceData &dd)
     TaaState fresh;
     fresh.device = g_taa.device;
     g_taa = fresh;
+}
+
+// Teardown = park, not destroy. Resolves recorded 1-2 frames ago still
+// reference these objects; destroying them under the GPU was the teardown
+// DEVICE_LOST, and deviceWaitIdle here races X-Plane's submit threads.
+// The graveyard holds each retired state until 8 presents have passed.
+struct TaaGrave { TaaState s; uint64_t frame; };
+static std::vector<TaaGrave> g_taaGraves;
+static uint64_t g_taaGraveNow = 0;
+
+static void taaDestroy(DeviceData &dd)
+{
+    (void)dd;
+    if (g_taa.ready || g_taa.pool) {
+        TaaGrave gr; gr.s = g_taa; gr.frame = g_taaGraveNow;
+        g_taaGraves.push_back(gr);
+    }
+    TaaState fresh;
+    fresh.device = g_taa.device;
+    g_taa = fresh;
+}
+
+// Called once per present with the current frame counter.
+static void taaGraveFlush(DeviceData &dd, uint64_t frame)
+{
+    g_taaGraveNow = frame;
+    for (size_t i = 0; i < g_taaGraves.size();) {
+        if (frame > g_taaGraves[i].frame + 8) {
+            taaDestroyState(dd, g_taaGraves[i].s);
+            g_taaGraves.erase(g_taaGraves.begin() + (long)i);
+        } else ++i;
+    }
 }
 
 // Build everything that depends on the scene target's size and format. Called

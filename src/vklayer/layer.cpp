@@ -7024,6 +7024,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     vram::onPresent((snap.camDelta >= 0.0f && snap.camDelta < 100000.0f)
                         ? snap.camDelta : -1.0f, rotDeg);
 
+    // Retired TAA states (teardown = park, not destroy) whose 8-present
+    // safety window has passed are destroyed here, GPU provably done.
+    {
+        VkDevice gd = g_taa.device;
+        if (gd == VK_NULL_HANDLE && !g_taaGraves.empty())
+            gd = g_taaGraves[0].s.device;
+        if (gd != VK_NULL_HANDLE) {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<void*, DeviceData>::iterator gi =
+                g_devices.find(dispatchKey(gd));
+            if (gi != g_devices.end()) taaGraveFlush(gi->second, g_frameCount);
+        }
+    }
+
     // Flush deferred image destroys whose safety window has passed, and
     // prune stale lifetime-ledger entries so the map stays bounded.
     {
