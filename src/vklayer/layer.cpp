@@ -4775,7 +4775,11 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                   (unsigned long long)mvBindAge);
         g_taaStaleResume = true;
     }
-    do if (litPass && taaEnabled() && !g_taaResolvedThisFrame && !g_mv.wantDump &&
+    // NOT gated on g_taaResolvedThisFrame: one present interval often carries
+    // two recorded frames (the MISS census), and a once-per-interval flag
+    // silently dropped the second frame's resolve. The modulo boundary below
+    // is the per-frame selector now; the flag stays as telemetry only.
+    do if (litPass && taaEnabled() && !g_mv.wantDump &&
         mvBindAge <= 1) {
         gateReach(2);
         std::map<VkCommandBuffer, VkDevice>::iterator tci = g_cbToDevice.find(cb);
@@ -4881,7 +4885,15 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // is invisible and strictly better than a frame resolved into
                 // the wrong pass.
                 const uint32_t hdrIdx = ++g_hdrPassesThisFrame;
-                if (g_hdrPassesLastFrame == 0 || hdrIdx != g_hdrPassesLastFrame)
+                // MODULO, not equality: X-Plane records ahead, so one present
+                // interval often carries TWO frames' passes (hdr=6 then hdr=0
+                // the next interval - the TAA MISS census measured it). With
+                // equality, the second frame's last pass (idx 6 != 3) never
+                // resolved and every other displayed frame shipped raw - the
+                // 54% duty and the flashes. Every multiple of the per-frame
+                // count is a frame boundary; resolve at each of them.
+                if (g_hdrPassesLastFrame == 0 ||
+                    (hdrIdx % g_hdrPassesLastFrame) != 0)
                     break;
                 gateReach(5);
 
@@ -7147,12 +7159,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // Report a change rather than only carrying it: the count moving means the
     // frame's pass structure moved, and one frame's TAA landed on the pass that
     // used to be last. Rare and self-correcting, but it should be visible.
-    if (g_hdrPassesLastFrame && g_hdrPassesThisFrame != g_hdrPassesLastFrame)
-        trace("TAA: HDR candidate passes %u -> %u. The resolve targets the last "
-              "one, so this frame's resolve used the previous count and the next "
-              "frame corrects itself.",
-              g_hdrPassesLastFrame, g_hdrPassesThisFrame);
-    g_hdrPassesLastFrame   = g_hdrPassesThisFrame;
+    // The per-frame HDR pass count survives intervals that carry zero or two
+    // frames' worth of recording: an empty interval keeps the known count, a
+    // clean multiple of it (two frames batched) keeps the PER-FRAME value,
+    // and only a genuinely new structure replaces it.
+    if (g_hdrPassesThisFrame) {
+        if (g_hdrPassesLastFrame == 0 ||
+            (g_hdrPassesThisFrame % g_hdrPassesLastFrame) != 0) {
+            if (g_hdrPassesLastFrame)
+                trace("TAA: HDR candidate passes %u -> %u per interval - pass "
+                      "structure changed; the modulo boundary follows it.",
+                      g_hdrPassesLastFrame, g_hdrPassesThisFrame);
+            g_hdrPassesLastFrame = g_hdrPassesThisFrame;
+        }
+    }
     g_hdrPassesThisFrame   = 0;
     // Name the stage every MISSED frame died at - the 54% duty question.
     if (taaEnabled() && g_mv.ready && !g_taaResolvedThisFrame) {
