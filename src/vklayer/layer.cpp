@@ -3738,6 +3738,13 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
     // matches without a single wasted slot.
     if (info->colorAttachmentCount >= 8) return false;   // no room; leave alone
 
+    // Depth-only passes (shadow cascades) get NO slot. Their pipelines carry
+    // no colour blend state, so the pipeline hook skips them - and an extended
+    // pass drawing unextended pipelines is an attachment-count mismatch, which
+    // is undefined behaviour that intermittently surfaces as DEVICE_LOST at
+    // submit. A velocity slot on a shadow pass bought nothing anyway.
+    if (info->colorAttachmentCount == 0) return false;
+
     atts.assign(info->pColorAttachments,
                 info->pColorAttachments + info->colorAttachmentCount);
 
@@ -9088,6 +9095,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
                     src = (const VkPipelineRenderingCreateInfo*)p;
             if (!src || !ci[i].pColorBlendState) continue;
+            // Mirror of the pass hook's depth-only rule: passes with zero
+            // colour attachments are no longer extended, so a zero-attachment
+            // pipeline must keep zero formats or it mismatches the very pass
+            // it runs in.
+            if (src->colorAttachmentCount == 0) continue;
 
             // ---- FULL-SCREEN PIPELINES MUST NOT WRITE VELOCITY.
             //
@@ -9109,15 +9121,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // The blend state below already sets the velocity write mask to 0
             // for anything left unpatched, so declining here is sufficient: the
             // attachment stays bound and keeps whatever the geometry wrote.
+            // Full-screen pipelines (no vertex attributes) must not WRITE
+            // velocity - reprojecting a screen corner means nothing and the
+            // triangle covers the frame - but they MUST still declare the
+            // attachment format. This used to `continue`, leaving them N
+            // formats inside N+1-attachment passes: an attachment-count
+            // mismatch on every post-process draw, which is the undefined
+            // behaviour behind the intermittent DEVICE_LOST at flight load
+            // and view changes. Extend the formats, skip the shader patch;
+            // the unpatched path below already sets colorWriteMask 0.
+            bool noPatch = false;
             if (!ci[i].pVertexInputState ||
                 ci[i].pVertexInputState->vertexAttributeDescriptionCount == 0) {
                 static uint64_t nFullScreen = 0;
                 if (++nFullScreen % 500 == 1)
-                    trace("MV: declining %llu full-screen pipeline(s) - no vertex "
-                          "attributes, so uReproj has nothing meaningful to "
-                          "reproject and the triangle covers the whole frame",
+                    trace("MV: %llu full-screen pipeline(s) - formats extended, "
+                          "shaders left alone, write mask 0",
                           (unsigned long long)nFullScreen);
-                continue;
+                noPatch = true;
             }
 
             // One extra format, at index colorAttachmentCount - matching the
@@ -9194,7 +9215,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             bool fragPatched = false;
             stages[i].assign(ci[i].pStages, ci[i].pStages + ci[i].stageCount);
             bool vertPatched = false;
-            for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
+            for (uint32_t s = 0; !noPatch && s < ci[i].stageCount; ++s) {
                 if (ci[i].pStages[s].stage & VK_SHADER_STAGE_FRAGMENT_BIT) {
                     VkShaderModule use = mvPatchFragment(
                         device, ci[i].pStages[s].module, mvIndex);
@@ -9232,7 +9253,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // cockpit switch are one bind each, and 1.4% of binds can be most of
             // the screen. So the useful number is not the percentage, it is
             // WHICH pipelines and WHY.
-            if (!mvPatchedThisCall[i]) {
+            if (!mvPatchedThisCall[i] && !noPatch) {
                 static uint64_t nFail = 0, nVertOnly = 0, nFragOnly = 0, nNeither = 0;
                 ++nFail;
                 if (vertPatched && !fragPatched) ++nVertOnly;
