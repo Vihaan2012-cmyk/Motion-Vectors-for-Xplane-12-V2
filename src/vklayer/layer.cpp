@@ -7154,6 +7154,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
               g_hdrPassesLastFrame, g_hdrPassesThisFrame);
     g_hdrPassesLastFrame   = g_hdrPassesThisFrame;
     g_hdrPassesThisFrame   = 0;
+    // Name the stage every MISSED frame died at - the 54% duty question.
+    if (taaEnabled() && g_mv.ready && !g_taaResolvedThisFrame) {
+        static uint64_t missLog = 0;
+        if ((missLog++ % 60) == 0)
+            trace("TAA MISS: frame ended unresolved at gateDepth=%u "
+                  "(hdr=%u/%u ends=%u/%u)",
+                  g_gateDepthThisFrame.load(),
+                  g_hdrPassesThisFrame, g_hdrPassesLastFrame,
+                  g_sceneEndsThisFrame, g_sceneEndsLastFrame);
+    }
     g_gateDepthLastFrame.store(g_gateDepthThisFrame.load());
     g_gateDepthThisFrame.store(0);
     {
