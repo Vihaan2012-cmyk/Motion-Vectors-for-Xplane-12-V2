@@ -3137,6 +3137,11 @@ static void gpuTimeReport(DeviceData &dd, uint64_t frames)
 
 static uint32_t g_renderW = 0, g_renderH = 0;
 static uint32_t g_sceneColourCount = 0;
+// The latched shape of the velocity-bound pass (see MV STICKY below): the
+// colour count the world pass had when first bound at the current target
+// size. 0 = unlatched. Reset when the target resizes or the bind starves.
+static uint32_t g_mvStickyColour = 0;
+static uint32_t g_mvStickyW      = 0;
 
 static bool isSceneSized(uint32_t w, uint32_t h, uint32_t colourCount = 1)
 {
@@ -3631,6 +3636,25 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
         if (onlyPass >= 0 && g_mvPassOrdinal != (int)onlyPass) isScene = false;
     } else {
         g_mvPassOrdinal = -1;
+    }
+
+    // The ordinal renumbers when the frame's pass list shifts, which is how
+    // the bind alternated between the G-buffer (colour=5) and lit (colour=1)
+    // passes at 4K and left the field zero where the resolve reads: the clear
+    // and the writes landed on a different pass every frame. A pass's SHAPE
+    // does not renumber. Latch the colour count of the first pass bound at
+    // this target size and refuse a differently-shaped pass - one frame
+    // unbound self-corrects; a wrong bind poisons the whole field.
+    if (isScene) {
+        const uint32_t cc = info->colorAttachmentCount;
+        if (g_mvStickyColour == 0 || g_mvStickyW != g_mv.w) {
+            g_mvStickyColour = cc;
+            g_mvStickyW      = g_mv.w;
+            trace("MV STICKY: latched pass shape colour=%u at %ux%u", cc,
+                  g_mv.w, g_mv.h);
+        } else if (cc != g_mvStickyColour) {
+            isScene = false;
+        }
     }
 
     if (isScene) {
@@ -7195,6 +7219,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // individual log line looked normal; only the boundary view showed them.
     if (g_mv.ready) {
         if (g_mvBindsThisFrame == 0) {
+            // If the latched pass shape stops matching anything for a sustained
+            // stretch, the latch is pinning a ghost - the frame's structure
+            // genuinely changed. Release it and let the next bind re-latch.
+            if (g_mvNoBindStreak == 30 && g_mvStickyColour != 0) {
+                g_mvStickyColour = 0;
+                trace("MV STICKY: released after 30 unbound frames - pass "
+                      "shape changed for real, re-latching on next bind");
+            }
             if (++g_mvNoBindStreak == 1)
                 trace("MV FREEZE: no pass bound the velocity target this frame "
                       "(%u qualified). The target is neither written nor "
