@@ -2645,9 +2645,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImageView(
     return r;
 }
 
+// Measured, deliberately reproduced: TAA on + a view-snap hotkey = instant
+// DEVICE_LOST. The view change destroys scene-sized images the resolve's
+// descriptors still reference. Any scene-sized destruction quiesces the
+// resolve for a few frames - a view change costs three TAA-less frames
+// instead of the device.
+static std::atomic<int> g_taaQuiesce(0);
+
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
     VkDevice device, VkImage img, const VkAllocationCallbacks *alloc)
 {
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkImage, VramEntry>::iterator ve = g_vramImg.find(img);
+        if (ve != g_vramImg.end() && ve->second.w >= 1280 &&
+            ve->second.h >= 720)
+            g_taaQuiesce.store(3);
+    }
     vram::noteImageDestroy(img);
     PFN_vkDestroyImage next = nullptr;
     {
@@ -4838,6 +4852,13 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     break;
                 }
 
+                // Quiesce after any scene-sized destruction (the view-snap
+                // crash): skip the resolve entirely and resume with a reset.
+                if (g_taaQuiesce.load() > 0) {
+                    g_taaQuiesce.fetch_sub(1);
+                    g_taaStaleResume = true;
+                    break;
+                }
                 const bool needInit = !g_taa.ready ||
                                       g_taa.w != passInfo.w ||
                                       g_taa.h != passInfo.h ||
