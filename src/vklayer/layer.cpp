@@ -4977,7 +4977,15 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                                       g_taa.w != passInfo.w ||
                                       g_taa.h != passInfo.h ||
                                       g_taa.layers != litLayers ||
-                                      g_taa.format != litFmt;
+                                      g_taa.format != litFmt ||
+                                      // The velocity target is recreated on its
+                                      // own schedule (menu -> flight, resolution
+                                      // change). A descriptor bound to the OLD
+                                      // view keeps reading a dead image - the
+                                      // readback said 10.9 px while the resolve
+                                      // sampled zero. Same shape, different
+                                      // image: shape keys cannot catch it.
+                                      g_taa.velView != g_mv.viewArray;
                 if (needInit) {
                     // A shape change is a history discontinuity in its own right.
                     tf.reset |= temporal::RESET_RESOLUTION;
