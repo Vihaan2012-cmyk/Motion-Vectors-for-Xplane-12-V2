@@ -91,11 +91,17 @@ struct Config {
     int   lookaheadFrames;   // vram.lookahead          SS85 trend horizon
     int   ageFrames;         // vram.age_frames         SS86 staleness window
 };
-static Config cfg = { true, true, true, true, true,
+// BOOT-SAFE DEFAULTS: every actuator starts OFF and flips to its live-file /
+// env / built-in value at the first refreshConfig. The old initializers left
+// elision, recycling and priority tagging live for the splash-screen seconds
+// before the first poll - an untested window that ran on every launch and
+// could never be switched off. Telemetry (enable) boots on; actuation waits
+// for configuration.
+static Config cfg = { true, false, false, false, false,
                       0.02f, {128,256,384,512,768}, 512, 600,
                       256, 180, {0,0,64,24,8}, 2,
                       2000.0f, 900, 600, 0.01f, true,
-                      true, 900, 512, 512, 300, 1800 };
+                      false, 900, 512, 512, 300, 1800 };
 
 // ------------------------------------------------------------------ zones
 enum Zone { GREEN = 0, YELLOW, ORANGE, RED, CRITICAL };
@@ -333,6 +339,7 @@ struct ShapeMip {
     }
 };
 static std::map<MipKey, uint64_t>   g_liveContent;
+static std::atomic<uint32_t>        g_liveContentCount(0);  // lock-free gate
 static std::map<ShapeMip, uint64_t> g_deadContent;
 // ---- THE SERVING CACHE'S STORAGE (runtime-restoration prerequisite). When
 // the pager drops a mip's upload, the payload the engine decoded is the LAST
@@ -772,6 +779,8 @@ static void noteImageDestroy(VkImage img)
             }
             g_liveContent.erase(ci++);
         }
+        g_liveContentCount.store((uint32_t)g_liveContent.size(),
+                                 std::memory_order_relaxed);
         // A burst of large preload-class destructions is an aircraft or
         // livery change (SS76). Score decays at present; the threshold fires
         // the same protective response as a teleport.
@@ -943,6 +952,8 @@ static bool cacheUpload(VkImage img, uint32_t mip, uint64_t hash,
         return true;
     }
     g_liveContent[k] = hash;
+    g_liveContentCount.store((uint32_t)g_liveContent.size(),
+                             std::memory_order_relaxed);
     // Did the engine just reload from disk what a destroyed image held?
     std::map<VkImage, ResRec>::iterator ck = g_registry.find(img);
     if (ck != g_registry.end()) {
@@ -967,6 +978,11 @@ static bool cacheUpload(VkImage img, uint32_t mip, uint64_t hash,
 static void contentInvalidate(VkImage img)
 {
     if (!img) return;
+    // Lock-free fast path: the barrier hooks call this from every recording
+    // thread for every UNDEFINED transition, and a global mutex on that path
+    // is the 9-fps mistake this project has already made once. The counter
+    // makes the common case (no cached content) a single atomic load.
+    if (g_liveContentCount.load(std::memory_order_relaxed) == 0) return;
     std::lock_guard<std::mutex> g(m);
     if (g_liveContent.empty()) return;
     uint64_t base = (uint64_t)(uintptr_t)img;
@@ -974,6 +990,8 @@ static void contentInvalidate(VkImage img)
     for (std::map<MipKey, uint64_t>::iterator it = g_liveContent.lower_bound(from);
          it != g_liveContent.end() && it->first.img == base;)
         g_liveContent.erase(it++);
+    g_liveContentCount.store((uint32_t)g_liveContent.size(),
+                             std::memory_order_relaxed);
 }
 
 static void noteUploadRegion(uint64_t imgHandle, uint32_t mip)
@@ -1933,7 +1951,7 @@ static void frameTimeTick()
             // is under 4 ms on any target hardware; the floor removes the
             // poisoning without touching genuine regressions.
             if (frameBestMs < 4.0) frameBestMs = 4.0;
-            if (cfg.adaptive) {
+            if (cfg.adaptive && g_camValid) {   // no notching before flight
                 bool uploadsFlowing = upBytesLast > (4ull << 20);
                 if (frameAvgMs > frameBestMs * 1.30 && uploadsFlowing) {
                     if (uploadNotch < 3) {
