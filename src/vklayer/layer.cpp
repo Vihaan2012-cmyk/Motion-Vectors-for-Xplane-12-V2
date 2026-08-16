@@ -4983,14 +4983,22 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                                       // change). A descriptor bound to the OLD
                                       // view keeps reading a dead image - the
                                       // readback said 10.9 px while the resolve
-                                      // sampled zero. Same shape, different
-                                      // image: shape keys cannot catch it.
-                                      g_taa.velView != g_mv.viewArray;
+                                      // sampled zero. Compared by GENERATION,
+                                      // not handle: drivers reuse handle values,
+                                      // so a recreated view can compare equal
+                                      // while the descriptor points at a corpse.
+                                      g_taa.velGen != g_mv.gen;
                 if (needInit) {
                     // A shape change is a history discontinuity in its own right.
                     tf.reset |= temporal::RESET_RESOLUTION;
                     taaInit(tdd, tci->second, passInfo.color0, litFmt,
                             passInfo.w, passInfo.h, litLayers, g_mv.viewArray);
+                    // Stamp which velocity-target generation the descriptors
+                    // were just written against - the needInit clause above
+                    // compares this, not the reusable handle value.
+                    g_taa.velGen = g_mv.gen;
+                    trace("TAA: descriptors bound to velocity gen %llu (view %p)",
+                          (unsigned long long)g_mv.gen, (void*)g_mv.viewArray);
                 } else if (!taaBindScene(tdd, passInfo.color0)) {
                     break;
                 }

@@ -56,6 +56,9 @@ struct TaaState {
     VkImageView     sceneView   = VK_NULL_HANDLE;
     VkImage         sceneImage  = VK_NULL_HANDLE;   // the view above belongs to this
     VkImageView     velView     = VK_NULL_HANDLE;
+    // Generation of the velocity target the descriptor was written against.
+    // Handles are reused; this is not. See MvTarget::gen.
+    uint64_t        velGen      = 0;
     VkSampler       sampler     = VK_NULL_HANDLE;
     // ---- X-PLANE'S gbuffer_vel, AND A FALLBACK FOR WHEN IT IS UNKNOWN.
     //

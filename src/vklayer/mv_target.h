@@ -53,6 +53,10 @@ struct MvTarget {
     // storage - and each is then the natural type for its own use.
     VkImageView    viewArray = VK_NULL_HANDLE;
     VkImageLayout  layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // Monotonic creation stamp. Handle VALUES are reused by drivers, so
+    // "same viewArray handle" does not mean "same view" - consumers that
+    // cache descriptors must compare this, not the handle.
+    uint64_t       gen = 0;
 
 
     // Readback, so the VALUES can be measured rather than assumed.
@@ -315,6 +319,10 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
               "measured");
 
     m.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    {
+        static uint64_t s_mvGen = 0;
+        m.gen = ++s_mvGen;
+    }
     m.ready  = true;
     trace("MV: velocity target ready %ux%u RGBA16F vel.xy + coverage.a (%.1f MB) - this is "
           "the one X-Plane's own shaders render into",
