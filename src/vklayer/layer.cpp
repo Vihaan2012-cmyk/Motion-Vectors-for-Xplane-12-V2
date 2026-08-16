@@ -5001,21 +5001,24 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     break;
                 }
                 gateReach(7);
+                // A regenerated velocity target needs NO rebuild: descriptors
+                // are rewritten every dispatch, so repointing the view in
+                // place is the whole fix - zero hitch. (The earlier full
+                // re-init here was the 19fps stutter.) The reset flag matters:
+                // a new target usually means a scene change, and blending
+                // history across one drags the old scene forward.
+                if (g_taa.ready && g_taa.velGen != g_mv.gen) {
+                    g_taa.velView = g_mv.viewArray;
+                    g_taa.velGen  = g_mv.gen;
+                    tf.reset |= temporal::RESET_SCENE_LOAD;
+                    trace("TAA: velocity view repointed in place (gen %llu)",
+                          (unsigned long long)g_mv.gen);
+                }
                 const bool needInit = !g_taa.ready ||
                                       g_taa.w != passInfo.w ||
                                       g_taa.h != passInfo.h ||
                                       g_taa.layers != litLayers ||
-                                      g_taa.format != litFmt ||
-                                      // The velocity target is recreated on its
-                                      // own schedule (menu -> flight, resolution
-                                      // change). A descriptor bound to the OLD
-                                      // view keeps reading a dead image - the
-                                      // readback said 10.9 px while the resolve
-                                      // sampled zero. Compared by GENERATION,
-                                      // not handle: drivers reuse handle values,
-                                      // so a recreated view can compare equal
-                                      // while the descriptor points at a corpse.
-                                      g_taa.velGen != g_mv.gen;
+                                      g_taa.format != litFmt;
                 if (needInit) {
                     // Re-init storms are the 19fps dips: each init rebuilds the
                     // pipeline and views (a hitch) and parks a state in the
@@ -5023,7 +5026,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     // trigger is real it still happens, just once; while
                     // throttled the resolve skips rather than thrashes.
                     static uint64_t lastInitFrame = 0;
-                    if (g_taa.ready && g_frameCount - lastInitFrame < 60) {
+                    if (g_taa.ready && g_frameCount - lastInitFrame < 600) {
                         static uint64_t thrLog = 0;
                         if ((thrLog++ % 120) == 0)
                             trace("TAA: re-init THROTTLED (last init %llu "
