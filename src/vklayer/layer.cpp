@@ -1423,6 +1423,11 @@ static uint32_t g_hdrPassesLastFrame   = 0;
 // resolved=0 on the GATE line says THAT it never ran; this says WHERE it died.
 static std::atomic<uint32_t> g_gateDepthThisFrame{0};
 static std::atomic<uint32_t> g_gateDepthLastFrame{0};
+// HDR candidate passes that END after the resolve already recorded this
+// frame - the overwrite census behind the "output only survives in flashes"
+// symptom. Reset at present.
+static std::atomic<uint32_t> g_hdrAfterResolveSame{0};
+static std::atomic<uint32_t> g_hdrAfterResolveOther{0};
 static inline void gateReach(uint32_t d) {
     uint32_t cur = g_gateDepthThisFrame.load(std::memory_order_relaxed);
     while (cur < d && !g_gateDepthThisFrame.compare_exchange_weak(cur, d)) {}
@@ -4814,6 +4819,17 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 if (litFmt != VK_FORMAT_R16G16B16A16_SFLOAT &&
                     litFmt != VK_FORMAT_R32G32B32A32_SFLOAT) break;
                 gateReach(4);
+                // The flashes diagnosis: if HDR candidate passes keep ENDING
+                // after the resolve already ran this frame, the engine paints
+                // over the resolve's output - same-image counts are direct
+                // overwrites, other-image counts mean the pick landed on the
+                // wrong half of a double-buffered pair.
+                if (g_taaResolvedThisFrame) {
+                    if (passInfo.color0 == g_taaWroteImageThisFrame)
+                        ++g_hdrAfterResolveSame;
+                    else
+                        ++g_hdrAfterResolveOther;
+                }
                 {
                     // CANDIDATE, not chosen: this fires BEFORE the last-pass
                     // filter below, so a frame with two qualifying passes
@@ -7140,6 +7156,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     g_hdrPassesThisFrame   = 0;
     g_gateDepthLastFrame.store(g_gateDepthThisFrame.load());
     g_gateDepthThisFrame.store(0);
+    {
+        const uint32_t same  = g_hdrAfterResolveSame.exchange(0);
+        const uint32_t other = g_hdrAfterResolveOther.exchange(0);
+        static uint64_t ovLog = 0;
+        if ((same || other) && (ovLog++ % 120) == 0)
+            trace("TAA OVERWRITE: %u same-image / %u other-image HDR passes "
+                  "ended AFTER the resolve this frame - the engine is painting "
+                  "over the output (this is the flashes mechanism)",
+                  same, other);
+    }
     g_prevLastDepthPassIdx = g_lastDepthPassIdx;   // predicts where to inject next frame
     g_lastDepthPassIdx     = -1;
     g_passesThisFrame      = 0;
