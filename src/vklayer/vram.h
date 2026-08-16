@@ -364,6 +364,11 @@ static float prioOfCat(int cat, bool streamed)
         case 5: /*BUF_GEOM*/                    return 0.7f;
         case 0: /*TEX*/     return streamed ? 0.35f : 0.6f;
         case 7: /*BUF_STAGING*/                 return 0.2f;
+        // IMG_OTHER is arrays and 3D volumes. Preloaded ones are engine
+        // infrastructure (cloud volumes carry STORAGE usage and classify
+        // higher already); streamed sampled arrays are scenery mega-texture
+        // pages and rank with streamed scenery.
+        case 4: /*IMG_OTHER*/ return streamed ? 0.4f : 0.6f;
         default:                                return 0.5f;
     }
 }

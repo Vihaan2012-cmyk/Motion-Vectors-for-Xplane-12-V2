@@ -1539,6 +1539,16 @@ static int   getVramTotal(void*)        { return g_share ? (int)g_share->vramTot
 static int   getVramBudget(void*)       { return g_share ? (int)g_share->vramBudgetMB : 0; }
 static int   getVramUsed(void*)         { return g_share ? (int)g_share->vramUsageMB  : 0; }
 
+// The VRAM system's live state (vram.h in the layer). The zone is the one
+// word that summarises pressure; the rest are the overlay counters - what the
+// system is holding, pooling, shaping and failing, without opening a log.
+static int   getVramZone(void*)         { return g_share ? (int)g_share->vramZone          : 0; }
+static int   getVramShaped(void*)       { return g_share ? (int)g_share->vramShapedMB      : 0; }
+static int   getVramUploadKB(void*)     { return g_share ? (int)g_share->vramUploadKBFrame : 0; }
+static int   getVramHeld(void*)         { return g_share ? (int)g_share->vramHeldSubmits   : 0; }
+static int   getVramPool(void*)         { return g_share ? (int)g_share->vramPoolMB        : 0; }
+static int   getVramFails(void*)        { return g_share ? (int)g_share->vramAllocFails    : 0; }
+
 // The pager's real limits after patching. Stock values if a patch refused.
 // g_floorValue, not a hardcoded 0.5 - the floor is a configurable value now, and
 // a panel that reports the wrong one is worse than one that reports nothing.
@@ -1634,6 +1644,23 @@ static void registerDatarefs()
                        getVramBudget, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
     g_myVramUsed   = XPLMRegisterDataAccessor("taaimpl/vram_used_mb", xplmType_Int, 0,
                        getVramUsed, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+
+    // The VRAM system's overlay surface: zone (0 GREEN .. 4 CRITICAL), the
+    // shaped budget X-Plane is actually reading, upload flow, governor holds,
+    // recycle pool residency, and allocation failures. Read-only; any panel,
+    // Lua script or the debug window can draw them.
+    XPLMRegisterDataAccessor("taaimpl/vram_zone", xplmType_Int, 0,
+                             getVramZone, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/vram_shaped_mb", xplmType_Int, 0,
+                             getVramShaped, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/vram_upload_kb_frame", xplmType_Int, 0,
+                             getVramUploadKB, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/vram_held_submits", xplmType_Int, 0,
+                             getVramHeld, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/vram_pool_mb", xplmType_Int, 0,
+                             getVramPool, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/vram_alloc_fails", xplmType_Int, 0,
+                             getVramFails, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
     // What the binary patches actually achieved, so the panel can show the
     // pager's real limits rather than what the launcher asked for. A patch that
