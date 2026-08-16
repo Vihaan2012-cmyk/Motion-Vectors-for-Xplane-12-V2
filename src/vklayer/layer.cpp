@@ -7443,8 +7443,34 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(device));
-        if (di != g_devices.end() && g_mv.device == device)
-            mvDestroy(di->second);
+        if (di != g_devices.end()) {
+            // The device is dying and the app guarantees its queues are idle -
+            // the ONE moment immediate destruction is safe and deferral is
+            // fatal: any grave flushed after this device is gone is a call on
+            // dead handles (the post-dormancy DEVICE_LOST). Drain everything
+            // belonging to this device NOW.
+            for (size_t i = 0; i < g_mvGraves.size();) {
+                if (g_mvGraves[i].t.device == device) {
+                    mvDestroyState(di->second, g_mvGraves[i].t);
+                    g_mvGraves.erase(g_mvGraves.begin() + (long)i);
+                } else ++i;
+            }
+            for (size_t i = 0; i < g_taaGraves.size();) {
+                if (g_taaGraves[i].s.device == device) {
+                    taaDestroyState(di->second, g_taaGraves[i].s);
+                    g_taaGraves.erase(g_taaGraves.begin() + (long)i);
+                } else ++i;
+            }
+            if (g_mv.device == device) {
+                mvDestroyState(di->second, g_mv);
+                g_mv = MvTarget();
+            }
+            if (g_taa.device == device) {
+                taaDestroyState(di->second, g_taa);
+                TaaState fresh;
+                g_taa = fresh;
+            }
+        }
     }
 
     PFN_vkDestroyDevice next = nullptr;
