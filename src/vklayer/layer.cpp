@@ -10723,7 +10723,18 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkCmdEndRendering",      Layer_CmdEndRendering)
     RETURN_IF("vkCmdEndRenderingKHR",   Layer_CmdEndRendering)
     RETURN_IF("vkCmdSetViewport",       Layer_CmdSetViewport)
-    RETURN_IF("vkAllocateMemory",      TAA_AllocateMemory)
+    // ---- HOOK-LEVEL KILL SWITCH for the crash bisect: TAA_VRAM_HOOKS=0
+    // removes every VRAM-system hook from dispatch entirely - the engine
+    // talks straight to the driver, and only the pre-existing layer remains.
+    // Fast default-aircraft loads crash where slow FF loads survive with all
+    // LIVE switches off, so the suspect is an always-on hook path racing the
+    // load; this cleaves the binary at that exact boundary.
+    static int vramHooks = -1;
+    if (vramHooks < 0) {
+        const char *vh = getenv("TAA_VRAM_HOOKS");
+        vramHooks = (!vh || atoi(vh) != 0) ? 1 : 0;
+    }
+    if (vramHooks) {
     RETURN_IF("vkFreeMemory",          Vram_FreeMemory)
     RETURN_IF("vkBindImageMemory",     Vram_BindImageMemory)
     RETURN_IF("vkBindImageMemory2",    Vram_BindImageMemory2)
@@ -10744,6 +10755,11 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkAllocateDescriptorSets", Vram_AllocateDescriptorSets)
     RETURN_IF("vkMapMemory",           Vram_MapMemory)
     RETURN_IF("vkUnmapMemory",         Vram_UnmapMemory)
+    }
+    // Everything below is the PRE-EXISTING layer - never gated. AllocateMemory
+    // stays hooked for the ledger and overcommit rescue; its new VRAM extras
+    // are internally inert when the hooks above are stripped.
+    RETURN_IF("vkAllocateMemory",      TAA_AllocateMemory)
     RETURN_IF("vkCmdCopyBufferToImage", TAA_CmdCopyBufferToImage)
     RETURN_IF("vkCmdPipelineBarrier",  TAA_CmdPipelineBarrier)
     RETURN_IF("vkCmdPipelineBarrier2", TAA_CmdPipelineBarrier2)
