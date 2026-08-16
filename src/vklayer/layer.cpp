@@ -11052,9 +11052,40 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
 
 #define RETURN_IF(nm, fn) if (!strcmp(name, nm)) return (PFN_vkVoidFunction)(fn);
 
+// The 38fps serialization instrument: X-Plane's frame time is CPU+GPU added,
+// never overlapped, and the present mode is where that lives. Log what the
+// engine asks for; TAA_PRESENT_MODE=<n> forces it (0 IMMEDIATE, 1 MAILBOX,
+// 2 FIFO, 3 FIFO_RELAXED) - MAILBOX is the "uncap without tearing" test.
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
+    VkDevice device, const VkSwapchainCreateInfoKHR *ci,
+    const VkAllocationCallbacks *alloc, VkSwapchainKHR *out)
+{
+    VkSwapchainCreateInfoKHR mod = *ci;
+    const char *e = getenv("TAA_PRESENT_MODE");
+    if (e && e[0]) {
+        mod.presentMode = (VkPresentModeKHR)atoi(e);
+        trace("SWAPCHAIN: present mode FORCED %d -> %d", (int)ci->presentMode,
+              (int)mod.presentMode);
+    }
+    trace("SWAPCHAIN: %ux%u images=%u presentMode=%d (0=IMM 1=MBOX 2=FIFO "
+          "3=RELAXED) fmt=%d",
+          mod.imageExtent.width, mod.imageExtent.height, mod.minImageCount,
+          (int)mod.presentMode, (int)mod.imageFormat);
+    PFN_vkCreateSwapchainKHR next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it =
+            g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.createSwapchainKHR;
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    return next(device, &mod, alloc, out);
+}
+
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 MV_GetDeviceProcAddr(VkDevice device, const char *name)
 {
+    RETURN_IF("vkCreateSwapchainKHR",  Layer_CreateSwapchainKHR)
     RETURN_IF("vkGetDeviceProcAddr",   MV_GetDeviceProcAddr)
     RETURN_IF("vkDestroyDevice",       Layer_DestroyDevice)
     RETURN_IF("vkCreateImage",         Layer_CreateImage)
