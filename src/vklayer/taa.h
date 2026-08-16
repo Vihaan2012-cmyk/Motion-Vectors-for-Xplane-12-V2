@@ -197,12 +197,10 @@ static uint32_t taaFindMemory(DeviceData &dd, uint32_t typeBits, VkMemoryPropert
 
 static void taaDestroy(DeviceData &dd)
 {
-    // A resolve recorded one or two frames ago can still be in flight when a
-    // re-init tears these objects down - destroying them under it is the
-    // view-change DEVICE_LOST. Teardown happens on a shape or target change,
-    // which is rare; a full idle here costs one hitch on those frames and
-    // removes the whole use-after-free class.
-    if (dd.deviceWaitIdle && g_taa.device) dd.deviceWaitIdle(g_taa.device);
+    // NO deviceWaitIdle here: X-Plane submits from several threads, and idling
+    // the device from inside a recording hook races them - it crashed within
+    // seconds of flight. In-flight protection has to come from deferral, not
+    // from a blocking wait on this thread.
     if (g_taa.pipeline)    dd.destroyPipeline(g_taa.device, g_taa.pipeline, nullptr);
     if (g_taa.pipeLayout)  dd.destroyPipelineLayout(g_taa.device, g_taa.pipeLayout, nullptr);
     if (g_taa.setLayout)   dd.destroyDescriptorSetLayout(g_taa.device, g_taa.setLayout, nullptr);

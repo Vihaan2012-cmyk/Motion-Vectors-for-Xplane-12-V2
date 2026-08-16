@@ -171,10 +171,8 @@ static void mvDestroy(DeviceData &dd)
 {
     MvTarget &m = g_mv;
     if (m.device == VK_NULL_HANDLE) { m = MvTarget(); return; }
-    // Scene passes and the resolve reference this image from command buffers
-    // recorded frames ago. Same rule as taaDestroy: idle first - recreation is
-    // rare, use-after-free is fatal.
-    if (dd.deviceWaitIdle) dd.deviceWaitIdle(m.device);
+    // NO deviceWaitIdle here - see taaDestroy: idling the device from inside a
+    // hook races X-Plane's submitting threads and crashes within seconds.
     if (m.readbackPtr) dd.unmapMemory(m.device, m.readbackMem);
     if (m.readback)    dd.destroyBuffer(m.device, m.readback, nullptr);
     if (m.readbackMem) dd.freeMemory(m.device, m.readbackMem, nullptr);
