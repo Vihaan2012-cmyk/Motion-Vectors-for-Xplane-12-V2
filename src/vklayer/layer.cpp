@@ -11147,7 +11147,17 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
         const char *vh = getenv("TAA_VRAM_HOOKS");
         vramHooks = (!vh || atoi(vh) != 0) ? 1 : 0;
     }
+    // TAA_VRAM_HOOK_MASK bisects within the set (default 15 = all):
+    //   bit0 memory (free/bind/map)   bit1 sync (fences/semaphores/idles)
+    //   bit2 sparse (QueueBindSparse) bit3 copy+descriptors
+    // The Felis-load crash lives behind ONE of these bits.
+    static int vramMask = -1;
+    if (vramMask < 0) {
+        const char *vm = getenv("TAA_VRAM_HOOK_MASK");
+        vramMask = vm ? atoi(vm) : 15;
+    }
     if (vramHooks) {
+    if (vramMask & 1) {
     RETURN_IF("vkFreeMemory",          Vram_FreeMemory)
     RETURN_IF("vkBindImageMemory",     Vram_BindImageMemory)
     RETURN_IF("vkBindImageMemory2",    Vram_BindImageMemory2)
@@ -11155,6 +11165,10 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkBindBufferMemory",    Vram_BindBufferMemory)
     RETURN_IF("vkBindBufferMemory2",   Vram_BindBufferMemory2)
     RETURN_IF("vkBindBufferMemory2KHR", Vram_BindBufferMemory2)
+    RETURN_IF("vkMapMemory",           Vram_MapMemory)
+    RETURN_IF("vkUnmapMemory",         Vram_UnmapMemory)
+    }
+    if (vramMask & 2) {
     RETURN_IF("vkGetDeviceQueue",      Vram_GetDeviceQueue)
     RETURN_IF("vkWaitForFences",       Vram_WaitForFences)
     RETURN_IF("vkGetFenceStatus",      Vram_GetFenceStatus)
@@ -11163,11 +11177,14 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkWaitSemaphoresKHR",   Vram_WaitSemaphores)
     RETURN_IF("vkQueueWaitIdle",       Vram_QueueWaitIdle)
     RETURN_IF("vkDeviceWaitIdle",      Vram_DeviceWaitIdle)
+    }
+    if (vramMask & 4) {
     RETURN_IF("vkQueueBindSparse",     Vram_QueueBindSparse)
+    }
+    if (vramMask & 8) {
     RETURN_IF("vkCmdCopyBuffer",       Vram_CmdCopyBuffer)
     RETURN_IF("vkAllocateDescriptorSets", Vram_AllocateDescriptorSets)
-    RETURN_IF("vkMapMemory",           Vram_MapMemory)
-    RETURN_IF("vkUnmapMemory",         Vram_UnmapMemory)
+    }
     }
     // Everything below is the PRE-EXISTING layer - never gated. AllocateMemory
     // stays hooked for the ledger and overcommit rescue; its new VRAM extras
