@@ -89,7 +89,35 @@ enum { ExecModel_Vertex = 0, ExecModel_Fragment = 4 };
 // then the jitter that was actually applied.
 //
 // vec4 rather than vec2 for the 16-byte alignment; only .xy is read.
-static const uint32_t kPushConstantBytes = 80;
+// 144 = mat4 world reprojection (64) + vec4 jitter/near-field (16) + mat4 BODY
+// reprojection (64).
+//
+// ---- WHY THE THIRD MEMBER EXISTS.
+//
+// Cockpit geometry is bolted to the airframe and so is the camera, so neither
+// of the two things this shader could previously do is right for it:
+//
+//   world reprojection - predicts the panel moved because the CAMERA moved
+//     through the world, when the panel moved with it. Shakes whenever the
+//     aircraft does anything, which is always.
+//   substitute currClip (velocity zero) - correct only while the camera is
+//     rigid in the body frame. Panning breaks that premise, the panel really
+//     does move across the screen, and history is fetched from the wrong
+//     place: the ghosting on camera movement.
+//
+// Both were observed, in that order, by switching taa.nearfield_m. The body
+// reprojection answers both: in the aircraft's frame a bolted-down panel has
+// constant coordinates, so it falls out as identity when nothing moves
+// relative to the airframe and reports exactly the right motion when the head
+// does move. The plugin already computes and publishes it (share.h,
+// bodyReproj/bodyReprojValid) - it was simply never sent to the shader.
+//
+// COST: this takes the block past the 128 bytes Vulkan guarantees. Desktop
+// drivers expose 256, which is why it is acceptable here, but it IS the
+// portability limit of this design. The compact form is known if it is ever
+// needed: prevProj equals proj every frame (measured), so the body transform
+// is rigid and packs into a quaternion plus a vec3 - 28 bytes rather than 64.
+static const uint32_t kPushConstantBytes = 144;
 
 // WHERE IT SITS, AND WHY NOT AT ZERO.
 //
@@ -700,6 +728,12 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // vec4 there anyway; it is stated explicitly because the layer pushes both
     // members in one call and the two descriptions have to agree exactly.
     annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructPC); annos.push_back(1); annos.push_back(Deco_Offset); annos.push_back(pushConstantOffset() + 64);
+    // Member 2: the BODY-frame reprojection, after the jitter vec4. Same
+    // column-major stride-16 description as member 0 - the layer pushes all
+    // three in one call, so the three descriptions have to agree exactly.
+    annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructPC); annos.push_back(2); annos.push_back(Deco_Offset); annos.push_back(pushConstantOffset() + 80);
+    annos.push_back(head(OpMemberDecorate, 4)); annos.push_back(idStructPC); annos.push_back(2); annos.push_back(Deco_ColMajor);
+    annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructPC); annos.push_back(2); annos.push_back(Deco_MatrixStride); annos.push_back(16);
     annos.push_back(head(OpDecorate, 4)); annos.push_back(idOutCurr); annos.push_back(Deco_Location); annos.push_back(currClipLocation());
     annos.push_back(head(OpDecorate, 4)); annos.push_back(idOutPrev); annos.push_back(Deco_Location); annos.push_back(prevClipLocation());
 
@@ -715,9 +749,13 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     if (newBool)     { globals.push_back(head(OpTypeBool, 2));    globals.push_back(newBool); }
     if (newOneV)     { uint32_t bits; float o = 1.0f; memcpy(&bits, &o, 4);
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newOneV); globals.push_back(bits); }
-    (void)idConst2NF;
+    // Constant 2: the member index of the body matrix in the block. The ID was
+    // reserved here long ago and never emitted - the near-field extract uses a
+    // literal - so it is emitted now that an OpAccessChain genuinely indexes
+    // member 2 with it.
+    globals.push_back(head(OpConstant, 4)); globals.push_back(idInt); globals.push_back(idConst2NF); globals.push_back(2);
 
-    globals.push_back(head(OpTypeStruct, 4));  globals.push_back(idStructPC);    globals.push_back(idMat4); globals.push_back(idV4);
+    globals.push_back(head(OpTypeStruct, 5));  globals.push_back(idStructPC);    globals.push_back(idMat4); globals.push_back(idV4); globals.push_back(idMat4);
     globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrPCStruct); globals.push_back(SC_PushConstant); globals.push_back(idStructPC);
     globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrPCMat4);   globals.push_back(SC_PushConstant); globals.push_back(idMat4);
     if (newPtrPCV4) { globals.push_back(head(OpTypePointer, 4)); globals.push_back(newPtrPCV4); globals.push_back(SC_PushConstant); globals.push_back(idV4); }
@@ -970,7 +1008,19 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // flip era, while currClip stores the unflipped one: not zero velocity but
     // a VERTICAL-MIRROR velocity on every near pixel, wrong since the flip was
     // removed and invisible until the select first armed.
-    body.push_back(head(OpSelect, 6)); body.push_back(idV4); body.push_back(idPrevSel); body.push_back(idNFcmp); body.push_back(idLoadedPos); body.push_back(idPrevClip);
+    // ---- NEAR GEOMETRY REPROJECTS IN THE BODY FRAME, NOT TO ZERO.
+    //
+    // Substituting idLoadedPos states "this vertex did not move on screen",
+    // which is true only while the camera is rigid in the body frame. Panning
+    // breaks it and the panel ghosts. The body matrix states where the vertex
+    // WAS in the aircraft's frame, which is identity when nothing moved
+    // relative to the airframe and exactly right when the head did - so it
+    // covers both cases and neither symptom returns. Member 2 of the block.
+    const uint32_t idChainBody = bound++, idBodyMat = bound++, idPrevBody = bound++;
+    body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrPCMat4); body.push_back(idChainBody); body.push_back(idPCVar); body.push_back(idConst2NF);
+    body.push_back(head(OpLoad, 4));        body.push_back(idMat4);      body.push_back(idBodyMat);   body.push_back(idChainBody);
+    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4); body.push_back(idPrevBody); body.push_back(idBodyMat); body.push_back(idLoadedPos);
+    body.push_back(head(OpSelect, 6)); body.push_back(idV4); body.push_back(idPrevSel); body.push_back(idNFcmp); body.push_back(idPrevBody); body.push_back(idPrevClip);
 
     // ---- DEBUG: REPORT THE MATRIX THE VERTEX SHADER ACTUALLY LOADED.
     //

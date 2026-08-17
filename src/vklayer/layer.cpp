@@ -4989,7 +4989,39 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     // two recorded frames (the MISS census), and a once-per-interval flag
     // silently dropped the second frame's resolve. The modulo boundary below
     // is the per-frame selector now; the flag stays as telemetry only.
+    // ---- AT MOST ONE RESOLVE PER PRESENTED FRAME.
+    //
+    // The modulo gate below fires at EVERY multiple of the per-frame pass
+    // count, which was right for catching frames X-Plane records ahead - but
+    // nothing capped how many times that could happen inside one present, and
+    // the once-per-frame guard had been dropped from this condition. Each extra
+    // pass is a full-resolution compute dispatch over 8.3 M pixels at 4K, and
+    // the sim measured 38 -> 19 fps when the clamp stage was switched on: the
+    // resolve was costing ~26 ms, which is several dispatches, not one.
+    //
+    // Only one frame is ever displayed per present, so only one resolve can
+    // reach the screen; the rest are work nobody sees. The counter says how
+    // many were being run, so the saving is visible rather than assumed, and
+    // taa.max_resolves raises the cap if a frame ever genuinely needs more.
+    static uint32_t resolvesThisPresent = 0;
+    static uint64_t resolvePresentTag = ~0ull;
+    if (resolvePresentTag != g_frameCount) {
+        if (resolvesThisPresent > 1) {
+            static uint32_t worst = 0;
+            if (resolvesThisPresent > worst) {
+                worst = resolvesThisPresent;
+                trace("TAA COST: %u resolves ran in one presented frame - each "
+                      "is a full-resolution dispatch and only one can be seen. "
+                      "Capping at taa.max_resolves.", resolvesThisPresent);
+            }
+        }
+        resolvesThisPresent = 0;
+        resolvePresentTag = g_frameCount;
+    }
+    const uint32_t maxResolves =
+        (uint32_t)live::i("taa.max_resolves", "TAA_MAX_RESOLVES", 1);
     do if (litPass && taaEnabled() && !g_mv.wantDump &&
+        resolvesThisPresent < maxResolves &&
         mvBindAge <= 1) {
         gateReach(2);
         std::map<VkCommandBuffer, VkDevice>::iterator tci = g_cbToDevice.find(cb);
@@ -5373,6 +5405,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 }
                 g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
+                ++resolvesThisPresent;
                 gateReach(9);
                 // Watched by noteSsrFeedbackCheck for the rest of the frame.
                 g_taaWroteImageThisFrame = passInfo.color0;
@@ -8897,7 +8930,7 @@ static std::map<VkPipeline, VkPipelineLayout> g_pipelineLayoutOf;
 //
 // Pushing again immediately before each draw closes that window: nothing can be
 // bound between the push and the draw that consumes it.
-struct PendingPush { VkCommandBuffer cb; VkPipelineLayout layout; float block[20]; bool valid; };
+struct PendingPush { VkCommandBuffer cb; VkPipelineLayout layout; float block[36]; bool valid; };
 
 // THREAD-LOCAL, NOT A MAP UNDER A MUTEX.
 //
@@ -10240,7 +10273,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // stray environment variable would have made every motion vector describe
     // a rotation the camera never performed, and no magnitude test would have
     // noticed.
-    float block[20];
+    float block[36];
     // ---- THE BODY MATRIX IS STILL CLIP-TO-CLIP. CONVERT IT.
     //
     // When the main reprojection moved to view space the shader changed what it
@@ -10284,6 +10317,34 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     if (useIdentity) memcpy(block, kIdentity, 64);
     if (useBody) ++g_bodyReprojPushes;
     block[16] = block[17] = block[18] = block[19] = 0.0f;
+
+    // ---- MEMBER 2: THE BODY MATRIX, FOR THE NEAR-FIELD SELECT.
+    //
+    // The block already carried the body reprojection, but only as a per-draw
+    // REPLACEMENT for member 0 (useBody above). That cannot serve the
+    // near-field select, which is per-VERTEX: one draw can contain both panel
+    // and windscreen, and the choice has to be made per vertex on depth.
+    //
+    // So it is sent alongside as well, always, and the shader picks between
+    // world and body per vertex. Same K conversion as the useBody path - the
+    // shader feeds every matrix (x, y, w, 1), so an unconverted clip-to-clip
+    // matrix produces the constant-scale band that note describes, and both
+    // paths must agree or the two halves of the frame disagree.
+    {
+        float K[16];
+        memset(K, 0, sizeof(K));
+        K[0] = 1.0f; K[5] = 1.0f;
+        K[10] = 1.0f; K[11] = 1.0f;
+        K[14] = g_velSnap.proj[14];
+        float bodyView[16];
+        if (g_velSnap.bodyReprojValid)
+            taaMul(bodyView, g_velSnap.bodyReproj, K);
+        else
+            // No valid body frame: fall back to the world matrix, which is the
+            // old behaviour for that case rather than a new failure mode.
+            memcpy(bodyView, block, 64);
+        memcpy(block + 20, bodyView, 64);
+    }
     // Recorded for the diagnostic. block[18] is the near-field threshold the
     // shader compares gl_Position.w against, and it is the one push value never
     // actually observed at runtime - the code path says zero, which is not the

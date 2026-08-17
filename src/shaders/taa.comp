@@ -470,10 +470,24 @@ void main()
     // no epsilon and nothing to divide by.
     vec3 m1 = vec3(0.0), m2 = vec3(0.0);
     vec3 nmin = vec3( 1e30), nmax = vec3(-1e30);
+    // ---- THE NEIGHBOURHOOD MUST BE READ WHERE THE CENTRE WAS READ.
+    //
+    // These taps used texelFetch at integer pixels while the centre sample is
+    // taken at uv + S, the jittered position where the geometry actually is.
+    // With jitter armed the box was therefore built from a raster half a pixel
+    // away from the sample it judges, in a DIFFERENT direction every frame, so
+    // history was accepted on one frame and clipped on the next across the
+    // whole image. That is the shake that appeared only with jitter on and
+    // survived every other fix - the clamp was fighting the jitter it was never
+    // told about.
+    //
+    // Sampling with the same offset costs a filtered fetch instead of a texel
+    // fetch and puts the statistics in the sample's own frame of reference.
+    vec2 tsz = 1.0 / vec2(size);
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 q = clamp(px + ivec2(dx, dy), ivec2(0), size - 1);
-            vec3  c = rgb2ycocg(tm(texelFetch(uScene, ivec3(q, layer), 0).rgb));
+            vec2  quv = uv + S + vec2(dx, dy) * tsz;
+            vec3  c = rgb2ycocg(tm(texture(uScene, vec3(quv, float(layer))).rgb));
             m1 += c;
             m2 += c * c;
             nmin = min(nmin, c);
