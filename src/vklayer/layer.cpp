@@ -1103,20 +1103,63 @@ static VKAPI_ATTR void VKAPI_CALL Vram_GetDeviceQueue(
 }
 
 // Every wait path releases held submissions first - the deadlock-proofing.
+// ---- WHERE THE FRAME ACTUALLY GOES. (the 38 fps serialisation)
+//
+// The sim's own readout says frame time = CPU time + GPU time EXACTLY
+// (26.3 = 16.5 + 9.9 ms), and that sum is the signature of no overlap: a
+// pipelined renderer's frame is the LARGER of the two, not the total. Something
+// makes the CPU wait for the GPU inside the frame instead of a frame or two
+// behind it, and these counters name it without guessing from a decompile.
+//
+// Blocking time is attributed to the call that blocks - fence waits, semaphore
+// waits, acquire, present - and reported per second alongside the frame count.
+// A fence figure close to the GPU time is the classic single-frame-in-flight
+// stall; an acquire figure that size is a swapchain with too few images or a
+// present mode that blocks; a present figure is the display path.
+static std::atomic<uint64_t> g_blkFenceUs(0), g_blkSemUs(0),
+                             g_blkAcquireUs(0), g_blkPresentUs(0);
+static std::atomic<uint64_t> g_blkFenceN(0), g_blkAcquireN(0);
+
+static inline uint64_t nowUs()
+{
+    LARGE_INTEGER c, f;
+    QueryPerformanceCounter(&c);
+    QueryPerformanceFrequency(&f);
+    return f.QuadPart ? (uint64_t)(c.QuadPart * 1000000ll / f.QuadPart) : 0;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL Vram_WaitForFences(
     VkDevice device, uint32_t count, const VkFence *fences,
     VkBool32 waitAll, uint64_t timeout)
 {
     vram::touchFences(count, fences);
-    return g_nextWaitForFences
-         ? g_nextWaitForFences(device, count, fences, waitAll, timeout)
-         : VK_ERROR_INITIALIZATION_FAILED;
+    if (!g_nextWaitForFences) return VK_ERROR_INITIALIZATION_FAILED;
+    const uint64_t t0 = nowUs();
+    VkResult r = g_nextWaitForFences(device, count, fences, waitAll, timeout);
+    g_blkFenceUs.fetch_add(nowUs() - t0, std::memory_order_relaxed);
+    g_blkFenceN.fetch_add(1, std::memory_order_relaxed);
+    return r;
 }
+
+// vkWaitForFences is never called by this engine (measured: 0 waits per frame),
+// so if the CPU is waiting for the GPU it is doing it by POLLING - and a spin
+// on vkGetFenceStatus is charged to the frame as CPU time, not as blocked time.
+// That would report as "CPU bound" on a machine doing no work, and would
+// produce frame time = CPU + GPU exactly. Count the calls and how many came
+// back NOT_READY: a large ready:notready ratio per frame is a spin loop.
+static std::atomic<uint64_t> g_fenceStatusN(0), g_fenceStatusNotReady(0);
 
 static VKAPI_ATTR VkResult VKAPI_CALL Vram_GetFenceStatus(
     VkDevice device, VkFence fence)
 {
     vram::touchFences(1, &fence);
+    if (g_nextGetFenceStatus) {
+        VkResult r = g_nextGetFenceStatus(device, fence);
+        g_fenceStatusN.fetch_add(1, std::memory_order_relaxed);
+        if (r == VK_NOT_READY)
+            g_fenceStatusNotReady.fetch_add(1, std::memory_order_relaxed);
+        return r;
+    }
     return g_nextGetFenceStatus ? g_nextGetFenceStatus(device, fence)
                                 : VK_ERROR_INITIALIZATION_FAILED;
 }
@@ -1135,9 +1178,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Vram_WaitSemaphores(
     if (info)
         vram::touchSemaphores(info->semaphoreCount, info->pSemaphores,
                               info->pValues);
-    return g_nextWaitSemaphores
-         ? g_nextWaitSemaphores(device, info, timeout)
-         : VK_ERROR_INITIALIZATION_FAILED;
+    if (!g_nextWaitSemaphores) return VK_ERROR_INITIALIZATION_FAILED;
+    const uint64_t t0 = nowUs();
+    VkResult r = g_nextWaitSemaphores(device, info, timeout);
+    g_blkSemUs.fetch_add(nowUs() - t0, std::memory_order_relaxed);
+    return r;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL Vram_QueueWaitIdle(VkQueue queue)
@@ -7574,7 +7619,51 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // breaking rather than the layer being asked to do nothing.
 
 
-    return g_nextQueuePresent ? g_nextQueuePresent(queue, info) : VK_SUCCESS;
+    // ---- THE FRAME BUDGET, BROKEN DOWN BY WHAT BLOCKED THE CPU.
+    //
+    // Reported once a second so the numbers can be read against the sim's own
+    // CPU/GPU row. Frame time equal to the SUM of CPU and GPU time means the
+    // two never overlap, and whichever line below carries the missing
+    // milliseconds is the call doing the waiting:
+    //   fence   - the CPU is waiting on work it just submitted (one frame in
+    //             flight); the fix is to wait on a fence a frame or two old
+    //   present - the display path, vsync or the compositor
+    //   sem     - a timeline wait inside the frame
+    // A total far below the gap means the CPU is genuinely busy and the sim is
+    // CPU-bound, which is a different problem with a different fix.
+    if (!g_nextQueuePresent) return VK_SUCCESS;
+    const uint64_t pt0 = nowUs();
+    VkResult pr = g_nextQueuePresent(queue, info);
+    g_blkPresentUs.fetch_add(nowUs() - pt0, std::memory_order_relaxed);
+    {
+        static uint64_t lastReport = 0, lastFrames = 0;
+        const uint64_t now = nowUs();
+        if (!lastReport) { lastReport = now; lastFrames = frames; }
+        else if (now - lastReport >= 1000000ull) {
+            const double secs = (now - lastReport) / 1000000.0;
+            const uint64_t df = frames - lastFrames;
+            const double f  = g_blkFenceUs.exchange(0)   / 1000.0;
+            const double s  = g_blkSemUs.exchange(0)     / 1000.0;
+            const double p  = g_blkPresentUs.exchange(0) / 1000.0;
+            const uint64_t fn = g_blkFenceN.exchange(0);
+            const uint64_t fs  = g_fenceStatusN.exchange(0);
+            const uint64_t fsn = g_fenceStatusNotReady.exchange(0);
+            if (df)
+                trace("FRAME BUDGET: %.1f fps | per frame: fence %.2f ms (%llu "
+                      "waits), present %.2f ms, timeline %.2f ms, fenceStatus "
+                      "%llu polls (%llu NOT_READY) | blocked %.1f%% of wall "
+                      "clock. Frame time = CPU + GPU means no overlap: a large "
+                      "NOT_READY count is a spin loop charged to CPU time; a "
+                      "large present figure is the display path.",
+                      df / secs, f / df, (unsigned long long)(fn / df),
+                      p / df, s / df,
+                      (unsigned long long)(fs / df),
+                      (unsigned long long)(fsn / df),
+                      100.0 * (f + s + p) / (secs * 1000.0));
+            lastReport = now; lastFrames = frames;
+        }
+    }
+    return pr;
 }
 
 
