@@ -255,9 +255,23 @@ void main()
     // NDC to UV: uv_x = 0.5 + 0.5*ndc_x but uv_y = 0.5 - 0.5*ndc_y, because
     // the viewport height is negative - the same sign the velocity fetch
     // below already carries.
+    // ---- THE SIGN, MEASURED RATHER THAN REASONED.
+    //
+    // Halving taa.jitter_scale left the shake unchanged in amplitude. An error
+    // that does not scale with the offset is not a magnitude mistake, it is a
+    // direction one: with the wrong sign the fetch moves AWAY from where the
+    // raster was displaced, so the sample lands two jitters from the geometry
+    // instead of on it, and doubling the displacement of a value that already
+    // changes every frame looks identical at any amplitude - which is exactly
+    // what the half-amplitude test showed.
+    //
+    // The raster was displaced by +jitter, so the geometry that belongs at uv
+    // now sits at uv MINUS that displacement in UV units. The Y term keeps its
+    // negation because the layer pushes NDC and the viewport height is
+    // negative; only the overall direction changes.
     vec2 S = (pc.flags & FLAG_NO_UNJITTER) != 0
            ? vec2(0.0)
-           : vec2(0.5 * pc.jitter.x, -0.5 * pc.jitter.y);
+           : vec2(-0.5 * pc.jitter.x, 0.5 * pc.jitter.y);
 
     // ---- THE STORED VALUE IS ALREADY A UV OFFSET.
     //
@@ -295,11 +309,23 @@ void main()
     // the mask now fires on the neighbourhood maximum: an edge pixel has an
     // opaque neighbour and stays temporal, the disc interior has none and
     // takes the current frame.
+    // ---- AND THIS NEIGHBOURHOOD HAS TO BE READ WHERE THE RASTER IS, TOO.
+    //
+    // The note above identifies the mechanism exactly, and the neighbourhood
+    // maximum is the right mitigation - but it was gathered with texelFetch at
+    // integer pixels while the centre coverage is read at uv + S, the jittered
+    // position. So the mask still compared a jittered centre against an
+    // unjittered neighbourhood, still flipped along every silhouette as the
+    // offset moved the edge across the sample point, and still refreshed those
+    // pixels as raw current every frame. A mask that fires takes the jittered
+    // frame whole, which is why the resulting shake never scaled with the
+    // jitter amplitude: it is a threshold flipping, not a displacement.
     float covMax = 0.0;
+    vec2 ctsz = 1.0 / vec2(size);
     for (int cy = -1; cy <= 1; ++cy)
         for (int cx = -1; cx <= 1; ++cx)
-            covMax = max(covMax, texelFetch(uVelocity,
-                ivec3(clamp(px + ivec2(cx, cy), ivec2(0), size - 1), layer), 0).w);
+            covMax = max(covMax, texture(uVelocity,
+                vec3(uv + S + vec2(cx, cy) * ctsz, float(layer))).w);
     if ((pc.flags & FLAG_NO_MOTION) != 0) vel = vec2(0.0);
     vec2 hUv  = uv + vec2(vel.x, pc.velYSign * vel.y);
 

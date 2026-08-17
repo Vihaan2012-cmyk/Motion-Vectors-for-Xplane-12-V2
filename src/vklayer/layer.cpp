@@ -5020,7 +5020,24 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     }
     const uint32_t maxResolves =
         (uint32_t)live::i("taa.max_resolves", "TAA_MAX_RESOLVES", 1);
-    do if (litPass && taaEnabled() && !g_mv.wantDump &&
+    // ---- A FRAME WITH NO VALID REPROJECTION MUST NOT BE RESOLVED.
+    //
+    // The plugin sets reprojValid = 0 when it cannot invert the current
+    // view-projection, and leaves reproj holding whatever it last had - the
+    // identity, if the inverse has never succeeded. Nothing here ever read the
+    // flag, so those frames were resolved against a matrix asserting that
+    // nothing moved: every vector zero, history fetched from the wrong place
+    // for the entire screen, the clamp dragging it back a huge distance, and
+    // the weight map going fully red the instant the camera moved. Measured
+    // directly - "MV REPROJ INVALID" beside a camera that moved 60 m.
+    //
+    // Skipping is the honest answer: one frame without temporal accumulation
+    // is invisible, whereas one frame reprojected through a lie poisons the
+    // history that every later frame builds on. The stale-resume path already
+    // exists for exactly this, so history resets cleanly when vectors return.
+    const bool reprojUsable = !g_share || g_share->reprojValid != 0;
+    if (!reprojUsable) g_taaStaleResume = true;
+    do if (litPass && taaEnabled() && !g_mv.wantDump && reprojUsable &&
         resolvesThisPresent < maxResolves &&
         mvBindAge <= 1) {
         gateReach(2);
@@ -10290,7 +10307,31 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // between two populations does to a median. This switch decides whether the
     // cockpit is that second population.
     static const bool noBody = (getenv("TAA_MV_NO_BODY") != nullptr);
-    bool useBody = inCockpit && g_velSnap.bodyReprojValid && !useIdentity && !noBody;
+    // ---- THE WHOLESALE BODY SWAP IS GONE. IT ZEROED THE WORLD.
+    //
+    // This replaced member 0 - the matrix EVERY vertex reprojects through -
+    // with the body matrix whenever the view was the 3-D cockpit. The body
+    // matrix is identity while the camera is rigid to the airframe, which is
+    // right for the panel and catastrophic for everything else: the trace
+    // caught it exactly, "camera moved 60.4628 m between these two frames"
+    // beside "MV PUSHED: [0]=1.00000 [5]=1.00000 (a still camera wants
+    // 1,0,0,0 / 0,1,0,0)". An identity reprojection means zero velocity, so
+    // the world got no vectors at all while it swept past the window.
+    //
+    // Downstream that is total history rejection under motion - the weight map
+    // goes fully red the moment the camera moves, flat interiors worst because
+    // their sigma is smallest - and it is why no amount of gain, clamp width,
+    // reactive-mask or velocity-sign tuning moved the shake: all of them sit
+    // downstream of a field that was zero.
+    //
+    // The per-vertex select added with member 2 is what this was reaching for:
+    // world reprojection for the world, body reprojection for near geometry,
+    // chosen per vertex on depth rather than per frame on view type. So member
+    // 0 is now always the world matrix. TAA_MV_BODY_WHOLESALE re-arms the old
+    // behaviour for comparison.
+    static const bool bodyWholesale = getenv("TAA_MV_BODY_WHOLESALE") != nullptr;
+    bool useBody = bodyWholesale && inCockpit && g_velSnap.bodyReprojValid &&
+                   !useIdentity && !noBody;
 
     // PER-PASS CENSUS. Which qualifying pass actually draws the world is a
     // measurement; attachment counts and submission order have both already
@@ -10415,6 +10456,26 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         // camera actually moving. A static camera in the same view measures
         // 0.000 px, so a matrix sampled there confirms only the case that
         // already worked - which is what the first correct reading did.
+        // ---- IS THE MATRIX EVEN VALID? NOTHING HERE EVER ASKED.
+        //
+        // The plugin sets reprojValid = 0 when it cannot invert the current
+        // view-projection, and in that case it LEAVES s->reproj untouched - so
+        // the field keeps whatever it last held, which is the identity it was
+        // initialised with if the inverse has never succeeded. This layer never
+        // read the flag (zero references before this), so an identity was
+        // pushed as though it were a real reprojection: velocity zero for the
+        // whole world while the camera moves, total history rejection, and the
+        // fully red weight map. Say it out loud, once, when it happens.
+        {
+            static bool warned = false;
+            if (g_share && !g_share->reprojValid && !warned) {
+                warned = true;
+                trace("MV REPROJ INVALID: the plugin could not invert the "
+                      "current view-projection, so reproj is stale/identity and "
+                      "every vector this frame is zero. This is what an "
+                      "all-red weight map under camera motion looks like.");
+            }
+        }
         const bool failing = (g_velSnap.viewType != 0 && g_velSnap.viewType != 1026);
         if (failing && (++nlog % 20000) == 1)
             trace("MV PUSHED: view=%d | rows 0/1 of the pushed matrix: "
