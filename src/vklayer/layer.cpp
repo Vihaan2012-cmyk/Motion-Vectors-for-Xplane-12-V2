@@ -6029,6 +6029,30 @@ static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSets(
     if (next) next(device, nw, w, nc, c);
 }
 
+// ---- IS X-PLANE REBINDING STATE IT HAS ALREADY BOUND?
+//
+// The frame budget says the render thread is busy ~97% of wall clock and blocks
+// on nothing, so the ceiling is CPU work inside the driver. The cheapest thing a
+// layer can do about that is stop forwarding calls that change nothing: engines
+// routinely rebind the same pipeline or the same descriptor sets between draws,
+// and the driver validates every one.
+//
+// Counted before anything is filtered, because the ratio decides whether
+// filtering is worth the risk at all. Recording is per-thread, so the cache is
+// thread_local and needs no lock; it is keyed by command buffer and reset when
+// the thread starts recording a different one, which is conservative - a stale
+// entry can only make us MISS a redundancy, never invent one.
+struct BindCache {
+    VkCommandBuffer  cb = VK_NULL_HANDLE;
+    VkPipeline       pipe[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };  // gfx, compute
+    VkPipelineLayout dsLayout = VK_NULL_HANDLE;
+    uint32_t         dsFirst = 0, dsCount = 0, dsDyn = 0;
+    VkDescriptorSet  dsSets[8] = {};
+};
+static thread_local BindCache g_bindCache;
+static std::atomic<uint64_t> g_pipeBinds(0), g_pipeBindsRedundant(0);
+static std::atomic<uint64_t> g_dsBinds(0), g_dsBindsRedundant(0);
+
 static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
     VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout,
     uint32_t first, uint32_t n, const VkDescriptorSet *sets,
@@ -6092,6 +6116,28 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                 }
             }
         }
+    }
+    // Redundancy census: identical layout, range, set handles and no dynamic
+    // offsets means this bind changes nothing the driver has not already been
+    // told. Counted only; nothing is filtered yet - see BindCache.
+    if (sets && n <= 8) {
+        if (g_bindCache.cb != cb) {
+            g_bindCache = BindCache();
+            g_bindCache.cb = cb;
+        }
+        bool same = (g_bindCache.dsLayout == layout &&
+                     g_bindCache.dsFirst == first &&
+                     g_bindCache.dsCount == n &&
+                     g_bindCache.dsDyn == 0 && nd == 0);
+        for (uint32_t s = 0; same && s < n; ++s)
+            if (g_bindCache.dsSets[s] != sets[s]) same = false;
+        g_dsBinds.fetch_add(1, std::memory_order_relaxed);
+        if (same && n) g_dsBindsRedundant.fetch_add(1, std::memory_order_relaxed);
+        g_bindCache.dsLayout = layout;
+        g_bindCache.dsFirst  = first;
+        g_bindCache.dsCount  = n;
+        g_bindCache.dsDyn    = nd;
+        for (uint32_t s = 0; s < n && s < 8; ++s) g_bindCache.dsSets[s] = sets[s];
     }
     if (next) next(cb, bp, layout, first, n, sets, nd, dyn);
 }
@@ -7648,6 +7694,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             const uint64_t fn = g_blkFenceN.exchange(0);
             const uint64_t fs  = g_fenceStatusN.exchange(0);
             const uint64_t fsn = g_fenceStatusNotReady.exchange(0);
+            {
+                const uint64_t pb = g_pipeBinds.exchange(0);
+                const uint64_t pr2 = g_pipeBindsRedundant.exchange(0);
+                const uint64_t db = g_dsBinds.exchange(0);
+                const uint64_t dr = g_dsBindsRedundant.exchange(0);
+                if (df && (pb || db))
+                    trace("BIND CENSUS: per frame pipeline %llu binds (%llu "
+                          "redundant, %.0f%%), descriptor-set %llu binds (%llu "
+                          "redundant, %.0f%%). Redundant means the driver was "
+                          "told something it already knew - the only CPU work a "
+                          "layer can remove without changing behaviour.",
+                          (unsigned long long)(pb / df),
+                          (unsigned long long)(pr2 / df),
+                          pb ? 100.0 * pr2 / pb : 0.0,
+                          (unsigned long long)(db / df),
+                          (unsigned long long)(dr / df),
+                          db ? 100.0 * dr / db : 0.0);
+            }
             if (df)
                 trace("FRAME BUDGET: %.1f fps | per frame: fence %.2f ms (%llu "
                       "waits), present %.2f ms, timeline %.2f ms, fenceStatus "
@@ -9965,6 +10029,20 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
 {
     if (!g_nextCmdBindPipeline) return;
     vram::notePipelineBind();
+    // Redundancy census (see BindCache). Graphics and compute keep separate
+    // slots because binding one does not disturb the other.
+    if (bind == VK_PIPELINE_BIND_POINT_GRAPHICS ||
+        bind == VK_PIPELINE_BIND_POINT_COMPUTE) {
+        const int slot = (bind == VK_PIPELINE_BIND_POINT_COMPUTE) ? 1 : 0;
+        if (g_bindCache.cb != cb) {
+            g_bindCache = BindCache();
+            g_bindCache.cb = cb;
+        }
+        g_pipeBinds.fetch_add(1, std::memory_order_relaxed);
+        if (g_bindCache.pipe[slot] == pipeline && pipeline != VK_NULL_HANDLE)
+            g_pipeBindsRedundant.fetch_add(1, std::memory_order_relaxed);
+        g_bindCache.pipe[slot] = pipeline;
+    }
     g_nextCmdBindPipeline(cb, bind, pipeline);
 
     // Remember whether the compute pipeline now bound is X-Plane's upscaler.
@@ -11404,6 +11482,38 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
         trace("SWAPCHAIN: present mode FORCED %d -> %d", (int)ci->presentMode,
               (int)mod.presentMode);
     }
+
+    // ---- MAILBOX WITH TWO IMAGES IS A STALL, AND IT IS THE 38 FPS.
+    //
+    // Measured in flight: vkQueuePresentKHR blocks 8-14 ms of a 26 ms frame and
+    // the CPU sits in it for 31-54% of wall clock, while nothing waits on a
+    // fence or a semaphore. The swapchain explains it - X-Plane asks for
+    // MAILBOX with minImageCount 2.
+    //
+    // MAILBOX only pipelines with THREE: one on screen, one queued for the next
+    // scan-out, one being rendered. With two there is no spare, so the CPU
+    // cannot hand over a frame until the display releases the image it is
+    // showing, and the frame time becomes render time PLUS a wait for the
+    // panel. That is also why the total looked like CPU + GPU added together
+    // and why the ceiling never moved with resolution, textures, plugins or
+    // this layer: none of them change how many images the swapchain has.
+    //
+    // Asking for one more is a request, not a demand - the driver clamps to
+    // what the surface supports - and if the create fails for any reason the
+    // original is retried unchanged below, so the worst case is today's
+    // behaviour. TAA_SWAP_IMAGES pins it (0 leaves the engine's choice alone).
+    uint32_t wantImages = 3;
+    if (const char *si = getenv("TAA_SWAP_IMAGES")) wantImages = (uint32_t)atoi(si);
+    if (wantImages && mod.minImageCount < wantImages &&
+        (mod.presentMode == VK_PRESENT_MODE_MAILBOX_KHR ||
+         mod.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+         mod.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
+        trace("SWAPCHAIN: raising minImageCount %u -> %u for present mode %d - "
+              "two images cannot pipeline, so present blocks on the display "
+              "(measured 8-14 ms per frame)",
+              mod.minImageCount, wantImages, (int)mod.presentMode);
+        mod.minImageCount = wantImages;
+    }
     trace("SWAPCHAIN: %ux%u images=%u presentMode=%d (0=IMM 1=MBOX 2=FIFO "
           "3=RELAXED) fmt=%d",
           mod.imageExtent.width, mod.imageExtent.height, mod.minImageCount,
@@ -11416,7 +11526,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
         if (it != g_devices.end()) next = it->second.createSwapchainKHR;
     }
     if (!next) return VK_ERROR_INITIALIZATION_FAILED;
-    return next(device, &mod, alloc, out);
+    VkResult scr = next(device, &mod, alloc, out);
+    if (scr != VK_SUCCESS && mod.minImageCount != ci->minImageCount) {
+        // Never trade a working swapchain for a faster one.
+        trace("SWAPCHAIN: create failed (%d) with %u images - retrying with the "
+              "engine's original %u", (int)scr, mod.minImageCount,
+              ci->minImageCount);
+        mod.minImageCount = ci->minImageCount;
+        scr = next(device, &mod, alloc, out);
+    }
+    return scr;
 }
 
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
