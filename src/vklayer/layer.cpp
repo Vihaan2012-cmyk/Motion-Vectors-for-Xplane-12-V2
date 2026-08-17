@@ -7824,6 +7824,150 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             lastReport = now; lastFrames = frames;
         }
     }
+
+    // ================================================================ SUITE
+    //
+    // One periodic dump of EVERY quantity this project has had to guess at,
+    // with stable "SUITE <topic>:" prefixes so a single grep answers a
+    // question without a rebuild, a relaunch, or someone sitting at the sim.
+    //
+    // Written because the debugging pattern that kept failing was: form a
+    // theory, change a knob, ask the user what changed. Every real find came
+    // instead from a number that was already being measured - the pushed
+    // matrix being identity, the pass count being stable, the weight map going
+    // red - and the cost was always in getting that number out. This puts them
+    // all in one place, every 600 frames, whatever else is switched on.
+    {
+        // Per-frame accumulation, so the dump reports RATES rather than a
+        // single instant. Every question this project has got wrong was got
+        // wrong by reading one sample: the pass count "alternating" (it was
+        // stable), the reprojection "failing 23% of the time" (a one-shot
+        // warning), the duty gap "being failures" (it was cadence).
+        static uint64_t sFrames = 0, sNoReproj = 0, sResolved = 0, sNoCand = 0;
+        static uint64_t sGate[10] = {0,0,0,0,0,0,0,0,0,0};
+        static uint64_t sBodyInvalid = 0, sIdentityReproj = 0;
+        ++sFrames;
+        if (g_share && !g_share->reprojValid) ++sNoReproj;
+        if (!g_velSnap.bodyReprojValid)       ++sBodyInvalid;
+        {
+            const uint32_t gd = g_gateDepthLastFrame.load();
+            sGate[gd < 10 ? gd : 9]++;
+            if (gd == 0) ++sNoCand;
+            if (gd == 9) ++sResolved;
+        }
+        // Is the pushed world matrix the identity? That single fact explains
+        // total history rejection under motion, and it is cheap to test: the
+        // off-diagonal translation terms are what a moving camera fills in.
+        {
+            const float *r = g_velSnap.reproj;
+            const bool ident = fabsf(r[0]-1.0f) < 1e-6f && fabsf(r[5]-1.0f) < 1e-6f &&
+                               fabsf(r[12]) < 1e-6f && fabsf(r[13]) < 1e-6f &&
+                               fabsf(r[8])  < 1e-6f && fabsf(r[9])  < 1e-6f;
+            if (ident) ++sIdentityReproj;
+        }
+
+        static uint64_t suiteTick = 0;
+        if ((++suiteTick % 600) == 0) {
+            trace("SUITE RATES over %llu frames: noReproj=%llu (%.1f%%) "
+                  "identityReproj=%llu (%.1f%%) bodyInvalid=%llu (%.1f%%) "
+                  "noCandidatePass=%llu (%.1f%%) resolved=%llu (%.1f%%)",
+                  (unsigned long long)sFrames,
+                  (unsigned long long)sNoReproj, 100.0*sNoReproj/sFrames,
+                  (unsigned long long)sIdentityReproj, 100.0*sIdentityReproj/sFrames,
+                  (unsigned long long)sBodyInvalid, 100.0*sBodyInvalid/sFrames,
+                  (unsigned long long)sNoCand, 100.0*sNoCand/sFrames,
+                  (unsigned long long)sResolved, 100.0*sResolved/sFrames);
+            trace("SUITE GATE HISTOGRAM: 0=%llu 1=%llu 2=%llu 3=%llu 4=%llu "
+                  "5=%llu 6=%llu 7=%llu 8=%llu 9=%llu  (0=no candidate pass, "
+                  "4=format ok, 5=chosen, 6=backend accepted, 9=resolved)",
+                  (unsigned long long)sGate[0], (unsigned long long)sGate[1],
+                  (unsigned long long)sGate[2], (unsigned long long)sGate[3],
+                  (unsigned long long)sGate[4], (unsigned long long)sGate[5],
+                  (unsigned long long)sGate[6], (unsigned long long)sGate[7],
+                  (unsigned long long)sGate[8], (unsigned long long)sGate[9]);
+            // --- inputs: is the camera data even usable this frame
+            trace("SUITE INPUT: shareValid=%d reprojValid=%d bodyValid=%d "
+                  "viewType=%d frame=%llu camMoved=%.4f rotDeg=%.3f",
+                  g_share ? (int)g_share->valid : -1,
+                  g_share ? (int)g_share->reprojValid : -1,
+                  (int)g_velSnap.bodyReprojValid, (int)g_velSnap.viewType,
+                  (unsigned long long)g_frameCount, snap.camDelta, rotDeg);
+            // --- the reprojection matrix as actually pushed. Identity here
+            //     means zero velocity everywhere, which is the failure that
+            //     survived a whole evening of downstream tuning.
+            trace("SUITE MATRIX: reproj row0=(%.5f %.5f %.5f %.5f) "
+                  "row1=(%.5f %.5f %.5f %.5f) wrow=(%.5f %.5f %.5f %.5f) "
+                  "proj[0]=%.5f proj[5]=%.5f proj[14]=%.5f",
+                  (double)g_velSnap.reproj[0], (double)g_velSnap.reproj[4],
+                  (double)g_velSnap.reproj[8], (double)g_velSnap.reproj[12],
+                  (double)g_velSnap.reproj[1], (double)g_velSnap.reproj[5],
+                  (double)g_velSnap.reproj[9], (double)g_velSnap.reproj[13],
+                  (double)g_velSnap.reproj[3], (double)g_velSnap.reproj[7],
+                  (double)g_velSnap.reproj[11], (double)g_velSnap.reproj[15],
+                  (double)g_velSnap.proj[0], (double)g_velSnap.proj[5],
+                  (double)g_velSnap.proj[14]);
+            // --- targets: a velocity target of 0x0 explains everything
+            //     downstream of it, and the panel has been reporting 0 MB.
+            trace("SUITE TARGET: mvReady=%d mv=%ux%u mvImage=%p mvView=%p | "
+                  "taaReady=%d taa=%ux%u layers=%u",
+                  g_mv.ready ? 1 : 0, g_mv.w, g_mv.h,
+                  (void*)g_mv.image, (void*)g_mv.view,
+                  g_taa.ready ? 1 : 0, g_taa.w, g_taa.h, g_taa.layers);
+            // --- jitter: applied amplitude, not the requested one
+            trace("SUITE JITTER: scale=%.3f snapJit=(%.5f %.5f) px "
+                  "appliedNDC=(%.6f %.6f) armed=%d",
+                  (double)g_jitterScale, (double)g_velSnap.jitterX,
+                  (double)g_velSnap.jitterY, (double)g_appliedJitX,
+                  (double)g_appliedJitY, g_jitterArmed ? 1 : 0);
+            // --- resolve: how far the gate got, and how many ran
+            trace("SUITE RESOLVE: gateDepthLast=%u hdrPassesLast=%u "
+                  "mvBindsMax=%u resolvedThisFrame=%d",
+                  g_gateDepthLastFrame.load(), g_hdrPassesLastFrame,
+                  g_mvBindsMax, g_taaResolvedThisFrame ? 1 : 0);
+            // --- injection: what fraction of geometry carries vectors
+            trace("SUITE INJECT: pipeBinds=%llu redundant=%llu dsBinds=%llu "
+                  "dsRedundant=%llu",
+                  (unsigned long long)g_pipeBinds.load(),
+                  (unsigned long long)g_pipeBindsRedundant.load(),
+                  (unsigned long long)g_dsBinds.load(),
+                  (unsigned long long)g_dsBindsRedundant.load());
+            // --- pass census: which qualifying pass draws the world
+            {
+                char b[256]; int o = 0;
+                for (int i = 0; i < 16 && o < 200; ++i)
+                    if (g_mvPassDraws[i])
+                        o += snprintf(b + o, sizeof(b) - o, " [%d]=%llu", i,
+                                      (unsigned long long)g_mvPassDraws[i]);
+                trace("SUITE PASSES:%s", o ? b : " none");
+            }
+            // --- pager / vram, since these have crashed the sim before
+            trace("SUITE VRAM: zone=%s pagerImages=%llu pagerSavedMB=%.1f "
+                  "skippedScaled=%llu",
+                  vram::zoneName(vram::zone),
+                  (unsigned long long)g_pagerImages,
+                  g_pagerSaved / 1048576.0,
+                  (unsigned long long)g_pagerSkippedScaled);
+            // --- the resolve's own tuning, echoed so a report is
+            //     self-contained: a trace without the settings that produced
+            //     it has cost this project several wrong conclusions, because
+            //     the file on disk had moved on by the time it was read.
+            trace("SUITE TUNING: enable=%d mode=%d alpha=%.3f gain=%.2f "
+                  "varclip=%.2f jitterScale=%.2f nearfield=%.2f unjitter=%d "
+                  "reactive=%d velScale=%.2f velYSign=%.1f maxResolves=%d",
+                  taaEnabled() ? 1 : 0,
+                  live::i("taa.mode", "TAA_MODE", 2),
+                  (double)live::f("taa.alpha", "TAA_ALPHA", 0.15f),
+                  (double)live::f("taa.gain", "TAA_GAIN", 4.0f),
+                  (double)live::f("taa.varclip", "TAA_VARCLIP", 1.25f),
+                  (double)g_jitterScale,
+                  (double)g_nearFieldM,
+                  live::onoff("taa.unjitter", nullptr, true) ? 1 : 0,
+                  live::onoff("taa.reactive", nullptr, true) ? 1 : 0,
+                  (double)live::f("taa.vel_scale", nullptr, 1.0f),
+                  (double)live::f("taa.vel_ypos", nullptr, 0.0f),
+                  live::i("taa.max_resolves", "TAA_MAX_RESOLVES", 1));
+        }
+    }
     return pr;
 }
 
@@ -10476,13 +10620,23 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         // whole world while the camera moves, total history rejection, and the
         // fully red weight map. Say it out loud, once, when it happens.
         {
-            static bool warned = false;
-            if (g_share && !g_share->reprojValid && !warned) {
-                warned = true;
-                trace("MV REPROJ INVALID: the plugin could not invert the "
-                      "current view-projection, so reproj is stale/identity and "
-                      "every vector this frame is zero. This is what an "
-                      "all-red weight map under camera motion looks like.");
+            // COUNT, do not merely warn. The first version of this was a
+            // one-shot bool, which cannot tell "failed once while loading,
+            // when the projection is legitimately still zero" from "failing
+            // every frame" - and those want opposite fixes. A rate is the only
+            // form of this measurement worth having.
+            static uint64_t nSeen = 0, nBad = 0;
+            if (g_share) {
+                ++nSeen;
+                if (!g_share->reprojValid) ++nBad;
+                if ((nSeen % 600) == 0)
+                    trace("MV REPROJ VALIDITY: %llu of %llu pushes had NO valid "
+                          "reprojection (%.1f%%). Those frames carry a stale or "
+                          "identity matrix, so every vector in them is zero. "
+                          "A rate near 0 means the inverse is healthy and the "
+                          "resolve duty gap is cadence, not failure.",
+                          (unsigned long long)nBad, (unsigned long long)nSeen,
+                          100.0 * (double)nBad / (double)nSeen);
             }
         }
         const bool failing = (g_velSnap.viewType != 0 && g_velSnap.viewType != 1026);
