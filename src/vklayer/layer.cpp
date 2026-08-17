@@ -9662,6 +9662,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // the screen. So the useful number is not the percentage, it is
             // WHICH pipelines and WHY.
             if (!mvPatchedThisCall[i] && !noPatch) {
+                // Name the shaders themselves, once each: a pipeline that fails
+                // both stages draws geometry with no jitter and no velocity,
+                // and knowing WHICH module defeats the injector is the whole
+                // difference between "895 failures" and a fixable list.
+                if (!vertPatched && !fragPatched) {
+                    static std::set<VkShaderModule> named;
+                    for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
+                        VkShaderModule m = ci[i].pStages[s].module;
+                        if (m == VK_NULL_HANDLE || named.count(m)) continue;
+                        if (named.size() >= 64) break;
+                        named.insert(m);
+                        trace("MV UNPATCHABLE MODULE %p stage 0x%x - this "
+                              "pipeline draws geometry with neither jitter nor "
+                              "velocity; the shader idiom here is what the "
+                              "injector cannot handle",
+                              (void*)m, (unsigned)ci[i].pStages[s].stage);
+                    }
+                }
                 static uint64_t nFail = 0, nVertOnly = 0, nFragOnly = 0, nNeither = 0;
                 ++nFail;
                 if (vertPatched && !fragPatched) ++nVertOnly;
@@ -9694,18 +9712,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // A pipeline needs BOTH stages patched or it gets neither, so this
             // counts the outcome per pipeline instead of per module.
             {
-                static uint64_t nBoth = 0, nVertOnly = 0, nFragOnly = 0, nNeither = 0;
-                if (fragPatched && vertPatched)      ++nBoth;
+                // ---- DELIBERATE SKIPS ARE NOT FAILURES, AND POOLING THEM HID
+                //      THE ONLY NUMBER THAT MATTERS.
+                //
+                // Full-screen pipelines are skipped on purpose - they have no
+                // vertex attributes, so there is no geometry to displace and
+                // nothing to reproject - but they were counted in "neither"
+                // alongside genuine patch failures. That made ~900 look like
+                // un-jittered geometry when most of it is post-process quads
+                // that correctly want none. Split them: "declined" is by
+                // design, "neither" is geometry we FAILED to patch, and only
+                // the latter renders unjittered while the resolve un-jitters
+                // the whole image.
+                static uint64_t nBoth = 0, nVertOnly = 0, nFragOnly = 0,
+                                nNeither = 0, nDeclined = 0;
+                if (noPatch)                         ++nDeclined;
+                else if (fragPatched && vertPatched) ++nBoth;
                 else if (vertPatched)                ++nVertOnly;
                 else if (fragPatched)                ++nFragOnly;
                 else                                 ++nNeither;
-                const uint64_t tot = nBoth + nVertOnly + nFragOnly + nNeither;
+                const uint64_t tot = nBoth + nVertOnly + nFragOnly + nNeither
+                                   + nDeclined;
                 if (tot == 500 || (tot % 5000) == 0)
                     trace("SPIRV INJECT: pipelines by patch outcome - both %llu, "
-                          "vertex only %llu, fragment only %llu, neither %llu "
-                          "(of %llu)",
+                          "vertex only %llu, fragment only %llu, NEITHER %llu, "
+                          "declined-by-design %llu (of %llu). Only NEITHER is "
+                          "geometry drawn without jitter while the resolve "
+                          "un-jitters the frame.",
                           (unsigned long long)nBoth, (unsigned long long)nVertOnly,
                           (unsigned long long)nFragOnly, (unsigned long long)nNeither,
+                          (unsigned long long)nDeclined,
                           (unsigned long long)tot);
             }
 
