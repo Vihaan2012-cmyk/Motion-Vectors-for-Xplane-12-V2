@@ -10336,9 +10336,18 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // PER-PASS CENSUS. Which qualifying pass actually draws the world is a
     // measurement; attachment counts and submission order have both already
     // been guessed at and both were wrong.
-    if (g_mvPassOrdinal >= 0 && g_mvPassOrdinal < 16 && isGeometry)
+    // ---- A MISSING BRACE WAS WRITING OUT OF BOUNDS ON EVERY NON-SCENE DRAW.
+    //
+    // Only the first increment was guarded. The second ran unconditionally,
+    // and g_mvPassOrdinal is -1 for every pass that is not a qualifying scene
+    // pass - so this was ++g_mvPassDrawsFrame[-1], a write to whatever global
+    // precedes that array, thousands of times a frame. Undefined behaviour in
+    // the recording hot path, and the kind of corruption that shows up as
+    // neighbouring state going wrong intermittently rather than as a crash.
+    if (g_mvPassOrdinal >= 0 && g_mvPassOrdinal < 16 && isGeometry) {
         ++g_mvPassDraws[g_mvPassOrdinal];
         ++g_mvPassDrawsFrame[g_mvPassOrdinal];
+    }
 
     // TAA_MV_TESTYAW is gone. It pushed a synthetic clip-to-clip rotation to
     // separate "the matrix is wrong" from "the shader is wrong", and both of
