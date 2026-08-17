@@ -5102,9 +5102,56 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // resolved and every other displayed frame shipped raw - the
                 // 54% duty and the flashes. Every multiple of the per-frame
                 // count is a frame boundary; resolve at each of them.
-                if (g_hdrPassesLastFrame == 0 ||
-                    (hdrIdx % g_hdrPassesLastFrame) != 0)
-                    break;
+                // ---- LATCH THE TARGET; THE ORDINAL ONLY ACQUIRES IT.
+                //
+                // The modulo above keeps the CADENCE right but says nothing
+                // about WHICH image, and the count is not stable: the trace
+                // shows "hdr 3 of 3" and "hdr 4 of 4" on consecutive frames,
+                // resolving into two DIFFERENT images. Accumulating into two
+                // images in turn means every other frame reprojects history
+                // belonging to the other one - that is the whole-scene wobble,
+                // still present with jitter at zero, and the crawl on
+                // high-frequency surfaces for the same reason.
+                //
+                // So the ordinal ACQUIRES a target and the image is then HELD.
+                // A latched target is re-accepted on sight whatever ordinal it
+                // carries, and released only after it has not appeared for a
+                // while - destroyed, or the view changed shape - at which point
+                // the ordinal picks the next one. Same shape as the pager's
+                // sticky decision: derive once, then hold, so frames agree.
+                // ---- TRIED, AND IT WAS THE WRONG READING. (off by default)
+                //
+                // Holding one image made the picture SMEAR heavily, which
+                // settles the question the comment below poses: the alternation
+                // is X-Plane double-buffering its lit target, not the pick
+                // drifting between passes. Both images are legitimate scene
+                // targets, so pinning to one resolves a buffer holding the
+                // PREVIOUS frame every other frame and blends that forward -
+                // textbook smear. The wobble has another cause and the ordinal
+                // path is correct after all. Kept behind TAA_TARGET_LATCH
+                // because the experiment is worth being able to repeat.
+                static const bool latchOn = getenv("TAA_TARGET_LATCH") != nullptr;
+                static VkImage  latchTarget = VK_NULL_HANDLE;
+                static uint64_t latchSeen   = 0;
+                const bool latchFresh = latchOn && latchTarget != VK_NULL_HANDLE &&
+                                        (g_frameCount - latchSeen) < 120;
+                if (latchFresh) {
+                    if (passInfo.color0 != latchTarget) break;
+                    latchSeen = g_frameCount;
+                } else {
+                    if (g_hdrPassesLastFrame == 0 ||
+                        (hdrIdx % g_hdrPassesLastFrame) != 0)
+                        break;
+                    if (latchTarget != passInfo.color0)
+                        trace("TAA LATCH: holding target %p (hdr %u of %u). The "
+                              "pass count alternates, so re-deriving the target "
+                              "every frame split history between two images - "
+                              "the whole-scene wobble.",
+                              (void*)passInfo.color0, hdrIdx,
+                              g_hdrPassesLastFrame);
+                    latchTarget = passInfo.color0;
+                    latchSeen   = g_frameCount;
+                }
                 gateReach(5);
 
                 {
