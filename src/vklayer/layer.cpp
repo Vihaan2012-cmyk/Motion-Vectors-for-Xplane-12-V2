@@ -7825,6 +7825,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         }
     }
 
+    // Re-arm the history ping-pong for the frame about to be recorded. One
+    // flip per DISPLAYED frame; see the note at the flip in taa.h.
+    g_taaFlipArmed = true;
+
     // ================================================================ SUITE
     //
     // One periodic dump of EVERY quantity this project has had to guess at,

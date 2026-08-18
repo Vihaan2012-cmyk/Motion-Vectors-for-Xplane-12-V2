@@ -99,6 +99,11 @@ struct TaaState {
 
 static TaaState g_taa;
 
+// Armed once per PRESENT by the present hook, consumed by the first resolve of
+// that frame. The history ping-pong has to follow displayed frames, not the
+// number of times the resolve happens to record - see the note at the flip.
+static bool g_taaFlipArmed = true;
+
 struct TaaPush {
     float invSizeX, invSizeY;
     float jitterX, jitterY;
@@ -893,7 +898,34 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                           0, nullptr, 0, nullptr, 1, &bar[2]);
 
-    g_taa.historyWrite ^= 1u;
+    // ---- ONE FLIP PER PRESENTED FRAME, NOT ONE PER RESOLVE.
+    //
+    // This flipped unconditionally, and the resolve can run several times in a
+    // single present (X-Plane records ahead; taa.max_resolves bounds it). With
+    // an EVEN number of resolves in a frame the index returns to where it
+    // started, so the same buffer is written every time and the other - the one
+    // every resolve READS - is never updated again. History freezes, and with
+    // it every property that depends on accumulation.
+    //
+    // Measured, with a static camera and 98% history weight, which cannot
+    // change the image at all if history is real:
+    //     TAA off                  frame-to-frame diff 0.149
+    //     TAA on                                       4.35
+    //     TAA on, alpha 0.02                           3.29
+    //     TAA on, alpha 0.02, jitter off               0.229
+    // TAA made a still image 29x LESS stable than no TAA. That is this.
+    //
+    // It also explains the shape of the whole hunt: without jitter consecutive
+    // frames are nearly identical, so a frozen history is invisible; with
+    // jitter every frame differs by a sub-pixel offset, the output becomes the
+    // raw jittered frame, and that is the shake. Gain, varclip, the reactive
+    // mask, both sign flips and the target latch all tune how history is
+    // BLENDED, which is why none of them moved a symptom caused by there being
+    // no history to blend.
+    //
+    // The arming flag is owned by the present hook, so the pairing follows
+    // DISPLAYED frames however many times the resolve records.
+    if (g_taaFlipArmed) { g_taa.historyWrite ^= 1u; g_taaFlipArmed = false; }
 
     if ((++g_taa.dispatches % 600) == 1)
         trace("TAA: dispatch %llu - mode %d alpha %.3f reset %d (%ux%u x%u)",
