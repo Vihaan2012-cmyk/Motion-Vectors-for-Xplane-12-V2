@@ -7848,6 +7848,50 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // flip per DISPLAYED frame; see the note at the flip in taa.h.
     g_taaFlipArmed = true;
 
+    // ---- THE HISTORY IMAGE, COMPARED AGAINST ITSELF, ON THE CPU.
+    //
+    // Reads the strip copied out during the resolve (see taa.h) and diffs it
+    // against the previous frame's. This is the one measurement of history that
+    // does not pass through the resolve's output path, which is what made every
+    // previous attempt unusable: viz=4 writes the visualisation INTO the
+    // history image, so it reports on itself.
+    //
+    // Halves are 16-bit floats; comparing raw bit patterns is enough for a
+    // stability metric and avoids a half-to-float conversion per texel. Two
+    // reads a frame apart that differ mean history is genuinely changing;
+    // reads that match while the composited image moves put the fault after
+    // the accumulation rather than in it.
+    if (g_taa.readPtr && taaEnabled()) {
+        static uint16_t prev[2048];
+        static bool havePrev = false;
+        static uint64_t nDiff = 0, nSame = 0;
+        const uint16_t *cur = (const uint16_t *)g_taa.readPtr;
+        const size_t nHalf = 512 * 4;              // 512 texels, RGBA
+        if (havePrev) {
+            uint64_t differing = 0;
+            double   sumAbs = 0.0;
+            for (size_t i = 0; i < nHalf; ++i) {
+                if (cur[i] != prev[i]) {
+                    ++differing;
+                    sumAbs += fabs((double)cur[i] - (double)prev[i]);
+                }
+            }
+            if (differing) ++nDiff; else ++nSame;
+            static uint64_t log = 0;
+            if ((log++ % 300) == 0)
+                trace("TAA HISTORY READBACK: %llu/%zu halves differ from last "
+                      "frame (mean |delta| %.1f raw) | frames identical %llu, "
+                      "changed %llu. History that never changes cannot be "
+                      "accumulating; history that changes while the composited "
+                      "image is stable puts the fault after the blend.",
+                      (unsigned long long)differing, nHalf,
+                      differing ? sumAbs / (double)differing : 0.0,
+                      (unsigned long long)nSame, (unsigned long long)nDiff);
+        }
+        memcpy(prev, cur, nHalf * sizeof(uint16_t));
+        havePrev = true;
+    }
+
     // ================================================================ SUITE
     //
     // One periodic dump of EVERY quantity this project has had to guess at,

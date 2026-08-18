@@ -97,6 +97,23 @@ struct TaaState {
     bool     ready = false;
     bool     historyCleared = false;
     uint64_t dispatches = 0;
+
+    // ---- DIRECT HISTORY READBACK.
+    //
+    // Every claim about whether history accumulates has so far been inferred
+    // from the composited screen, and viz=4 cannot settle it because the
+    // visualisation is written INTO the history image - the measurement
+    // contaminates the thing measured. This copies a strip of the history
+    // image itself into host memory, so the bytes can be compared across
+    // frames without passing through the resolve's own output path.
+    //
+    // A strip, not the frame: 512 texels of RGBA16F is 4 KB, enough for a
+    // stable statistic and small enough that the copy cannot meaningfully
+    // perturb the timing it is measuring.
+    VkBuffer        readBuf  = VK_NULL_HANDLE;
+    VkDeviceMemory  readMem  = VK_NULL_HANDLE;
+    void           *readPtr  = nullptr;
+    uint64_t        readFrame = 0;
 };
 
 static TaaState g_taa;
@@ -381,6 +398,47 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     sci.minFilter = VK_FILTER_NEAREST;
     if (dd.createSampler(dev, &sci, nullptr, &g_taa.samplerNearest) != VK_SUCCESS)
         return false;
+
+    // ---- THE READBACK BUFFER. See TaaState::readBuf.
+    //
+    // Host-visible and COHERENT so no explicit flush or invalidate is needed;
+    // persistently mapped, because mapping per frame would serialise against
+    // the very timing this exists to observe. Failure here is not fatal - the
+    // resolve runs exactly as before and only the diagnostic is absent.
+    {
+        VkBufferCreateInfo bci;
+        memset(&bci, 0, sizeof(bci));
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size  = 512ull * 8ull;                 // 512 texels of RGBA16F
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (dd.createBuffer && dd.createBuffer(dev, &bci, nullptr, &g_taa.readBuf) == VK_SUCCESS) {
+            VkMemoryRequirements mr;
+            memset(&mr, 0, sizeof(mr));
+            if (dd.getBufferMemReq) dd.getBufferMemReq(dev, g_taa.readBuf, &mr);
+            const uint32_t mt = taaFindMemory(dd, mr.memoryTypeBits,
+                                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkMemoryAllocateInfo mai;
+            memset(&mai, 0, sizeof(mai));
+            mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            mai.allocationSize  = mr.size ? mr.size : bci.size;
+            mai.memoryTypeIndex = mt;
+            if (mt != UINT32_MAX && dd.allocateMemory &&
+                dd.allocateMemory(dev, &mai, nullptr, &g_taa.readMem) == VK_SUCCESS &&
+                dd.bindBufferMemory &&
+                dd.bindBufferMemory(dev, g_taa.readBuf, g_taa.readMem, 0) == VK_SUCCESS &&
+                dd.mapMemory &&
+                dd.mapMemory(dev, g_taa.readMem, 0, VK_WHOLE_SIZE, 0, &g_taa.readPtr) == VK_SUCCESS) {
+                memset(g_taa.readPtr, 0, (size_t)bci.size);
+                trace("TAA READBACK: history strip buffer mapped - the history "
+                      "image can now be compared across frames directly, "
+                      "instead of through the resolve's own output path");
+            } else {
+                g_taa.readPtr = nullptr;
+            }
+        }
+    }
 
     // ---- THE FALLBACK FLAG IMAGE. 1x1, uint, zero.
     //
@@ -1061,6 +1119,56 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                           0, nullptr, 0, nullptr, 1, &bar[2]);
 
+    // ---- COPY A STRIP OF HISTORY OUT, FOR THE CPU TO COMPARE.
+    //
+    // Recorded after the dispatch and after the copy-back, so it captures the
+    // history this frame actually produced. No fence: the read happens at
+    // present, at least one frame later, by which point the submission that
+    // recorded this has long retired. A stale read would understate the
+    // difference, never invent one, so the metric is conservative in the
+    // direction that matters.
+    if (g_taa.readPtr && g_taa.readBuf && dd.cmdCopyImageToBuffer) {
+        VkImageMemoryBarrier rb;
+        memset(&rb, 0, sizeof(rb));
+        rb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        rb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rb.subresourceRange.levelCount = 1;
+        rb.subresourceRange.layerCount = g_taa.layers;
+        rb.image = g_taa.history[hw_];
+        rb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        rb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        rb.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        rb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                              0, nullptr, 0, nullptr, 1, &rb);
+        VkBufferImageCopy bic;
+        memset(&bic, 0, sizeof(bic));
+        bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bic.imageSubresource.layerCount = 1;
+        // A horizontal strip across the middle of the frame: guaranteed to
+        // cross real scene content at any camera angle.
+        bic.imageOffset.x = 0;
+        bic.imageOffset.y = (int32_t)(g_taa.h / 2);
+        bic.imageExtent.width  = g_taa.w < 512 ? g_taa.w : 512;
+        bic.imageExtent.height = 1;
+        bic.imageExtent.depth  = 1;
+        dd.cmdCopyImageToBuffer(cb, g_taa.history[hw_],
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                g_taa.readBuf, 1, &bic);
+        VkImageMemoryBarrier rbk = rb;
+        rbk.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        rbk.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        rbk.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        rbk.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                              0, nullptr, 0, nullptr, 1, &rbk);
+    }
+
     // ---- ONE FLIP PER PRESENTED FRAME, NOT ONE PER RESOLVE.
     //
     // This flipped unconditionally, and the resolve can run several times in a
@@ -1088,7 +1196,26 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     //
     // The arming flag is owned by the present hook, so the pairing follows
     // DISPLAYED frames however many times the resolve records.
-    if (g_taaFlipArmed) { g_taa.historyWrite ^= 1u; g_taaFlipArmed = false; }
+    // ---- FLIP PER RECORDED FRAME, WHICH IS PER RESOLVE.
+    //
+    // This was briefly tied to PRESENT, on the reasoning that the ping-pong
+    // should follow displayed frames. That is wrong here: X-Plane records
+    // ahead, so several frames' command buffers are built before any present.
+    // Arming at present meant the first recorded frame flipped and every
+    // further frame recorded before that present did not - consecutive frames
+    // wrote the SAME buffer, so the buffer being read never advanced and the
+    // blend had nothing to accumulate against.
+    //
+    // Measured with the direct history readback, at alpha 0.02 (98% history),
+    // vel_scale 0 (lookup pinned to the same pixel) and reset 0 - conditions
+    // under which the output mathematically cannot change if history is real:
+    //     1532 of 2048 halves differed every frame, mean |delta| 193.
+    // The blend cannot produce that; only a history read that is not the
+    // previous write can.
+    //
+    // One resolve per recorded frame (taa.max_resolves=1) makes per-resolve and
+    // per-frame the same thing, which is the pairing the algorithm needs.
+    g_taa.historyWrite ^= 1u;
 
     if ((++g_taa.dispatches % 600) == 1)
         trace("TAA: dispatch %llu - mode %d alpha %.3f reset %d (%ux%u x%u)",
