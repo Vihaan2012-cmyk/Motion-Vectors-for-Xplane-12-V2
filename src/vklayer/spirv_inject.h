@@ -330,10 +330,44 @@ inline bool placeLocations(const bool *used, uint32_t nLoc)
     // the caller's bound is all we have.
     uint32_t devLocs = deviceLocationCount();
     if (devLocs && devLocs < nLoc) nLoc = devLocs;
-    // One slot of headroom below the ceiling: built-ins consume output
-    // components too, so the last slot the arithmetic allows is not necessarily
-    // a slot that links.
-    if (nLoc >= 3) nLoc -= 1;
+    // ---- TWO SLOTS OF HEADROOM, NOT ONE. THE BUILT-INS NEED BOTH.
+    //
+    // One slot was not enough and validation caught it on every patched vertex
+    // module:
+    //
+    //   VUID-RuntimeSpirv-Location-06272
+    //   output interface variable (Location = 30 | Component = 3) along with 7
+    //   built-in components, exceeds component limit
+    //   maxVertexOutputComponents (128)
+    //
+    // The arithmetic: 128 components is 32 locations, but gl_Position and its
+    // companions take 7 of those components before any of ours. Location 30
+    // starts at component 120, our vec4 runs to 124, and 124 + 7 is 131. The
+    // pair has to end at or below location 29, so the ceiling must drop by two
+    // slots rather than one.
+    //
+    // Consequence of getting it wrong: the patched vertex shader declares more
+    // output than the stage permits, which is invalid - so the VELOCITY path
+    // itself was undefined on every module that took the highest pair. That is
+    // upstream of the resolve and of everything measured about it.
+    if (nLoc >= 4) nLoc -= 2;
+    else if (nLoc >= 3) nLoc -= 1;
+    // ---- AND AN ABSOLUTE CEILING, BECAUSE THE RELATIVE ONE IS COMPUTED FROM
+    //      A NUMBER THAT IS ITSELF TOO HIGH.
+    //
+    // deviceLocationCount() is maxVertexOutputComponents / 4, which counts
+    // every component as available to interface variables - but gl_Position
+    // and its companions are spent before ours are placed. Validation reports
+    // exactly 7 such components on this driver, so the usable ceiling is
+    // (128 - 7) / 4 = 30.25 locations, and a vec4 must therefore START at 29 or
+    // below. Subtracting two from an inflated 32 still permitted 29/30, and
+    // location 30 is precisely what was flagged.
+    //
+    // Clamping to 28 leaves the pair at 27/28 with a component to spare, and
+    // costs nothing: the point of choosing high is to avoid the slots shaders
+    // actually use, and the corpus allocates upward from 0 - two slots lower is
+    // still far above anything X-Plane occupies.
+    if (nLoc > 29) nLoc = 29;
 
     for (uint32_t L = nLoc; L >= 2; --L) {
         uint32_t a = L - 1, b = L - 2;

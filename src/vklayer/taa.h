@@ -60,6 +60,8 @@ struct TaaState {
     // Handles are reused; this is not. See MvTarget::gen.
     uint64_t        velGen      = 0;
     VkSampler       sampler     = VK_NULL_HANDLE;
+    // NEAREST, for the integer flags image - see the note at its creation.
+    VkSampler       samplerNearest = VK_NULL_HANDLE;
     // ---- X-PLANE'S gbuffer_vel, AND A FALLBACK FOR WHEN IT IS UNKNOWN.
     //
     // The flags view is over an image X-Plane owns, identified by shape by the
@@ -212,6 +214,7 @@ static void taaDestroyState(DeviceData &dd, TaaState &g_taa)
     if (g_taa.setLayout)   dd.destroyDescriptorSetLayout(g_taa.device, g_taa.setLayout, nullptr);
     if (g_taa.pool)        dd.destroyDescriptorPool(g_taa.device, g_taa.pool, nullptr);
     if (g_taa.sampler)     dd.destroySampler(g_taa.device, g_taa.sampler, nullptr);
+    if (g_taa.samplerNearest) dd.destroySampler(g_taa.device, g_taa.samplerNearest, nullptr);
     for (int i = 0; i < 2; ++i)
         if (g_taa.historyView[i]) dd.destroyImageView(g_taa.device, g_taa.historyView[i], nullptr);
     for (std::map<VkImage, VkImageView>::iterator it = g_taa.sceneViews.begin();
@@ -359,6 +362,25 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.maxLod = 0.0f;
     if (dd.createSampler(dev, &sci, nullptr, &g_taa.sampler) != VK_SUCCESS) return false;
+
+    // ---- A SECOND, NEAREST SAMPLER, FOR THE INTEGER FLAGS IMAGE.
+    //
+    // uFlags is X-Plane's gbuffer_vel, VK_FORMAT_R32_UINT. Integer formats do
+    // not advertise SAMPLED_IMAGE_FILTER_LINEAR, so sampling one through the
+    // linear sampler above is undefined - and validation says so on every
+    // dispatch:
+    //
+    //   VUID-vkCmdDispatch-magFilter-04553
+    //   binding 4 "uFlags" ... VK_FILTER_LINEAR ... format VK_FORMAT_R32_UINT
+    //   does not contain VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
+    //
+    // Nothing about a bitfield wants interpolating anyway: the shader tests
+    // bit 2, and a blended fraction of two flag words is meaningless. NEAREST
+    // is both legal and the only correct filter for this input.
+    sci.magFilter = VK_FILTER_NEAREST;
+    sci.minFilter = VK_FILTER_NEAREST;
+    if (dd.createSampler(dev, &sci, nullptr, &g_taa.samplerNearest) != VK_SUCCESS)
+        return false;
 
     // ---- THE FALLBACK FLAG IMAGE. 1x1, uint, zero.
     //
@@ -818,7 +840,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     ii[4].imageView = (g_taa.flagsValid && g_taa.flagsView) ? g_taa.flagsView
                                                             : g_taa.flagsFallbackView;
     ii[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ii[4].sampler   = g_taa.sampler;
+    ii[4].sampler   = g_taa.samplerNearest;   // integer format: NEAREST only
 
     VkWriteDescriptorSet wr[5];
     memset(wr, 0, sizeof(wr));
