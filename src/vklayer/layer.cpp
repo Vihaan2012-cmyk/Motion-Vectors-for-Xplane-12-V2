@@ -4975,6 +4975,19 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     // absorbs the recording-order race. Anything older is a fossil and the
     // only correct resolve is no resolve.
     const uint64_t mvBindAge = g_frameCount - g_mvLastBindFrame.load();
+    // A stale velocity field means the resolve cannot run, but history is still
+    // the best image we have - deliver it rather than shipping the raw frame.
+    // See taaRecordDeliverOnly: the measured fault was delivery, not accumulation.
+    if (litPass && taaEnabled() && !g_taaResolvedThisFrame && mvBindAge > 1 &&
+        g_taa.ready && passInfo.color0 == g_taa.sceneImage) {
+        std::map<VkCommandBuffer, VkDevice>::iterator dci = g_cbToDevice.find(cb);
+        if (dci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator ddi =
+                g_devices.find(dispatchKey(dci->second));
+            if (ddi != g_devices.end())
+                taaRecordDeliverOnly(ddi->second, cb, passInfo.color0);
+        }
+    }
     if (litPass && taaEnabled() && !g_taaResolvedThisFrame && mvBindAge > 1) {
         static uint64_t nStaleSkip = 0;
         if ((++nStaleSkip % 300) == 1)
@@ -5304,6 +5317,12 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 if (g_taaQuiesce.load() > 0) {
                     g_taaQuiesce.fetch_sub(1);
                     g_taaStaleResume = true;
+                    // Deliver the accumulated image anyway. Skipping the
+                    // DISPATCH is the point of a quiesce; skipping the COPY
+                    // just ships a raw frame, and a raw frame between resolved
+                    // ones is the alternation the history/composited split
+                    // measured (0.447 against 3.78).
+                    taaRecordDeliverOnly(tdd, cb, passInfo.color0);
                     break;
                 }
                 gateReach(7);

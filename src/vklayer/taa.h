@@ -679,6 +679,97 @@ static void taaBindFlags(DeviceData &dd, VkImage image, VkFormat fmt,
 // Called from vkCmdEndRendering once the scene pass has finished, which is the
 // only point where the colour target holds a complete frame and the velocity
 // target beside it describes that same frame.
+// ---- DELIVER HISTORY WITHOUT RESOLVING. (the alternation fix)
+//
+// The copy that carries the accumulated image into the scene target lives at
+// the end of taaRecordResolve, so a frame that does not dispatch does not
+// deliver either - it ships the raw scene. Measured, static camera:
+//
+//     history buffer      0.447   <- stable, accumulating correctly
+//     composited output   3.78    <- unstable
+//     TAA off baseline    0.806
+//
+// History is MORE stable than the raw scene. The resolve works. What alternates
+// is whether its result reaches the screen, and alternating between accumulated
+// and raw output is the shake - which is also why jitter made it visible, since
+// without jitter the two look nearly identical.
+//
+// So when a frame has a validated target and a ready history but skips the
+// dispatch - the per-present resolve cap, a quiesce, a stale velocity field -
+// it still delivers the last good accumulation instead of nothing. That is
+// strictly better than raw: the image is at most one frame old, where before it
+// was a different image entirely.
+//
+// Only called with a target this frame's pass actually rendered into; there is
+// deliberately no path for frames with no candidate pass at all, because the
+// destination would be a guess and copying into the wrong half is the smearing
+// the target-latch experiment produced.
+static void taaRecordDeliverOnly(DeviceData &dd, VkCommandBuffer cb, VkImage scene)
+{
+    if (!g_taa.ready || !taaEnabled() || !g_taa.historyCleared) return;
+    if (scene == VK_NULL_HANDLE || !dd.cmdCopyImage) return;
+    // The most recently written buffer. The flip happens at the end of a
+    // resolve, so the freshest history is the one the index no longer points at.
+    const uint32_t src = g_taa.historyWrite ^ 1u;
+    if (!g_taa.history[src]) return;
+
+    VkImageMemoryBarrier pre[2];
+    memset(pre, 0, sizeof(pre));
+    for (int i = 0; i < 2; ++i) {
+        pre[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        pre[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pre[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pre[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        pre[i].subresourceRange.levelCount = 1;
+        pre[i].subresourceRange.layerCount = g_taa.layers;
+    }
+    pre[0].image = scene;
+    pre[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    pre[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    pre[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    pre[1].image = g_taa.history[src];
+    pre[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    pre[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    pre[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    // Each half named with a stage that can actually perform its access - the
+    // mistake VUID-02819 caught in the resolve's own barrier.
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                          0, nullptr, 0, nullptr, 1, &pre[0]);
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                          0, nullptr, 0, nullptr, 1, &pre[1]);
+
+    VkImageCopy cp;
+    memset(&cp, 0, sizeof(cp));
+    cp.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    cp.srcSubresource.layerCount = g_taa.layers;
+    cp.dstSubresource = cp.srcSubresource;
+    cp.extent.width = g_taa.w; cp.extent.height = g_taa.h; cp.extent.depth = 1;
+    dd.cmdCopyImage(cb, g_taa.history[src], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    scene, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+
+    VkImageMemoryBarrier post[2] = { pre[0], pre[1] };
+    post[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    post[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    post[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    post[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    post[1].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    post[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    post[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    post[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                          0, nullptr, 0, nullptr, 1, &post[0]);
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                          0, nullptr, 0, nullptr, 1, &post[1]);
+}
+
 static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                              float jitterX, float jitterY, bool reset,
                              bool cameraMoved)
