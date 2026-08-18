@@ -167,6 +167,24 @@ vec3 heat(float t)
 const int MODE_PASSTHROUGH = 0;
 const int MODE_REPROJECT   = 1;
 const int MODE_FULL        = 2;
+// ---- MODE 3: A CLEAN ROOM. TEXTBOOK TAA, NOTHING ELSE.
+//
+// Written because debugging MODE_FULL stopped converging. It carries a
+// variance-normalised rejection metric, a reactive mask keyed on a coverage
+// channel opaque geometry does not write, an unjitter step, a gain that drives
+// the weight to 1 on flat ground, and several years of layered corrections -
+// and the measured result is that TAA makes a STATIC image 4x less stable than
+// no TAA even with reprojection disabled entirely, which is a statement about
+// the accumulation and not about any of those knobs.
+//
+// This path shares only the inputs. It does what every TAA does and no more:
+// fetch history along the motion vector, clamp it to the colour range its own
+// neighbourhood spans this frame, blend at a fixed weight, store. No gain, no
+// sigma, no reactive term, no unjitter, no tonemap round trip. If THIS is
+// unstable on a still camera, the fault is in the plumbing around the resolve -
+// the history binding or the copy back - and not in any resolve logic, which is
+// a different search and a much shorter one.
+const int MODE_CLEAN       = 3;
 
 // RGB to YCoCg. The neighbourhood clamp is done in YCoCg because clamping in
 // RGB clips hue as well as luminance, which is what turns a rejected sample
@@ -450,6 +468,34 @@ void main()
     if ((pc.flags & FLAG_FREEZE_HISTORY) != 0) return;
     if ((pc.flags & FLAG_NO_ACCUM) != 0) {
         imageStore(uHistory, ivec3(px, layer), vec4(currA, 1.0));
+        return;
+    }
+
+    // ---- MODE 3: the clean room. See the note at MODE_CLEAN.
+    if (pc.mode == MODE_CLEAN) {
+        vec2 tszC = 1.0 / vec2(size);
+        // Neighbourhood in LINEAR space - no tonemap, so no inverse is ever
+        // needed and the epsilon that broke earlier attempts cannot arise.
+        vec3 cmin = vec3( 1e30), cmax = vec3(-1e30);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                vec3 s = texture(uScene,
+                          vec3(uv + vec2(dx, dy) * tszC, float(layer))).rgb;
+                cmin = min(cmin, s);
+                cmax = max(cmax, s);
+            }
+        // History along the motion vector, clamped into that range. A sample
+        // outside every colour around it cannot belong to this pixel, whatever
+        // the vector claimed - that single rule is what stops ghosting, and it
+        // needs no variance, no gain and no coverage channel.
+        vec3 h = texture(uHistorySampler, vec3(hUv, float(layer))).rgb;
+        h = clamp(h, cmin, cmax);
+        // First frame, a reset, or a reprojection that left the screen: take
+        // the current frame whole rather than blending against nothing.
+        bool bad = pc.reset != 0 ||
+                   hUv.x < 0.0 || hUv.x > 1.0 || hUv.y < 0.0 || hUv.y > 1.0;
+        vec3 o = bad ? currA : mix(h, currA, pc.alpha);
+        imageStore(uHistory, ivec3(px, layer), vec4(max(o, vec3(0.0)), 1.0));
         return;
     }
 
