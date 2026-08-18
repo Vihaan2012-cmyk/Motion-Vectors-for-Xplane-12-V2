@@ -149,6 +149,26 @@ struct TaaPush {
     float   velYSign;
     // 1 when binding 4 is X-Plane's real gbuffer_vel rather than the fallback.
     int32_t flagsValid;
+    // ---- THE UNJITTER SHIFT, AS TWO NUMBERS RATHER THAN A CONVICTION.
+    //
+    // S = (sMulX * jitter.x, sMulY * jitter.y). The hardcoded (-0.5, +0.5)
+    // encodes two conventions at once - NDC-to-UV is a half, and the viewport
+    // height is negative so Y flips - and getting either wrong turns the
+    // cancellation into a doubling. That is indistinguishable from "no
+    // cancellation" by eye, and it scales with jitter amplitude, which is
+    // exactly the symptom: shake at jitter_scale=1, none at 0. Both have been
+    // wrong in this file before, so they are swept, not argued.
+    //
+    // MEASURED, parked aircraft, still camera, temporal mean absolute
+    // deviation over 8 frames of the same ground:
+    //     jitter off .................. 0.22   (the floor)
+    //     (+0.5, -0.5) ................ 2.94   <- default
+    //     no cancellation at all ...... 4.34
+    //     (-0.5, +0.5), as shipped .... 5.93
+    // The shipped pair was WORSE than doing nothing: it added the
+    // displacement instead of removing it.
+    float   sMulX;
+    float   sMulY;
 };
 
 enum {
@@ -1015,6 +1035,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.invSizeX = 1.0f / (float)g_taa.w;
     pcv.invSizeY = 1.0f / (float)g_taa.h;
     pcv.jitterX = jitterX;
+    pcv.sMulX = live::f("taa.smul_x", "TAA_SMUL_X",  0.5f);
+    pcv.sMulY = live::f("taa.smul_y", "TAA_SMUL_Y", -0.5f);
     pcv.jitterY = jitterY;
     pcv.alpha = taaAlpha();
     pcv.mode = taaMode();

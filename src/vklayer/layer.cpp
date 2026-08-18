@@ -3463,6 +3463,11 @@ static float g_appliedJitX = 0.0f, g_appliedJitY = 0.0f;
 // Reads the jitter out of THIS command buffer's pending-push slot - defined
 // below the slot machinery it needs, used above it by the resolve.
 static bool mvPendingJitter(VkCommandBuffer cb, float *jx, float *jy);
+static std::atomic<uint64_t> g_jitSlotHit(0);
+static std::atomic<uint64_t> g_jitSlotMiss(0);
+static std::atomic<uint64_t> g_jitZero(0);
+static std::atomic<uint64_t> g_jitNonZero(0);
+static float g_jitLastX = 0.0f, g_jitLastY = 0.0f;
 static uint64_t g_jitterApplied = 0;
 
 // Did a resolve actually happen this frame, and how often does it not.
@@ -3832,8 +3837,17 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
     // are still being accumulated when the first pass has to be decided. Passes
     // are stable frame to frame, so a one-frame-old census is the right answer
     // for this frame.
+    // LIVE, not env-only. Which passes carry velocity is the single control
+    // that decides whether terrain smears, and an env variable can only be
+    // judged by relaunching - which is how the wrong answer survived: the
+    // "binding every pass is worse" verdict came from a measurement, never from
+    // looking at the ground. -2 keeps the census winner, -1 binds every
+    // qualifying pass, >=0 pins one ordinal.
     long onlyPass = g_mvSceneOrdinal;
-    if (const char *e = getenv("TAA_MV_PASS")) onlyPass = atol(e);
+    {
+        const int sel = live::i("taa.mv_pass", "TAA_MV_PASS", -2);
+        if (sel != -2) onlyPass = sel;
+    }
 
     // The ordinal counts every QUALIFYING pass, whether or not it ends up
     // bound - otherwise pinning to one pass would renumber the very thing being
@@ -5277,10 +5291,41 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // hold the NEXT frame's offset - the same straddle MV PUSH
                 // RACE counts. The slot is thread-local and keyed by this cb,
                 // which is the recording the raster was actually displaced in.
-                if (!mvPendingJitter(cb, &tf.jitter.x, &tf.jitter.y)) {
-                    tf.jitter.x = g_appliedJitX;
-                    tf.jitter.y = g_appliedJitY;
+                // ---- DERIVE IT, DO NOT FETCH IT.
+                //
+                // The per-cb slot lookup SUCCEEDS and hands back the zeroed
+                // block: measured 450 zero jitters out of 450 resolves. The
+                // resolve is not recorded in the command buffer that carried
+                // the geometry pushes, so its slot never held the offset. S was
+                // therefore always zero and the unjitter has never once run -
+                // which is why no sign of it changed anything, why toggling
+                // taa.unjitter did nothing, and why only jitter_scale=0 ever
+                // stopped the shake.
+                //
+                // The applied offset is a pure function of the frame snapshot
+                // and the target size - the same expression the vertex push
+                // uses - so compute it from g_velSnap, which this resolve is
+                // already using for the reprojection and is therefore
+                // consistent with by construction.
+                {
+                    const float ySignR = g_viewportYFlipped ? -1.0f : 1.0f;
+                    const float wR = (float)g_taa.w, hR = (float)g_taa.h;
+                    if (wR > 0.0f && hR > 0.0f) {
+                        tf.jitter.x = 2.0f * g_velSnap.jitterX * g_jitterScale / wR;
+                        tf.jitter.y = ySignR * 2.0f * g_velSnap.jitterY * g_jitterScale / hR;
+                    } else {
+                        tf.jitter.x = tf.jitter.y = 0.0f;
+                    }
                 }
+                // The per-cb slot is left in place as INSTRUMENTATION only:
+                // it proved the zero (450 of 450) and stays useful if the
+                // recording order ever changes. It no longer feeds the shader.
+                { float px_, py_;
+                  if (mvPendingJitter(cb, &px_, &py_)) ++g_jitSlotHit;
+                  else                                 ++g_jitSlotMiss; }
+                if (tf.jitter.x == 0.0f && tf.jitter.y == 0.0f) ++g_jitZero;
+                else                                            ++g_jitNonZero;
+                g_jitLastX = tf.jitter.x; g_jitLastY = tf.jitter.y;
                 memcpy(tf.camera.reproj, g_velSnap.reproj, sizeof(tf.camera.reproj));
                 // Not camDelta: that is translation only, and a camera rotating
                 // in place moves every pixel while translating zero. The
@@ -8009,6 +8054,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                   (void*)g_mv.image, (void*)g_mv.view,
                   g_taa.ready ? 1 : 0, g_taa.w, g_taa.h, g_taa.layers);
             // --- jitter: applied amplitude, not the requested one
+            trace("SUITE JITVALUE: resolve saw a ZERO jitter %llu times, non-zero "
+                  "%llu times, last=(%.7f %.7f) - a zero here means S is zero and "
+                  "no sign of the unjitter can matter",
+                  (unsigned long long)g_jitZero.load(),
+                  (unsigned long long)g_jitNonZero.load(),
+                  (double)g_jitLastX, (double)g_jitLastY);
+            trace("SUITE JITSLOT: resolve got the raster's own jitter %llu times, "
+                  "fell back to the racy globals %llu times - a fallback cancels "
+                  "this frame's displacement with another frame's number",
+                  (unsigned long long)g_jitSlotHit.load(),
+                  (unsigned long long)g_jitSlotMiss.load());
             trace("SUITE JITTER: scale=%.3f snapJit=(%.5f %.5f) px "
                   "appliedNDC=(%.6f %.6f) armed=%d",
                   (double)g_jitterScale, (double)g_velSnap.jitterX,

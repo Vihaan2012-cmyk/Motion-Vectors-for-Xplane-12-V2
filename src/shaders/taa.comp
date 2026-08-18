@@ -132,6 +132,8 @@ layout(push_constant) uniform Params {
     float velYSign;     // -1.0 = shipping belief (negative viewport), +1.0 = flipped
     // 1 when uFlags is X-Plane's real gbuffer_vel; 0 when it is the fallback.
     int   flagsValid;
+    float sMulX;        // S.x = sMulX * jitter.x
+    float sMulY;        // S.y = sMulY * jitter.y
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -289,7 +291,7 @@ void main()
     // negative; only the overall direction changes.
     vec2 S = (pc.flags & FLAG_NO_UNJITTER) != 0
            ? vec2(0.0)
-           : vec2(-0.5 * pc.jitter.x, 0.5 * pc.jitter.y);
+           : vec2(pc.sMulX * pc.jitter.x, pc.sMulY * pc.jitter.y);
 
     // ---- THE STORED VALUE IS ALREADY A UV OFFSET.
     //
@@ -344,6 +346,26 @@ void main()
         for (int cx = -1; cx <= 1; ++cx)
             covMax = max(covMax, texture(uVelocity,
                 vec3(uv + S + vec2(cx, cy) * ctsz, float(layer))).w);
+    // ---- REJECT A VECTOR THAT IS NOT A NUMBER.
+    //
+    // MEASURED: with velocity live, alpha does NOTHING - 1.0 and 0.01 give the
+    // same temporal deviation (6.2 vs 6.6), which is only possible if history
+    // is never retained. Forcing vel to zero restores it exactly as theory
+    // says it should (0.98 at alpha 0.05, 0.44 at 0.01). But SCALING velocity
+    // to zero does NOT (5.94), and the only quantity that survives a multiply
+    // by zero is NaN or infinity.
+    //
+    // A NaN hUv is worse than an out-of-range one, because every comparison
+    // against NaN is FALSE: the bounds test below reads "in range", the fetch
+    // returns undefined, and the neighbourhood clamp then drags that undefined
+    // value into the current frame's colour range - so the frame looks
+    // plausible while carrying no history at all. That is the whole failure:
+    // no antialiasing, and shake that tracks the jitter exactly.
+    //
+    // Written as a NEGATED in-range test so NaN fails it: NaN < 1.0 is false,
+    // so !(false) is true and the vector is discarded. One texel of motion is
+    // already far more than any real frame produces at this resolution.
+    if (!(abs(vel.x) < 1.0) || !(abs(vel.y) < 1.0)) vel = vec2(0.0);
     if ((pc.flags & FLAG_NO_MOTION) != 0) vel = vec2(0.0);
     vec2 hUv  = uv + vec2(vel.x, pc.velYSign * vel.y);
 
@@ -479,8 +501,18 @@ void main()
         vec3 cmin = vec3( 1e30), cmax = vec3(-1e30);
         for (int dy = -1; dy <= 1; ++dy)
             for (int dx = -1; dx <= 1; ++dx) {
+                // AT uv + S, LIKE currA. Without S the box is built from a
+                // neighbourhood displaced by this frame's jitter while the
+                // sample it bounds is not, so the two disagree by up to half a
+                // pixel and the disagreement CHANGES EVERY FRAME with the
+                // Halton phase. On high-frequency ground the min/max of a
+                // shifting 3x3 then differs frame to frame, history is clamped
+                // into a different range each time, and a still camera over
+                // still grass produces a picture that will not sit still. That
+                // is the shake, and it is why jitter_scale=0 removed it: at
+                // zero, S is zero and the two positions coincide.
                 vec3 s = texture(uScene,
-                          vec3(uv + vec2(dx, dy) * tszC, float(layer))).rgb;
+                          vec3(uv + S + vec2(dx, dy) * tszC, float(layer))).rgb;
                 cmin = min(cmin, s);
                 cmax = max(cmax, s);
             }
