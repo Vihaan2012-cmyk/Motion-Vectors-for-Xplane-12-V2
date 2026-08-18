@@ -426,7 +426,26 @@ inline void chooseLocations(uint32_t vertexComponents, uint32_t fragmentComponen
     //
     // TAA_MV_LOC pins the pair for testing; the default now leaves two slots of
     // headroom rather than sitting on the ceiling.
-    uint32_t top = locs - 2;
+    // ---- THREE SLOTS, NOT TWO, AND THE ARITHMETIC THIS TIME.
+    //
+    // locs is maxVertexOutputComponents / 4 = 32 here, so `locs - 2` put
+    // prevClip at Location 30. That occupies components 120..123, and the
+    // built-ins take 7 more:  124 + 7 = 131, against a limit of 128. Validation
+    // says it in those terms, twenty times a run:
+    //
+    //   VUID-RuntimeSpirv-Location-06272
+    //   output interface variable (Location = 30 | Component = 3) along with 7
+    //   built-in components, exceeds maxVertexOutputComponents (128)
+    //
+    // The note above had the reasoning right - built-ins consume output
+    // components, so the arithmetic ceiling is not a usable ceiling - and then
+    // left a headroom of two, which is one short of what its own argument
+    // requires. Location 29 ends at component 120 and 120 + 7 = 127 fits.
+    //
+    // This is where the pair is really decided; placeLocations' census only
+    // runs when a module contests the slots, so a ceiling enforced only there
+    // is a ceiling not enforced at all.
+    uint32_t top = locs - 3;
     if (const char *e = getenv("TAA_MV_LOC")) {
         uint32_t v = (uint32_t)atoi(e);
         if (v >= 2 && v < locs) top = v;
