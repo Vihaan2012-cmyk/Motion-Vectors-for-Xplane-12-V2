@@ -291,8 +291,21 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     ici.mipLevels = 1; ici.arrayLayers = g_taa.layers;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    // TRANSFER_SRC because the resolve's OUTPUT PATH reads from here: history
+    // is copied into the scene target every frame. Without it that copy is
+    // illegal, and validation says so twenty times a run:
+    //
+    //   VUID-vkCmdCopyImage-aspect-06662
+    //   srcImage was created with TRANSFER_DST|SAMPLED|STORAGE but requires
+    //   VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT
+    //
+    // TRANSFER_DST was here for the initial clear and nobody added the SRC
+    // side when the copy-back was introduced. The image is written, the
+    // accumulation happens - viz=4 shows a real accumulated picture - and the
+    // step that carries it to the screen is undefined behaviour.
     ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     for (int hi = 0; hi < 2; ++hi) {
@@ -686,10 +699,40 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     barRead.oldLayout = g_taa.historyCleared ? VK_IMAGE_LAYOUT_GENERAL
                                              : VK_IMAGE_LAYOUT_UNDEFINED;
     barRead.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkImageMemoryBarrier all4[4] = { bar[0], bar[1], bar[2], barRead };
-    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                          0, nullptr, 0, nullptr, 4, all4);
+    // ---- TWO BARRIERS, BECAUSE THE FOUR IMAGES COME FROM DIFFERENT STAGES.
+    //
+    // All four used to go through one barrier whose source stage was chosen for
+    // the colour attachments. But bar[1] and barRead describe the HISTORY
+    // images, whose previous write was last frame's COMPUTE dispatch, and
+    // SHADER_WRITE is not an access that can occur in COLOR_ATTACHMENT_OUTPUT.
+    // The source half of those two was therefore empty: no execution dependency
+    // on last frame's dispatch, and no availability operation for its writes.
+    // Validation names them individually:
+    //
+    //   VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02819
+    //   pImageMemoryBarriers[1].srcAccessMask (VK_ACCESS_2_SHADER_WRITE_BIT)
+    //   is not supported by stage mask (COLOR_ATTACHMENT_OUTPUT)   [and [3]]
+    //
+    // Indices 1 and 3 are exactly bar[1] and barRead in the old all4 array.
+    //
+    // The copy-back does not rescue it: that path ends on a barrier whose
+    // srcAccessMask is TRANSFER_READ, and a read performs no availability
+    // operation, so the compute write is never made available to the next
+    // frame's sampled read. Splitting gives each pair a source scope that
+    // actually contains the write it is describing - and the history pair also
+    // names TRANSFER, since the copy-back reads these images too.
+    {
+        VkImageMemoryBarrier att[2] = { bar[0], bar[2] };
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                              0, nullptr, 0, nullptr, 2, att);
+        VkImageMemoryBarrier hist[2] = { bar[1], barRead };
+        dd.cmdPipelineBarrier(cb,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                              0, nullptr, 0, nullptr, 2, hist);
+    }
 
     // Clear the history once, explicitly. Reading an UNDEFINED image gives
     // undefined contents and on the first frame every output pixel is a blend
@@ -883,6 +926,12 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                               0, nullptr, 0, nullptr, 1, &post);
     }
 
+    // The destination stage for this transition back is COLOR_ATTACHMENT_OUTPUT
+    // (see the call below), and SHADER_READ is not an access that occurs there
+    // - VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02820, twenty a run. The
+    // shader-read half was silently dropped exactly as the source half was at
+    // the barrier above. Naming FRAGMENT_SHADER alongside the attachment stage
+    // in the call makes both halves real; the mask itself is right.
     bar[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     bar[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
     bar[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -892,7 +941,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     bar[2].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     bar[2].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
                           0, nullptr, 0, nullptr, 1, &bar[0]);
     dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,

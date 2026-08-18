@@ -102,6 +102,35 @@ rem puts the sim straight back into replay rather than a live flight. Start
 rem normally and fly it.
 
 
+rem ---- VALIDATION, one argument away.
+rem
+rem The resolve carried two malformed barriers and an image missing the usage
+rem its own copy needs. All three are parameter checks: the validation layer
+rem reports them by name and line the first time it runs. They survived 62
+rem commits, a bisect rig, a diagnostic suite and a fly/shoot harness, because
+rem nothing in that pile validates - it all measures SYMPTOMS.
+rem
+rem   dev-run.cmd validate     spec checks (cheap enough to fly with)
+rem   dev-run.cmd sync         + synchronization validation (very slow, ~11 fps)
+rem
+rem Findings land in %TEMP%\mv_validation.txt.
+if /I "%~1"=="validate" goto :setval
+if /I "%~1"=="sync"     goto :setsync
+goto :noval
+:setsync
+set "MVSYNC=khronos_validation.enables = VALIDATION_CHECK_ENABLE_SYNCHRONIZATION_VALIDATION"
+:setval
+if not defined MVSYNC set "MVSYNC="
+> "%TEMP%\mv_layer_settings.txt" echo khronos_validation.report_flags = error,warn
+>>"%TEMP%\mv_layer_settings.txt" echo khronos_validation.log_filename = %TEMP:\=/%/mv_validation.txt
+>>"%TEMP%\mv_layer_settings.txt" echo khronos_validation.duplicate_message_limit = 10
+if defined MVSYNC >>"%TEMP%\mv_layer_settings.txt" echo %MVSYNC%
+set "VK_LAYER_SETTINGS_PATH=%TEMP%\mv_layer_settings.txt"
+set "VK_LAYER_PATH=%LAYERDIR%;C:\VulkanSDK.4.357.0\Bin"
+set "VK_INSTANCE_LAYERS=VK_LAYER_mv;VK_LAYER_KHRONOS_validation"
+echo Validation: ON  -^> %TEMP%\mv_validation.txt
+:noval
+
 echo Layer:     %LAYERDIR%
 start "" /D "%XPROOT%" "%XPROOT%\X-Plane.exe"
 
