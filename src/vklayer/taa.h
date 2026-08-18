@@ -409,7 +409,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
         VkBufferCreateInfo bci;
         memset(&bci, 0, sizeof(bci));
         bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bci.size  = 512ull * 8ull;                 // 512 texels of RGBA16F
+        bci.size  = 2ull * 512ull * 8ull;          // history strip + scene strip
         bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         if (dd.createBuffer && dd.createBuffer(dev, &bci, nullptr, &g_taa.readBuf) == VK_SUCCESS) {
@@ -1159,6 +1159,43 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         dd.cmdCopyImageToBuffer(cb, g_taa.history[hw_],
                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 g_taa.readBuf, 1, &bic);
+        // ---- AND THE SAME STRIP OF THE SCENE TARGET, RIGHT AFTER THE COPY.
+        //
+        // History accumulates correctly (delta 6.3 at 98% history weight) while
+        // the composited image stays ~6x less stable than TAA off. Everything
+        // between those two facts is delivery, and this settles it in one run:
+        // if the scene strip matches the history strip, the copy landed and
+        // something downstream repaints; if it differs, the copy is not
+        // reaching the image the display reads from - which is what a
+        // double-buffered scene target would do.
+        //
+        // Into the second half of the same buffer, so one map serves both.
+        if (g_taa.sceneImage) {
+            VkImageMemoryBarrier sb = rb;
+            sb.image = g_taa.sceneImage;
+            sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            sb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            sb.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                  0, nullptr, 0, nullptr, 1, &sb);
+            VkBufferImageCopy sic = bic;
+            sic.bufferOffset = 2048ull * sizeof(uint16_t);
+            dd.cmdCopyImageToBuffer(cb, g_taa.sceneImage,
+                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    g_taa.readBuf, 1, &sic);
+            VkImageMemoryBarrier sbk = sb;
+            sbk.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            sbk.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            sbk.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            sbk.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                                  0, nullptr, 0, nullptr, 1, &sbk);
+        }
         VkImageMemoryBarrier rbk = rb;
         rbk.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         rbk.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;

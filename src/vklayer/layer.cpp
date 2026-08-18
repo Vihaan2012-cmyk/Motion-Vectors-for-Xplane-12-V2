@@ -7888,6 +7888,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                       differing ? sumAbs / (double)differing : 0.0,
                       (unsigned long long)nSame, (unsigned long long)nDiff);
         }
+        // ---- DID THE COPY ACTUALLY LAND? history strip vs scene strip, same
+        //      frame, same pixels.
+        //
+        // The copy-back writes history into the scene target, so immediately
+        // after it the two strips must be IDENTICAL. They are read from the two
+        // halves of one buffer, captured in the same command buffer, so there
+        // is no timing skew between them.
+        //
+        //   match  -> delivery works; the composited instability is something
+        //             downstream repainting over our output
+        //   differ -> the copy is not reaching the image the display reads
+        //             from, which is what a double-buffered scene target does
+        {
+            const uint16_t *scn = cur + nHalf;
+            uint64_t bad = 0;
+            double   sum = 0.0;
+            for (size_t i = 0; i < nHalf; ++i)
+                if (cur[i] != scn[i]) { ++bad; sum += fabs((double)cur[i] - (double)scn[i]); }
+            static uint64_t l2 = 0;
+            if ((l2++ % 300) == 0)
+                trace("TAA DELIVERY: history vs scene, SAME FRAME: %llu/%zu "
+                      "halves differ (mean |delta| %.1f). The copy-back writes "
+                      "history into the scene, so identical means it landed and "
+                      "the instability is downstream; differing means it is not "
+                      "reaching the image the display reads.",
+                      (unsigned long long)bad, nHalf,
+                      bad ? sum / (double)bad : 0.0);
+        }
         memcpy(prev, cur, nHalf * sizeof(uint16_t));
         havePrev = true;
     }
