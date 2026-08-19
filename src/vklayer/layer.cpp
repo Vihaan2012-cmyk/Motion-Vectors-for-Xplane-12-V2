@@ -5545,7 +5545,12 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // below is what the pass hook already reads to stop clearing -
                 // it was declared and read but never set, so the racy path was
                 // the only one that ever ran.
-                if (g_mv.image && tdd.cmdClearColorImage) {
+                // Live, because the two strategies win in different views: the
+                // post-resolve clear fixed the cockpit and emptied the external
+                // view, which means the resolve does not sit at the same point
+                // in the frame in both.
+                if (g_mv.image && tdd.cmdClearColorImage &&
+                    live::onoff("taa.clear_after_resolve", "TAA_CLEAR_AFTER_RESOLVE", false)) {
                     VkImageMemoryBarrier mb;
                     memset(&mb, 0, sizeof(mb));
                     mb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -5580,6 +5585,9 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                                           0, nullptr, 0, nullptr, 1, &mb);
                     g_mvClearedAtPresent.store(true);
+                } else if (g_mv.image) {
+                    // Hand the clear back to the render passes.
+                    g_mvClearedAtPresent.store(false);
                 }
                 ++resolvesThisPresent;
                 gateReach(9);

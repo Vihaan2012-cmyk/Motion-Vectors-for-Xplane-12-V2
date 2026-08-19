@@ -1050,7 +1050,22 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.sMulX = live::f("taa.smul_x", "TAA_SMUL_X",  0.5f);
     pcv.sMulY = live::f("taa.smul_y", "TAA_SMUL_Y", -0.5f);
     pcv.velMax = live::f("taa.vel_max", "TAA_VEL_MAX", 1.0f);
-    pcv.novecCov = live::f("taa.novec_cov", "TAA_NOVEC_COV", 0.5f);
+    // ---- THE UNWRITTEN-PIXEL REJECTION IS OFF BY DEFAULT.
+    //
+    // Its purpose is sound - sky and cloud pixels must not reproject - but no
+    // signal available here identifies them reliably. vel==0 is ambiguous the
+    // moment the camera moves by less than a pixel, coverage reads zero
+    // everywhere, and the sentinel marks whole passes that a racing clear
+    // erased. Every version of the test rejected most of the frame, and
+    // rejecting history IS the shake:
+    //     rejection on ....... 1.409
+    //     rejection off ...... 0.172
+    //     jitter off ......... 0.128
+    //     TAA off ............ 0.107
+    // Negative disables it. A real fix needs a per-pixel written flag the
+    // fragment patcher owns; until then, keeping history everywhere is the
+    // measurably better picture.
+    pcv.novecCov = live::f("taa.novec_cov", "TAA_NOVEC_COV", -1.0f);
     pcv.jitterY = jitterY;
     pcv.alpha = taaAlpha();
     pcv.mode = taaMode();
