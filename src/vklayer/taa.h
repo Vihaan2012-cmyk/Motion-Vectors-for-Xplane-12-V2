@@ -1070,7 +1070,16 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // fragment patcher owns; until then, keeping history everywhere is the
     // measurably better picture.
     pcv.novecCov = live::f("taa.novec_cov", "TAA_NOVEC_COV", -1.0f);
-    pcv.novecAlpha = live::f("taa.novec_alpha", "TAA_NOVEC_ALPHA", 0.5f);
+    // 0.5 was chosen to stop the ground crawling, but it also refuses to
+    // accumulate on every pixel the sentinel calls unwritten - which is most of
+    // an external frame - and that is shimmer and aliasing. Measured with the
+    // detection off entirely and this at the normal alpha:
+    //     TAA off ............. shimmer 0.737   jaggedness 48.8
+    //     detection ON ........ shimmer 1.986   jaggedness 25.6
+    //     detection OFF ....... shimmer 0.358   jaggedness 24.6
+    // TAA is then steadier than no TAA and halves the aliasing. The crawl is
+    // the price, and it is the lower priority of the two.
+    pcv.novecAlpha = live::f("taa.novec_alpha", "TAA_NOVEC_ALPHA", 0.05f);
     pcv.jitterY = jitterY;
     pcv.alpha = taaAlpha();
     pcv.mode = taaMode();
