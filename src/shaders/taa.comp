@@ -136,6 +136,7 @@ layout(push_constant) uniform Params {
     float sMulY;        // S.y = sMulY * jitter.y
     float velMax;       // largest believable |velocity| in UV
     float novecCov;     // coverage below this = unwritten; <0 disables
+    float novecAlpha;   // blend weight for pixels with no vector
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -559,7 +560,16 @@ void main()
         // the current frame whole rather than blending against nothing.
         bool bad = pc.reset != 0 ||
                    hUv.x < 0.0 || hUv.x > 1.0 || hUv.y < 0.0 || hUv.y > 1.0;
-        vec3 o = bad ? currA : mix(h, currA, pc.alpha);
+        // ---- A PIXEL WITH NO VECTOR CANNOT FOLLOW THE CAMERA.
+        //
+        // Keeping its history at the same texel is what makes the ground
+        // crawl: the world shifts under it by the camera's own micro-motion
+        // and the stale sample is dragged along. Throwing it away instead is
+        // the shake this build just removed. Decaying it is neither - the
+        // stale contribution is gone in a few frames, so the ground stops
+        // creeping, and nothing is refreshed hard enough to flicker.
+        float aEff = unwritten ? max(pc.alpha, pc.novecAlpha) : pc.alpha;
+        vec3 o = bad ? currA : mix(h, currA, aEff);
         imageStore(uHistory, ivec3(px, layer), vec4(max(o, vec3(0.0)), 1.0));
         return;
     }

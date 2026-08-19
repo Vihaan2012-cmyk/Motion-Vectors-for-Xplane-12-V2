@@ -176,6 +176,10 @@ struct TaaPush {
     // Coverage below this counts as "nobody wrote here". Negative disables the
     // unwritten-pixel rejection entirely, which is how its cost is measured.
     float   novecCov;
+    // Blend weight for a pixel that never received a vector. 1.0 is the old
+    // hard rejection (shake); pc.alpha is keeping it forever (crawl); between
+    // the two the stale history decays instead of being kept or thrown away.
+    float   novecAlpha;
 };
 
 enum {
@@ -1066,6 +1070,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // fragment patcher owns; until then, keeping history everywhere is the
     // measurably better picture.
     pcv.novecCov = live::f("taa.novec_cov", "TAA_NOVEC_COV", -1.0f);
+    pcv.novecAlpha = live::f("taa.novec_alpha", "TAA_NOVEC_ALPHA", 0.5f);
     pcv.jitterY = jitterY;
     pcv.alpha = taaAlpha();
     pcv.mode = taaMode();
