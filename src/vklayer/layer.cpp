@@ -3463,6 +3463,10 @@ static float g_appliedJitX = 0.0f, g_appliedJitY = 0.0f;
 // Reads the jitter out of THIS command buffer's pending-push slot - defined
 // below the slot machinery it needs, used above it by the resolve.
 static bool mvPendingJitter(VkCommandBuffer cb, float *jx, float *jy);
+// Velocity-target clear value meaning "no patched shader wrote this pixel".
+// RGBA16F maxes near 65504, so this saturates to -inf/-65504 and stays
+// unmistakable; the shader tests with a threshold, never equality.
+static const float kMvUnwritten = -60000.0f;
 static std::atomic<uint64_t> g_jitSlotHit(0);
 static std::atomic<uint64_t> g_jitSlotMiss(0);
 static std::atomic<uint64_t> g_jitZero(0);
@@ -3976,10 +3980,27 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
         mv.loadOp  = first ? VK_ATTACHMENT_LOAD_OP_CLEAR
                            : VK_ATTACHMENT_LOAD_OP_LOAD;
         mv.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        // Zero is "did not move" - the right value for anything nothing draws
-        // over, and for any pipeline whose fragment shader we could not patch.
-        mv.clearValue.color.float32[0] = 0.0f;
-        mv.clearValue.color.float32[1] = 0.0f;
+        // ---- A SENTINEL, NOT ZERO.
+        //
+        // Zero conflates two opposite facts: "nothing drew here" and "this
+        // surface is genuinely stationary". The resolve has to tell them apart -
+        // sky and clouds must decline history, stationary ground must keep it -
+        // and it was doing so with `cameraMoved && vel == 0`. That works only
+        // while a still camera reads as still. It does not: the matrix is float32
+        // and the airframe trembles on its gear with engines running, so
+        // cameraMoved is true, a stationary world writes exactly zero
+        // everywhere, and the ENTIRE FRAME is declared unwritten and loses its
+        // history. Measured: the rejection viz is solid red across the ground,
+        // alpha has no effect at any value, and disabling the test alone takes
+        // temporal deviation from 0.89 to 0.154.
+        //
+        // Clearing to a value no real vector can hold removes the ambiguity at
+        // the source. Screen-space motion is bounded by a couple of screens per
+        // frame; -1e9 is not reachable, survives RGBA16F (finite, ~-1e9 rounds
+        // to a large negative half-float... which is why the test below uses a
+        // threshold rather than equality), and needs no extra channel.
+        mv.clearValue.color.float32[0] = kMvUnwritten;
+        mv.clearValue.color.float32[1] = kMvUnwritten;
     }
 
     atts.push_back(mv);
@@ -5331,9 +5352,28 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // in place moves every pixel while translating zero. The
                 // reprojection matrix is the identity exactly when nothing
                 // moved, whatever the motion was made of.
+                // ---- 1e-6 CALLS A PARKED CAMERA "MOVING".
+                //
+                // The matrix is built in float32 from datarefs that are
+                // themselves float32, so its identity case carries noise around
+                // 1e-7..1e-5 - permanently above a 1e-6 threshold. cameraMoved
+                // therefore reads TRUE with the aircraft parked and the view
+                // still, and downstream that is not a cosmetic error: the
+                // unwritten-pixel test is `cameraMoved && vel == 0`, and a
+                // stationary world writes exactly zero everywhere, so the whole
+                // frame is declared unwritten and its history is discarded
+                // every frame. That is the missing accumulation, the missing
+                // antialiasing, and the shake.
+                //
+                // The threshold that matters is one PIXEL, not one epsilon. The
+                // reprojection maps NDC to NDC, so a term of e displaces a
+                // pixel by e * width / 2; at 3840 one pixel is 5.2e-4. A
+                // default of 1e-4 is a fifth of a pixel - far below anything
+                // visible, far above the float noise floor.
+                const float movedEps = live::f("taa.moved_eps", "TAA_MOVED_EPS", 1e-4f);
                 for (int mi = 0; mi < 16 && !tf.camera.moved; ++mi) {
                     const float ident = (mi % 5) == 0 ? 1.0f : 0.0f;
-                    if (fabsf(g_velSnap.reproj[mi] - ident) > 1e-6f)
+                    if (fabsf(g_velSnap.reproj[mi] - ident) > movedEps)
                         tf.camera.moved = true;
                 }
 
@@ -5486,6 +5526,61 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 }
                 g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
+
+                // ---- CLEAR THE VELOCITY TARGET HERE, NOT IN A RENDER PASS.
+                //
+                // The in-pass clear picks whichever scene pass is RECORDED
+                // first and makes it LOAD_OP_CLEAR. X-Plane records passes on
+                // several threads, so the pass that wins the flag is not
+                // necessarily the pass that EXECUTES first - and when it is
+                // not, its clear wipes velocities another pass already wrote.
+                // That is why the terrain reads as unwritten while trees and
+                // buildings, drawn after the clear, survive: the sentinel viz
+                // is red across the ground and yellow on exactly the geometry
+                // that happens to be drawn later.
+                //
+                // Clearing immediately after the resolve has consumed the
+                // target removes the ordering question entirely: there is one
+                // clear, at one point, and every pass then LOADs. The flag
+                // below is what the pass hook already reads to stop clearing -
+                // it was declared and read but never set, so the racy path was
+                // the only one that ever ran.
+                if (g_mv.image && tdd.cmdClearColorImage) {
+                    VkImageMemoryBarrier mb;
+                    memset(&mb, 0, sizeof(mb));
+                    mb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    mb.image = g_mv.image;
+                    mb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    mb.subresourceRange.levelCount = 1;
+                    mb.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+                    mb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    mb.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    mb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    tdd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                          0, nullptr, 0, nullptr, 1, &mb);
+
+                    VkClearColorValue cv;
+                    memset(&cv, 0, sizeof(cv));
+                    cv.float32[0] = kMvUnwritten;
+                    cv.float32[1] = kMvUnwritten;
+                    VkImageSubresourceRange rng = mb.subresourceRange;
+                    tdd.cmdClearColorImage(cb, g_mv.image,
+                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          &cv, 1, &rng);
+
+                    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    mb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    mb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    mb.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                    tdd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                                          0, nullptr, 0, nullptr, 1, &mb);
+                    g_mvClearedAtPresent.store(true);
+                }
                 ++resolvesThisPresent;
                 gateReach(9);
                 // Watched by noteSsrFeedbackCheck for the rest of the frame.
@@ -8104,7 +8199,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             //     the file on disk had moved on by the time it was read.
             trace("SUITE TUNING: enable=%d mode=%d alpha=%.3f gain=%.2f "
                   "varclip=%.2f jitterScale=%.2f nearfield=%.2f unjitter=%d "
-                  "reactive=%d velScale=%.2f velYSign=%.1f maxResolves=%d",
+                  "reactive=%d velScale=%.2f velYSign=%.1f maxResolves=%d | "
+                  "smulX=%.3f smulY=%.3f velMax=%.6f",
                   taaEnabled() ? 1 : 0,
                   live::i("taa.mode", "TAA_MODE", 2),
                   (double)live::f("taa.alpha", "TAA_ALPHA", 0.15f),
@@ -8116,7 +8212,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                   live::onoff("taa.reactive", nullptr, true) ? 1 : 0,
                   (double)live::f("taa.vel_scale", nullptr, 1.0f),
                   (double)live::f("taa.vel_ypos", nullptr, 0.0f),
-                  live::i("taa.max_resolves", "TAA_MAX_RESOLVES", 1));
+                  live::i("taa.max_resolves", "TAA_MAX_RESOLVES", 1),
+                  (double)live::f("taa.smul_x", "TAA_SMUL_X", 0.5f),
+                  (double)live::f("taa.smul_y", "TAA_SMUL_Y", -0.5f),
+                  (double)live::f("taa.vel_max", "TAA_VEL_MAX", 1.0f));
         }
     }
     return pr;
@@ -9850,9 +9949,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // behaviour behind the intermittent DEVICE_LOST at flight load
             // and view changes. Extend the formats, skip the shader patch;
             // the unpatched path below already sets colorWriteMask 0.
+            // ---- "NO VERTEX ATTRIBUTES" IS NOT "FULL-SCREEN QUAD".
+            //
+            // It was, once. X-Plane 12 draws its TERRAIN by pulling vertices
+            // from storage buffers, so the terrain pipelines declare no vertex
+            // attributes either - and were therefore classified as post-process
+            // quads and left unpatched. The ground then writes no velocity at
+            // all, which the sentinel makes visible: the rejection viz is red
+            // across the runway and grass and yellow on the trees and buildings,
+            // because those are ordinary attribute meshes and did get patched.
+            //
+            // Depth separates them. A full-screen pass neither tests nor writes
+            // depth - it covers the frame unconditionally - while any pipeline
+            // drawing world geometry does at least one of the two.
+            const VkPipelineDepthStencilStateCreateInfo *dss = ci[i].pDepthStencilState;
+            const bool touchesDepth = dss && (dss->depthTestEnable == VK_TRUE ||
+                                              dss->depthWriteEnable == VK_TRUE);
+            const bool quadRuleDepthAware =
+                live::onoff("taa.quad_needs_depth", "TAA_QUAD_NEEDS_DEPTH", true);
             bool noPatch = false;
-            if (!ci[i].pVertexInputState ||
-                ci[i].pVertexInputState->vertexAttributeDescriptionCount == 0) {
+            if ((!ci[i].pVertexInputState ||
+                 ci[i].pVertexInputState->vertexAttributeDescriptionCount == 0)
+                && !(quadRuleDepthAware && touchesDepth)) {
                 static uint64_t nFullScreen = 0;
                 if (++nFullScreen % 500 == 1)
                     trace("MV: %llu full-screen pipeline(s) - formats extended, "

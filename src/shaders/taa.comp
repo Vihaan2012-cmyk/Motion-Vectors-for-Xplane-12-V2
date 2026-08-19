@@ -134,13 +134,17 @@ layout(push_constant) uniform Params {
     int   flagsValid;
     float sMulX;        // S.x = sMulX * jitter.x
     float sMulY;        // S.y = sMulY * jitter.y
+    float velMax;       // largest believable |velocity| in UV
+    float novecCov;     // coverage below this = unwritten; <0 disables
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
 const int FLAG_NO_MOTION      = 2;
 const int FLAG_NO_ACCUM       = 4;
 const int FLAG_REACTIVE       = 8;   // consume the coverage mask in .a
-const int FLAG_NO_UNJITTER    = 16;  // sample the raster raw - isolation only
+const int FLAG_NO_UNJITTER    = 16;
+const int FLAG_NOVEC_BY_VEL   = 64;  // legacy: pick unwritten pixels by
+                                     // vel==0 instead of by coverage  // sample the raster raw - isolation only
 
 const int VIZ_OFF       = 0;
 const int VIZ_MOTION    = 1;   // direction as colour
@@ -305,7 +309,12 @@ void main()
     // d(uv_y) = -vel_y while d(uv_x) = +vel_x. The same sign that took the
     // field's own diagnostic from 4.8 px to 0.0015 px applies here.
     vec4 velS = texture(uVelocity, vec3(uv + S, float(layer)));
-    vec2 vel  = velS.xy * pc.velScale;
+    // The target is cleared to a sentinel, so "nobody wrote here" is a fact
+    // rather than an inference from a zero vector. Bilinear filtering can blend
+    // a sentinel texel with a real one, so the test is a threshold well below
+    // any reachable velocity and well above the sentinel.
+    bool unwritten = velS.x < -1000.0 || velS.y < -1000.0;
+    vec2 vel  = unwritten ? vec2(0.0) : velS.xy * pc.velScale;
     // ---- THE COVERAGE MASK (C13 -> C14).
     //
     // The velocity target is RGBA16F and its alpha carries the transparency
@@ -365,7 +374,7 @@ void main()
     // Written as a NEGATED in-range test so NaN fails it: NaN < 1.0 is false,
     // so !(false) is true and the vector is discarded. One texel of motion is
     // already far more than any real frame produces at this resolution.
-    if (!(abs(vel.x) < 1.0) || !(abs(vel.y) < 1.0)) vel = vec2(0.0);
+    if (!(abs(vel.x) < pc.velMax) || !(abs(vel.y) < pc.velMax)) vel = vec2(0.0);
     if ((pc.flags & FLAG_NO_MOTION) != 0) vel = vec2(0.0);
     vec2 hUv  = uv + vec2(vel.x, pc.velYSign * vel.y);
 
@@ -430,8 +439,32 @@ void main()
     // pixel. That is precisely the set we cannot reproject - sky, clouds, and
     // any draw whose shader we failed to patch, which is the right set for all
     // three reasons.
-    bool noVector = pc.cameraMoved != 0 && vel == vec2(0.0)
-                 && (pc.flags & FLAG_NO_MOTION) == 0;
+    // ---- "EXACTLY ZERO" IS NOT THE SAME AS "NOBODY WROTE HERE".
+    //
+    // The reasoning above is right about WHICH pixels must be declined - sky,
+    // clouds, unpatched draws - but the test picks them by vel == 0, and that
+    // is only diagnostic while the camera is MOVING. It reads cameraMoved to
+    // establish that, and cameraMoved is set by comparing the reprojection
+    // matrix against identity at 1e-6: a still camera with a hair of numerical
+    // noise reads as moving. Every correctly-written pixel of a stationary
+    // world then holds exactly zero - the true answer - and the test calls the
+    // WHOLE FRAME unwritten and throws its history away.
+    //
+    // MEASURED: that is the missing accumulation. Zeroing the velocity through
+    // this test gives 0.733; zeroing it through FLAG_NO_MOTION, which skips the
+    // test, gives 0.079 - a tenfold difference between two paths that produce
+    // an identical vector. No alpha, clamp or jitter change can reach it,
+    // which is why alpha never bit and why nothing antialiased.
+    //
+    // Coverage answers the actual question. The fragment patcher writes 1 into
+    // alpha where opaque geometry owns the pixel and 0 where nothing drew, so
+    // it separates "unwritten" from "written, and stationary" - which a zero
+    // vector cannot do.
+    bool noVector = (pc.flags & FLAG_NOVEC_BY_VEL) != 0
+                  ? (pc.cameraMoved != 0 && vel == vec2(0.0)
+                     && (pc.flags & FLAG_NO_MOTION) == 0)
+                  : (pc.novecCov >= 0.0 && unwritten
+                     && (pc.flags & FLAG_NO_MOTION) == 0);
 
     // ---- WHICH PIXELS WERE REJECTED, AND WHY.
     //

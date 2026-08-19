@@ -169,6 +169,13 @@ struct TaaPush {
     // displacement instead of removing it.
     float   sMulX;
     float   sMulY;
+    // Largest |velocity|, in UV, that is believed. Live so the magnitude of
+    // whatever is poisoning history can be found by bisection rather than
+    // guessed: accumulation returns at whatever threshold excludes it.
+    float   velMax;
+    // Coverage below this counts as "nobody wrote here". Negative disables the
+    // unwritten-pixel rejection entirely, which is how its cost is measured.
+    float   novecCov;
 };
 
 enum {
@@ -177,6 +184,7 @@ enum {
     kTaaFlagNoAccum       = 1 << 2,
     kTaaFlagReactive      = 1 << 3,
     kTaaFlagNoUnjitter    = 1 << 4,
+    kTaaFlagNoVecByVel    = 1 << 6,
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -998,7 +1006,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     ii[0].sampler   = g_taa.sampler;
     ii[1].imageView = g_taa.historyView[hw_]; ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[2].imageView = g_taa.velView;     ii[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ii[2].sampler   = g_taa.sampler;
+    // NEAREST. A velocity field is piecewise per surface, and now it also
+    // carries a large negative sentinel in unwritten pixels - bilinear would
+    // blend that sentinel into neighbouring real vectors and mark them
+    // unwritten too, eating history in a halo around every sky edge.
+    ii[2].sampler   = g_taa.samplerNearest;
     ii[3].imageView = g_taa.historyView[hr_]; ii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[3].sampler   = g_taa.sampler;
     // Binding 4: X-Plane's gbuffer_vel when identified, our zero fallback
@@ -1037,6 +1049,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.jitterX = jitterX;
     pcv.sMulX = live::f("taa.smul_x", "TAA_SMUL_X",  0.5f);
     pcv.sMulY = live::f("taa.smul_y", "TAA_SMUL_Y", -0.5f);
+    pcv.velMax = live::f("taa.vel_max", "TAA_VEL_MAX", 1.0f);
+    pcv.novecCov = live::f("taa.novec_cov", "TAA_NOVEC_COV", 0.5f);
     pcv.jitterY = jitterY;
     pcv.alpha = taaAlpha();
     pcv.mode = taaMode();
@@ -1050,7 +1064,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
                  | (taaReactive()      ? kTaaFlagReactive      : 0)
-                 | (taaUnjitter()      ? 0 : kTaaFlagNoUnjitter);
+                 | (taaUnjitter()      ? 0 : kTaaFlagNoUnjitter)
+                 | (live::onoff("taa.novec_by_vel", nullptr, false)
+                        ? kTaaFlagNoVecByVel : 0);
     pcv.velScale = taaVelScale();
     pcv.velYSign = taaVelYSign();
     pcv.flagsValid = (g_taa.flagsValid && taaObjFlags()) ? 1 : 0;
