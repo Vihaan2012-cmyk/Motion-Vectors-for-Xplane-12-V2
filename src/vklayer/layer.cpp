@@ -454,6 +454,71 @@ static std::atomic<bool> g_mvClearedAtPresent(false);
 // original words are stored - and ahead of vkCreateGraphicsPipelines, which is
 // where they are finally patched.
 static std::map<VkShaderModule, std::vector<uint32_t> > g_moduleCode;
+
+// ---- DOES THIS VERTEX SHADER PULL ITS VERTICES FROM MEMORY?
+//
+// "No vertex attributes" collapses two opposite things into one test, and
+// both halves of this project's terrain work have now been wrong because of
+// it. X-Plane 12 pulls TERRAIN vertices from storage buffers, so terrain
+// declares no attributes; a post-process full-screen triangle builds its
+// position from gl_VertexIndex and also declares none.
+//
+// Depth was tried as the separator and is not sufficient. X-Plane sets depth
+// state dynamically, so create-info depth reads false for terrain; widening
+// the rule to "declares depth dynamic state AND draws into a depth pass"
+// rescued terrain and swept in the post-process quads with it. Measured, at
+// viz=2 during a pan: the whole frame saturates - 100% of pixels nonzero,
+// ~100% at the top of the magnitude ramp - because a full-screen triangle
+// covers every pixel and reprojecting a screen corner is meaningless. With
+// the strict rule the same scene measures 0.0% saturated. That is the
+// "translucent boxes" failure this file already warned the loose rule would
+// cause, and it is what a full-screen stamp looks like from the outside.
+//
+// The honest separator is the mechanism itself. Pulling vertices means
+// READING A BUFFER: an SSBO in StorageBuffer storage, or the pre-1.3 spelling,
+// a Uniform-storage struct decorated BufferBlock. A full-screen triangle reads
+// no buffer at all to place itself - that is the whole point of the trick.
+//
+// Note this is deliberately a property of the SHADER, not of the pass, the
+// draw or the pipeline state. Passes and dynamic state are X-Plane's to change
+// between versions; "does the vertex stage read a storage buffer" is a fact
+// about the module and survives a recompile.
+enum { kSC_Uniform = 2, kSC_StorageBuffer = 12 };
+enum { kDeco_BufferBlock = 3 };
+
+static bool spirvPullsVertices(const std::vector<uint32_t> &w)
+{
+    if (w.size() < 5 || w[0] != 0x07230203u) return false;
+    std::set<uint32_t> bufferBlockTypes;
+    // Pass 1: type ids decorated BufferBlock (the Uniform-storage SSBO spelling).
+    for (size_t k = 5; k < w.size(); ) {
+        const uint32_t op = w[k] & 0xFFFFu, len = w[k] >> 16;
+        if (len == 0 || k + len > w.size()) break;
+        if (op == 71 /* OpDecorate */ && len >= 3 && w[k+2] == kDeco_BufferBlock)
+            bufferBlockTypes.insert(w[k+1]);
+        k += len;
+    }
+    // Pass 2: any OpVariable in StorageBuffer storage, or in Uniform storage
+    // whose pointee type was decorated BufferBlock.
+    std::map<uint32_t, uint32_t> ptrPointee;   // pointer type id -> pointee id
+    for (size_t k = 5; k < w.size(); ) {
+        const uint32_t op = w[k] & 0xFFFFu, len = w[k] >> 16;
+        if (len == 0 || k + len > w.size()) break;
+        if (op == 32 /* OpTypePointer */ && len >= 4)
+            ptrPointee[w[k+1]] = w[k+3];
+        else if (op == 59 /* OpVariable */ && len >= 4) {
+            const uint32_t sc = w[k+3];
+            if (sc == kSC_StorageBuffer) return true;
+            if (sc == kSC_Uniform) {
+                std::map<uint32_t, uint32_t>::iterator it = ptrPointee.find(w[k+1]);
+                if (it != ptrPointee.end() && bufferBlockTypes.count(it->second))
+                    return true;
+            }
+        }
+        k += len;
+    }
+    return false;
+}
 // The second half of the key packs the attachment index and the quantised
 typedef std::pair<VkShaderModule, uint32_t> FragKey;
 static std::map<FragKey, VkShaderModule> g_fragVariant;
@@ -10065,15 +10130,57 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 || (dynamicDepth && intoDepth);
             const bool quadRuleDepthAware =
                 live::onoff("taa.quad_needs_depth", "TAA_QUAD_NEEDS_DEPTH", true);
+
+            // Depth alone is too loose - it rescued the post-process quads and
+            // they stamped the frame. Require the vertex stage to actually PULL
+            // its vertices from a buffer as well; see spirvPullsVertices.
+            //   taa.quad_needs_pull = 1  require the buffer read too (default)
+            //                         0  depth alone (the loose rule; stamps)
+            const bool quadRulePull =
+                live::onoff("taa.quad_needs_pull", "TAA_QUAD_NEEDS_PULL", true);
+            bool pullsVertices = false;
+            if (quadRulePull) {
+                for (uint32_t st = 0; st < ci[i].stageCount; ++st) {
+                    if (!(ci[i].pStages[st].stage & VK_SHADER_STAGE_VERTEX_BIT))
+                        continue;
+                    std::map<VkShaderModule, std::vector<uint32_t> >::iterator mit =
+                        g_moduleCode.find(ci[i].pStages[st].module);
+                    if (mit != g_moduleCode.end())
+                        pullsVertices = spirvPullsVertices(mit->second);
+                    break;
+                }
+            }
+            const bool rescued = quadRuleDepthAware && touchesDepth &&
+                                 (!quadRulePull || pullsVertices);
+
+            if (rescued && (!ci[i].pVertexInputState ||
+                 ci[i].pVertexInputState->vertexAttributeDescriptionCount == 0)) {
+                static uint64_t nPulled = 0;
+                if (++nPulled % 200 == 1)
+                    trace("MV: %llu vertex-PULLED pipeline(s) rescued - zero "
+                          "attributes but the vertex stage reads a storage "
+                          "buffer, which is the terrain", 
+                          (unsigned long long)nPulled);
+            }
             bool noPatch = false;
             if ((!ci[i].pVertexInputState ||
                  ci[i].pVertexInputState->vertexAttributeDescriptionCount == 0)
-                && !(quadRuleDepthAware && touchesDepth)) {
-                static uint64_t nFullScreen = 0;
+                && !rescued) {
+                static uint64_t nFullScreen = 0, nStamps = 0;
+                // Pipelines the LOOSE rule would have rescued and this one
+                // declines: zero attributes, touches depth, but reads no
+                // buffer to place itself. Those are the frame-stamping
+                // post-process quads, and their count is the whole difference
+                // between a saturated field and a correct one.
+                if (quadRuleDepthAware && touchesDepth && !pullsVertices)
+                    ++nStamps;
                 if (++nFullScreen % 500 == 1)
                     trace("MV: %llu full-screen pipeline(s) - formats extended, "
-                          "shaders left alone, write mask 0",
-                          (unsigned long long)nFullScreen);
+                          "shaders left alone, write mask 0 (%llu of them would "
+                          "have been rescued by depth alone and would stamp the "
+                          "frame)",
+                          (unsigned long long)nFullScreen,
+                          (unsigned long long)nStamps);
                 noPatch = true;
             }
 
