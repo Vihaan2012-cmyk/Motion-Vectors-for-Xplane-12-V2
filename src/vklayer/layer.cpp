@@ -3871,15 +3871,69 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
     // does not renumber. Latch the colour count of the first pass bound at
     // this target size and refuse a differently-shaped pass - one frame
     // unbound self-corrects; a wrong bind poisons the whole field.
-    if (isScene) {
-        const uint32_t cc = info->colorAttachmentCount;
-        if (g_mvStickyColour == 0 || g_mvStickyW != g_mv.w) {
-            g_mvStickyColour = cc;
-            g_mvStickyW      = g_mv.w;
-            trace("MV STICKY: latched pass shape colour=%u at %ux%u", cc,
-                  g_mv.w, g_mv.h);
-        } else if (cc != g_mvStickyColour) {
-            isScene = false;
+    // ---- THE LATCH WAS LOCKING OUT THE G-BUFFER, WHICH IS THE TERRAIN.
+    //
+    // X-Plane 12 is a DEFERRED renderer. The opaque world - terrain first of
+    // all - is drawn into a five-attachment G-buffer, and only the lighting
+    // result lands in a single-colour target. Both are 3840x2160 with depth, so
+    // both satisfy isScene; the pass census recorded them as
+    //
+    //     [17] 3840x2160  depth=yes  color=5     <- G-buffer, the terrain
+    //     [20] 3840x2160  depth=yes  color=3
+    //     [16/19/21..] 3840x2160  depth=yes  color=1
+    //
+    // The latch below took the colour count of whichever qualifying pass
+    // arrived FIRST and refused every differently-shaped pass afterwards. It
+    // latched 1. From then on the G-buffer could never bind the velocity
+    // target, so the terrain draws had no velocity attachment to write into -
+    // and it did not matter in the slightest that they were being patched.
+    //
+    // That is the whole of the black ground. viz=8 showed the written map black
+    // across the entire terrain while 14872 pipelines reported "both" stages
+    // patched, which reads as a contradiction only until you notice that a
+    // patched shader writing to an attachment that is not bound writes nowhere.
+    // Pipeline counts are not draw counts: the 122 pipelines still declined
+    // by design can be, and were, the whole ground.
+    //
+    // The alternation the latch was written to stop came from the ORDINAL
+    // filter - g_mvPassOrdinal renumbers when the frame's pass list shifts, so
+    // a pinned ordinal points at the G-buffer one frame and the lit pass the
+    // next, and the clear and the writes land on different passes. That is a
+    // real failure, but it only exists while an ordinal is pinned. With
+    // taa.mv_pass = -1 every qualifying pass binds, the first one of the frame
+    // clears and the rest LOAD, and passes accumulate instead of fighting.
+    //
+    // So the latch is now scoped to the case it was built for.
+    //   taa.sticky_colour = -1  AUTO: latch only while an ordinal is pinned
+    //                        0  never latch - every qualifying pass may bind
+    //                        1  always latch (the old behaviour)
+    {
+        const int stickyMode = live::i("taa.sticky_colour",
+                                       "TAA_STICKY_COLOUR", -1);
+        const bool stickyOn = (stickyMode > 0) ||
+                              (stickyMode < 0 && onlyPass >= 0);
+        if (isScene && stickyOn) {
+            const uint32_t cc = info->colorAttachmentCount;
+            if (g_mvStickyColour == 0 || g_mvStickyW != g_mv.w) {
+                g_mvStickyColour = cc;
+                g_mvStickyW      = g_mv.w;
+                trace("MV STICKY: latched pass shape colour=%u at %ux%u", cc,
+                      g_mv.w, g_mv.h);
+            } else if (cc != g_mvStickyColour) {
+                // Never silent again. A pass refused here writes no velocity
+                // for everything drawn in it, and the only symptom downstream
+                // is an empty region of the field that looks exactly like a
+                // shader that failed to patch.
+                static std::set<uint32_t> refused;
+                std::lock_guard<std::mutex> g(g_lock);
+                if (!refused.count(cc)) {
+                    refused.insert(cc);
+                    trace("MV STICKY: REFUSING pass colour=%u (latched %u) - "
+                          "every draw in it writes no velocity", cc,
+                          g_mvStickyColour);
+                }
+                isScene = false;
+            }
         }
     }
 
@@ -9971,8 +10025,44 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // depth - it covers the frame unconditionally - while any pipeline
             // drawing world geometry does at least one of the two.
             const VkPipelineDepthStencilStateCreateInfo *dss = ci[i].pDepthStencilState;
-            const bool touchesDepth = dss && (dss->depthTestEnable == VK_TRUE ||
-                                              dss->depthWriteEnable == VK_TRUE);
+
+            // ---- X-PLANE SETS DEPTH STATE DYNAMICALLY, SO THE CREATE INFO
+            //      SAYS NOTHING.
+            //
+            // The rule above is right and its test was not. Reading
+            // depthTestEnable out of pDepthStencilState answers "was depth
+            // baked on at pipeline creation", not "does this pipeline use
+            // depth" - and X-Plane sets depth test, depth write and the
+            // compare op through DYNAMIC STATE, so the create info reads
+            // VK_FALSE for terrain and terrain stayed indistinguishable from a
+            // post-process quad. Measured with viz=8: the written map is BLACK
+            // across the entire ground, white only on the wings, which are
+            // ordinary attribute meshes that were patched.
+            //
+            // A pipeline that declares any of the depth dynamic states intends
+            // to use depth. On its own that is too loose - it would sweep in
+            // genuine post-process passes and stamp a screen-space vector
+            // across them - so it must ALSO be drawing into a pass that
+            // actually has a depth attachment. Both together is the terrain
+            // signature and nothing else's.
+            bool dynamicDepth = false;
+            if (ci[i].pDynamicState) {
+                for (uint32_t d = 0; d < ci[i].pDynamicState->dynamicStateCount; ++d) {
+                    const VkDynamicState ds = ci[i].pDynamicState->pDynamicStates[d];
+                    if (ds == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE ||
+                        ds == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE ||
+                        ds == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP) {
+                        dynamicDepth = true;
+                        break;
+                    }
+                }
+            }
+            const bool intoDepth =
+                src && src->depthAttachmentFormat != VK_FORMAT_UNDEFINED;
+            const bool touchesDepth =
+                (dss && (dss->depthTestEnable == VK_TRUE ||
+                         dss->depthWriteEnable == VK_TRUE))
+                || (dynamicDepth && intoDepth);
             const bool quadRuleDepthAware =
                 live::onoff("taa.quad_needs_depth", "TAA_QUAD_NEEDS_DEPTH", true);
             bool noPatch = false;
@@ -10847,9 +10937,33 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         if (g_velSnap.bodyReprojValid)
             taaMul(bodyView, g_velSnap.bodyReproj, K);
         else
-            // No valid body frame: fall back to the world matrix, which is the
-            // old behaviour for that case rather than a new failure mode.
-            memcpy(bodyView, block, 64);
+        {
+            // ---- IDENTITY, NOT THE WORLD MATRIX. THIS IS THE COCKPIT SHAKE.
+            //
+            // "Fall back to the world matrix" sounds conservative and is the
+            // bug. The near-field select exists to give cockpit geometry -
+            // which is rigidly attached to the camera and therefore does NOT
+            // move on screen - a reprojection that says "stationary". Filling
+            // the body slot with the WORLD matrix makes the select a no-op:
+            // both branches carry world motion, so the panel and yoke are told
+            // they moved by the full camera delta, the resolve drags history
+            // across them, and the cockpit shakes.
+            //
+            // bodyReprojValid is 0 for a long time by design - the plugin needs
+            // 120 frames of the aircraft ROTATING before it will vouch for a
+            // body frame - so this fallback is not a rare edge case. It is the
+            // normal state for most of a session, which is why the shake read
+            // as constant rather than intermittent.
+            //
+            // Identity is the correct answer: no valid body frame means the
+            // best available statement about near-field geometry is that it did
+            // not move relative to the camera, which is exactly what identity
+            // pushes. It is also what the world matrix degenerates to when the
+            // camera is still, so this changes nothing in the case the old code
+            // was right about, and fixes every case it was wrong about.
+            memset(bodyView, 0, sizeof(bodyView));
+            bodyView[0] = bodyView[5] = bodyView[10] = bodyView[15] = 1.0f;
+        }
         memcpy(block + 20, bodyView, 64);
     }
     // Recorded for the diagnostic. block[18] is the near-field threshold the
@@ -11050,9 +11164,57 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // failure mode of a wrong provisional arming is zeroed velocity on
     // geometry within two metres of the eye in a cockpit view - which is the
     // panel, whose correct velocity in that view IS zero.
-    if ((g_velSnap.bodyReprojValid || g_velSnap.viewType == 1018) &&
-        g_nearFieldM > 0.0f)
+    // ---- 1018 IS NOT THE 3-D COCKPIT. 1026 IS.
+    //
+    // The provisional arming above was written against the wrong constant, and
+    // this same file contradicts it eleven lines of code earlier: the MV PUSHED
+    // diagnostic treats viewType 1026 as the normal, non-failing view, because
+    // 1026 is where the sim actually sits in a cockpit. X-Plane's view_type
+    // numbering is
+    //
+    //     1000  forward with 2-D panel      1018  forward with HUD
+    //     1017  forward with nothing        1026  3-D COCKPIT
+    //
+    // so arming on 1018 alone armed the select in a view nobody flies in, and
+    // left block[18] at zero in the one view the select exists for. The
+    // threshold being zero means no vertex ever passes `w < block[18]`, so the
+    // body matrix is never selected no matter what it contains - which is why
+    // restoring the identity fallback changed nothing on its own. Two separate
+    // faults were sitting in series on the same feature.
+    //
+    // All four of those views are mounted on the airframe: the camera rides the
+    // aeroplane by construction, which is the premise the body calibration
+    // exists to verify for exotic cameras. The external views - 1003 tower,
+    // 1004 ride-along, 1005 track, 1006 free, 1007 chase - are not, and must
+    // keep waiting for the calibrated path.
+    //
+    //   taa.nearfield_view = -1  AUTO: any airframe-mounted view (default)
+    //                         0  never arm provisionally (calibration only)
+    //                     >1000  arm only in exactly this view id
+    const int nfView = live::i("taa.nearfield_view", "TAA_NEARFIELD_VIEW", -1);
+    const int vt     = g_velSnap.viewType;
+    const bool ridesAirframe = (vt == 1000 || vt == 1017 ||
+                                vt == 1018 || vt == 1026);
+    const bool provisional = (nfView < 0)      ? ridesAirframe
+                           : (nfView == 0)     ? false
+                                               : (vt == nfView);
+    if ((g_velSnap.bodyReprojValid || provisional) && g_nearFieldM > 0.0f)
         block[18] = g_nearFieldM;
+
+    // Never silent again. The select being disarmed is invisible from every
+    // downstream measurement - the field simply carries world motion on the
+    // panel, which looks like a correct field of a moving world.
+    {
+        static int lastVt = -1;
+        static float lastThr = -1.0f;
+        if (vt != lastVt || block[18] != lastThr) {
+            lastVt = vt; lastThr = block[18];
+            trace("NEAR FIELD SELECT: view=%d bodyValid=%d -> threshold %.2f m "
+                  "(0 means DISARMED: every vertex takes the world matrix and "
+                  "cockpit geometry is told it moved with the camera)",
+                  vt, (int)g_velSnap.bodyReprojValid, block[18]);
+        }
+    }
     g_diagLastBlock18 = block[18];
 
 

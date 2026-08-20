@@ -154,6 +154,14 @@ const int VIZ_INVALID   = 3;   // which pixels were rejected, and why
 const int VIZ_HISTORY   = 4;   // the history buffer itself
 const int VIZ_WEIGHT    = 5;   // the blend weight actually used
 const int VIZ_CLAMP     = 6;   // how far the clamp moved history, in sigma
+const int VIZ_WRITTEN   = 8;   // did ANY shader write velocity here - WHITE
+                               // yes, BLACK no. Ungated by every other
+                               // setting, deliberately: VIZ_MOTION zeroes the
+                               // unwritten sentinel, so "nothing wrote here"
+                               // and "the vector is zero" draw identically and
+                               // a uniform-zero field is consistent with BOTH.
+                               // This is the only view that separates them, and
+                               // it is what showed the ground was black.
 
 // A perceptually ordered ramp for the scalar views: black -> blue -> green ->
 // yellow -> red. Ordered so that "more" always reads as "hotter" without a
@@ -393,6 +401,14 @@ void main()
         vec2 px2 = vec2(vel.x, pc.velYSign * vel.y) * vec2(size);
         vec3 c = vec3(0.5) + vec3(px2.x, px2.y, 0.0) * 0.02 * pc.vizScale;
         imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
+        return;
+    }
+    if (pc.viz == VIZ_WRITTEN) {
+        // Keyed straight on the clear sentinel, so it reports the raw state of
+        // the velocity target and nothing downstream of it.
+        imageStore(uHistory, ivec3(px, layer),
+                   unwritten ? vec4(0.0, 0.0, 0.0, 1.0)
+                             : vec4(1.0, 1.0, 1.0, 1.0));
         return;
     }
     if (pc.viz == VIZ_MAGNITUDE) {

@@ -73,6 +73,11 @@ rem compare the vectors against the pixel displacement that motion must
 rem produce. This is what turns "does it look right" into a number, and it is
 rem the only way to measure without someone flying.
 rem TAA is now switched from the panel; this only forces it on for debugging.
+rem Velocity pass armed HERE, in the launcher, because passing it via
+rem the environment failed silently twice and a backup restore wipes
+rem this file - both times the layer came up inert while every
+rem measurement looked like a real reading of an empty field.
+set "TAA_VELOCITY=1"
 set "TAA_RESOLVE=1"
 set "TAA_MODE=2"
 rem set "TAA_SHOT_SECONDS=12"   (TAA off - re-enable to resume at mode 1)
