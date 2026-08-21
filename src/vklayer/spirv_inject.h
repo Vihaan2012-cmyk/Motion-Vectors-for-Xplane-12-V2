@@ -81,6 +81,7 @@ enum {
     // the cheapest available check that this block is numbered right.
     OpTypeArray = 28, OpTypeRuntimeArray = 29,
     OpConvertFToS = 110, OpIAdd = 128, OpIMul = 132,
+    OpFOrdNotEqual = 182,
     OpLogicalOr = 166, OpLogicalAnd = 167, OpLogicalNot = 168,
     OpINotEqual = 171, OpSGreaterThanEqual = 175, OpSLessThan = 177,
     OpReturn = 253
@@ -805,6 +806,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     uint32_t idDSVar = 0, idPtrDSInt = 0, idPtrDSMat4 = 0, idPtrDSV4 = 0;
     uint32_t idPtrDSIV4 = 0, idConstDataN = 0, idConstDiscard = 0;
     uint32_t idConst2DS = 0, idConst3DS = 0, idConstZeroF = 0;
+    uint32_t idConst4DS = 0, idConst5DS = 0;
     if (wantDestruct) {
         idIV4          = bound++;
         idArrData      = bound++;
@@ -819,6 +821,8 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         idConstDiscard = bound++;
         idConst2DS     = bound++;
         idConst3DS     = bound++;
+        idConst4DS     = bound++;
+        idConst5DS     = bound++;
         idConstZeroF   = bound++;
     }
 
@@ -882,12 +886,19 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         // cannot disagree about where anything lives.
         annos.push_back(head(OpDecorate, 4)); annos.push_back(idArrData); annos.push_back(Deco_ArrayStride); annos.push_back(4);
         annos.push_back(head(OpDecorate, 3)); annos.push_back(idStructDS); annos.push_back(Deco_Block);
-        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(0); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffAircraftInv);
-        annos.push_back(head(OpMemberDecorate, 4)); annos.push_back(idStructDS); annos.push_back(0); annos.push_back(Deco_ColMajor);
-        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(0); annos.push_back(Deco_MatrixStride); annos.push_back(16);
-        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(1); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffGridMinCell);
-        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(2); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffGridDim);
-        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(3); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffOccupancy);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(destruct::kMemAircraftInv); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffAircraftInv);
+        annos.push_back(head(OpMemberDecorate, 4)); annos.push_back(idStructDS); annos.push_back(destruct::kMemAircraftInv); annos.push_back(Deco_ColMajor);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(destruct::kMemAircraftInv); annos.push_back(Deco_MatrixStride); annos.push_back(16);
+        // The forward matrix needs the SAME three decorations. A matrix member
+        // without ColMajor and MatrixStride is not a validation error at
+        // declaration - it is a layout disagreement discovered as wrong numbers.
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(destruct::kMemAircraftFwd); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffAircraftFwd);
+        annos.push_back(head(OpMemberDecorate, 4)); annos.push_back(idStructDS); annos.push_back(destruct::kMemAircraftFwd); annos.push_back(Deco_ColMajor);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(destruct::kMemAircraftFwd); annos.push_back(Deco_MatrixStride); annos.push_back(16);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(destruct::kMemGridMinCell); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffGridMinCell);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(destruct::kMemGridDim);     annos.push_back(Deco_Offset); annos.push_back(destruct::kOffGridDim);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(destruct::kMemTestOffset);  annos.push_back(Deco_Offset); annos.push_back(destruct::kOffTestOffset);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(destruct::kMemData);        annos.push_back(Deco_Offset); annos.push_back(destruct::kOffOccupancy);
         annos.push_back(head(OpDecorate, 4)); annos.push_back(idDSVar); annos.push_back(Deco_DescriptorSet); annos.push_back((uint32_t)destructSet);
         annos.push_back(head(OpDecorate, 4)); annos.push_back(idDSVar); annos.push_back(Deco_Binding); annos.push_back(0);
     }
@@ -930,13 +941,20 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         globals.push_back(head(OpConstant, 4));   globals.push_back(idInt); globals.push_back(idConstDiscard); globals.push_back(destruct::kDataDiscard);
         globals.push_back(head(OpConstant, 4));   globals.push_back(idInt); globals.push_back(idConst2DS);     globals.push_back(2);
         globals.push_back(head(OpConstant, 4));   globals.push_back(idInt); globals.push_back(idConst3DS);     globals.push_back(3);
+        globals.push_back(head(OpConstant, 4));   globals.push_back(idInt); globals.push_back(idConst4DS);     globals.push_back(4);
+        globals.push_back(head(OpConstant, 4));   globals.push_back(idInt); globals.push_back(idConst5DS);     globals.push_back(5);
         {
             const float zero = 0.0f; uint32_t bits; memcpy(&bits, &zero, 4);
             globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(idConstZeroF); globals.push_back(bits);
         }
         globals.push_back(head(OpTypeArray, 4));  globals.push_back(idArrData); globals.push_back(idInt); globals.push_back(idConstDataN);
-        globals.push_back(head(OpTypeStruct, 6)); globals.push_back(idStructDS);
-        globals.push_back(idMat4); globals.push_back(idV4); globals.push_back(idIV4); globals.push_back(idArrData);
+        globals.push_back(head(OpTypeStruct, 8)); globals.push_back(idStructDS);
+        globals.push_back(idMat4);    // 0 aircraftInv
+        globals.push_back(idMat4);    // 1 aircraftFwd
+        globals.push_back(idV4);      // 2 gridMinCell
+        globals.push_back(idIV4);     // 3 gridDim
+        globals.push_back(idV4);      // 4 testOffset
+        globals.push_back(idArrData); // 5 data
         globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrDSStruct); globals.push_back(SC_StorageBuffer); globals.push_back(idStructDS);
         globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrDSInt);    globals.push_back(SC_StorageBuffer); globals.push_back(idInt);
         globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrDSMat4);   globals.push_back(SC_StorageBuffer); globals.push_back(idMat4);
@@ -1468,12 +1486,12 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 
         // Grid origin and cell size, then the integer dimensions.
         const uint32_t idPG = bound++, idG = bound++, idCell = bound++;
-        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrDSV4); body.push_back(idPG); body.push_back(idDSVar); body.push_back(idConst1);
+        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrDSV4); body.push_back(idPG); body.push_back(idDSVar); body.push_back(idConst2DS);   // gridMinCell, member 2
         body.push_back(head(OpLoad, 4)); body.push_back(idV4); body.push_back(idG); body.push_back(idPG);
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idCell); body.push_back(idG); body.push_back(3);
 
         const uint32_t idPD = bound++, idD = bound++;
-        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrDSIV4); body.push_back(idPD); body.push_back(idDSVar); body.push_back(idConst2DS);
+        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrDSIV4); body.push_back(idPD); body.push_back(idDSVar); body.push_back(idConst3DS);  // gridDim, member 3
         body.push_back(head(OpLoad, 4)); body.push_back(idIV4); body.push_back(idD); body.push_back(idPD);
 
         // Per axis: subtract the origin, divide by the cell, reject negative
@@ -1558,10 +1576,77 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         body.push_back(head(OpSelect, 6)); body.push_back(idInt); body.push_back(idSafe);
         body.push_back(idInB); body.push_back(idFinal); body.push_back(idConstDiscard);
 
+        // ---- READ THE CELL BEFORE WRITING IT.
+        //
+        // The displacement gate below asks whether this cell is airframe. The
+        // store a few lines down puts a 1 into that very word, so reading after
+        // it returns the 1 this vertex just wrote - every accepted vertex would
+        // find itself occupied and displace. That authorises everything rather
+        // than blocking anything, and the whole screen moves.
+        //
+        // The value wanted is the one the CPU uploaded. Program order is the
+        // whole of the difference.
+        const uint32_t idPOcc = bound++, idOcc = bound++, idOccupied = bound++;
+        body.push_back(head(OpAccessChain, 6)); body.push_back(idPtrDSInt); body.push_back(idPOcc);
+        body.push_back(idDSVar); body.push_back(idConst5DS); body.push_back(idSafe);
+        body.push_back(head(OpLoad, 4)); body.push_back(idInt); body.push_back(idOcc); body.push_back(idPOcc);
+        body.push_back(head(OpINotEqual, 5)); body.push_back(idBool); body.push_back(idOccupied); body.push_back(idOcc); body.push_back(idConst0);
+
         const uint32_t idPStore = bound++;
         body.push_back(head(OpAccessChain, 6)); body.push_back(idPtrDSInt); body.push_back(idPStore);
-        body.push_back(idDSVar); body.push_back(idConst3DS); body.push_back(idSafe);
+        body.push_back(idDSVar); body.push_back(idConst5DS); body.push_back(idSafe);   // data, member 5
         body.push_back(head(OpStore, 3)); body.push_back(idPStore); body.push_back(idConst1);
+
+        // ---- AND THEN MOVE IT, IF THIS CELL IS THE AEROPLANE.
+        //
+        // Being inside the box is NOT enough, and assuming it was turned the
+        // screen black. A full-screen quad's vertices are already in clip space
+        // - x, y in [-1,1], w = 1 - so aircraftInv maps them to some
+        // aircraft-local point, and inside a 65 x 20 x 80 m box that is easy to
+        // land in. Every post-process and UI quad moved five metres, which is
+        // enormous for a quad.
+        //
+        // Requiring the cell to be OCCUPIED is the real test and needs no
+        // per-draw signal: a quad in an empty cell moves nothing, and so does
+        // anything else that is not the airframe. It is also safe by default,
+        // because occupancy is all zeros until the aeroplane has been
+        // voxelised into it.
+        //
+        // Read BEFORE the store above would have changed it - program order
+        // matters here, and the value wanted is the one the CPU uploaded, not
+        // the 1 this shader just wrote.
+        const uint32_t idPFwd = bound++, idFwd = bound++;
+        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrDSMat4); body.push_back(idPFwd);
+        body.push_back(idDSVar); body.push_back(idConst1);      // aircraftFwd, member 1
+        body.push_back(head(OpLoad, 4)); body.push_back(idMat4); body.push_back(idFwd); body.push_back(idPFwd);
+
+        const uint32_t idPTest = bound++, idTest = bound++;
+        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrDSV4); body.push_back(idPTest);
+        body.push_back(idDSVar); body.push_back(idConst4DS);    // testOffset, member 4
+        body.push_back(head(OpLoad, 4)); body.push_back(idV4); body.push_back(idTest); body.push_back(idPTest);
+
+        const uint32_t idDelta = bound++, idCur = bound++;
+        const uint32_t idMoved = bound++, idPicked = bound++;
+        body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4); body.push_back(idDelta); body.push_back(idFwd); body.push_back(idTest);
+        body.push_back(head(OpLoad, 4)); body.push_back(idV4); body.push_back(idCur); body.push_back(idPosPtr);
+        body.push_back(head(OpFAdd, 5)); body.push_back(idV4); body.push_back(idMoved); body.push_back(idCur); body.push_back(idDelta);
+        // ---- THE GATE: IN RANGE, OCCUPIED, AND ASKED FOR.
+        //
+        // testOffset.w is the displace flag, separate from gridDim.w which
+        // drives the occupancy store. One flag used to do both jobs, which
+        // conflates finding the aeroplane with moving it - they do not happen
+        // at the same time, and joined together a displacement frame would
+        // WRITE occupancy and mark every cell it moved as airframe.
+        const uint32_t idWant = bound++, idWantB = bound++;
+        const uint32_t idInRange = bound++, idOk1 = bound++, idOkAll = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idWant); body.push_back(idTest); body.push_back(3);
+        body.push_back(head(OpFOrdNotEqual, 5)); body.push_back(idBool); body.push_back(idWantB); body.push_back(idWant); body.push_back(idConstZeroF);
+        body.push_back(head(OpLogicalNot, 4)); body.push_back(idBool); body.push_back(idInRange); body.push_back(idSkip);
+        body.push_back(head(OpLogicalAnd, 5)); body.push_back(idBool); body.push_back(idOk1);   body.push_back(idInRange); body.push_back(idOccupied);
+        body.push_back(head(OpLogicalAnd, 5)); body.push_back(idBool); body.push_back(idOkAll); body.push_back(idOk1);     body.push_back(idWantB);
+        body.push_back(head(OpSelect, 6)); body.push_back(idV4); body.push_back(idPicked);
+        body.push_back(idOkAll); body.push_back(idMoved); body.push_back(idCur);
+        body.push_back(head(OpStore, 3)); body.push_back(idPosPtr); body.push_back(idPicked);
 
         ++occupancyVsCount();
     }

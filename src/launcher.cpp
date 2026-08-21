@@ -34,13 +34,15 @@
 // 1.3.234 and newer, which is a good way to spend an afternoon wondering why
 // nothing loaded.
 
+#include "product.h"
+
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 
 // Everything after our own arguments is handed to X-Plane untouched, so
 // --load_smo and friends still work through the launcher.
-static const char *kLayerName = "VK_LAYER_mv";
+static const char *kLayerName = MV_LAYER_NAME;
 
 static void dirOf(const char *path, char *out, size_t n)
 {

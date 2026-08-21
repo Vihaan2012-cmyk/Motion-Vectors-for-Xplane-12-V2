@@ -305,8 +305,10 @@ inline void upload(const float *xyz, uint32_t count)
 // active is the uniform branch the shader tests. It is in the buffer rather
 // than a specialisation constant because it changes at crash time and
 // recompiling every pipeline at the moment of a crash is not an option.
-inline void uploadHeader(const float aircraftInv[16], const float gridMin[3],
-                         float cell, int nx, int ny, int nz, int active)
+inline void uploadHeader(const float aircraftInv[16], const float aircraftFwd[16],
+                         const float gridMin[3], float cell,
+                         int nx, int ny, int nz, int active,
+                         const float testOffset[3])
 {
     State &s = state();
     if (!s.ready || !s.mapped) return;
@@ -314,6 +316,21 @@ inline void uploadHeader(const float aircraftInv[16], const float gridMin[3],
 
     if (aircraftInv)
         memcpy(base + destruct::kOffAircraftInv, aircraftInv, 16 * sizeof(float));
+    if (aircraftFwd)
+        memcpy(base + destruct::kOffAircraftFwd, aircraftFwd, 16 * sizeof(float));
+
+    // The constant displacement for Task 10's static test. Written every time
+    // the header is, so clearing the key puts the airframe back where it was
+    // on the next frame rather than at the next reload.
+    float *to = (float *)(base + destruct::kOffTestOffset);
+    to[0] = testOffset ? testOffset[0] : 0.0f;
+    to[1] = testOffset ? testOffset[1] : 0.0f;
+    to[2] = testOffset ? testOffset[2] : 0.0f;
+    // w is the DISPLACE flag, kept apart from gridDim.w which drives the
+    // occupancy store. Derived from the offset rather than passed separately:
+    // a zero displacement and "displacement off" are the same state, and two
+    // ways to say it is one way to disagree.
+    to[3] = (to[0] != 0.0f || to[1] != 0.0f || to[2] != 0.0f) ? 1.0f : 0.0f;
 
     float *mc = (float *)(base + destruct::kOffGridMinCell);
     mc[0] = gridMin ? gridMin[0] : 0.0f;

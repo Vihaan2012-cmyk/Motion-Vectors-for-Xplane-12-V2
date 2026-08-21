@@ -74,12 +74,14 @@
 #ifndef TAA_SHARE_H
 #define TAA_SHARE_H
 
+#include "product.h"
+
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
 
 #define TAA_MAGIC       0x4D414154u            // 'TAAM'
-#define TAA_VERSION     9      // 9: XeSS slot widens availability[]
+#define TAA_VERSION     10     // 10: crashAircraftFwd for displacement
                                // 8: crash destruction state (grid, transform)
 
 // Which temporal backend to run. All of them consume the SAME inputs - velocity
@@ -229,7 +231,10 @@ static inline const char *taaAvailabilityText(int a)
     }
 }
 
-#define TAA_SHARE_NAME  "Local\\TAAImpl_Matrices"
+// Per PRODUCT. Two mods mapping one name is not a conflict anyone sees:
+// the second to start finds the block already there and maps it as its
+// own, and then two layers write each other's matrices.
+#define TAA_SHARE_NAME  MV_SHARE_NAME
 
 #define TAA_MAX_OBJECTS   32
 
@@ -619,6 +624,13 @@ struct TaaShare {
     // probe) and multiplies by this to reach the frame the grid is defined in.
     // Column-major, same convention as the reprojection matrices above.
     float crashAircraftInv[16];
+    // Aircraft-local -> clip. The inverse direction of crashAircraftInv,
+    // carried because a shader cannot invert a matrix and the plugin
+    // already composes it as Ac.
+    //
+    // It multiplies a DISPLACEMENT and never a position, so only its 3x3
+    // part is ever read - see the layout note in gpu_layout.h.
+    float crashAircraftFwd[16];
 
     // The grid, in airframe-local metres. gridClassify in destruct/grid.h and
     // the shader perform the IDENTICAL arithmetic on these; if the two ever

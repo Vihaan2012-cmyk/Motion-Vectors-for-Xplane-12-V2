@@ -31,3 +31,5 @@ validation.txt
 # present and compiles the matching backend; absent means the backend
 # reports no-library, which is a correct answer rather than an error.
 third_party/
+build/
+dist/

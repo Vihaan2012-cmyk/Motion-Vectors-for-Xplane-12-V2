@@ -93,7 +93,7 @@ static void trace(const char *fmt, ...)
     static std::string path;
     if (path.empty()) {
         const char *t = getenv("TEMP");
-        path = std::string(t ? t : ".") + "\\taa_layer.txt";
+        path = std::string(t ? t : ".") + "\\" MV_TRACE_FILE;
     }
 
     std::lock_guard<std::mutex> g(g_traceLock);
@@ -516,6 +516,31 @@ static uint32_t g_maxBoundSets = 4;
 //
 // Read once at first use, like crash.enable, because pipelines are patched at
 // startup and a value that changed later could not reach them anyway.
+// ---- THE STATIC DISPLACEMENT, FOR TASK 10'S ACCEPTANCE TEST.
+//
+// A constant offset in AIRCRAFT-LOCAL metres, applied to every vertex the
+// classification accepts. The plan's test is "set crash.test_offset=5 and
+// confirm the whole airframe moves five metres while the world stays put",
+// which is the cheapest possible proof that the displacement path reaches real
+// geometry with the right transform.
+//
+// Read fresh every frame rather than latched, unlike crash.enable and
+// crash.occupancy. Those two decide what gets COMPILED INTO a shader and so
+// cannot change without new modules; this is data in a buffer, and being able
+// to drag it while watching the aeroplane is the entire point of the test.
+//
+// Along +y, so the airframe rises out of the scenery rather than sliding into
+// it - a vertical move is unambiguous from any camera angle, and a horizontal
+// one at an airport is easy to mistake for the world moving instead.
+static const float *crashTestOffset()
+{
+    static float off[3] = { 0.0f, 0.0f, 0.0f };
+    off[0] = 0.0f;
+    off[1] = live::f("crash.test_offset", "TAA_CRASH_TEST_OFFSET", 0.0f);
+    off[2] = 0.0f;
+    return off;
+}
+
 static bool crashOccupancy()
 {
     static int on = -1;
@@ -7447,8 +7472,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
 
                 destructgpu::clearOccupancy(discoverCells);
                 destructgpu::clearDiscard();
-                destructgpu::uploadHeader(g_share->crashAircraftInv, g.min, g.cell,
-                                          g.nx, g.ny, g.nz, 1);
+                destructgpu::uploadHeader(g_share->crashAircraftInv,
+                                          g_share->crashAircraftFwd,
+                                          g.min, g.cell,
+                                          g.nx, g.ny, g.nz, 1,
+                                          crashTestOffset());
                 discoverPhase = 1;
                 trace("DESTRUCT: discovery armed - %u cells of %.2f m, grid "
                       "%dx%dx%d from (%.1f %.1f %.1f)",
@@ -7532,8 +7560,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             // Switch the vertex writes back off and clear the one-shot, so a
             // key left set in the file costs one discovery rather than one per
             // frame forever.
-            destructgpu::uploadHeader(g_share->crashAircraftInv, g.min, g.cell,
-                                      g.nx, g.ny, g.nz, 0);
+            destructgpu::uploadHeader(g_share->crashAircraftInv,
+                                      g_share->crashAircraftFwd,
+                                      g.min, g.cell,
+                                      g.nx, g.ny, g.nz, 0,
+                                      crashTestOffset());
             live::clearOneShot("crash.discover");
             discoverPhase = 0;
         }
@@ -7541,10 +7572,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         if (!want && discoverPhase == 0) {
             // Keep the header current even when idle, so the first armed frame
             // is not classifying against a matrix from several seconds ago.
+            // ---- ACTIVE IS NOT THE SAME QUESTION AS DISCOVERING.
+            //
+            // The shader's `active` flag drives ONE select that both the
+            // occupancy write and the displacement read, so uploading 0 here
+            // told every vertex to skip - and the 5 m test offset moved
+            // precisely nothing. Measured rather than assumed: two captures
+            // either side of the key differed by 801 pixels out of 950300,
+            // which is instrument animation.
+            //
+            // Discovery is one reason to be active. A displacement is another,
+            // and it outlives the two frames discovery runs for. So the flag is
+            // the union, and the fragment transforms will join it at Task 11
+            // rather than adding a third switch.
+            // gridDim.w is DISCOVER and nothing else. It briefly also meant
+            // "displacing", back when one flag drove both; testOffset.w carries
+            // that now. Leaving it joined meant setting a test offset switched
+            // the occupancy WRITE on, which filled the very cells the
+            // displacement gate then read - and moved the entire screen.
+            const float *tOff = crashTestOffset();
+            const int    live = 0;
             destructgpu::uploadHeader(g_share->crashAircraftInv,
+                                      g_share->crashAircraftFwd,
                                       g_share->crashGridMin, g_share->crashCell,
                                       g_share->crashNx, g_share->crashNy,
-                                      g_share->crashNz, 0);
+                                      g_share->crashNz, live,
+                                      tOff);
         }
     }
 

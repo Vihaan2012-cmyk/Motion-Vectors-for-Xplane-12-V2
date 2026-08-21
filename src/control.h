@@ -51,11 +51,13 @@
 #ifndef TAA_CONTROL_H
 #define TAA_CONTROL_H
 
+#include "product.h"
+
 #include <stdint.h>
 
 #define TAA_CONTROL_MAGIC   0x4C43414Du          // 'MACL'
 #define TAA_CONTROL_VERSION 1
-#define TAA_CONTROL_NAME    "Local\\TAAImpl_Control"
+#define TAA_CONTROL_NAME    MV_CONTROL_NAME
 
 // Which fields of a request the plugin should act on.
 //

@@ -1,4 +1,38 @@
-param([switch]$Installer, [switch]$Dev)
+param([switch]$Installer, [switch]$Dev,
+      [ValidateSet('MotionVectors','Crash')] [string]$Target = 'MotionVectors')
+
+# ---- WHICH PRODUCT THIS BUILD IS.
+#
+# One source tree, two mods: Motion Vectors and Realistic Crash Physics. They
+# share the Vulkan layer because crash destruction IS the motion-vector
+# machinery - the same SPIR-V injector, the same pipeline and descriptor
+# interception, the same live config. Forking the tree would mean fixing the
+# injector twice.
+#
+# src/product.h holds the identity; this block holds the file names, and the
+# two must agree. Everything below is DERIVED from $Target rather than typed,
+# because a build that writes MotionVectors.xpl while compiling the crash
+# product surfaces later as "why is the wrong mod loading".
+$isCrash = ($Target -eq 'Crash')
+if ($isCrash) {
+    $prodId     = 'RealisticCrashPhysics'
+    $prodTitle  = 'Realistic Crash Physics'
+    $xplName    = 'RealisticCrashPhysics.xpl'
+    $layerDll   = 'VkLayer_rcp.dll'
+    $layerJson  = 'VkLayer_rcp.json'
+    $launcher   = 'RealisticCrashPhysicsLauncher.exe'
+    $panelLua   = 'RealisticCrashPhysics.lua'
+    $prodDefine = '-DMV_PRODUCT_CRASH=1'
+} else {
+    $prodId     = 'MotionVectors'
+    $prodTitle  = 'Motion Vectors'
+    $xplName    = 'MotionVectors.xpl'
+    $layerDll   = 'VkLayer_mv.dll'
+    $layerJson  = 'VkLayer_mv.json'
+    $launcher   = 'MotionVectorsLauncher.exe'
+    $panelLua   = 'MotionVectors.lua'
+    $prodDefine = '-DMV_PRODUCT_CRASH=0'
+}
 
 # Build: XPLM plugin + Vulkan layer.
 #
@@ -34,7 +68,7 @@ $mvVersion = (Get-Content (Join-Path $root "VERSION") -Raw).Trim()
 # build that claims to be a release IS one, and there is nothing to keep in step.
 if ($Dev) { $mvVersion = "$mvVersion-dev" }
 
-Write-Host "Motion Vectors $mvVersion"
+Write-Host "$prodTitle $mvVersion"
 
 # ---- WHICH VENDOR UPSCALER SDKs THIS BUILD CAN SEE.
 #
@@ -70,7 +104,9 @@ Write-Host ("  SDKs: FSR2={0} DLSS={1} XeSS={2}" -f `
 if ($Dev) { Write-Host "  DEVELOPER BUILD - launcher shows all dev surfaces" -ForegroundColor Cyan }
 
 $src   = Join-Path $root "src"
-$out   = Join-Path $root "build"
+# Per product, so switching targets cannot relink against the other
+# one's objects or leave its DLL sitting where the installer looks.
+$out   = Join-Path $root (Join-Path "build" $prodId)
 $vksdk = (Get-ChildItem "C:\VulkanSDK\*" -Directory | Sort-Object Name | Select-Object -Last 1).FullName
 
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -78,7 +114,7 @@ New-Item -ItemType Directory -Force (Join-Path $out "vklayer") | Out-Null
 
 
 Write-Host "Building plugin..."
-& g++ -shared -o "$out\MotionVectors.xpl" "$src\plugin.cpp" `
+& g++ -shared -o "$out\$xplName" "$src\plugin.cpp" $prodDefine `
   -I"$root\SDK\CHeaders\XPLM" -DIBM=1 "-DMV_VERSION=\`"$mvVersion\`"" -m64 -O2 -std=c++17 `
   @sdkDefines @sdkIncludes `
   -static -static-libgcc -static-libstdc++ `
@@ -136,18 +172,29 @@ Set-Content -Path "$src\vklayer\taa_spv.h" -Value $sb.ToString() -Encoding utf8 
 Write-Host "  taa_spv.h: $($words.Count) words"
 
 Write-Host "Building Vulkan layer..."
-& g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
+& g++ -shared -o "$out\vklayer\$layerDll" "$src\vklayer\layer.cpp" $prodDefine `
   -I"$vksdk\Include" -m64 -O2 -std=c++17 `
   @sdkDefines @sdkIncludes `
   -static -static-libgcc -static-libstdc++
 if ($LASTEXITCODE -ne 0) { throw "layer build failed" }
-Copy-Item "$src\vklayer\VkLayer_mv.json" "$out\vklayer" -Force
+# GENERATED, not copied. The manifest names both the layer and its
+# library, and a crash build shipping a manifest that says VK_LAYER_mv would
+# have the loader hand our layer the other mod's name - or refuse both.
+$mfSrc = Get-Content "$src\vklayer\VkLayer_mv.json" -Raw
+if ($isCrash) {
+    $mfSrc = $mfSrc -replace '"VK_LAYER_mv"', '"VK_LAYER_rcp"'
+    $mfSrc = $mfSrc -replace 'VkLayer_mv\.dll', 'VkLayer_rcp.dll'
+    $mfSrc = $mfSrc -replace '"description"\s*:\s*"[^"]*"',
+                             '"description": "Realistic Crash Physics"'
+}
+[System.IO.File]::WriteAllText((Join-Path "$out\vklayer" $layerJson), $mfSrc,
+                               (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host "Building launcher..."
 # -mwindows: no console window. The launcher sets the two loader variables and
 # starts the sim, so the layer is EXPLICIT and is never loaded into any other
 # Vulkan application.
-& g++ -o "$out\MotionVectorsLauncher.exe" "$src\launcher.cpp" `
+& g++ -o "$out\$launcher" "$src\launcher.cpp" $prodDefine `
   -m64 -O2 -std=c++17 -mwindows -static -static-libgcc -static-libstdc++ -s
 if ($LASTEXITCODE -ne 0) { throw "launcher build failed" }
 
@@ -276,9 +323,12 @@ if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
 
 Write-Host "Installing..."
 $xp  = Split-Path $root -Parent
-$dst = Join-Path $xp "Resources\plugins\MotionVectors\64"
+# PER PRODUCT. This was hardcoded to MotionVectors, so building the crash
+# target installed a crash plugin over the motion-vector one and left the
+# sim loading the wrong mod under the right name.
+$dst = Join-Path $xp "Resources\plugins\$prodId\64"
 New-Item -ItemType Directory -Force $dst | Out-Null
-Copy-Item "$out\MotionVectors.xpl" (Join-Path $dst "win.xpl") -Force
+Copy-Item "$out\$xplName" (Join-Path $dst "win.xpl") -Force
 
 # ---- THE LUA PANEL, INSTALLED BY THE BUILD RATHER THAN BY HAND.
 #
@@ -290,8 +340,8 @@ Copy-Item "$out\MotionVectors.xpl" (Join-Path $dst "win.xpl") -Force
 # MOD_VERSION is STAMPED here from VERSION rather than edited in the Lua, so
 # VERSION stays the single source it was made into. A constant kept by hand in a
 # second file is the same trap as a hand-kept settings table.
-$luaSrc = Join-Path $root "lua\MotionVectors.lua"
-$luaDst = Join-Path $xp "Resources\plugins\FlyWithLua\Scripts\MotionVectors.lua"
+$luaSrc = Join-Path $root "lua\$panelLua"
+$luaDst = Join-Path $xp "Resources\plugins\FlyWithLua\Scripts\$panelLua"
 if (Test-Path $luaSrc) {
     $luaDir = Split-Path $luaDst -Parent
     if (Test-Path $luaDir) {

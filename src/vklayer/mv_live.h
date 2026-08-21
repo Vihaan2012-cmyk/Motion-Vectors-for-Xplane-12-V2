@@ -28,6 +28,8 @@
 // frames comparing a 64-bit timestamp, which is unmeasurable next to a frame,
 // and it cannot leak anything.
 
+#include "../product.h"
+
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -48,11 +50,11 @@ static bool                    g_everSeen = false;
 inline const char *path()
 {
     if (g_path.empty()) {
-        if (const char *p = getenv("TAA_LIVE_FILE")) {
+        if (const char *p = getenv(MV_LIVE_ENV)) {
             g_path = p;
         } else {
             const char *t = getenv("TEMP");
-            g_path = std::string(t ? t : ".") + "\\taa_live.ini";
+            g_path = std::string(t ? t : ".") + "\\" MV_LIVE_FILE;
         }
     }
     return g_path.c_str();

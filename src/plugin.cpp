@@ -1939,75 +1939,75 @@ static void publishCrashGrid(bool force)
 
 static void registerDatarefs()
 {
-    g_myEnabled  = XPLMRegisterDataAccessor("taaimpl/enabled", xplmType_Int, 1,
+    g_myEnabled  = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "enabled", xplmType_Int, 1,
                      getEnabled, setEnabled, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myAttached = XPLMRegisterDataAccessor("taaimpl/layer_attached", xplmType_Int, 0,
+    g_myAttached = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "layer_attached", xplmType_Int, 0,
                      getAttached, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
-    g_myLodBias  = XPLMRegisterDataAccessor("taaimpl/lod_bias", xplmType_Float, 1,
+    g_myLodBias  = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "lod_bias", xplmType_Float, 1,
                      0,0, getLodBias, setLodBias, 0,0,0,0,0,0,0,0, nullptr, nullptr);
 
     // The upscaler surface. These handles have existed since the share block
     // was designed and were never assigned to anything, so taaimpl/upscaler
     // and taaimpl/upscaler_available were documented in this file's own header
     // comment while not existing at runtime.
-    g_myUpscaler = XPLMRegisterDataAccessor("taaimpl/upscaler", xplmType_Int, 1,
+    g_myUpscaler = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "upscaler", xplmType_Int, 1,
                      getUpscaler, setUpscaler, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/upscaler_running", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "upscaler_running", xplmType_Int, 0,
                      getUpscalerRunning, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myQuality  = XPLMRegisterDataAccessor("taaimpl/quality", xplmType_Int, 1,
+    g_myQuality  = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "quality", xplmType_Int, 1,
                      getQuality, setQuality, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myAvail    = XPLMRegisterDataAccessor("taaimpl/upscaler_available",
+    g_myAvail    = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "upscaler_available",
                      xplmType_IntArray, 0,
                      0,0, 0,0, 0,0, getUpscalerAvail, nullptr, 0,0, 0,0,
                      nullptr, nullptr);
 
     // VRAM, straight from the driver via the layer. Read-only - these report,
     // they do not steer.
-    g_myVramTotal  = XPLMRegisterDataAccessor("taaimpl/vram_total_mb", xplmType_Int, 0,
+    g_myVramTotal  = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "vram_total_mb", xplmType_Int, 0,
                        getVramTotal, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myVramBudget = XPLMRegisterDataAccessor("taaimpl/vram_budget_mb", xplmType_Int, 0,
+    g_myVramBudget = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "vram_budget_mb", xplmType_Int, 0,
                        getVramBudget, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myVramUsed   = XPLMRegisterDataAccessor("taaimpl/vram_used_mb", xplmType_Int, 0,
+    g_myVramUsed   = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "vram_used_mb", xplmType_Int, 0,
                        getVramUsed, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
     // The VRAM system's overlay surface: zone (0 GREEN .. 4 CRITICAL), the
     // shaped budget X-Plane is actually reading, upload flow, governor holds,
     // recycle pool residency, and allocation failures. Read-only; any panel,
     // Lua script or the debug window can draw them.
-    XPLMRegisterDataAccessor("taaimpl/vram_zone", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "vram_zone", xplmType_Int, 0,
                              getVramZone, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/vram_shaped_mb", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "vram_shaped_mb", xplmType_Int, 0,
                              getVramShaped, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/vram_upload_kb_frame", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "vram_upload_kb_frame", xplmType_Int, 0,
                              getVramUploadKB, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/vram_held_submits", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "vram_held_submits", xplmType_Int, 0,
                              getVramHeld, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/vram_pool_mb", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "vram_pool_mb", xplmType_Int, 0,
                              getVramPool, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/vram_alloc_fails", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "vram_alloc_fails", xplmType_Int, 0,
                              getVramFails, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
     // What the binary patches actually achieved, so the panel can show the
     // pager's real limits rather than what the launcher asked for. A patch that
     // refused leaves these at the stock values, which is exactly the case worth
     // being able to see without reading Log.txt.
-    g_myTexFloor = XPLMRegisterDataAccessor("taaimpl/tex_scale_floor", xplmType_Float, 0,
+    g_myTexFloor = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "tex_scale_floor", xplmType_Float, 0,
                      0,0, getTexFloor, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myTexStep  = XPLMRegisterDataAccessor("taaimpl/tex_scale_step", xplmType_Float, 0,
+    g_myTexStep  = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "tex_scale_step", xplmType_Float, 0,
                      0,0, getTexStep, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
 
-    g_myRevZMat   = XPLMRegisterDataAccessor("taaimpl/reverse_z_matrix", xplmType_Int, 0,
+    g_myRevZMat   = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "reverse_z_matrix", xplmType_Int, 0,
                       getReverseZMat, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myViewportW = XPLMRegisterDataAccessor("taaimpl/viewport_w", xplmType_Int, 0,
+    g_myViewportW = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "viewport_w", xplmType_Int, 0,
                       getViewportW, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myViewportH = XPLMRegisterDataAccessor("taaimpl/viewport_h", xplmType_Int, 0,
+    g_myViewportH = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "viewport_h", xplmType_Int, 0,
                       getViewportH, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myJitPhases = XPLMRegisterDataAccessor("taaimpl/jitter_phases", xplmType_Int, 0,
+    g_myJitPhases = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "jitter_phases", xplmType_Int, 0,
                       getJitterPhases, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myReverseZ  = XPLMRegisterDataAccessor("taaimpl/reverse_z", xplmType_Int, 0,
+    g_myReverseZ  = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "reverse_z", xplmType_Int, 0,
                       getReverseZ, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    g_myObjCount  = XPLMRegisterDataAccessor("taaimpl/moving_objects", xplmType_Int, 0,
+    g_myObjCount  = XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "moving_objects", xplmType_Int, 0,
                       getObjectCount, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
 
@@ -2017,22 +2017,22 @@ static void registerDatarefs()
     // took the whole Lua engine down with it - every other script the user had
     // loaded, for one name in a comment that was never code.
 
-    XPLMRegisterDataAccessor("taaimpl/render_scale", xplmType_Float, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "render_scale", xplmType_Float, 0,
         nullptr, nullptr, getRenderScale, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
 
-    XPLMRegisterDataAccessor("taaimpl/mv_residual_px", xplmType_Float, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "mv_residual_px", xplmType_Float, 0,
         nullptr, nullptr, getMvResidual, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/mv_residual_p95_px", xplmType_Float, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "mv_residual_p95_px", xplmType_Float, 0,
         nullptr, nullptr, getMvResidualP95, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/mv_samples", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "mv_samples", xplmType_Int, 0,
         getMvSamples, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/velocity_mb", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "velocity_mb", xplmType_Int, 0,
         getMvVelocityMB, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/pipelines_patched", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "pipelines_patched", xplmType_Int, 0,
         getMvPatched, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/pipelines_rejected", xplmType_Int, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "pipelines_rejected", xplmType_Int, 0,
         getMvRejected, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
-    XPLMRegisterDataAccessor("taaimpl/version", xplmType_Data, 0,
+    XPLMRegisterDataAccessor(MV_DATAREF_PREFIX "version", xplmType_Data, 0,
         nullptr, nullptr, nullptr, nullptr, 0,0,0,0,0,0,
         getVersionString, nullptr, nullptr, nullptr);
 
@@ -3985,11 +3985,20 @@ static float matrixCallback(float sinceLast, float, int, void *)
                 M4[10] = -1.0f;    // view.z = -clip.w
                 M4[15] = 1.0f;
                 taaMul(s->crashAircraftInv, invMc, M4);
+                // The inverse direction, for displacement. Ac is already
+                // aircraft-local -> clip: the plugin composes it a few lines
+                // above as proj * Mc, which is exactly the matrix the shader
+                // needs to carry a displacement from aircraft-local into clip.
+                memcpy(s->crashAircraftFwd, Ac, sizeof(s->crashAircraftFwd));
             } else {
                 // Singular, so the shader must not classify against it. An
                 // identity here would silently classify every vertex in CLIP
                 // space and fill the grid with nonsense.
+                // BOTH, or the shader gets a refusal in one direction and a
+                // stale matrix in the other - which displaces geometry using
+                // last frame's camera while declining to classify it.
                 memset(s->crashAircraftInv, 0, sizeof(s->crashAircraftInv));
+                memset(s->crashAircraftFwd, 0, sizeof(s->crashAircraftFwd));
             }
         }
 
@@ -4467,8 +4476,8 @@ static void loadConfig(const std::string &path)
 
 PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
 {
-    strcpy(outName, "TAAImplementation");
-    strcpy(outSig,  "com.nitin.taaimplementation");
+    strcpy(outName, MV_PLUGIN_NAME);
+    strcpy(outSig,  MV_PLUGIN_SIG);
     strcpy(outDesc, "Publishes camera matrices for the TAA Vulkan layer.");
 
     char root[1024] = {0};

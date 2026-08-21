@@ -46,15 +46,45 @@ static const uint32_t kMaxGpuFragments = 4096;
 
 // ---- BUFFER LAYOUT, in bytes, std430.
 //
-//   0    mat4  aircraftInv      world/view -> aircraft-local
-//   64   vec4  gridMinCell      min.xyz, cell size in w
-//   80   ivec4 gridDim          nx, ny, nz, active
-//   96   uint  occupancy[kMaxCells]
+//   0    mat4  aircraftInv      clip -> aircraft-local
+//   64   mat4  aircraftFwd      aircraft-local -> clip
+//   128  vec4  gridMinCell      min.xyz, cell size in w
+//   144  ivec4 gridDim          nx, ny, nz, active
+//   160  vec4  testOffset       a constant displacement, for Task 10 step 3
+//   176  uint  occupancy[kMaxCells]
 //   ...  vec4  xform[kMaxGpuFragments]
+//
+// aircraftFwd is the inverse direction of aircraftInv and is carried rather
+// than derived: a shader cannot invert a matrix, and the plugin already has
+// both.
+//
+// It only ever multiplies a DISPLACEMENT, never a position. M is linear, so
+//
+//     clip' = M * (local + d) = M * local + M * d = clip + M * d
+//
+// and the vertex already holds M * local as its own gl_Position. That makes
+// displacement three dot products against the 3x3 part, with clip.z consistent
+// by construction because M is the real projection composition - there is no
+// separately reconstructed depth term to disagree with the world.
 static const uint32_t kOffAircraftInv = 0;
-static const uint32_t kOffGridMinCell = 64;
-static const uint32_t kOffGridDim     = 80;
-static const uint32_t kOffOccupancy   = 96;
+static const uint32_t kOffAircraftFwd = 64;
+static const uint32_t kOffGridMinCell = 128;
+static const uint32_t kOffGridDim     = 144;
+static const uint32_t kOffTestOffset  = 160;
+static const uint32_t kOffOccupancy   = 176;
+
+// ---- MEMBER INDICES, BECAUSE SPIR-V ADDRESSES THEM BY LITERAL.
+//
+// OpAccessChain names a struct member by its ordinal, so inserting a member in
+// the middle shifts every later one. The shader would then read gridDim out of
+// the middle of a matrix - and still validate, because the types happen to line
+// up. Naming them here means the emitter and this file cannot drift.
+static const uint32_t kMemAircraftInv = 0;
+static const uint32_t kMemAircraftFwd = 1;
+static const uint32_t kMemGridMinCell = 2;
+static const uint32_t kMemGridDim     = 3;
+static const uint32_t kMemTestOffset  = 4;
+static const uint32_t kMemData        = 5;
 
 // ---- THE DISCARD SLOT, AND WHY A BRANCH-FREE SHADER NEEDS ONE.
 //

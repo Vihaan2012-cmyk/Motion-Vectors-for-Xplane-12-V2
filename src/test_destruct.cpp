@@ -554,8 +554,39 @@ int main()
     // ------------------------------------------------ buffer layout sanity
     printf("\nbuffer layout\n");
     {
-        check(destruct::kOffOccupancy == 96,
-              "the header is 96 bytes and occupancy starts after it");
+        // ---- THE INVARIANTS, NOT THE NUMBER.
+        //
+        // This asserted kOffOccupancy == 96 and duly failed the moment
+        // aircraftFwd and testOffset were added. That is a test of today's
+        // arithmetic rather than of anything that must be true, and the honest
+        // version states what the layout actually has to satisfy: the fields
+        // appear in order, none overlaps the next, and the array is aligned.
+        //
+        // A field inserted in the middle should pass this. A field that
+        // overlaps its neighbour should not, and the old form could not tell
+        // the difference.
+        check(destruct::kOffAircraftInv == 0,
+              "the block starts with the classification matrix");
+        check(destruct::kOffAircraftFwd >= destruct::kOffAircraftInv + 64u,
+              "the forward matrix clears the inverse one");
+        check(destruct::kOffGridMinCell >= destruct::kOffAircraftFwd + 64u,
+              "the grid origin clears both matrices");
+        check(destruct::kOffGridDim >= destruct::kOffGridMinCell + 16u,
+              "the dimensions clear the origin");
+        check(destruct::kOffTestOffset >= destruct::kOffGridDim + 16u,
+              "the test offset clears the dimensions");
+        check(destruct::kOffOccupancy >= destruct::kOffTestOffset + 16u,
+              "and occupancy starts after the whole header");
+        check((destruct::kOffOccupancy % 16u) == 0,
+              "the array is 16-byte aligned, as std430 wants");
+
+        // The member ORDINALS must march with the offsets. SPIR-V addresses
+        // members by literal index, so a field added to one and not the other
+        // reads the wrong bytes and still validates - the types line up.
+        check(destruct::kMemAircraftInv == 0 && destruct::kMemAircraftFwd == 1 &&
+              destruct::kMemGridMinCell == 2 && destruct::kMemGridDim == 3 &&
+              destruct::kMemTestOffset == 4 && destruct::kMemData == 5,
+              "member ordinals are consecutive and in the same order as the offsets");
         check(destruct::kOffDiscard ==
                   destruct::kOffOccupancy + destruct::kMaxCells * 4u,
               "the discard slot sits immediately after the occupancy region");
