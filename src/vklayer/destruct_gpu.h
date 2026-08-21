@@ -46,6 +46,11 @@ struct State {
     void                 *mapped   = nullptr;
     VkDeviceSize          bytes    = 0;
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    // An EMPTY set layout, used to pad the indices between what X-Plane
+    // declares and where ours sits. See setIndex below for why it has to sit
+    // at a fixed place rather than wherever the layout happens to end.
+    VkDescriptorSetLayout emptyLayout = VK_NULL_HANDLE;
+    uint32_t              setIndex   = 0;
     VkDescriptorPool      pool     = VK_NULL_HANDLE;
     VkDescriptorSet       set      = VK_NULL_HANDLE;
     uint32_t              capacity = 0;     // fragments the buffer can hold
@@ -54,6 +59,34 @@ struct State {
 };
 
 inline State &state() { static State s; return s; }
+
+// ---- WHY OUR SET SITS AT A FIXED INDEX.
+//
+// The first version appended our set at each pipeline layout's OWN
+// setLayoutCount, so it landed at index 1 on one layout and 4 on another. That
+// is fine while only C++ touches it, because the bind looks the index up.
+//
+// It stops being fine the moment a SHADER references the set, because a
+// shader's OpDecorate DescriptorSet is a literal baked into the module - and a
+// module is patched once and then used with many different pipeline layouts.
+// A varying index cannot be expressed in a constant. Hardcoding whichever
+// index we happened to see first would make every other layout bind our buffer
+// over one of X-Plane's, which is corruption rather than a missing feature.
+//
+// So the index is chosen once per device and every extended layout is padded
+// with EMPTY set layouts up to it. Empty layouts cost nothing - they declare no
+// bindings - and sets 0..N-1 keep exactly the layouts X-Plane declared, which
+// is what keeps its own bound sets undisturbed.
+//
+// 7 is high enough to clear anything X-Plane uses (it binds a handful) and low
+// enough to exist on any sane device; the min() keeps it legal on a driver
+// with a small maxBoundDescriptorSets.
+inline uint32_t chooseSetIndex(uint32_t maxBoundSets)
+{
+    const uint32_t want = 7;
+    if (maxBoundSets == 0) return 0;
+    return (want < maxBoundSets - 1) ? want : (maxBoundSets - 1);
+}
 
 // Counters. See the note at the top: a silent failure here is invisible
 // downstream, so every outcome is countable.
@@ -77,9 +110,12 @@ static_assert(kMaxFragments == destruct::kMaxGpuFragments,
               "fragment capacity disagrees with gpu_layout.h");
 #endif
 
-inline bool ensure(DeviceData &dd, VkDevice dev)
+inline bool ensure(DeviceData &dd, VkDevice dev, uint32_t maxBoundSets)
 {
     State &s = state();
+    // Chosen before anything can read it. setIndex defaulting to 0 would
+    // put our set exactly where X-Plane's first set lives.
+    s.setIndex = chooseSetIndex(maxBoundSets);
     if (s.ready)  return true;
     if (s.failed) return false;
     if (!dd.createBuffer || !dd.allocateMemory || !dd.mapMemory ||
@@ -168,6 +204,21 @@ inline bool ensure(DeviceData &dd, VkDevice dev)
     lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     lci.bindingCount = 1;
     lci.pBindings    = &b;
+    // The empty padding layout, created alongside ours. One is enough: the same
+    // handle can fill every gap index on every layout, because an empty layout
+    // declares nothing and so is compatible with itself everywhere.
+    {
+        VkDescriptorSetLayoutCreateInfo eci;
+        memset(&eci, 0, sizeof(eci));
+        eci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        eci.bindingCount = 0;
+        eci.pBindings    = nullptr;
+        if (dd.createDescriptorSetLayout(dev, &eci, nullptr, &s.emptyLayout) != VK_SUCCESS) {
+            s.failed = true;
+            trace("DESTRUCT: empty padding set layout failed - disabled");
+            return false;
+        }
+    }
     if (dd.createDescriptorSetLayout(dev, &lci, nullptr, &s.setLayout) != VK_SUCCESS) {
         s.failed = true;
         trace("DESTRUCT: descriptor set layout creation failed");
@@ -311,6 +362,8 @@ inline void destroy(DeviceData &dd, VkDevice dev)
     if (s.pool && dd.destroyDescriptorPool) dd.destroyDescriptorPool(dev, s.pool, nullptr);
     if (s.setLayout && dd.destroyDescriptorSetLayout)
         dd.destroyDescriptorSetLayout(dev, s.setLayout, nullptr);
+    if (s.emptyLayout && dd.destroyDescriptorSetLayout)
+        dd.destroyDescriptorSetLayout(dev, s.emptyLayout, nullptr);
     if (s.buf && dd.destroyBuffer) dd.destroyBuffer(dev, s.buf, nullptr);
     if (s.mem && dd.freeMemory)    dd.freeMemory(dev, s.mem, nullptr);
     s = State();

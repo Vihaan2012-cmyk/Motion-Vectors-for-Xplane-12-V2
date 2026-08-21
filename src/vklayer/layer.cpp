@@ -5362,7 +5362,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // which is deliberately the whole of this step. Adding a
                 // descriptor set to every pipeline is the invasive part and is
                 // easier to judge when creation is already known good.
-                if (crashEnabled()) destructgpu::ensure(tdd, tci->second);
+                if (crashEnabled()) destructgpu::ensure(tdd, tci->second, g_maxBoundSets);
                 // Re-init only on a real change of shape. The scene IMAGE
                 // alternates every frame between two targets, and keying on it
                 // rebuilt everything each frame and destroyed objects still in
@@ -9615,16 +9615,43 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreatePipelineLayout(
         ci->pSetLayouts, ci->pSetLayouts + ci->setLayoutCount);
     uint32_t ourSet = UINT32_MAX;
     if (destructgpu::state().ready) {
-        if (ci->setLayoutCount + 1u <= g_maxBoundSets) {
-            ourSet = ci->setLayoutCount;
+        // ---- A FIXED INDEX, PADDED UP TO.
+        //
+        // This used to append at the layout's own setLayoutCount, which put our
+        // set at index 1 on one layout and 4 on another. That works while only
+        // C++ touches it, because the bind looks the index up - and it becomes
+        // impossible the moment a SHADER references the set, because
+        // OpDecorate DescriptorSet is a literal baked into a module that is
+        // patched once and used with many layouts.
+        //
+        // So every extended layout puts our set at the SAME index, padding the
+        // gap with an empty layout that declares no bindings. Indices below
+        // X-Plane's own count are untouched, which is what keeps its bound sets
+        // undisturbed; the padding only occupies indices nobody was using.
+        const uint32_t want = destructgpu::state().setIndex;
+        if (ci->setLayoutCount <= want && want + 1u <= g_maxBoundSets) {
+            ourSet = want;
+            while (sets.size() < want)
+                sets.push_back(destructgpu::state().emptyLayout);
             sets.push_back(destructgpu::state().setLayout);
             ci2.setLayoutCount = (uint32_t)sets.size();
             ci2.pSetLayouts    = sets.data();
             if (++destructgpu::layoutsExtended() % 500 == 1)
-                trace("DESTRUCT: %llu layout(s) carry the fragment set, ours at "
-                      "index %u of %u max",
+                trace("DESTRUCT: %llu layout(s) carry the fragment set at the "
+                      "fixed index %u (%u of X-Plane's own, %u empty pad, %u max)",
                       (unsigned long long)destructgpu::layoutsExtended(),
-                      ourSet, g_maxBoundSets);
+                      ourSet, ci->setLayoutCount,
+                      want - ci->setLayoutCount, g_maxBoundSets);
+        } else if (ci->setLayoutCount > want) {
+            // X-Plane already uses the index we picked. Counted, never silent:
+            // overwriting one of its sets would be corruption, so this layout
+            // simply does not carry ours and its draws cannot displace.
+            if (++destructgpu::layoutsTooMany() % 100 == 1)
+                trace("DESTRUCT: %llu layout(s) already declare %u sets, past our "
+                      "fixed index %u - not extended, so their draws cannot "
+                      "displace. Raise the index if this is common.",
+                      (unsigned long long)destructgpu::layoutsTooMany(),
+                      ci->setLayoutCount, want);
         } else {
             // Counted, never silent. A layout at the device limit cannot take
             // our set, and every draw using it will be unable to displace -
@@ -12783,7 +12810,7 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         std::lock_guard<std::mutex> g(g_lock);
         std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(*out));
         if (crashEnabled() && di != g_devices.end())
-            destructgpu::ensure(di->second, *out);
+            destructgpu::ensure(di->second, *out, g_maxBoundSets);
     }
 
 
