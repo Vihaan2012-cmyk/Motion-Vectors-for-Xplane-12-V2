@@ -502,7 +502,21 @@ static uint32_t g_maxBoundSets = 4;
 static bool crashEnabled()
 {
     static int on = -1;
-    if (on < 0) on = live::onoff("crash.enable", "TAA_CRASH", false) ? 1 : 0;
+    if (on < 0) {
+        // FORCE A READ FIRST.
+        //
+        // The first caller of this is vkCreateDevice, and live::poll() only
+        // runs on the frame path - so the key table was empty here, the lookup
+        // missed, the built-in default of false won, and that false was then
+        // cached for the whole process. crash.enable=1 in the control file
+        // could not switch the system on no matter what it said.
+        //
+        // Caching is still right: this is read per pipeline bind. What was
+        // wrong was caching a value taken before the file had been read.
+        live::loadNow();
+        on = live::onoff("crash.enable", "TAA_CRASH", false) ? 1 : 0;
+        trace("DESTRUCT: crash.enable=%d (from %s)", on, live::path());
+    }
     return on != 0;
 }
 static std::map<VkPipelineLayout, uint32_t> g_layoutOurSet;

@@ -185,6 +185,22 @@ inline void writeTemplate()
 
 // Re-read if the file changed. Called once per frame; the common case is one
 // GetFileAttributesEx and a 64-bit compare.
+// ---- READ THE FILE NOW, WHATEVER THE COUNTER SAYS.
+//
+// poll() is a FRAME-RATE thing: it reads on every fifteenth call and returns
+// immediately the other fourteen times. That is right for a hot path and wrong
+// for anyone who needs an answer before the first frame exists.
+//
+// vkCreateDevice is exactly that caller. It has to know whether crash
+// destruction is enabled in order to decide whether to build the descriptor
+// resources, and it runs long before anything calls poll(). Reading a key
+// there without this returned the built-in default, and because the answer was
+// then cached for the process, crash.enable=1 in the file could never switch
+// anything on - the file was correct, the gate was closed, and nothing said so.
+//
+// Both entry points share one body so the parse cannot drift between them.
+inline void loadNow();
+
 inline void poll()
 {
     static uint32_t counter = 0;
@@ -195,6 +211,15 @@ inline void poll()
         writeTemplate();
     }
     if (++counter % everyN) return;
+    loadNow();
+}
+
+inline void loadNow()
+{
+    // The template has to exist before it can be read. poll() does this on its
+    // first call; loadNow() may well BE the first call.
+    static bool templated = false;
+    if (!templated) { templated = true; writeTemplate(); }
 
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (!GetFileAttributesExA(path(), GetFileExInfoStandard, &fad)) return;
