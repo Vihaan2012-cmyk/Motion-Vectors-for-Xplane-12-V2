@@ -77,7 +77,7 @@ local C_LOG       = 0x6A101010   -- log box, translucent like the panel
 
 -- Version the panel reports, and the newest X-Plane this build has been tested
 -- against. No network check: bump this constant per release.
-local MOD_VERSION      = "0.0.16"
+local MOD_VERSION      = "0.0.18"
 local MAX_TESTED_XP    = "12.43.11"
 
 -- A style push that cannot quarantine the script.
@@ -213,9 +213,35 @@ local attach_pending = false
 local function verify_integrity()
     local root = SYSTEM_DIRECTORY or ""
     local base = root .. "MotionVectors\\"
+    -- ---- TWO LAYOUTS EXIST, AND ONLY ONE OF THEM WAS CHECKED.
+    --
+    -- This looked only in MotionVectors\build\vklayer\, which is where a
+    -- DEVELOPMENT tree keeps the layer. The release zip installs it to
+    -- MotionVectors\ instead, so every installed user was told
+    --
+    --     MISSING Vulkan layer
+    --     MISSING Layer manifest
+    --     OK      Vulkan layer is attached to this process
+    --
+    -- which contradicts itself - it cannot be missing and attached at once -
+    -- and reported a broken install to people whose install was fine.
+    --
+    -- Both layouts are legitimate, so both are accepted.
+    local function first_existing(paths)
+        for _, q in ipairs(paths) do
+            if file_exists(q) then return q end
+        end
+        return nil
+    end
+
+    local dll  = { base .. "VkLayer_mv.dll",
+                   base .. "build\\vklayer\\VkLayer_mv.dll" }
+    local json = { base .. "VkLayer_mv.json",
+                   base .. "build\\vklayer\\VkLayer_mv.json" }
+
     local checks = {
-        { "Vulkan layer",     base .. "build\\vklayer\\VkLayer_mv.dll" },
-        { "Layer manifest",   base .. "build\\vklayer\\VkLayer_mv.json" },
+        { "Vulkan layer",     first_existing(dll)  or dll[1]  },
+        { "Layer manifest",   first_existing(json) or json[1] },
         { "Plugin",           root .. "Resources\\plugins\\MotionVectors\\64\\win.xpl" },
         { "Live controls",    ini_path() },
     }

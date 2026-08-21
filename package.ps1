@@ -32,7 +32,10 @@ param([switch]$NoBuild)
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$ver  = '0.0.17'
+# Read from VERSION, never restated. build.ps1 reads the same file, and a
+# package that says one version while the binary says another is the exact
+# failure build.ps1's own comments were written about.
+$ver  = (Get-Content (Join-Path $root "VERSION") -Raw).Trim()
 
 if (-not $NoBuild) {
     Write-Host "Building..."
