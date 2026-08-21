@@ -116,8 +116,36 @@ if (-not $NoLaunch) {
 # view change - then hits both configurations equally instead of landing
 # entirely on one and inventing a difference.
 Head "parked image quality (interleaved, 5 rounds)"
-Say "  keep the camera STILL"
 Set-Key 'taa.viz' '0'
+
+# ---- WAIT FOR STILLNESS, DO NOT ASSUME IT.
+#
+# The first run of this bench measured "parked" image quality while the CAMERA
+# was moving between captures - consecutive frames differed by 33 of 255, and
+# the section still reported a flicker ratio as though the scene were static.
+# The comparison stays fair because the configurations are interleaved, but
+# the thresholds are calibrated for a still camera and the label was a lie.
+#
+# So the same rule as the motion section, inverted: measure, do not assume.
+Write-Host "  HOLD THE CAMERA STILL" -ForegroundColor Yellow
+Write-Host "  (waiting for a steady frame, up to 2 minutes)"
+$still = $false
+$stillDeadline = (Get-Date).AddMinutes(2)
+while ((Get-Date) -lt $stillDeadline) {
+    Shot "still_a"
+    Start-Sleep -Milliseconds 450
+    Shot "still_b"
+    $d = & python (Join-Path $PSScriptRoot "bench.py") --framediff `
+             "$shots\still_a.png" "$shots\still_b.png"
+    if ($LASTEXITCODE -eq 0 -and [double]$d -lt 2.0) {
+        Say ("  camera is steady (frame delta {0})" -f $d)
+        $still = $true
+        break
+    }
+}
+if (-not $still) {
+    Say "  camera never settled - the parked section will be labelled as moving"
+}
 for ($r = 0; $r -lt 5; $r++) {
     Set-Key 'taa.enable' '1'
     Start-Sleep -Milliseconds 1600
@@ -132,8 +160,39 @@ Set-Key 'taa.enable' '1'
 # ---------------------------------------------------------------- motion
 if (-not $Quick) {
     Head "velocity field (needs camera motion)"
-    Write-Host "  PAN NOW - hold an arrow key for about $PanSeconds seconds" -ForegroundColor Yellow
-    Start-Sleep -Seconds 3
+
+    # ---- WAIT FOR MOTION, DO NOT ANNOUNCE AND HOPE.
+    #
+    # The first version printed PAN NOW and slept. That fails whenever the
+    # console is not being watched - and when this is launched in the
+    # background its output goes to a file, so the operator never sees the
+    # prompt at all. The run then captures 33 frames of a parked aeroplane and
+    # the section comes back VOID, which is honest but useless.
+    #
+    # So the bench watches for the camera to actually move and starts the real
+    # capture only then. It cannot fly the aeroplane, but it can wait for it.
+    Write-Host "  PAN NOW - hold an arrow key" -ForegroundColor Yellow
+    Write-Host "  (waiting for the camera to move, up to 3 minutes)"
+    Set-Key 'taa.viz' '0'
+    Start-Sleep -Milliseconds 800
+
+    $moved = $false
+    $probeDeadline = (Get-Date).AddMinutes(3)
+    while ((Get-Date) -lt $probeDeadline) {
+        Shot "probe_a"
+        Start-Sleep -Milliseconds 450
+        Shot "probe_b"
+        $delta = & python (Join-Path $PSScriptRoot "bench.py") --framediff `
+                     "$shots\probe_a.png" "$shots\probe_b.png"
+        if ($LASTEXITCODE -eq 0 -and [double]$delta -gt 2.0) {
+            Say ("  motion detected (frame delta {0}) - capturing" -f $delta)
+            $moved = $true
+            break
+        }
+    }
+    if (-not $moved) {
+        Say "  no motion after 3 minutes - velocity section will report VOID"
+    }
 
     # viz=2 is VIZ_MAGNITUDE, which reads the velocity texture. It does not
     # touch history, so unlike viz 4/5/6 it cannot contaminate what it measures.

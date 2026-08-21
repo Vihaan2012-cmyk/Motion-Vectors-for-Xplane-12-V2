@@ -146,6 +146,31 @@ def main(d):
     else:
         line(BAD, "resolve is running", "no scene passes seen at all")
 
+    # ---- WHICH VIEW WAS THIS MEASURED IN?
+    #
+    # The crop is the lower-centre of the frame, which is ground and airframe
+    # in an external view and INSTRUMENT PANEL in the cockpit. Worse, panel
+    # geometry is given the identity body matrix on purpose, so it reads zero
+    # velocity by design - measuring it and calling the result a failure would
+    # be the tool misreading correct behaviour as a bug.
+    #
+    # X-Plane loads in the cockpit, so this is the normal case, not an edge one.
+    if haveTrace:
+        views = re.findall(r"NEAR FIELD SELECT: view=(\d+)", tx)
+        seen = [v for v in dict.fromkeys(views) if v != "0"]
+        names = {"1000": "forward w/ panel", "1017": "forward, no panel",
+                 "1018": "forward w/ HUD",   "1026": "3-D cockpit"}
+        if not seen:
+            line(VOID, "view during capture", "no view reported")
+        else:
+            cockpit = [v for v in seen if v in names]
+            desc = ", ".join("%s (%s)" % (v, names.get(v, "external")) for v in seen)
+            if cockpit and len(seen) == len(cockpit):
+                line(VOID, "view during capture",
+                     "%s - the crop is instrument panel, not scene" % desc)
+            else:
+                line(OK, "view during capture", desc)
+
     # ------------------------------------------------------ patching
     section("pipeline patching")
 
@@ -204,7 +229,49 @@ def main(d):
                  "TAA-off detail moved %.0f%% - scene drifted, comparison void" %
                  ((spread - 1) * 100))
         else:
-            line(OK, "scene stability during capture", "control steady")
+            # How much did the scene move DURING the parked section? The
+            # thresholds below assume a still camera, and the first bench run
+            # measured a moving one without noticing - consecutive frames
+            # differed by 33 of 255 while the section still called itself
+            # "parked". Interleaving keeps the comparison fair; it does not
+            # make the label true.
+            # ---- SAY WHICH ROUNDS WERE DISCARDED.
+            #
+            # Taking the median across interleaved rounds makes a single bad
+            # round harmless, and the first bench run proved it: the camera was
+            # still settling during round 0, whose TAA-on frames differed by
+            # 19.4 against ~0.1 for every later round, and the median absorbed
+            # it without comment.
+            #
+            # That is the right arithmetic and the wrong report. Silent
+            # robustness is indistinguishable from not having noticed, and a
+            # reader cannot tell four good rounds from five. So the outliers are
+            # named, and if too few survive the section is VOID rather than an
+            # average of noise.
+            onFl = [o[0] for o in on[:n]]
+            med  = np.median(onFl)
+            bad_rounds = [i for i, v in enumerate(onFl) if v > max(med * 5.0, 2.0)]
+            if bad_rounds:
+                line(OK, "rounds discarded as outliers",
+                     "round(s) %s - camera moved; median over the other %d"
+                     % (", ".join(str(b) for b in bad_rounds), n - len(bad_rounds)))
+            if n - len(bad_rounds) < 3:
+                line(VOID, "parked comparison",
+                     "only %d clean round(s) - not enough to conclude"
+                     % (n - len(bad_rounds)))
+                bad_rounds = list(range(n))     # suppress the numbers below
+
+            baseline = np.median([o[0] for o in off[:n]])
+            if bad_rounds and n - len(bad_rounds) < 3:
+                pass
+            elif baseline > 2.0:
+                line(VOID, "scene stability during capture",
+                     "camera moved during capture (delta %.1f) - the numbers "
+                     "below compare fairly but are NOT parked measurements"
+                     % baseline)
+            else:
+                line(OK, "scene stability during capture",
+                     "camera steady (delta %.2f)" % baseline)
             fr = np.median([on[i][0] / max(off[i][0], 1e-9) for i in range(n)])
             dr = np.median([on[i][1] / max(off[i][1], 1e-9) for i in range(n)])
             # TAA should be no LESS stable than not running it. Above ~2x it is
@@ -318,7 +385,22 @@ def main(d):
     return 1 if bad else 0
 
 
+def framediff(a, b):
+    """Mean absolute difference between two frames, for motion detection.
+
+    Printed to stdout so the PowerShell side can wait for the camera to move
+    rather than announcing a prompt nobody may be watching."""
+    ia = np.asarray(Image.open(a).convert("L"), dtype=np.float64)
+    ib = np.asarray(Image.open(b).convert("L"), dtype=np.float64)
+    if ia.shape != ib.shape:
+        return 0.0
+    return float(np.mean(np.abs(crop(ia) - crop(ib))))
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--framediff":
+        print("%.3f" % framediff(sys.argv[2], sys.argv[3]))
+        sys.exit(0)
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     sys.exit(main(sys.argv[1]))
