@@ -81,8 +81,8 @@ enum {
     // the cheapest available check that this block is numbered right.
     OpTypeArray = 28, OpTypeRuntimeArray = 29,
     OpConvertFToS = 110, OpIAdd = 128, OpIMul = 132,
-    OpLogicalOr = 166, OpLogicalNot = 168,
-    OpINotEqual = 171, OpSGreaterThanEqual = 175,
+    OpLogicalOr = 166, OpLogicalAnd = 167, OpLogicalNot = 168,
+    OpINotEqual = 171, OpSGreaterThanEqual = 175, OpSLessThan = 177,
     OpReturn = 253
 };
 enum { SC_Input = 1, SC_Output = 3, SC_PushConstant = 9,
@@ -1411,48 +1411,24 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     // Through OUR pointer, for the same dominance reason as the load above.
     body.push_back(head(OpStore, 3)); body.push_back(idPosPtr); body.push_back(idJittered);
 
-    out.clear();
-    out.reserve(w.size() + annos.size() + globals.size() + body.size() + 4);
-    for (int i = 0; i < 5; ++i) out.push_back(w[i]);
-    out[3] = bound;
-
-    size_t i = 5;
-    while (i < w.size()) {
-        uint16_t op  = (uint16_t)(w[i] & 0xFFFF);
-        uint16_t len = (uint16_t)(w[i] >> 16);
-        if (len == 0) break;
-
-        if (i == entryAt) {
-            // From SPIR-V 1.4 EVERY global variable must appear in the entry
-            // point's interface, push constants included; before that, only
-            // Input and Output. Getting this wrong is a validation error rather
-            // than a silent one, which is a mercy.
-            bool needPC = (version >= 0x00010400u);
-            // The storage buffer is a global variable too, so from 1.4 it has
-            // to be listed here as well. Omitting it is a validation error
-            // rather than a silent one, which is the mercy noted above - but it
-            // would be a validation error in fifteen thousand pipelines.
-            const bool needDS = needPC && wantDestruct;
-            uint16_t extra = (uint16_t)(2 + (needPC ? 1 : 0) + (needDS ? 1 : 0));
-            out.push_back(head(OpEntryPoint, (uint16_t)(len + extra)));
-            for (uint16_t k = 1; k < len; ++k) out.push_back(w[i + k]);
-            out.push_back(idOutCurr);
-            out.push_back(idOutPrev);
-            if (needPC) out.push_back(idPCVar);
-            if (needDS) out.push_back(idDSVar);
-            i += len;
-            continue;
-        }
-
-        for (uint16_t k = 0; k < len; ++k) out.push_back(w[i + k]);
-        i += len;
-
-        if (i == annotationsEnd) for (size_t k = 0; k < annos.size();   ++k) out.push_back(annos[k]);
-        if (i == globalsEnd)     for (size_t k = 0; k < globals.size(); ++k) out.push_back(globals[k]);
-        if (i == injectAt)       for (size_t k = 0; k < body.size();    ++k) out.push_back(body[k]);
-    }
-
-
+    // Built BEFORE out.clear(), and this ordering is the whole fix.
+    //
+    // This block used to sit AFTER the emission loop, appending to `body`
+    // that the loop had already copied into `out`. So the store was built
+    // and discarded, every time, and the module came out carrying the
+    // storage buffer, its decorations and its interface entry with nothing
+    // that writes to it.
+    //
+    // It hid well because every check passed on its own terms: spirv-val
+    // is happy with a declared, unused variable; the added word count was
+    // real; occupancyVsCount() counts intent rather than emission; and the
+    // decorations the dump was searched for were genuinely present. The
+    // discard word was the only witness that could tell the difference,
+    // and it read zero through 70999 draw-time binds.
+    //
+    // It also has to precede `out[3] = bound`, because it allocates dozens
+    // of ids. Emitting the body without moving the block would have
+    // written ids past the declared bound - invalid, in every pipeline.
     // ================= CRASH DESTRUCTION: WHICH CELL IS THIS VERTEX IN =====
     //
     // Emitted only when destructSet >= 0, which means crash.enable was on when
@@ -1555,13 +1531,82 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         body.push_back(head(OpSelect, 6)); body.push_back(idInt); body.push_back(idFinal);
         body.push_back(idSkip); body.push_back(idConstDiscard); body.push_back(idIdx);
 
+        // ---- AND NOW MAKE IT IN-BOUNDS BY CONSTRUCTION.
+        //
+        // Everything above rejects an out-of-range CELL. That is not the same
+        // claim as an in-range INDEX, and the difference is a lost device.
+        //
+        // OpFOrdLessThan(f, 0) is FALSE for NaN, because an ordered comparison
+        // with NaN always is - so the negative test passes a NaN straight
+        // through. OpConvertFToS of a NaN, or of any float too large to
+        // represent, is UNDEFINED by the specification, so the ">= n" test then
+        // compares a value the driver was free to invent. Both guards can say
+        // "in range" about a vertex that is nothing of the kind.
+        //
+        // X-Plane supplies such vertices constantly: culled instances collapsed
+        // to a point, unloaded geometry at infinity, particles with w = 0. This
+        // is not an edge case that has to be sought out - it took a few frames.
+        //
+        // So the index is checked against the array itself, after the select,
+        // where no arithmetic can follow it. Three instructions per vertex to
+        // convert a device loss into a write nobody reads.
+        const uint32_t idGe0 = bound++, idLtN = bound++, idInB = bound++;
+        const uint32_t idSafe = bound++;
+        body.push_back(head(OpSGreaterThanEqual, 5)); body.push_back(idBool); body.push_back(idGe0); body.push_back(idFinal); body.push_back(idConst0);
+        body.push_back(head(OpSLessThan, 5));         body.push_back(idBool); body.push_back(idLtN); body.push_back(idFinal); body.push_back(idConstDataN);
+        body.push_back(head(OpLogicalAnd, 5));        body.push_back(idBool); body.push_back(idInB); body.push_back(idGe0);   body.push_back(idLtN);
+        body.push_back(head(OpSelect, 6)); body.push_back(idInt); body.push_back(idSafe);
+        body.push_back(idInB); body.push_back(idFinal); body.push_back(idConstDiscard);
+
         const uint32_t idPStore = bound++;
         body.push_back(head(OpAccessChain, 6)); body.push_back(idPtrDSInt); body.push_back(idPStore);
-        body.push_back(idDSVar); body.push_back(idConst3DS); body.push_back(idFinal);
+        body.push_back(idDSVar); body.push_back(idConst3DS); body.push_back(idSafe);
         body.push_back(head(OpStore, 3)); body.push_back(idPStore); body.push_back(idConst1);
 
         ++occupancyVsCount();
     }
+
+    out.clear();
+    out.reserve(w.size() + annos.size() + globals.size() + body.size() + 4);
+    for (int i = 0; i < 5; ++i) out.push_back(w[i]);
+    out[3] = bound;
+
+    size_t i = 5;
+    while (i < w.size()) {
+        uint16_t op  = (uint16_t)(w[i] & 0xFFFF);
+        uint16_t len = (uint16_t)(w[i] >> 16);
+        if (len == 0) break;
+
+        if (i == entryAt) {
+            // From SPIR-V 1.4 EVERY global variable must appear in the entry
+            // point's interface, push constants included; before that, only
+            // Input and Output. Getting this wrong is a validation error rather
+            // than a silent one, which is a mercy.
+            bool needPC = (version >= 0x00010400u);
+            // The storage buffer is a global variable too, so from 1.4 it has
+            // to be listed here as well. Omitting it is a validation error
+            // rather than a silent one, which is the mercy noted above - but it
+            // would be a validation error in fifteen thousand pipelines.
+            const bool needDS = needPC && wantDestruct;
+            uint16_t extra = (uint16_t)(2 + (needPC ? 1 : 0) + (needDS ? 1 : 0));
+            out.push_back(head(OpEntryPoint, (uint16_t)(len + extra)));
+            for (uint16_t k = 1; k < len; ++k) out.push_back(w[i + k]);
+            out.push_back(idOutCurr);
+            out.push_back(idOutPrev);
+            if (needPC) out.push_back(idPCVar);
+            if (needDS) out.push_back(idDSVar);
+            i += len;
+            continue;
+        }
+
+        for (uint16_t k = 0; k < len; ++k) out.push_back(w[i + k]);
+        i += len;
+
+        if (i == annotationsEnd) for (size_t k = 0; k < annos.size();   ++k) out.push_back(annos[k]);
+        if (i == globalsEnd)     for (size_t k = 0; k < globals.size(); ++k) out.push_back(globals[k]);
+        if (i == injectAt)       for (size_t k = 0; k < body.size();    ++k) out.push_back(body[k]);
+    }
+
 
     // ---- DUMP THE PATCHED MODULE, NOT JUST THE ORIGINAL.
     //

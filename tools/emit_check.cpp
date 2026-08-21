@@ -36,18 +36,47 @@ static std::vector<uint32_t> readSpv(const char *path)
 
 int main(int argc, char **argv)
 {
+    // ---- UNBUFFERED, BECAUSE THIS TOOL CRASHES ON THE WAY OUT.
+    //
+    // Something in the static teardown segfaults after main returns. With
+    // buffered stdout that discards every line the tool printed, so a working
+    // run and a broken one both showed nothing at all - and the empty output
+    // was read as "inject() crashed", which sent the search into the injector
+    // instead of into the exit path.
+    //
+    // The teardown fault is worth fixing on its own account; this makes the
+    // tool's findings survive it in the meantime.
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) { printf("usage: emit_check <module.spv>\n"); return 2; }
+    fprintf(stderr, "[m1] before readSpv\n");
     std::vector<uint32_t> in = readSpv(argv[1]);
+    fprintf(stderr, "[m2] readSpv gave %zu words\n", in.size());
     if (in.size() < 5) { printf("could not read %s\n", argv[1]); return 2; }
 
     std::vector<uint32_t> off, on;
     uint32_t l1 = 0, l2 = 0;
+    fprintf(stderr, "[m3] before inject(off)\n");
     const spvinj::Result r1 = spvinj::inject(in.data(), in.size() * 4, off, &l1, -1);
+    fprintf(stderr, "[m4] inject(off) -> %d, %zu words\n", (int)r1, off.size());
     const uint64_t emittedBefore = spvinj::occupancyVsCount();
+    fprintf(stderr, "[m5] before inject(on)\n");
     const spvinj::Result r2 = spvinj::inject(in.data(), in.size() * 4, on,  &l2, 7);
+    fprintf(stderr, "[m6] inject(on) -> %d, %zu words\n", (int)r2, on.size());
     const uint64_t emittedAfter = spvinj::occupancyVsCount();
 
     printf("module            %s\n", argv[1]);
+
+    // A refused injection returns an EMPTY vector, and every check below
+    // indexes into it - on[3] for the id bound most obviously. Reading it
+    // segfaulted the tool before it printed anything, so a module the injector
+    // declined looked identical to a tool that was broken.
+    if (on.size() < 5 || off.size() < 5) {
+        printf("inject off        result %d, %zu words\n", (int)r1, off.size());
+        printf("inject on         result %d, %zu words\n", (int)r2, on.size());
+        printf("\nINJECTION REFUSED - nothing to check. This is a statement "
+               "about the module, not about the occupancy code.\n");
+        return 2;
+    }
     printf("inject off        result %d, %zu words\n", (int)r1, off.size());
     printf("inject on         result %d, %zu words\n", (int)r2, on.size());
     printf("words added       %zd\n", (ptrdiff_t)on.size() - (ptrdiff_t)off.size());
@@ -74,9 +103,78 @@ int main(int argc, char **argv)
     printf("Binding 0         %s\n", sawBinding0 ? "present" : "ABSENT");
     printf("StorageBuffer ptr %s\n", sawStorageBufferPtr ? "present" : "ABSENT");
 
+    // ---- THE ONLY CHECK THAT WOULD HAVE CAUGHT THE BUG.
+    //
+    // Everything above was true of a module that could not possibly work. The
+    // occupancy instructions were appended to a vector the emitter had already
+    // read, so the patched module declared the storage buffer, decorated it at
+    // set 7 binding 0, listed it in the entry point - and never wrote to it.
+    //
+    // This tool said EMISSION CONFIRMED, spirv-val agreed, and the discard word
+    // stayed at zero through 70999 draw-time binds while the search went
+    // looking at descriptor binding.
+    //
+    // A declaration is not a write. Find the store, through an access chain
+    // rooted at the storage buffer variable, or report nothing was emitted.
+    uint32_t dsVar = 0;
+    i = 5;
+    while (i < on.size()) {            // the variable our decoration names
+        const uint16_t op  = (uint16_t)(on[i] & 0xFFFF);
+        const uint16_t len = (uint16_t)(on[i] >> 16);
+        if (!len) break;
+        if (op == spvinj::OpDecorate && len >= 4 &&
+            on[i + 2] == spvinj::Deco_DescriptorSet && on[i + 3] == 7)
+            dsVar = on[i + 1];
+        i += len;
+    }
+
+    bool sawChain = false, sawStore = false;
+    uint32_t chainId = 0;
+    i = 5;
+    while (i < on.size()) {
+        const uint16_t op  = (uint16_t)(on[i] & 0xFFFF);
+        const uint16_t len = (uint16_t)(on[i] >> 16);
+        if (!len) break;
+        if (op == spvinj::OpAccessChain && len >= 4 && dsVar && on[i + 3] == dsVar) {
+            sawChain = true;
+            chainId  = on[i + 2];
+        }
+        if (op == spvinj::OpStore && len >= 3 && chainId && on[i + 1] == chainId)
+            sawStore = true;
+        i += len;
+    }
+
+    printf("access chain      %s\n", sawChain ? "present" : "ABSENT");
+    printf("STORE through it  %s\n", sawStore ? "present" : "ABSENT - nothing writes");
+
+    // ---- WRITE THE PATCHED MODULE OUT FOR spirv-val.
+    //
+    // A bound check was tried here and removed. It scanned every operand of
+    // every instruction and took each for an id, so an OpName's packed ASCII
+    // read as id 7628147 and the tool reported PAST THE BOUND on a module that
+    // was fine. Telling ids from literals needs per-opcode operand knowledge,
+    // which is a SPIR-V grammar table - and spirv-val already has one.
+    //
+    // So the module is written next to its input and validated by the tool
+    // whose job that is. A heuristic that produces false failures is worse than
+    // no check: it costs exactly the time a real failure would.
+    if (argc >= 3) {
+        FILE *fo = fopen(argv[2], "wb");
+        if (fo) {
+            fwrite(on.data(), 4, on.size(), fo);
+            fclose(fo);
+            printf("patched module    written to %s (validate with spirv-val)\n",
+                   argv[2]);
+        } else {
+            printf("patched module    could NOT be written to %s\n", argv[2]);
+        }
+    }
+
     const bool ok = (emittedAfter == emittedBefore + 1) &&
                     on.size() > off.size() &&
-                    sawDescriptorSet7 && sawBinding0 && sawStorageBufferPtr;
-    printf("\n%s\n", ok ? "EMISSION CONFIRMED" : "EMISSION DID NOT HAPPEN");
+                    sawDescriptorSet7 && sawBinding0 && sawStorageBufferPtr &&
+                    sawChain && sawStore;
+    printf("\n%s\n", ok ? "EMISSION CONFIRMED - and it writes"
+                        : "EMISSION INCOMPLETE");
     return ok ? 0 : 1;
 }

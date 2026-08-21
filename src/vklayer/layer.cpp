@@ -119,6 +119,7 @@ static void trace(const char *fmt, ...)
 #include "vram.h"
 #include "upscaler_policy.h"
 #include "xess_probe.h"
+#include "../destruct/bounds.h"
 
 // ------------------------------------------------------- shared memory
 
@@ -500,6 +501,35 @@ static uint32_t g_maxBoundSets = 4;
 // switched off, and it is invisible in a trace because nothing reports it.
 // With this, crash.enable=0 means destructgpu::state().ready stays false and
 // all three fall away together.
+// ---- WHETHER THE PER-VERTEX OCCUPANCY CODE IS EMITTED AT ALL.
+//
+// Separate from crash.enable, and off by default, because the two costs are
+// nothing alike.
+//
+// crash.enable buys the descriptor resources and the per-pipeline-bind, which
+// is a bind per pipeline change - about a thousand a frame, and cheap.
+//
+// This buys a matrix multiply, three divides, six comparisons and a store ON
+// EVERY VERTEX IN THE SIM, on every frame, forever. Measured at 4K that is
+// 38 fps down to 27.5 - and it is spent on a feature that matters for exactly
+// two frames of a discovery run, or during a crash that has not happened yet.
+//
+// Read once at first use, like crash.enable, because pipelines are patched at
+// startup and a value that changed later could not reach them anyway.
+static bool crashOccupancy()
+{
+    static int on = -1;
+    if (on < 0) {
+        live::loadNow();
+        on = live::onoff("crash.occupancy", "TAA_CRASH_OCCUPANCY", false) ? 1 : 0;
+        trace("DESTRUCT: crash.occupancy=%d - the per-vertex classification is "
+              "%s. It costs a matrix multiply and a store on every vertex in "
+              "the sim, so it is off unless a discovery run needs it.",
+              on, on ? "COMPILED INTO EVERY VERTEX SHADER" : "not emitted");
+    }
+    return on != 0;
+}
+
 static bool crashEnabled()
 {
     static int on = -1;
@@ -7371,6 +7401,154 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // be lost by anyone else clearing the block.
     if (g_share) g_share->layerAttached = 1;
 
+    // ================= CRASH DESTRUCTION: DISCOVERY =======================
+    //
+    // Two frames, driven from the control file. Frame one publishes the grid
+    // and switches the vertex patch on with the occupancy region cleared;
+    // frame two reads back what the airframe's own vertices marked.
+    //
+    // Two frames and not one because the write happens on the GPU during the
+    // frame we arm it. Reading in the same frame would report whatever was
+    // there before the draws ran, which is zero - and zero is
+    // indistinguishable from "the transform is wrong and nothing landed in the
+    // grid", which is the single most important failure this is looking for.
+    if (g_share && crashEnabled() && destructgpu::state().ready) {
+        static int discoverPhase = 0;   // 0 idle, 1 armed, 2 read next frame
+        static uint32_t discoverCells = 0;
+
+        const bool want = live::onoff("crash.discover", "TAA_CRASH_DISCOVER", false);
+
+        // The matrix is refused rather than defaulted. A zeroed
+        // crashAircraftInv means the plugin could not invert the body-to-view
+        // matrix, and classifying against identity would fill the grid with
+        // clip-space nonsense that looks like a working discovery.
+        bool haveMatrix = false;
+        for (int mi = 0; mi < 16; ++mi)
+            if (g_share->crashAircraftInv[mi] != 0.0f) { haveMatrix = true; break; }
+
+        if (want && discoverPhase == 0) {
+            if (!haveMatrix) {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    trace("DESTRUCT: discovery asked for but the clip-to-aircraft "
+                          "matrix is not available - the plugin could not invert "
+                          "the body-to-view transform. Refusing rather than "
+                          "classifying against identity.");
+                }
+            } else if (g_share->crashNx > 0 && g_share->crashCell > 0.0f) {
+                destruct::Grid g;
+                g.min[0] = g_share->crashGridMin[0];
+                g.min[1] = g_share->crashGridMin[1];
+                g.min[2] = g_share->crashGridMin[2];
+                g.cell   = g_share->crashCell;
+                g.nx = g_share->crashNx; g.ny = g_share->crashNy; g.nz = g_share->crashNz;
+                discoverCells = destruct::gpuCellCount(g);
+
+                destructgpu::clearOccupancy(discoverCells);
+                destructgpu::clearDiscard();
+                destructgpu::uploadHeader(g_share->crashAircraftInv, g.min, g.cell,
+                                          g.nx, g.ny, g.nz, 1);
+                discoverPhase = 1;
+                trace("DESTRUCT: discovery armed - %u cells of %.2f m, grid "
+                      "%dx%dx%d from (%.1f %.1f %.1f)",
+                      discoverCells, (double)g.cell, g.nx, g.ny, g.nz,
+                      (double)g.min[0], (double)g.min[1], (double)g.min[2]);
+            }
+        } else if (discoverPhase == 1) {
+            // Let the armed frame actually render before believing the buffer.
+            discoverPhase = 2;
+        } else if (discoverPhase == 2) {
+            std::vector<unsigned char> occ(discoverCells ? discoverCells : 1, 0);
+            const uint32_t hit = destructgpu::readOccupancy(occ.data(), discoverCells);
+            const float frac = discoverCells ? (float)hit / (float)discoverCells : 0.0f;
+
+            destruct::Grid g;
+            g.min[0] = g_share->crashGridMin[0];
+            g.min[1] = g_share->crashGridMin[1];
+            g.min[2] = g_share->crashGridMin[2];
+            g.cell   = g_share->crashCell;
+            g.nx = g_share->crashNx; g.ny = g_share->crashNy; g.nz = g_share->crashNz;
+
+            float rMin[3], rMax[3];
+            const bool refined = destruct::refineBounds(g, occ.data(), rMin, rMax);
+
+            // The plan's gate, stated in its own terms, because a number with
+            // no verdict beside it gets read as whatever the reader hoped.
+            const char *verdict =
+                (frac < 0.02f) ? "TOO LOW - classification is missing the aircraft" :
+                (frac > 0.40f) ? "TOO HIGH - the box or the transform is catching the world" :
+                                 "plausible";
+
+            // The discard word separates the two ways this can read zero.
+            // Without it, "no patched shader ran" and "every vertex was
+            // rejected by the transform" are the same number with completely
+            // different causes.
+            const uint32_t disc = destructgpu::readDiscard();
+            trace("DESTRUCT: discovery %u of %u cells occupied (%.1f%%) - %s",
+                  hit, discoverCells, (double)(frac * 100.0f), verdict);
+            trace("DESTRUCT: %llu vertex module(s) carry the occupancy write",
+                  (unsigned long long)spvinj::occupancyVsCount());
+
+            // ---- THE COVERAGE NUMBERS, IN FULL, ONCE.
+            //
+            // These counters are otherwise only ever seen through a
+            // "% 500 == 1" trace, so the log said "1 layout(s) carry the
+            // fragment set" whether the true figure was 1 or 499. That is a
+            // LOWER BOUND being read as a count, and it is the reason it was
+            // not possible to tell whether layout coverage matched the 307
+            // patched modules - the single most useful comparison there is.
+            //
+            // A patched shader whose pipeline layout does not declare the set
+            // cannot write, however correct its arithmetic, so these two
+            // numbers failing to correspond is a diagnosis on its own.
+            trace("DESTRUCT: coverage - %llu layout(s) extended, %llu refused "
+                  "(already past index %u or at the device limit), %llu "
+                  "pipeline bind(s) carried the set, %llu draw-time rebind(s)",
+                  (unsigned long long)destructgpu::layoutsExtended(),
+                  (unsigned long long)destructgpu::layoutsTooMany(),
+                  destructgpu::state().setIndex,
+                  (unsigned long long)destructgpu::bindsIssued(),
+                  (unsigned long long)destructgpu::drawRebinds());
+            trace("DESTRUCT: discard word = %u. %s", disc,
+                  disc ? "The shader DID run, so the occupancy result is a "
+                         "verdict on the transform."
+                       : "The shader did NOT run - no patched vertex shader "
+                         "reached the store, so this says nothing about the "
+                         "transform. Look at emission and binding first.");
+
+            if (refined)
+                trace("DESTRUCT: measured airframe box (%.2f %.2f %.2f) to "
+                      "(%.2f %.2f %.2f), %.1f x %.1f x %.1f m",
+                      (double)rMin[0], (double)rMin[1], (double)rMin[2],
+                      (double)rMax[0], (double)rMax[1], (double)rMax[2],
+                      (double)(rMax[0] - rMin[0]), (double)(rMax[1] - rMin[1]),
+                      (double)(rMax[2] - rMin[2]));
+            else
+                trace("DESTRUCT: nothing occupied. The transform put the "
+                      "aeroplane somewhere other than the grid - this is the "
+                      "answer, not an absence of one.");
+
+            // Switch the vertex writes back off and clear the one-shot, so a
+            // key left set in the file costs one discovery rather than one per
+            // frame forever.
+            destructgpu::uploadHeader(g_share->crashAircraftInv, g.min, g.cell,
+                                      g.nx, g.ny, g.nz, 0);
+            live::clearOneShot("crash.discover");
+            discoverPhase = 0;
+        }
+
+        if (!want && discoverPhase == 0) {
+            // Keep the header current even when idle, so the first armed frame
+            // is not classifying against a matrix from several seconds ago.
+            destructgpu::uploadHeader(g_share->crashAircraftInv,
+                                      g_share->crashGridMin, g_share->crashCell,
+                                      g_share->crashNx, g_share->crashNy,
+                                      g_share->crashNz, 0);
+        }
+    }
+
+
     if (g_share && !g_availReported) {
         g_availReported = true;
 
@@ -9305,8 +9483,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
             // The set index is passed rather than assumed. -1 means emit nothing at
             // all, so with crash.enable off the occupancy instructions do not
             // exist in the module and cannot affect normal flight.
-            const int dsSet = (crashEnabled() && destructgpu::state().ready)
+            const int dsSet = (crashEnabled() && crashOccupancy() && destructgpu::state().ready)
                                 ? (int)destructgpu::state().setIndex : -1;
+            // WHY, not just what. A single "emitted 0 modules" cannot say which
+            // of the three conditions was false, and the whole discovery result
+            // is meaningless if this is -1 - which is exactly how a 0% reading
+            // was nearly blamed on the transform.
+            {
+                static bool saidDs = false;
+                if (!saidDs) {
+                    saidDs = true;
+                    trace("DESTRUCT: shader patch decision - crash.enable=%d "
+                          "crash.occupancy=%d resources_ready=%d -> set %d%s",
+                          crashEnabled() ? 1 : 0, crashOccupancy() ? 1 : 0,
+                          destructgpu::state().ready ? 1 : 0, dsSet,
+                          dsSet < 0 ? " (NO occupancy code will be emitted)" : "");
+                }
+            }
             spvinj::Result r = spvinj::inject(ci->pCode, ci->codeSize, patched, &loc, dsSet);
             if (r == spvinj::INJ_NOT_VERTEX) {
                 // USE THE REAL ATTACHMENT INDEX, NOT A NOMINAL 1.
@@ -9742,7 +9935,12 @@ static std::map<VkPipeline, VkPipelineLayout> g_pipelineLayoutOf;
 //
 // Pushing again immediately before each draw closes that window: nothing can be
 // bound between the push and the draw that consumes it.
-struct PendingPush { VkCommandBuffer cb; VkPipelineLayout layout; float block[36]; bool valid; };
+struct PendingPush { VkCommandBuffer cb; VkPipelineLayout layout;
+                     float block[36]; bool valid;
+                     // UINT32_MAX when this pipeline's layout does not
+                     // carry the destruction set - which is the common
+                     // case, and must bind NOTHING rather than bind at 0.
+                     uint32_t destructSet; };
 
 // THREAD-LOCAL, NOT A MAP UNDER A MUTEX.
 //
@@ -9781,25 +9979,68 @@ struct PushSlots {
             slot[i].valid = false;
         }
     }
+    // ---- OCCUPANCY IS NOT VALIDITY. THEY WERE THE SAME FLAG AND STOPPED BEING.
+    //
+    // This matched on `valid`, which means "a matrix has been pushed into this
+    // slot". That was the same thing as "this slot belongs to this command
+    // buffer" for as long as a push was the only thing that ever created one.
+    //
+    // It stopped being the same thing when the pipeline bind began creating
+    // slots to carry destructSet - and those start with valid = false on
+    // purpose, so the push path cannot fire on a block nobody wrote. So find()
+    // skipped exactly the slots that carried the descriptor set index, the
+    // draw took the "no slot" early return, and set 7 was never bound.
+    //
+    // The shader statically uses set 7, so a draw with it unbound is
+    // VUID-vkCmdDrawIndexed-None-08600 and then a lost device. Validation
+    // named it in one run: "The set (7) is out of bounds for the number of
+    // sets bound (3)".
+    //
+    // Occupancy is the command buffer matching. Whether the MATRIX is usable is
+    // a separate question, asked separately by every caller that reads it.
     PendingPush *find(VkCommandBuffer cb) {
+        if (cb == VK_NULL_HANDLE) return nullptr;
         for (int i = 0; i < kN; ++i)
-            if (slot[i].valid && slot[i].cb == cb) return &slot[i];
+            if (slot[i].cb == cb) return &slot[i];
         return nullptr;
     }
     PendingPush *obtain(VkCommandBuffer cb) {
         if (PendingPush *p = find(cb)) return p;
         PendingPush *p = &slot[next];
         next = (next + 1) % kN;
+        // ---- A RECYCLED SLOT CARRIES THE PREVIOUS BUFFER'S STATE.
+        //
+        // It was left uninitialised while the only field that mattered was the
+        // matrix, which every caller wrote before use. destructSet is not like
+        // that: the push path never sets it, so a slot recycled from a command
+        // buffer whose pipeline DID carry the set arrived at one whose pipeline
+        // does not, still saying 7.
+        //
+        // The result is vkCmdBindDescriptorSets(firstSet = 7) against a layout
+        // that declares one set. X-Plane did not survive the first frame.
+        //
+        // Cleared here, once, rather than at each call site - the previous
+        // version guarded the site that was written last week and not the one
+        // written a month ago, which is the failure mode this avoids.
+        p->cb          = cb;
+        p->layout      = VK_NULL_HANDLE;
+        p->valid       = false;
+        p->destructSet = UINT32_MAX;
+        memset(p->block, 0, sizeof(p->block));
         return p;
     }
 };
 static thread_local PushSlots g_tlPushSlots;
-static thread_local PendingPush g_tlPush = { VK_NULL_HANDLE, VK_NULL_HANDLE, {0}, false };
+static thread_local PendingPush g_tlPush = { VK_NULL_HANDLE, VK_NULL_HANDLE, {0}, false, UINT32_MAX };
 
 static bool mvPendingJitter(VkCommandBuffer cb, float *jx, float *jy)
 {
     PendingPush *pp = g_tlPushSlots.find(cb);
-    if (!pp) return false;
+    // find() now returns a slot the PIPELINE BIND may have created, whose block
+    // nobody has written. It used to filter those out itself, and the jitter
+    // read would otherwise be two floats of zeroed memory presented as a real
+    // sub-pixel offset.
+    if (!pp || !pp->valid) return false;
     *jx = pp->block[16];
     *jy = pp->block[17];
     return true;
@@ -10076,7 +10317,7 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
     std::vector<uint32_t> patched;
     uint32_t loc = 0;
     VkShaderModule out = VK_NULL_HANDLE;
-    const int dsSet2 = (crashEnabled() && destructgpu::state().ready)
+    const int dsSet2 = (crashEnabled() && crashOccupancy() && destructgpu::state().ready)
                          ? (int)destructgpu::state().setIndex : -1;
     spvinj::Result ir = spvinj::inject(src.data(), src.size() * 4, patched, &loc, dsSet2);
     mvNoteInjectReason(ir);
@@ -10261,6 +10502,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                         patchedVert = true;
                 }
                 if (!patchedVert) continue;
+
+                // ---- THE SET MISMATCH, WHICH IS FATAL RATHER THAN WRONG.
+                //
+                // A patched module declares the storage buffer at descriptor
+                // set 7 STATICALLY. Using it with a pipeline layout that does
+                // not declare that set is invalid, and now that the occupancy
+                // store actually executes it is a GPU fault rather than a bad
+                // number: VK_ERROR_DEVICE_LOST on vkQueueSubmit, a few frames
+                // in.
+                //
+                // It could not bite before, because the store was being built
+                // into a vector that had already been emitted and so never
+                // reached the module at all. Fixing the emission is what made
+                // this reachable.
+                if (destructgpu::state().ready &&
+                    g_layoutOurSet.find(ci[i].layout) == g_layoutOurSet.end()) {
+                    static uint64_t nSetMismatch = 0;
+                    if (++nSetMismatch <= 3 || (nSetMismatch % 500) == 0)
+                        trace("DESTRUCT: *** SET MISMATCH - a PATCHED vertex "
+                              "module is bound to layout %p, which does NOT "
+                              "carry our descriptor set (%llu so far). The "
+                              "shader writes through a set the layout never "
+                              "declared, which is a device loss rather than a "
+                              "wrong answer. ***",
+                              (void*)ci[i].layout,
+                              (unsigned long long)nSetMismatch);
+                }
+
                 std::map<VkPipelineLayout, bool>::iterator lt =
                     g_layoutHasOurPC.find(ci[i].layout);
                 if (lt != g_layoutHasOurPC.end() && lt->second) continue;
@@ -10918,6 +11187,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
 // exactly rather than one recovered from a quantised depth value.
 static PFN_vkCmdBindPipeline  g_nextCmdBindPipeline = nullptr;
 static PFN_vkCmdPushConstants g_nextCmdPushConstants = nullptr;
+// Resolved once beside the push entry point, for the same reason: the
+// draw path must not take the global lock to find it.
+static PFN_vkCmdBindDescriptorSets g_nextCmdBindSets = nullptr;
 static thread_local bool g_inOurPush = false;
 static uint64_t g_foreignPushes = 0;
 static uint32_t g_foreignLo = 0xFFFFFFFFu, g_foreignHi = 0;
@@ -11005,12 +11277,45 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
 //
 // Writing it immediately before each draw closes the window by construction.
 // TAA_MV_NO_REPUSH turns it off to compare.
+// ---- THE DESTRUCTION SET, BOUND WHERE IT SURVIVES.
+//
+// Immediately before the draw is the only point at which nothing can intervene
+// between the binding and its use - which is the same sentence the push
+// constant re-push above is justified by, because it is the same problem.
+//
+// pp->layout is the PIPELINE'S layout, and therefore the extended one: sets
+// 0..N-1 are described exactly as X-Plane declared them, so binding at index 7
+// leaves its own bound sets undisturbed.
+static void mvRebindDestructSet(VkCommandBuffer cb, const PendingPush *pp)
+{
+    if (!pp || pp->destructSet == UINT32_MAX) return;
+    // A set index without the layout it was measured against is not a binding,
+    // it is a guess at one. Both come from the same pipeline bind, so either
+    // both are present or neither is usable.
+    if (pp->layout == VK_NULL_HANDLE) return;
+    if (!g_nextCmdBindSets || !destructgpu::state().ready) return;
+    VkDescriptorSet set = destructgpu::state().set;
+    g_nextCmdBindSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->layout,
+                      pp->destructSet, 1, &set, 0, nullptr);
+    ++destructgpu::drawRebinds();
+}
+
 static void mvRepushBeforeDraw(VkCommandBuffer cb)
 {
     static const bool off = (getenv("TAA_MV_NO_REPUSH") != nullptr);
-    if (off || !g_nextCmdPushConstants) return;
     PendingPush *pp = g_tlPushSlots.find(cb);
     if (!pp) { ++g_drawRepushMissed; return; }
+
+    // Before the early return, and deliberately. The descriptor set and the
+    // matrix are independent: TAA_MV_NO_REPUSH is a switch for testing the
+    // matrix, and having it silently also disable crash destruction would make
+    // one diagnostic quietly disable an unrelated feature.
+    mvRebindDestructSet(cb, pp);
+
+    // pp->valid, not merely pp. A slot is now created by the pipeline bind as
+    // well as by a push, so its existence no longer implies a matrix has been
+    // written into it.
+    if (off || !g_nextCmdPushConstants || !pp->valid) return;
     g_inOurPush = true;
     g_nextCmdPushConstants(cb, pp->layout, VK_SHADER_STAGE_VERTEX_BIT,
                            spvinj::pushConstantOffset(),
@@ -11155,12 +11460,27 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // statically references the binding, the descriptor has to be valid at
     // draw time whether or not the branch is taken. crash.enable is the gate
     // because it also decides whether displacement is patched in.
-    if (crashEnabled() && bind == VK_PIPELINE_BIND_POINT_GRAPHICS &&
-        destructgpu::state().ready) {
-        VkPipelineLayout lay = VK_NULL_HANDLE;
+    // ---- RECORD WHERE OUR SET LIVES. DO NOT BIND IT HERE.
+    //
+    // This used to bind the set on every graphics pipeline bind, and that is
+    // too early to be worth anything. Vulkan disturbs the bindings for every
+    // set index >= N the moment a later vkCmdBindDescriptorSets uses a layout
+    // that is not compatible for set N - and X-Plane binds its own sets AFTER
+    // the pipeline, with a layout declaring nothing like eight of them.
+    //
+    // So the set was bound 11.5 million times and unbound again before every
+    // draw. The readback said exactly that and it was hard to hear: 307 patched
+    // vertex modules, 11.5M binds, discard word still zero. The store is
+    // branch-free, so a shader that RAN had to write somewhere; zero everywhere
+    // means the writes had no descriptor to land in.
+    //
+    // The index is recorded on the thread-local slot instead, and the bind
+    // happens immediately before the draw - the same place, and for the same
+    // reason, as the push constant re-push.
+    if (bind == VK_PIPELINE_BIND_POINT_GRAPHICS) {
         uint32_t ourSet = UINT32_MAX;
-        PFN_vkCmdBindDescriptorSets bindSets = nullptr;
-        {
+        VkPipelineLayout lay = VK_NULL_HANDLE;
+        if (crashEnabled() && destructgpu::state().ready) {
             std::lock_guard<std::mutex> g(g_lock);
             std::map<VkPipeline, VkPipelineLayout>::iterator pi =
                 g_pipelineLayoutOf.find(pipeline);
@@ -11170,24 +11490,32 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
                     g_layoutOurSet.find(lay);
                 if (li != g_layoutOurSet.end()) ourSet = li->second;
             }
-            // The entry point is per DEVICE, not global - resolved through the
-            // command buffer the same way every other hook here does it.
-            std::map<VkCommandBuffer, VkDevice>::iterator ci =
-                g_cbToDevice.find(cb);
-            if (ci != g_cbToDevice.end()) {
-                std::map<void*, DeviceData>::iterator di =
-                    g_devices.find(dispatchKey(ci->second));
-                if (di != g_devices.end()) bindSets = di->second.cmdBindDescriptorSets;
-            }
         }
-        if (ourSet != UINT32_MAX && bindSets) {
-            VkDescriptorSet set = destructgpu::state().set;
-            bindSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                     lay, ourSet, 1, &set, 0, nullptr);
+        // Written on EVERY graphics bind, including as UINT32_MAX. A slot is
+        // recycled across command buffers, so leaving it alone when the feature
+        // is off would let a stale index bind our buffer over one of X-Plane's
+        // on an unrelated pipeline - corruption rather than a missing feature.
+        PendingPush *dp = g_tlPushSlots.find(cb);
+        if (!dp) {
+            // A slot now exists for this command buffer whether or not a matrix
+            // was ever pushed into it, so it must start INVALID. Without this,
+            // mvRepushBeforeDraw's "no slot means nothing to push" test starts
+            // succeeding on a slot recycled from another command buffer, and
+            // pushes that buffer's matrix into this one.
+            dp = g_tlPushSlots.obtain(cb);
+            dp->cb     = cb;
+            dp->layout = VK_NULL_HANDLE;
+            dp->valid  = false;
+            memset(dp->block, 0, sizeof(dp->block));
+        }
+        dp->destructSet = ourSet;
+        if (ourSet != UINT32_MAX) {
+            dp->layout = lay;
             if (++destructgpu::bindsIssued() % 100000 == 1)
-                trace("DESTRUCT: %llu descriptor set binds (set index %u) - "
-                      "rebound per pipeline bind because X-Plane's own layout "
-                      "does not describe our set and would disturb it",
+                trace("DESTRUCT: %llu pipeline(s) bound whose layout carries the "
+                      "fragment set at index %u; the set itself is bound before "
+                      "each draw, because binding it here is undone by X-Plane's "
+                      "own descriptor binds before the draw ever runs",
                       (unsigned long long)destructgpu::bindsIssued(), ourSet);
         }
     }
@@ -12694,6 +13022,9 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     }
     g_nextCmdBindPipeline = (PFN_vkCmdBindPipeline)nextGDPA(*out, "vkCmdBindPipeline");
     g_nextCmdPushConstants = (PFN_vkCmdPushConstants)nextGDPA(*out, "vkCmdPushConstants");
+    if (!g_nextCmdBindSets)
+        g_nextCmdBindSets = (PFN_vkCmdBindDescriptorSets)
+            nextGDPA(*out, "vkCmdBindDescriptorSets");
     g_nextCmdBlitImage = (PFN_vkCmdBlitImage)nextGDPA(*out, "vkCmdBlitImage");
     g_nextCmdCopyImage = (PFN_vkCmdCopyImage)nextGDPA(*out, "vkCmdCopyImage");
     g_nextCmdClearColorImage = (PFN_vkCmdClearColorImage)

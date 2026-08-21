@@ -93,6 +93,9 @@ inline uint32_t chooseSetIndex(uint32_t maxBoundSets)
 inline uint64_t &layoutsExtended() { static uint64_t n = 0; return n; }
 inline uint64_t &layoutsTooMany()  { static uint64_t n = 0; return n; }
 inline uint64_t &bindsIssued()     { static uint64_t n = 0; return n; }
+// Binds issued immediately before a draw, which are the only ones that
+// survive to be read. See the comment on mvRebindDestructSet.
+inline uint64_t &drawRebinds()     { static uint64_t n = 0; return n; }
 
 // Fragments the buffer is sized for. The plan targets 800-2000 for an
 // airliner; 4096 leaves headroom without the allocation mattering (48 KB).
@@ -339,6 +342,31 @@ inline void clearOccupancy(uint32_t cells)
 // Returns how many cells came back set. The count is the number the trace
 // reports and the number Task 9's gate is judged on, so it is produced here
 // rather than recomputed by each caller.
+// The discard word, read on its own.
+//
+// This is the difference between "the shader ran and rejected everything" and
+// "the shader never ran at all", which an occupancy count of zero cannot
+// distinguish and which have completely different causes. Every vertex that is
+// out of the grid, and every vertex at all while discovery is off, writes 1
+// here - so a zero means no patched vertex shader executed the code, and a one
+// means the code ran and the transform is wrong.
+inline uint32_t readDiscard()
+{
+    State &s = state();
+    if (!s.ready || !s.mapped) return 0;
+    const uint32_t *p =
+        (const uint32_t *)((const unsigned char *)s.mapped + destruct::kOffDiscard);
+    return *p;
+}
+
+inline void clearDiscard()
+{
+    State &s = state();
+    if (!s.ready || !s.mapped) return;
+    uint32_t *p = (uint32_t *)((unsigned char *)s.mapped + destruct::kOffDiscard);
+    *p = 0;
+}
+
 inline uint32_t readOccupancy(unsigned char *out, uint32_t cells)
 {
     State &s = state();
