@@ -486,6 +486,82 @@ static std::map<VkShaderModule, std::vector<uint32_t> > g_moduleCode;
 enum { kSC_Uniform = 2, kSC_StorageBuffer = 12 };
 enum { kDeco_BufferBlock = 3 };
 
+// ---- WHAT IS ACTUALLY IN THE ZERO-ATTRIBUTE PILE?
+//
+// Two guesses have now been made about this pile and both were wrong. "No
+// vertex attributes means full-screen quad" blacked the ground; "depth state
+// separates them" swept in 1379 post-process quads that stamp the frame; and
+// "the terrain reads an SSBO" rescued exactly ONE pipeline, which is not a
+// terrain system. Guess three would be worth less than one measurement.
+//
+// So this prints a FINGERPRINT of every distinct zero-attribute vertex module:
+// how it is built and where it reads from. The terrain must place its vertices
+// from somewhere, and whatever that source is will show up here next to the
+// post-process quads that read nothing to place themselves. The discriminator
+// then gets chosen from the data instead of from an assumption about how
+// X-Plane is written.
+struct VsFingerprint {
+    uint32_t words;
+    bool vertexIndex, instanceIndex;
+    bool ssbo, uniform, bufferBlock, runtimeArray;
+    bool imageFetchOrRead, sampledImage, texelBuffer;
+    uint32_t nUniformLoads;
+};
+
+static VsFingerprint spirvVsFingerprint(const std::vector<uint32_t> &w)
+{
+    VsFingerprint f;
+    memset(&f, 0, sizeof(f));
+    f.words = (uint32_t)w.size();
+    if (w.size() < 5 || w[0] != 0x07230203u) return f;
+
+    std::set<uint32_t> bufferBlockTypes, ptrsToWatch;
+    std::map<uint32_t, uint32_t> ptrPointee, ptrClass;
+    for (size_t k = 5; k < w.size(); ) {
+        const uint32_t op = w[k] & 0xFFFFu, len = w[k] >> 16;
+        if (len == 0 || k + len > w.size()) break;
+        switch (op) {
+        case 71: /* OpDecorate */
+            if (len >= 3 && w[k+2] == 3 /* BufferBlock */) bufferBlockTypes.insert(w[k+1]);
+            if (len >= 4 && w[k+2] == 11 /* BuiltIn */) {
+                if (w[k+3] == 42) f.vertexIndex   = true;
+                if (w[k+3] == 43) f.instanceIndex = true;
+            }
+            break;
+        case 32: /* OpTypePointer */
+            if (len >= 4) { ptrPointee[w[k+1]] = w[k+3]; ptrClass[w[k+1]] = w[k+2]; }
+            break;
+        case 29: /* OpTypeRuntimeArray */ f.runtimeArray = true; break;
+        case 25: /* OpTypeImage */
+            // Dim 5 = Buffer: a texel buffer, the other way to pull vertices.
+            if (len >= 4 && w[k+3] == 5) f.texelBuffer = true;
+            break;
+        case 27: /* OpTypeSampledImage */ f.sampledImage = true; break;
+        case 59: /* OpVariable */
+            if (len >= 4) {
+                const uint32_t sc = w[k+3];
+                if (sc == 12) f.ssbo = true;
+                if (sc == 2) {
+                    f.uniform = true;
+                    std::map<uint32_t,uint32_t>::iterator it = ptrPointee.find(w[k+1]);
+                    if (it != ptrPointee.end() && bufferBlockTypes.count(it->second))
+                        f.bufferBlock = true;
+                }
+                if (sc == 2 || sc == 12) ptrsToWatch.insert(w[k+2]);
+            }
+            break;
+        case 95: /* OpImageFetch  */
+        case 98: /* OpImageRead   */ f.imageFetchOrRead = true; break;
+        case 61: /* OpLoad */
+            if (len >= 4 && ptrsToWatch.count(w[k+3])) ++f.nUniformLoads;
+            break;
+        default: break;
+        }
+        k += len;
+    }
+    return f;
+}
+
 static bool spirvPullsVertices(const std::vector<uint32_t> &w)
 {
     if (w.size() < 5 || w[0] != 0x07230203u) return false;
@@ -10138,15 +10214,57 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             //                         0  depth alone (the loose rule; stamps)
             const bool quadRulePull =
                 live::onoff("taa.quad_needs_pull", "TAA_QUAD_NEEDS_PULL", true);
+            const bool zeroAttribs =
+                !ci[i].pVertexInputState ||
+                ci[i].pVertexInputState->vertexAttributeDescriptionCount == 0;
+
             bool pullsVertices = false;
-            if (quadRulePull) {
+            if (quadRulePull || zeroAttribs) {
                 for (uint32_t st = 0; st < ci[i].stageCount; ++st) {
                     if (!(ci[i].pStages[st].stage & VK_SHADER_STAGE_VERTEX_BIT))
                         continue;
                     std::map<VkShaderModule, std::vector<uint32_t> >::iterator mit =
                         g_moduleCode.find(ci[i].pStages[st].module);
-                    if (mit != g_moduleCode.end())
+                    if (mit != g_moduleCode.end()) {
                         pullsVertices = spirvPullsVertices(mit->second);
+
+                        // ---- REPORT EVERY DISTINCT ZERO-ATTRIBUTE MODULE ONCE.
+                        //
+                        // Keyed by word count plus the fingerprint bits, so one
+                        // line appears per KIND of shader rather than per
+                        // pipeline. The terrain and the post-process quads are
+                        // both in here; this is what tells them apart, and it
+                        // is the step that should have come before either of
+                        // the two discriminators that were guessed.
+                        if (zeroAttribs) {
+                            const VsFingerprint f = spirvVsFingerprint(mit->second);
+                            const uint32_t key =
+                                (f.words << 10) ^
+                                ((uint32_t)f.vertexIndex      << 0) ^
+                                ((uint32_t)f.instanceIndex    << 1) ^
+                                ((uint32_t)f.ssbo             << 2) ^
+                                ((uint32_t)f.uniform          << 3) ^
+                                ((uint32_t)f.bufferBlock      << 4) ^
+                                ((uint32_t)f.runtimeArray     << 5) ^
+                                ((uint32_t)f.imageFetchOrRead << 6) ^
+                                ((uint32_t)f.sampledImage     << 7) ^
+                                ((uint32_t)f.texelBuffer      << 8);
+                            static std::set<uint32_t> seenVs;
+                            std::lock_guard<std::mutex> g(g_lock);
+                            if (seenVs.size() < 60 && !seenVs.count(key)) {
+                                seenVs.insert(key);
+                                trace("VS ZEROATTR: %5u words | vtxIdx=%d instIdx=%d "
+                                      "| ssbo=%d ubo=%d bufblock=%d rtarray=%d "
+                                      "| imgfetch=%d sampled=%d texelbuf=%d "
+                                      "| bufLoads=%u | depth=%d",
+                                      f.words, (int)f.vertexIndex, (int)f.instanceIndex,
+                                      (int)f.ssbo, (int)f.uniform, (int)f.bufferBlock,
+                                      (int)f.runtimeArray, (int)f.imageFetchOrRead,
+                                      (int)f.sampledImage, (int)f.texelBuffer,
+                                      f.nUniformLoads, (int)touchesDepth);
+                            }
+                        }
+                    }
                     break;
                 }
             }

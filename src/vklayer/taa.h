@@ -180,6 +180,7 @@ struct TaaPush {
     // hard rejection (shake); pc.alpha is keeping it forever (crawl); between
     // the two the stale history decays instead of being kept or thrown away.
     float   novecAlpha;
+    float   movedDead;
 };
 
 enum {
@@ -203,6 +204,10 @@ static int   taaMode()     { return live::i("taa.mode",  "TAA_MODE",  0); }
 static float taaAlpha()    { return live::f("taa.alpha", "TAA_ALPHA", 0.1f); }
 static float taaGain()     { return live::f("taa.gain",  "TAA_GAIN",  4.0f); }
 static float taaVarClip()  { return live::f("taa.varclip", "TAA_VARCLIP", 1.25f); }
+// Deadband on the clamp correction, in units of the noise floor. 1.0 makes a
+// correction at or below the floor read as zero, which is what the shader's
+// floorS note asks for; 0.0 restores the old behaviour that pinned a at 1.0.
+static float taaMovedDead(){ return live::f("taa.moved_dead", "TAA_MOVED_DEAD", 0.0f); }
 static int   taaViz()      { return live::i("taa.viz",   "TAA_VIZ",   0); }
 static float taaVizScale() { return live::f("taa.viz_scale", nullptr, 1.0f); }
 
@@ -1089,6 +1094,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.vizScale = taaVizScale();
     pcv.gain     = taaGain();
     pcv.varClip  = taaVarClip();
+    pcv.movedDead = taaMovedDead();
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)

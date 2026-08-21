@@ -137,6 +137,7 @@ layout(push_constant) uniform Params {
     float velMax;       // largest believable |velocity| in UV
     float novecCov;     // coverage below this = unwritten; <0 disables
     float novecAlpha;   // blend weight for pixels with no vector
+    float movedDead;    // deadband on the clamp correction, in units of floorS
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -696,7 +697,33 @@ void main()
     // luminance the neighbourhood genuinely agrees, history is genuinely fine,
     // and `moved` should read as zero rather than as noise amplified.
     float floorS = 0.01 * luma(tm(currA)) + 1e-4;
-    float moved  = length(hy - hRaw) / max(length(sigma), floorS);
+    // ---- A DEADBAND, DEFAULT OFF, AND WHY ITS EVIDENCE WAS WORTHLESS.
+    //
+    // The note above says a correction below the noise floor means history is
+    // fine and `moved` should read as zero. The code floors only the
+    // DENOMINATOR, which does not do that, so the deadband below implements
+    // the sentence as written.
+    //
+    // It is DEFAULT OFF, because the measurement that motivated it was void.
+    // moved was read as ~25 at rest via viz=6, and a as 1.0 via viz=5 - but
+    // BOTH of those viz modes imageStore into uHistory and return, so while
+    // either is on, history IS THE PREVIOUS FRAME'S HEATMAP. moved then
+    // saturates by construction and a pins at 1.0, whatever the resolve is
+    // really doing. The measurement created the condition it measured, which
+    // is the exact trap the direct-history-readback note in taa.h was written
+    // to warn about.
+    //
+    // What survived: at gain=0, alpha=0.02, captured at viz=0 so history was
+    // clean, the image was normal and frozen frame to frame (mean delta 0.06).
+    // History is real and it accumulates. There is no "TAA never accumulates"
+    // bug; that conclusion came entirely from contaminated viz.
+    //
+    // So this stays available and inert. Anything that turns it on must be
+    // justified by a viz=0 measurement - a readback or a composited-image
+    // statistic - never by viz=5 or viz=6.
+    float dHist  = length(hy - hRaw);
+    float moved  = max(dHist - pc.movedDead * floorS, 0.0)
+                 / max(length(sigma), floorS);
 
     // ---- THE CLAMP DRIVES THE WEIGHT. IT IS NOT APPLIED TO THE COLOUR.
     //
