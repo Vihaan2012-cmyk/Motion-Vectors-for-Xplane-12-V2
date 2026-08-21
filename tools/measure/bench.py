@@ -158,13 +158,17 @@ def main(d):
     if haveTrace:
         views = re.findall(r"NEAR FIELD SELECT: view=(\d+)", tx)
         seen = [v for v in dict.fromkeys(views) if v != "0"]
-        names = {"1000": "forward w/ panel", "1017": "forward, no panel",
-                 "1018": "forward w/ HUD",   "1026": "3-D cockpit"}
+        # Only 1026 is evidenced as a cockpit view - learnings.md records the
+        # residual measurement that separated it from 1018, which is EXTERNAL
+        # despite an earlier guess in this file calling it "forward w/ HUD".
+        # Anything not named here is reported as its raw number rather than
+        # labelled from an assumption.
+        names = {"1026": "3-D cockpit"}
         if not seen:
             line(VOID, "view during capture", "no view reported")
         else:
             cockpit = [v for v in seen if v in names]
-            desc = ", ".join("%s (%s)" % (v, names.get(v, "external")) for v in seen)
+            desc = ", ".join("%s (%s)" % (v, names.get(v, "external/unknown")) for v in seen)
             if cockpit and len(seen) == len(cockpit):
                 line(VOID, "view during capture",
                      "%s - the crop is instrument panel, not scene" % desc)

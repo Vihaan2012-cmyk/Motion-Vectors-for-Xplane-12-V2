@@ -11452,8 +11452,32 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     //                     >1000  arm only in exactly this view id
     const int nfView = live::i("taa.nearfield_view", "TAA_NEARFIELD_VIEW", -1);
     const int vt     = g_velSnap.viewType;
-    const bool ridesAirframe = (vt == 1000 || vt == 1017 ||
-                                vt == 1018 || vt == 1026);
+    // ---- 1018 IS EXTERNAL. THE SET ABOVE WAS GUESSED.
+    //
+    // This armed on {1000, 1017, 1018, 1026} as "airframe-mounted views". Only
+    // 1026 was ever evidenced. The rest were inferred from X-Plane's view_type
+    // numbering as I believed it to be, and 1018 in particular was called
+    // "forward with HUD" - it is EXTERNAL. learnings.md recorded that months
+    // ago, from the residual measurement that separated the two:
+    //
+    //     view 1026 (cockpit)   median residual 0.000 - 0.005 px
+    //     view 1018 (external)  median residual 56 - 681 px
+    //
+    // and a screenshot of the bench captures settles it visually: the aircraft
+    // is seen from outside while the trace reports 1018.
+    //
+    // Arming provisionally in an EXTERNAL view is wrong on its own premise.
+    // The provisional arming exists because in a cockpit view the camera rides
+    // the airframe BY CONSTRUCTION, which is the thing the body calibration
+    // would otherwise have to prove. In an external view the camera does not
+    // ride anything, so near geometry - a hangar the camera drifts past, the
+    // ground on a low fly-by - would be handed the identity matrix and told it
+    // did not move. Rare, because little comes within nearfield_m of an
+    // external camera, but wrong whenever it happens.
+    //
+    // So the set is now only what is evidenced. 1026. Anything else waits for
+    // bodyReprojValid, which is the calibrated path and needs no guessing.
+    const bool ridesAirframe = (vt == 1026);
     const bool provisional = (nfView < 0)      ? ridesAirframe
                            : (nfView == 0)     ? false
                                                : (vt == nfView);
