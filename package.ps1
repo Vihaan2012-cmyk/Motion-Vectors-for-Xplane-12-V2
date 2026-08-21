@@ -65,8 +65,8 @@ if (-not $NoBuild) {
 $need = @(
     "$root\build\MotionVectors\vklayer\VkLayer_mv.dll",
     "$root\build\MotionVectors\vklayer\VkLayer_mv.json",
-    "$root\build\MotionVectors.xpl",
-    "$root\build\MotionVectorsLauncher.exe"
+    "$root\build\MotionVectors\MotionVectors.xpl",
+    "$root\build\MotionVectors\MotionVectorsLauncher.exe"
 )
 foreach ($f in $need) {
     if (-not (Test-Path $f)) { throw "missing build artefact: $f" }
@@ -87,13 +87,33 @@ foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path $d | Out-Null 
 # directory, so the manifest and the DLL have to be beside it.
 Copy-Item "$root\build\MotionVectors\vklayer\VkLayer_mv.dll"  "$stage\MotionVectors\"
 Copy-Item "$root\build\MotionVectors\vklayer\VkLayer_mv.json" "$stage\MotionVectors\"
-Copy-Item "$root\build\MotionVectorsLauncher.exe" "$stage\MotionVectors\"
-if (Test-Path "$root\build\qt\MotionVectors.exe") {
-    Copy-Item "$root\build\qt\MotionVectors.exe" "$stage\MotionVectors\MotionVectorsSettings.exe"
+Copy-Item "$root\build\MotionVectors\MotionVectorsLauncher.exe" "$stage\MotionVectors\"
+
+# ---- THE QT APPS SHIP AS A DIRECTORY, NOT AS A LONE EXE.
+#
+# This looked for build\qt\MotionVectors.exe, which the build has never
+# produced - the Qt output is build\<product>\qtlauncher\ - so the guard was
+# always false and the zip silently shipped without the settings app. A
+# missing optional component that never reports itself missing cannot be told
+# apart from one deliberately left out.
+#
+# The whole folder is copied because MotionVectors.exe cannot start without
+# the Qt runtime windeployqt puts beside it. Shipping the exe alone would
+# have shipped something that fails on launch, which is worse than absent -
+# the same reasoning installer.iss uses when it takes qtlauncher\* wholesale.
+$qtSrc = "$root\build\MotionVectors\qtlauncher"
+if (Test-Path "$qtSrc\MotionVectors.exe") {
+    Copy-Item $qtSrc "$stage\MotionVectors\launcher" -Recurse
+} else {
+    Write-Host "  (no Qt launcher in build\MotionVectors\qtlauncher - zip ships without it)"
 }
 
 # X-Plane requires the plugin at Resources/plugins/<name>/64/win.xpl
-Copy-Item "$root\build\MotionVectors.xpl" "$stage\Resources\plugins\MotionVectors\64\win.xpl"
+# NOTE the path: build\MotionVectors\MotionVectors.xpl, not
+# build\MotionVectors.xpl. BOTH exist - the second is a PRE-SPLIT leftover
+# that nothing rebuilds any more, so packaging it shipped a plugin hours
+# older than the layer beside it, with no error anywhere to say so.
+Copy-Item "$root\build\MotionVectors\MotionVectors.xpl" "$stage\Resources\plugins\MotionVectors\64\win.xpl"
 
 # The panel is a FlyWithLua script. Shipped, but optional - the mod runs without
 # it; it only provides the in-sim controls.
