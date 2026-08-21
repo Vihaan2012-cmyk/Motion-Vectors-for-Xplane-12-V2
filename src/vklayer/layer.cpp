@@ -12079,7 +12079,19 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         // Reported whether or not it succeeds. "XeSS wants three extensions
         // this driver does not have" and "libxess.dll is missing" are different
         // problems, and the availability report has different names for them.
-        {
+        // ---- OFF BY DEFAULT, BECAUSE THIS KILLED THE SIM.
+        //
+        // The first version of this ran unconditionally and X-Plane died
+        // inside vkCreateDevice - the trace stops on the line above and the
+        // log never reaches a frame. Two plausible causes, neither yet
+        // separated: LoadLibrary of a 77 MB DLL from inside a layer's device
+        // creation, and XeSS re-entering the Vulkan loader while the loader is
+        // already inside our interception of it.
+        //
+        // Whatever the cause, an optional capability probe must not be able to
+        // take the whole mod down, so it is behind a key that defaults to off
+        // and the default path is exactly what shipped before it existed.
+        if (live::onoff("xess.probe", "TAA_XESS_PROBE", false)) {
             xessprobe::query(g_firstInstance, phys);
             const xessprobe::Requirements &xr = xessprobe::state();
             if (xr.queried) {
