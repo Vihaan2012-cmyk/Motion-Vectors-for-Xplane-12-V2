@@ -21,3 +21,4 @@ stop-xp.ps1
 tools/*.exe
 tools/inject_test.exe
 xp-shot.ps1
+__pycache__/
