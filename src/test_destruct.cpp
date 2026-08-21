@@ -7,6 +7,7 @@
 
 #include "destruct/trigger.h"
 #include "destruct/occupancy.h"
+#include "destruct/solver.h"
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -263,6 +264,222 @@ int main()
         const float far[3] = { 3.5f, 3.5f, 3.5f };
         destruct::occupancySet(lone, destruct::gridClassify(g, far));
         check(destruct::buildLinks(lone, g).empty(), "an isolated cell has no links");
+    }
+
+    // ---------------------------------------------------------- integration
+    printf("\nfragment integration\n");
+    {
+        // One second of free fall covers 4.905 m. Semi-implicit Euler at 60 Hz
+        // should land within a few centimetres of that.
+        destruct::Fragment f;
+        f.p[0] = 0; f.p[1] = 100; f.p[2] = 0;
+        f.v[0] = f.v[1] = f.v[2] = 0;
+        f.restP[0] = f.restP[1] = f.restP[2] = 0;
+        f.alive = 1;
+        for (int i = 0; i < 60; ++i)
+            destruct::integrate(&f, 1, 1.0f / 60.0f, 9.81f, 0.0f);
+        checkNear(f.p[1], 100.0 - 4.905, 0.15, "one second of free fall");
+    }
+    {
+        // Damping removes energy and must never reverse or amplify it. A sign
+        // flip here would send wreckage upward, which is the sort of thing
+        // that looks like a physics bug and is actually an arithmetic one.
+        destruct::Fragment d;
+        d.p[0] = d.p[1] = d.p[2] = 0;
+        d.v[0] = 10.0f; d.v[1] = d.v[2] = 0;
+        d.restP[0] = d.restP[1] = d.restP[2] = 0;
+        d.alive = 1;
+        destruct::integrate(&d, 1, 1.0f / 60.0f, 0.0f, 5.0f);
+        check(d.v[0] < 10.0f, "damping reduces speed");
+        check(d.v[0] > 0.0f,  "damping does not reverse it");
+
+        // An absurd damping value must clamp, not invert.
+        destruct::Fragment e = d;
+        e.v[0] = 10.0f;
+        destruct::integrate(&e, 1, 1.0f / 60.0f, 0.0f, 1000.0f);
+        check(e.v[0] >= 0.0f, "extreme damping clamps rather than inverting");
+    }
+    {
+        // A dead fragment is inert.
+        destruct::Fragment f;
+        f.p[0] = f.p[1] = f.p[2] = 0;
+        f.v[0] = f.v[1] = f.v[2] = 0;
+        f.restP[0] = f.restP[1] = f.restP[2] = 0;
+        f.alive = 0;
+        destruct::integrate(&f, 1, 1.0f / 60.0f, 9.81f, 0.0f);
+        checkNear(f.p[1], 0.0, 1e-6, "a dead fragment does not fall");
+    }
+
+    // ---------------------------------------------------------- ground
+    printf("\nground contact\n");
+    {
+        destruct::GroundPlane gp;
+        gp.height = 10.0f;
+        gp.normal[0] = 0; gp.normal[1] = 1; gp.normal[2] = 0;
+
+        destruct::Fragment f;
+        f.p[0] = 0; f.p[1] = 9.0f; f.p[2] = 0;
+        f.v[0] = 0; f.v[1] = -20.0f; f.v[2] = 0;
+        f.restP[0] = f.restP[1] = f.restP[2] = 0;
+        f.alive = 1;
+
+        int hit = destruct::clampToGround(&f, 1, gp, 0.5f, 0.0f, 1.0f);
+        check(hit == 1, "contact is reported");
+        check(f.p[1] >= 10.5f - 1e-3f, "the fragment sits ON the surface");
+        check(f.v[1] >= 0.0f, "downward velocity is removed");
+
+        destruct::Fragment s = f;
+        s.v[0] = 8.0f; s.v[1] = -1.0f;
+        destruct::clampToGround(&s, 1, gp, 0.5f, 0.0f, 1.0f);
+        checkNear(s.v[0], 0.0, 1e-3, "full friction halts sliding");
+
+        destruct::Fragment air = f;
+        air.p[1] = 50.0f; air.v[1] = -3.0f;
+        check(destruct::clampToGround(&air, 1, gp, 0.5f, 0.0f, 1.0f) == 0,
+              "an airborne fragment is not in contact");
+        checkNear(air.v[1], -3.0, 1e-5, "and its velocity is untouched");
+    }
+    {
+        // Sinking through terrain is the artefact that would make the whole
+        // system read as broken, so it must hold under repeated stepping and
+        // not merely on the frame of contact.
+        destruct::GroundPlane gp;
+        gp.height = 0.0f;
+        gp.normal[0] = 0; gp.normal[1] = 1; gp.normal[2] = 0;
+        destruct::Fragment f;
+        f.p[0] = 0; f.p[1] = 5.0f; f.p[2] = 0;
+        f.v[0] = f.v[1] = f.v[2] = 0;
+        f.restP[0] = f.restP[1] = f.restP[2] = 0;
+        f.alive = 1;
+        for (int i = 0; i < 600; ++i) {
+            destruct::integrate(&f, 1, 1.0f / 60.0f, 9.81f, 0.2f);
+            destruct::clampToGround(&f, 1, gp, 0.5f, 0.0f, 0.8f);
+        }
+        check(f.p[1] >= 0.5f - 1e-3f, "ten seconds of gravity never sinks it");
+    }
+
+    // ---------------------------------------------------------- seeding
+    printf("\nimpact seeding\n");
+    {
+        // Fragments near the impact get more energy than distant ones, so the
+        // aeroplane comes apart FROM the impact rather than exploding evenly.
+        destruct::Fragment f[2];
+        for (int i = 0; i < 2; ++i) {
+            f[i].p[0] = f[i].p[1] = f[i].p[2] = 0;
+            f[i].v[0] = f[i].v[1] = f[i].v[2] = 0;
+            f[i].alive = 1;
+            f[i].restP[1] = f[i].restP[2] = 0;
+        }
+        f[0].restP[0] = 1.0f;      // near
+        f[1].restP[0] = 20.0f;     // far
+        const float impact[3] = { 0.0f, 0.0f, 0.0f };
+        const float vel[3]    = { 0.0f, 0.0f, 0.0f };
+        destruct::seedImpact(f, 2, impact, vel, 50.0f);
+        check(std::fabs(f[0].v[0]) > std::fabs(f[1].v[0]),
+              "near fragments get more energy than far ones");
+        check(f[0].v[0] > 0.0f, "the impulse radiates away from the impact");
+    }
+    {
+        // The airframe's own velocity is carried by every fragment, or the
+        // wreckage would stop dead at the moment of impact.
+        destruct::Fragment f;
+        f.p[0] = f.p[1] = f.p[2] = 0;
+        f.v[0] = f.v[1] = f.v[2] = 0;
+        f.restP[0] = 50.0f; f.restP[1] = f.restP[2] = 0;
+        f.alive = 1;
+        const float impact[3] = { 0.0f, 0.0f, 0.0f };
+        const float vel[3]    = { 0.0f, 0.0f, -80.0f };
+        destruct::seedImpact(&f, 1, impact, vel, 1.0f);
+        check(f.v[2] < -70.0f, "fragments inherit the airframe's velocity");
+    }
+
+    // ---------------------------------------------------------- solver
+    printf("\nconstraint solver\n");
+    {
+        destruct::Fragment f[2];
+        for (int i = 0; i < 2; ++i) {
+            f[i].v[0] = f[i].v[1] = f[i].v[2] = 0;
+            f[i].restP[0] = f[i].restP[1] = f[i].restP[2] = 0;
+            f[i].alive = 1;
+            f[i].p[1] = f[i].p[2] = 0;
+        }
+        f[0].p[0] = 0.0f;
+        f[1].p[0] = 1.3f;                       // rest 1.0 -> 30% strain
+
+        destruct::Link L; L.a = 0; L.b = 1; L.rest = 1.0f;
+        unsigned char broken = 0;
+        destruct::SolverCfg cfg = destruct::defaultSolverCfg();
+        cfg.stiffness = 1.0f;
+        cfg.breakStrain = 0.5f;
+
+        int nb = destruct::solveLinks(f, 2, &L, 1, &broken, cfg);
+        check(nb == 0, "30% strain under a 50% threshold does not break");
+        checkNear(f[1].p[0] - f[0].p[0], 1.0, 0.05, "the link pulls back to rest");
+
+        f[0].p[0] = 0.0f; f[1].p[0] = 2.0f;     // 100% strain
+        broken = 0;
+        nb = destruct::solveLinks(f, 2, &L, 1, &broken, cfg);
+        check(nb == 1, "100% strain over the threshold breaks");
+        check(broken == 1, "the break is recorded");
+
+        const float before = f[1].p[0] - f[0].p[0];
+        destruct::solveLinks(f, 2, &L, 1, &broken, cfg);
+        checkNear(f[1].p[0] - f[0].p[0], before, 1e-4,
+                  "a broken link exerts no further force");
+    }
+    {
+        // Load redistribution. A chain whose middle joint is already broken
+        // must not transmit force across the gap - that is what makes failure
+        // propagate rather than happening everywhere at once.
+        destruct::Fragment f[3];
+        for (int i = 0; i < 3; ++i) {
+            f[i].v[0] = f[i].v[1] = f[i].v[2] = 0;
+            f[i].restP[0] = f[i].restP[1] = f[i].restP[2] = 0;
+            f[i].alive = 1;
+            f[i].p[0] = (float)i; f[i].p[1] = f[i].p[2] = 0;
+        }
+        f[2].p[0] = 5.0f;
+        destruct::Link L[2];
+        L[0].a = 0; L[0].b = 1; L[0].rest = 1.0f;
+        L[1].a = 1; L[1].b = 2; L[1].rest = 1.0f;
+        unsigned char broken[2] = { 0, 1 };
+        destruct::SolverCfg cfg = destruct::defaultSolverCfg();
+
+        const float far0 = f[2].p[0];
+        destruct::solveLinks(f, 3, L, 2, broken, cfg);
+        checkNear(f[2].p[0], far0, 1e-4, "a detached fragment is not dragged back");
+        check(destruct::intactLinkCount(broken, 2) == 1, "one joint still holds");
+    }
+    {
+        // A structure under a large impulse must actually come apart, or the
+        // whole system is an expensive way to wobble an aeroplane.
+        const int N = 8;
+        destruct::Fragment f[N];
+        for (int i = 0; i < N; ++i) {
+            f[i].p[0] = (float)i; f[i].p[1] = f[i].p[2] = 0;
+            f[i].restP[0] = (float)i; f[i].restP[1] = f[i].restP[2] = 0;
+            f[i].v[0] = f[i].v[1] = f[i].v[2] = 0;
+            f[i].alive = 1;
+        }
+        destruct::Link L[N - 1];
+        unsigned char broken[N - 1];
+        for (int i = 0; i < N - 1; ++i) {
+            L[i].a = i; L[i].b = i + 1; L[i].rest = 1.0f;
+            broken[i] = 0;
+        }
+        const float impact[3] = { 0.0f, 0.0f, 0.0f };
+        const float vel[3]    = { 0.0f, 0.0f, 0.0f };
+        destruct::seedImpact(f, N, impact, vel, 200.0f);
+
+        destruct::SolverCfg cfg = destruct::defaultSolverCfg();
+        int totalBroken = 0;
+        for (int step = 0; step < 30; ++step) {
+            destruct::integrate(f, N, 1.0f / 60.0f, 9.81f, 0.1f);
+            totalBroken += destruct::solveLinks(f, N, L, N - 1, broken, cfg);
+        }
+        check(totalBroken > 0, "a heavy impact breaks the structure apart");
+        check(destruct::intactLinkCount(broken, N - 1) < N - 1,
+              "and some joints are gone afterwards");
     }
 
     printf("\n%s: %d failure(s)\n", g_fail ? "FAILED" : "OK", g_fail);
