@@ -8,6 +8,7 @@
 #include "destruct/trigger.h"
 #include "destruct/occupancy.h"
 #include "destruct/solver.h"
+#include "destruct/gpu_layout.h"
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -480,6 +481,99 @@ int main()
         check(totalBroken > 0, "a heavy impact breaks the structure apart");
         check(destruct::intactLinkCount(broken, N - 1) < N - 1,
               "and some joints are gone afterwards");
+    }
+
+
+    // ------------------------------------------------ GPU / CPU agreement
+    //
+    // The one failure Task 9 calls out by name: if the vertex patch classifies
+    // a vertex into a different cell from gridClassify(), the CPU builds its
+    // constraint graph over cells the GPU never displaces. Nothing crashes,
+    // nothing logs, and the aeroplane just breaks along the wrong seams.
+    //
+    // So the shader's arithmetic is kept in gpu_layout.h as C and compared
+    // against the CPU's here, over the whole box and past every edge of it.
+    printf("\ngpu and cpu classify identically\n");
+    {
+        float bbMin[3] = { -18.0f, -4.0f, -21.0f };
+        float bbMax[3] = {  18.0f,  7.0f,  21.0f };
+        destruct::Grid g = destruct::gridForBounds(bbMin, bbMax);
+
+        int mismatches = 0, inside = 0, outside = 0;
+        // A deterministic sweep rather than random points: a test that samples
+        // differently every run reports a different answer every run.
+        unsigned seed = 12345u;
+        for (int t = 0; t < 20000; ++t) {
+            seed = seed * 1664525u + 1013904223u;
+            float u = (float)((seed >> 8) & 0xFFFF) / 65535.0f;
+            seed = seed * 1664525u + 1013904223u;
+            float v = (float)((seed >> 8) & 0xFFFF) / 65535.0f;
+            seed = seed * 1664525u + 1013904223u;
+            float w = (float)((seed >> 8) & 0xFFFF) / 65535.0f;
+
+            // Deliberately overshoot the box by 20% on every side so the
+            // out-of-range rejection is exercised, not just the interior.
+            float p[3];
+            p[0] = bbMin[0] - 0.2f * (bbMax[0] - bbMin[0]) + u * 1.4f * (bbMax[0] - bbMin[0]);
+            p[1] = bbMin[1] - 0.2f * (bbMax[1] - bbMin[1]) + v * 1.4f * (bbMax[1] - bbMin[1]);
+            p[2] = bbMin[2] - 0.2f * (bbMax[2] - bbMin[2]) + w * 1.4f * (bbMax[2] - bbMin[2]);
+
+            const int a = destruct::gridClassify(g, p);
+            const int b = destruct::gpuCellIndex(g, p);
+            if (a != b) ++mismatches;
+            if (a >= 0) ++inside; else ++outside;
+        }
+        check(mismatches == 0, "20000 points classify the same on both paths");
+        check(inside  > 1000, "the sweep actually lands inside the box");
+        check(outside > 1000, "and the sweep actually lands outside it too");
+
+        // Exact cell boundaries are where a floor-vs-truncate difference would
+        // show, so they are hit deliberately rather than left to the sweep.
+        int edgeMismatch = 0;
+        for (int cx = -1; cx <= g.nx; ++cx) {
+            float p[3];
+            p[0] = g.min[0] + (float)cx * g.cell;
+            p[1] = g.min[1] + 0.5f * g.cell;
+            p[2] = g.min[2] + 0.5f * g.cell;
+            if (destruct::gridClassify(g, p) != destruct::gpuCellIndex(g, p))
+                ++edgeMismatch;
+        }
+        check(edgeMismatch == 0, "cell boundaries classify the same on both paths");
+
+        // A point below the grid minimum must be rejected, not wrapped. This is
+        // the case where truncation toward zero and floor() differ.
+        float below[3] = { g.min[0] - 0.5f * g.cell, g.min[1] + 0.1f, g.min[2] + 0.1f };
+        check(destruct::gpuCellIndex(g, below) == -1,
+              "a point just below the grid is rejected, not wrapped to cell 0");
+        check(destruct::gridClassify(g, below) == -1,
+              "and the CPU rejects it too");
+    }
+
+    // ------------------------------------------------ buffer layout sanity
+    printf("\nbuffer layout\n");
+    {
+        check(destruct::kOffOccupancy == 96,
+              "the header is 96 bytes and occupancy starts after it");
+        check(destruct::kOffXform ==
+                  destruct::kOffOccupancy + destruct::kMaxCells * 4u,
+              "transforms start after the whole occupancy region");
+        check(destruct::kWordOccupancy * 4u == destruct::kOffOccupancy,
+              "word and byte offsets agree for occupancy");
+        check(destruct::kWordXform * 4u == destruct::kOffXform,
+              "word and byte offsets agree for transforms");
+        check((destruct::kOffAircraftInv % 16u) == 0 &&
+              (destruct::kOffGridMinCell % 16u) == 0 &&
+              (destruct::kOffGridDim % 16u) == 0 &&
+              (destruct::kOffXform % 16u) == 0,
+              "every vector member is 16-byte aligned as std430 requires");
+
+        // A grid big enough to overflow the occupancy region must be clamped
+        // rather than allowed to index past it.
+        destruct::Grid huge;
+        huge.min[0] = huge.min[1] = huge.min[2] = 0.0f;
+        huge.cell = 0.4f; huge.nx = 200; huge.ny = 200; huge.nz = 200;
+        check(destruct::gpuCellCount(huge) == destruct::kMaxCells,
+              "an oversized grid clamps to the buffer rather than overrunning it");
     }
 
     printf("\n%s: %d failure(s)\n", g_fail ? "FAILED" : "OK", g_fail);

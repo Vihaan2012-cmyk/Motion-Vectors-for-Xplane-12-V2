@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../destruct/gpu_layout.h"
+
 // GPU side of crash destruction: the fragment transform buffer and the
 // descriptor set that carries it into every patched pipeline.
 //
@@ -68,6 +70,13 @@ static const uint32_t kMaxFragments = 4096;
 // alignment bug that is tedious to find from a picture.
 static const uint32_t kFragmentStride = 16;
 
+// The layout header and this file must agree on how many fragments there are.
+// A mismatch would size the buffer for one count and index it with another.
+#if defined(__cplusplus) && __cplusplus >= 201103L
+static_assert(kMaxFragments == destruct::kMaxGpuFragments,
+              "fragment capacity disagrees with gpu_layout.h");
+#endif
+
 inline bool ensure(DeviceData &dd, VkDevice dev)
 {
     State &s = state();
@@ -82,7 +91,12 @@ inline bool ensure(DeviceData &dd, VkDevice dev)
     }
 
     s.device = dev;
-    s.bytes  = (VkDeviceSize)kMaxFragments * kFragmentStride;
+    // The whole block, not just the transforms: header, occupancy and
+    // transforms are one buffer because they are one descriptor. Sizes and
+    // offsets come from gpu_layout.h, which is the file the SPIR-V generator
+    // also reads them from - two copies of an offset is how a shader ends up
+    // reading transforms out of the middle of the occupancy region.
+    s.bytes  = (VkDeviceSize)destruct::kBufferBytes;
 
     VkBufferCreateInfo bci;
     memset(&bci, 0, sizeof(bci));
@@ -217,13 +231,77 @@ inline void upload(const float *xyz, uint32_t count)
     State &s = state();
     if (!s.ready || !s.mapped || !xyz) return;
     if (count > s.capacity) count = s.capacity;
-    float *dst = (float *)s.mapped;
+    // Transforms live at their own offset now, not at the start of the buffer.
+    float *dst = (float *)((unsigned char *)s.mapped + destruct::kOffXform);
     for (uint32_t i = 0; i < count; ++i) {
         dst[i * 4 + 0] = xyz[i * 3 + 0];
         dst[i * 4 + 1] = xyz[i * 3 + 1];
         dst[i * 4 + 2] = xyz[i * 3 + 2];
         dst[i * 4 + 3] = 0.0f;
     }
+}
+
+// ---- THE HEADER THE VERTEX SHADER READS.
+//
+// aircraftInv maps whatever space the shader reconstructs into aircraft-local
+// space. Sent every frame the aircraft moves, because the whole classification
+// is relative to the airframe, and a stale matrix classifies vertices against
+// where the aeroplane WAS.
+//
+// active is the uniform branch the shader tests. It is in the buffer rather
+// than a specialisation constant because it changes at crash time and
+// recompiling every pipeline at the moment of a crash is not an option.
+inline void uploadHeader(const float aircraftInv[16], const float gridMin[3],
+                         float cell, int nx, int ny, int nz, int active)
+{
+    State &s = state();
+    if (!s.ready || !s.mapped) return;
+    unsigned char *base = (unsigned char *)s.mapped;
+
+    if (aircraftInv)
+        memcpy(base + destruct::kOffAircraftInv, aircraftInv, 16 * sizeof(float));
+
+    float *mc = (float *)(base + destruct::kOffGridMinCell);
+    mc[0] = gridMin ? gridMin[0] : 0.0f;
+    mc[1] = gridMin ? gridMin[1] : 0.0f;
+    mc[2] = gridMin ? gridMin[2] : 0.0f;
+    mc[3] = cell;
+
+    int32_t *gd = (int32_t *)(base + destruct::kOffGridDim);
+    gd[0] = nx; gd[1] = ny; gd[2] = nz; gd[3] = active;
+}
+
+// ---- OCCUPANCY.
+//
+// Cleared before a discovery frame and read after it. Both operate on the
+// CELLS THE CURRENT GRID USES, not the whole region: leftovers from a previous,
+// larger grid would otherwise read as occupied and seed fragments in mid-air.
+inline void clearOccupancy(uint32_t cells)
+{
+    State &s = state();
+    if (!s.ready || !s.mapped) return;
+    if (cells > destruct::kMaxCells) cells = destruct::kMaxCells;
+    memset((unsigned char *)s.mapped + destruct::kOffOccupancy, 0,
+           (size_t)cells * 4u);
+}
+
+// Returns how many cells came back set. The count is the number the trace
+// reports and the number Task 9's gate is judged on, so it is produced here
+// rather than recomputed by each caller.
+inline uint32_t readOccupancy(unsigned char *out, uint32_t cells)
+{
+    State &s = state();
+    if (!s.ready || !s.mapped) return 0;
+    if (cells > destruct::kMaxCells) cells = destruct::kMaxCells;
+    const uint32_t *src =
+        (const uint32_t *)((const unsigned char *)s.mapped + destruct::kOffOccupancy);
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < cells; ++i) {
+        const unsigned char v = src[i] ? 1u : 0u;
+        if (out) out[i] = v;
+        n += v;
+    }
+    return n;
 }
 
 inline void destroy(DeviceData &dd, VkDevice dev)
