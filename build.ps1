@@ -210,6 +210,41 @@ $dst = Join-Path $xp "Resources\plugins\MotionVectors\64"
 New-Item -ItemType Directory -Force $dst | Out-Null
 Copy-Item "$out\MotionVectors.xpl" (Join-Path $dst "win.xpl") -Force
 
+# ---- THE LUA PANEL, INSTALLED BY THE BUILD RATHER THAN BY HAND.
+#
+# This step did not exist, so the panel was only ever updated by remembering to
+# copy it - and the installed copy had drifted a full day behind the tree. A
+# stale panel is worse than an absent one: it shows settings that have moved and
+# reports a version that is not what is running.
+#
+# MOD_VERSION is STAMPED here from VERSION rather than edited in the Lua, so
+# VERSION stays the single source it was made into. A constant kept by hand in a
+# second file is the same trap as a hand-kept settings table.
+$luaSrc = Join-Path $root "lua\MotionVectors.lua"
+$luaDst = Join-Path $xp "Resources\plugins\FlyWithLua\Scripts\MotionVectors.lua"
+if (Test-Path $luaSrc) {
+    $luaDir = Split-Path $luaDst -Parent
+    if (Test-Path $luaDir) {
+        $luaText = Get-Content $luaSrc -Raw
+        $stamped = [regex]::Replace(
+            $luaText,
+            'local MOD_VERSION\s*=\s*"[^"]*"',
+            ('local MOD_VERSION      = "' + $mvVersion + '"'))
+        if ($stamped -eq $luaText -and $luaText -notmatch [regex]::Escape($mvVersion)) {
+            Write-Host "  WARNING: MOD_VERSION not found in the panel - version not stamped" -ForegroundColor Yellow
+        }
+        # NO BOM. Set-Content -Encoding utf8 writes one on PowerShell 5.1,
+        # and FlyWithLua's Lua 5.1 does not skip a BOM - it fails to parse the
+        # first line and quarantines the script, which looks from the outside
+        # like the panel having vanished.
+        [System.IO.File]::WriteAllText(
+            $luaDst, $stamped, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "  panel -> $luaDst ($mvVersion)"
+    } else {
+        Write-Host "  FlyWithLua not installed - skipping the panel" -ForegroundColor Yellow
+    }
+}
+
 
 # ---- THE INSTALLER, BUILT FROM THE SAME TREE AS THE BINARIES.
 #

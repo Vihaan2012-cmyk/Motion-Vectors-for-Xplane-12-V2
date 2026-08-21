@@ -117,6 +117,7 @@ static void trace(const char *fmt, ...)
 // upload governor, predictor, emergency ladder. Same placement logic: it
 // calls trace() and live::, both defined above.
 #include "vram.h"
+#include "upscaler_policy.h"
 
 // ------------------------------------------------------- shared memory
 
@@ -478,6 +479,11 @@ static std::atomic<bool> g_mvClearedAtPresent(false);
 // setLayoutCount and different layouts declare different counts. The shader
 // patch and the bind both need this number, and getting it wrong means reading
 // a buffer that belongs to X-Plane.
+// What this GPU can actually run, as QUERIED facts rather than a device-name
+// guess. Filled once at device creation, where the extension list is already
+// in hand, and read by the capability report the plugin's UI depends on.
+static upscaler::DeviceCaps g_upscalerCaps;
+
 static uint32_t g_maxBoundSets = 4;
 
 // ---- THE SINGLE CRASH-DESTRUCTION GATE.
@@ -7365,10 +7371,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             strncpy(g_share->gpuName, props.deviceName, sizeof(g_share->gpuName) - 1);
             g_share->gpuName[sizeof(g_share->gpuName) - 1] = 0;
         }
+        g_share->gpuVendorId = props.vendorID;
 
+        // ---- THE AVAILABILITY THIS TRACE HAS ALWAYS CLAIMED TO REPORT.
+        //
+        // It did not. The array was left at zero, which is TAA_AVAIL_UNKNOWN,
+        // while the line below said "reported attach + availability" - so the
+        // only symptom of the gap was a UI that offered nothing and a log that
+        // said it had been told everything.
+        //
+        // Every slot is written from one call, so a backend added to the enum
+        // cannot be silently left out of the report.
+        upscaler::availabilityAll(g_upscalerCaps, g_share->availability);
 
         MemoryBarrier();
-        trace("SHARE: reported attach + availability (gpu=%s)", g_share->gpuName);
+        trace("SHARE: reported attach + availability (gpu=%s, vendor=0x%04X)",
+              g_share->gpuName, (unsigned)props.vendorID);
+        for (int ui = 0; ui < TAA_UPSCALER_COUNT; ++ui)
+            trace("UPSCALER: %-5s %s", upscaler::name(ui),
+                  upscaler::availabilityName(g_share->availability[ui]));
     }
 
     // Report the 3D colour target once, with the verdict on whether a resolve
@@ -8471,17 +8492,35 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                   "varclip=%.2f jitterScale=%.2f nearfield=%.2f unjitter=%d "
                   "reactive=%d velScale=%.2f velYSign=%.1f maxResolves=%d | "
                   "smulX=%.3f smulY=%.3f velMax=%.6f",
+                  // ---- ASK THE ACCESSORS, NEVER RE-DERIVE THE DEFAULTS.
+                  //
+                  // These arguments used to repeat the live:: calls with their
+                  // own default arguments, and the copies had drifted: this
+                  // line claimed mode=2, alpha=0.15, varclip=1.25 and
+                  // reactive=1 while the shader actually ran mode=0,
+                  // alpha=0.05, varclip=8.0 and reactive=0.
+                  //
+                  // It only lied when the control file did NOT set a key -
+                  // which is every fresh install, since taa_live.ini does not
+                  // exist until something writes it. So the one configuration
+                  // most likely to be reported by a user was the one
+                  // configuration this line described wrongly, and varclip is
+                  // the value whose 1.25-vs-8.0 confusion caused the edge
+                  // shimmer that was already diagnosed and fixed once.
+                  //
+                  // A diagnostic that exists to prevent wrong conclusions must
+                  // not hold a second opinion about the settings.
                   taaEnabled() ? 1 : 0,
-                  live::i("taa.mode", "TAA_MODE", 2),
-                  (double)live::f("taa.alpha", "TAA_ALPHA", 0.15f),
-                  (double)live::f("taa.gain", "TAA_GAIN", 4.0f),
-                  (double)live::f("taa.varclip", "TAA_VARCLIP", 1.25f),
+                  taaMode(),
+                  (double)taaAlpha(),
+                  (double)taaGain(),
+                  (double)taaVarClip(),
                   (double)g_jitterScale,
                   (double)g_nearFieldM,
-                  live::onoff("taa.unjitter", nullptr, true) ? 1 : 0,
-                  live::onoff("taa.reactive", nullptr, true) ? 1 : 0,
-                  (double)live::f("taa.vel_scale", nullptr, 1.0f),
-                  (double)live::f("taa.vel_ypos", nullptr, 0.0f),
+                  taaUnjitter() ? 1 : 0,
+                  taaReactive() ? 1 : 0,
+                  (double)taaVelScale(),
+                  (double)taaVelYSign(),
                   live::i("taa.max_resolves", "TAA_MAX_RESOLVES", 1),
                   (double)live::f("taa.smul_x", "TAA_SMUL_X", 0.5f),
                   (double)live::f("taa.smul_y", "TAA_SMUL_Y", -0.5f),
@@ -11980,6 +12019,27 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
             g_nextEnumDeviceExt(phys, nullptr, &n, have.data());
         }
         trace("DEVICE: driver offers %zu device extensions", have.size());
+
+        // ---- UPSCALER CAPABILITY, RECORDED WHILE THE LIST IS IN SCOPE.
+        //
+        // Cooperative matrix is the capability FSR 4's model actually needs, so
+        // it is what gets asked about - rather than matching "RDNA 4" against
+        // props.deviceName, which is marketing text that changes between driver
+        // releases and is localised in some of them.
+        for (size_t ei = 0; ei < have.size(); ++ei) {
+            if (strcmp(have[ei].extensionName, "VK_KHR_cooperative_matrix") == 0) {
+                g_upscalerCaps.coopMatrix = true;
+                break;
+            }
+        }
+        if (g_getPhysProps) {
+            VkPhysicalDeviceProperties up;
+            memset(&up, 0, sizeof(up));
+            g_getPhysProps(phys, &up);
+            g_upscalerCaps.vendorId = up.vendorID;
+        }
+        // Last, so a half-filled struct can never read as authoritative.
+        g_upscalerCaps.valid = true;
 
         // ---- STREAMLINE'S OWN REQUIREMENTS, ADDED FROM ITS OWN LIST.
         //

@@ -53,6 +53,7 @@
 #include "XPLMPlanes.h"   // XPLMSetUsersAircraft / XPLMPlaceUserAtAirport
 
 #include "share.h"
+#include "vklayer/upscaler_policy.h"
 #include "control.h"
 
 #include <windows.h>
@@ -1496,6 +1497,19 @@ static XPLMDataRef g_drPropRpm    = nullptr;   // float[8]
 static XPLMDataRef g_drEngRotRate = nullptr;   // float[8], rad/s
 
 // Tunables, overridable from taa.ini so this does not need a rebuild to retune.
+// The upscaler REQUEST. What actually runs is decided against the layer's
+// availability report every frame, because a request for a backend this
+// machine or this build cannot run has to degrade to something, visibly.
+//
+// The default is TAA rather than Off because TAA is what runs today. A default
+// of Off would have described a design rather than the software: the resolve
+// would keep running while every readout said it was disabled, which is the
+// exact class of "the log says one thing and the frame says another" that has
+// cost this project several wrong diagnoses.
+static int g_upscalerReq = TAA_UPSCALER_TAA;
+static int g_qualityReq  = TAA_QUALITY_NATIVE;
+static int g_upscalerRunning = TAA_UPSCALER_TAA;
+
 static float g_lodBias      = -0.5f;
 static float g_renderScale  = 1.0f;
 static int   g_jitterPhases = 8;
@@ -1639,10 +1653,87 @@ static int getVersionString(void *, void *out, int off, int max)
 static int   getReverseZ(void*)     { return g_share ? g_share->reverseZ : 0; }
 static int   getReverseZMat(void*)  { return g_share ? g_share->reverseZFromMatrix : 0; }
 
+// ---- UPSCALER SELECTION.
+//
+// The request is writable; what is RUNNING is not. Two datarefs rather than
+// one because they genuinely differ - ask for DLSS on an AMD card and the
+// request stays DLSS while the running backend is TAA. Collapsing them would
+// mean either silently rewriting the user's choice or reporting a backend that
+// is not executing.
+static int  getUpscaler(void*)        { return g_upscalerReq; }
+static void setUpscaler(void*, int v)
+{
+    if (v < 0 || v >= TAA_UPSCALER_COUNT) return;   // ignore, do not clamp
+    g_upscalerReq = v;
+}
+static int  getUpscalerRunning(void*) { return g_upscalerRunning; }
+
+static int  getQuality(void*)         { return g_qualityReq; }
+static void setQuality(void*, int v)
+{
+    if (v < 0 || v >= TAA_QUALITY_COUNT) return;
+    g_qualityReq = v;
+}
+
+// Per-backend availability, straight from the layer's device query.
+// Read-only: this reports what the hardware and this build can do, and a
+// writable capability table would just be a way to lie to the UI.
+static int getUpscalerAvail(void *, int *out, int off, int max)
+{
+    if (!out) return TAA_UPSCALER_COUNT;            // XPLM size probe
+    if (off < 0 || off >= TAA_UPSCALER_COUNT) return 0;
+    int n = TAA_UPSCALER_COUNT - off;
+    if (n > max) n = max;
+    for (int i = 0; i < n; ++i)
+        out[i] = g_share ? g_share->availability[off + i] : TAA_AVAIL_UNKNOWN;
+    return n;
+}
 
 
 
 
+
+
+// ---- WHAT THE REQUEST ACTUALLY GETS.
+//
+// Re-evaluated every frame rather than once, because availability is not fixed
+// at startup: the layer cannot fill the table until a device exists, and a
+// vendor runtime that probes on a worker thread can answer seconds in. A
+// single early attempt would read UNKNOWN, refuse, and leave the setting
+// silently ignored.
+//
+// Only logs on CHANGE. A per-frame line saying the same thing is how a trace
+// becomes unreadable, and this one has to stay readable - it is the only place
+// that says why the backend running is not the backend asked for.
+static void applyUpscalerRequest()
+{
+    if (!g_share) return;
+
+    g_share->upscaler = g_upscalerReq;
+    g_share->quality  = g_qualityReq;
+
+    // Decided from the layer's own report, not from a second capability guess
+    // on this side. Two independent opinions about the same GPU is how they
+    // start disagreeing.
+    const int avail = (g_upscalerReq >= 0 && g_upscalerReq < TAA_UPSCALER_COUNT)
+                        ? g_share->availability[g_upscalerReq]
+                        : TAA_AVAIL_NO_SUPPORT;
+
+    const int running = (avail == TAA_AVAIL_OK) ? g_upscalerReq : TAA_UPSCALER_TAA;
+
+    static int lastReq = -1, lastAvail = -1;
+    if (g_upscalerReq != lastReq || avail != lastAvail) {
+        lastReq = g_upscalerReq; lastAvail = avail;
+        if (running == g_upscalerReq)
+            xlog("upscaler: %s", upscaler::name(running));
+        else
+            xlog("upscaler: %s requested but %s - running %s instead",
+                 upscaler::name(g_upscalerReq),
+                 upscaler::availabilityName(avail),
+                 upscaler::name(running));
+    }
+    g_upscalerRunning = running;
+}
 
 static void registerDatarefs()
 {
@@ -1653,6 +1744,21 @@ static void registerDatarefs()
 
     g_myLodBias  = XPLMRegisterDataAccessor("taaimpl/lod_bias", xplmType_Float, 1,
                      0,0, getLodBias, setLodBias, 0,0,0,0,0,0,0,0, nullptr, nullptr);
+
+    // The upscaler surface. These handles have existed since the share block
+    // was designed and were never assigned to anything, so taaimpl/upscaler
+    // and taaimpl/upscaler_available were documented in this file's own header
+    // comment while not existing at runtime.
+    g_myUpscaler = XPLMRegisterDataAccessor("taaimpl/upscaler", xplmType_Int, 1,
+                     getUpscaler, setUpscaler, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/upscaler_running", xplmType_Int, 0,
+                     getUpscalerRunning, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    g_myQuality  = XPLMRegisterDataAccessor("taaimpl/quality", xplmType_Int, 1,
+                     getQuality, setQuality, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    g_myAvail    = XPLMRegisterDataAccessor("taaimpl/upscaler_available",
+                     xplmType_IntArray, 0,
+                     0,0, 0,0, 0,0, getUpscalerAvail, nullptr, 0,0, 0,0,
+                     nullptr, nullptr);
 
     // VRAM, straight from the driver via the layer. Read-only - these report,
     // they do not steer.
@@ -2521,6 +2627,8 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // dataref value is unstable. Same rule as every other read here.
     dumpPagerControls();
     holdArtControls();
+
+    applyUpscalerRequest();
 
     // APPLY taa.ini's upscaler request, once the layer can answer for it.
     //
@@ -4088,8 +4196,19 @@ static void loadConfig(const std::string &path)
         else if (!strcmp(key, "traffic_radius")) g_trafficRadius= (float)val;
         // The upscaler selection, which this file claimed to carry and did not.
         //
-        // The default stays Off, deliberately - something that changes what the
-        // sim looks like the moment it is installed should be opted into. But
+        // Validated here rather than clamped. A file asking for backend 7 is a
+        // typo, and silently running backend 4 instead teaches the user that
+        // the file was read correctly.
+        else if (!strcmp(key, "upscaler")) {
+            const int v = (int)val;
+            if (v >= 0 && v < TAA_UPSCALER_COUNT) g_upscalerReq = v;
+            else xlog("config: upscaler=%d is not a backend - ignoring", v);
+        }
+        else if (!strcmp(key, "quality")) {
+            const int v = (int)val;
+            if (v >= 0 && v < TAA_QUALITY_COUNT) g_qualityReq = v;
+            else xlog("config: quality=%d is out of range - ignoring", v);
+        }
     }
     fclose(f);
 
@@ -4101,8 +4220,10 @@ static void loadConfig(const std::string &path)
     if (g_lodBias < -3.0f)    g_lodBias = -3.0f;
     if (g_lodBias >  1.0f)    g_lodBias =  1.0f;
 
-    xlog("config: lodBias=%.2f renderScale=%.2f jitterPhases=%d objects=%d",
-         g_lodBias, g_renderScale, g_jitterPhases, g_objectsOn ? 1 : 0);
+    xlog("config: lodBias=%.2f renderScale=%.2f jitterPhases=%d objects=%d "
+         "upscaler=%s quality=%d",
+         g_lodBias, g_renderScale, g_jitterPhases, g_objectsOn ? 1 : 0,
+         upscaler::name(g_upscalerReq), g_qualityReq);
 }
 
 PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
