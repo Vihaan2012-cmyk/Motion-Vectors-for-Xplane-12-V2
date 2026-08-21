@@ -164,6 +164,11 @@ if ($LASTEXITCODE -ne 0) { throw "launcher build failed" }
 # windeployqt is what makes the output runnable: Qt will not start without
 # platforms\qwindows.dll, and a missing plugin folder fails at run time on the
 # user's machine rather than here.
+# Set by the catch around the Qt build; the installer gate near the end of the
+# script reads it, so a build that could not produce the launcher does not go
+# on to package an installer that silently lacks one.
+$qtFailed = $false
+$qtOut    = $null
 $qtRoot = "C:\Qt\6.8.3\mingw_64"
 
 # ---- THE Qt APPS NEED AN MSVCRT COMPILER. THIS IS NOT A PREFERENCE.
@@ -194,6 +199,23 @@ if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
     Write-Host "  compiler produces binaries that crash on the first QString." -ForegroundColor Yellow
     Write-Host "  Install with: winget install BrechtSanders.WinLibs.POSIX.MSVCRT" -ForegroundColor Yellow
 } elseif (Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) {
+  # ---- A COSMETIC APP MUST NOT BLOCK DEPLOYING THE MOD.
+  #
+  # These four steps used to throw straight out of the script, and everything
+  # below - including "Installing..." - is downstream of them. So a Qt
+  # toolchain problem left the freshly built .xpl and layer DLL sitting in
+  # build\ while the sim went on loading the previous ones, and the build
+  # reported a failure that looked like it was about the launcher.
+  #
+  # That cost a full test cycle: the plugin was rebuilt with a corrected
+  # airframe box, the sim was restarted, and the log still printed the OLD
+  # box - which reads as "the fix did not work" rather than "the fix was never
+  # installed". The two are indistinguishable from the log alone.
+  #
+  # So Qt failures degrade to a warning here. The launcher is a convenience
+  # around a mod that runs perfectly well without it; the layer and the plugin
+  # are the product.
+  try {
     Write-Host "Building Qt launcher..."
     $qtOut = Join-Path $out "qtlauncher"
     # Cleared first. windeployqt only ADDS files, so a runtime left behind by a
@@ -234,6 +256,20 @@ if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
     & (Join-Path $qtRoot "bin\windeployqt.exe") --release --no-translations `
       (Join-Path $qtOut "MotionVectorsDebug.exe") | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "windeployqt failed for the debug console" }
+  } catch {
+    # The output directory is REMOVED rather than left half-built. The comment
+    # above records that this folder was once shipped stale for months because
+    # nothing regenerated it; a partial build left here would be shipped the
+    # same way, and a launcher that starts and then fails is worse than one
+    # that is plainly absent.
+    $qtFailed = $true
+    if ($qtOut -and (Test-Path $qtOut)) { Remove-Item -Recurse -Force $qtOut }
+    Write-Host "Qt launcher FAILED to build - continuing without it." -ForegroundColor Yellow
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "  The layer and the plugin are unaffected and are still being installed." -ForegroundColor Yellow
+    Write-Host "  The installer will NOT be built, because shipping one without" -ForegroundColor Yellow
+    Write-Host "  the launcher is a release defect rather than a local inconvenience." -ForegroundColor Yellow
+  }
 } else {
     Write-Host "Qt not found at $qtRoot - skipping the Qt launcher" -ForegroundColor Yellow
 }
@@ -285,6 +321,15 @@ if (Test-Path $luaSrc) {
 # On request only: it takes several seconds and most iterations do not need
 # one. Every release does.
 if ($Installer) {
+    # A local build tolerates a missing launcher; a RELEASE does not. Refusing
+    # here is the whole reason the Qt failure above is allowed to be a warning:
+    # the inconvenience is absorbed during development and stopped at the point
+    # where it would reach someone else.
+    if ($qtFailed) {
+        throw ("the Qt launcher failed to build, so this tree cannot produce a " +
+               "complete installer. Fix the Qt build, or run without -Installer " +
+               "to install locally.")
+    }
     $iscc = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
     if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
     Write-Host "Building installer..."
