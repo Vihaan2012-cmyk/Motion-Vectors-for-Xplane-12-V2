@@ -99,6 +99,34 @@ int main(int argc, char **argv)
     SetEnvironmentVariableA("VK_LAYER_PATH", layerDir);
     SetEnvironmentVariableA("VK_LOADER_LAYERS_ENABLE", kLayerName);
 
+    // ---- ARM THE VELOCITY PASS. WITHOUT THIS THE MOD DOES NOTHING.
+    //
+    // The layer treats TAA_VELOCITY as the master switch for SPIR-V injection,
+    // and it must be EXACTLY "1" - absence means off:
+    //
+    //     velArmed      = velEnv && velEnv[0] == '1' && velEnv[1] == 0;
+    //     g_spirvInject = velArmed && envOn("TAA_SPIRV_INJECT");
+    //
+    // With it unset nothing is injected, so no pipeline carries motion vectors,
+    // so the velocity target is never built and TAA has nothing to resolve. The
+    // panel shows exactly one symptom of this:
+    //
+    //     PIPELINES CARRYING VELOCITY 0
+    //
+    // and every other indicator - layer attached, plugin loaded, version
+    // correct - still reads healthy.
+    //
+    // It was set ONLY by test.ps1, the development launcher. So the mod worked
+    // on the machine it was built on and did nothing at all on every machine it
+    // was installed to, which is the precise trap the comment above the gate in
+    // layer.cpp warns about.
+    //
+    // Not overwritten if the user already set it: an explicit TAA_VELOCITY=0 is
+    // how you turn the layer back into a pure observer, and that has to survive
+    // being started through the launcher.
+    if (GetEnvironmentVariableA("TAA_VELOCITY", nullptr, 0) == 0)
+        SetEnvironmentVariableA("TAA_VELOCITY", "1");
+
     // Rebuild the command line: our own path first, then anything the user
     // passed, quoted so paths with spaces survive.
     char cmd[8192];

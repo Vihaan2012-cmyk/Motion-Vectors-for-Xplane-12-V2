@@ -560,6 +560,19 @@ private:
         env.insert("VK_LAYER_PATH", QDir::toNativeSeparators(layerDir()));
         env.insert("VK_LOADER_LAYERS_ENABLE", kLayer);
 
+        // ---- THE MASTER SWITCH FOR SPIR-V INJECTION.
+        //
+        // TAA_VELOCITY must be exactly "1" or the layer injects nothing: no
+        // pipeline carries motion vectors, no velocity target is built, and TAA
+        // has nothing to resolve. The panel reports it as
+        // "PIPELINES CARRYING VELOCITY 0" while every other indicator stays
+        // green.
+        //
+        // Only test.ps1 ever set it, so this worked in development and did
+        // nothing once installed. Set here as well as in the plain launcher,
+        // because either can start the sim.
+        env.insert("TAA_VELOCITY", "1");
+
         const Backend &rb = kReconstruction[m_recon->currentIndex()];
         const Backend &fb = kFrameGen[m_fg->currentIndex()];
         env.insert("TAA_BACKEND",  rb.env);
