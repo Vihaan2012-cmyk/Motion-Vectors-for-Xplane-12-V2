@@ -73,6 +73,19 @@ switch ($Action) {
         if (Test-Path $trace) { Clear-Content $trace }
         if ($NoTaa) { Set-LiveKey "taa.enable" "0" } else { Set-LiveKey "taa.enable" "1" }
         if ($Viz -ge 0) { Set-LiveKey "taa.viz" "$Viz" } else { Set-LiveKey "taa.viz" "0" }
+        # ---- ONE SIM AT A TIME.
+        #
+        # Two X-Plane instances share one Log.txt, one shared block and one
+        # layer trace, so the evidence from both is interleaved and neither
+        # is trustworthy. A run that crashed twice - once in XPLM_64 from a
+        # third-party threading violation, once in Avitab - turned out to be
+        # two processes dying separately, which read as one incomprehensible
+        # crash until the Report Ids were compared.
+        $running = Get-Process -Name "X-Plane" -ErrorAction SilentlyContinue
+        if ($running) {
+            Write-Host "X-Plane is ALREADY running (PID $($running.Id -join ', ')). Not starting a second one: two instances share one Log.txt and one shared block. Close it, or run: test.ps1 kill"
+            return
+        }
         Start-Process -FilePath (Join-Path $xp "X-Plane.exe") -WorkingDirectory $xp
         Start-Sleep 8
         if (Get-Process -Name "X-Plane" -ErrorAction SilentlyContinue) {

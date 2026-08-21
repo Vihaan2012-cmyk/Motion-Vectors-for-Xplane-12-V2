@@ -263,6 +263,28 @@ if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
   # around a mod that runs perfectly well without it; the layer and the plugin
   # are the product.
   try {
+    # ---- A WARNING ON STDERR IS NOT A FAILED BUILD.
+    #
+    # $ErrorActionPreference is "Stop" for this whole script, and in PowerShell
+    # 5.1 that turns ANY stderr output from a native executable into a
+    # terminating NativeCommandError - regardless of the exit code. GCC 16
+    # added -Wsfinae-incomplete, Qt 6.8.3's headers trip it, and from that day
+    # every build reported
+    #
+    #   Qt launcher FAILED to build - continuing without it.
+    #   In file included from .../QtCore/qstring.h:23,
+    #
+    # while g++ was returning 0 and producing a working 177 KB binary. The
+    # message even quoted the first WARNING line as though it were the error.
+    #
+    # The cost was not cosmetic: the installer is deliberately skipped when the
+    # launcher is missing, so this silently blocked every release.
+    #
+    # Exit codes are the truth here, and they are already checked after each
+    # step below. Restored in the catch and after the block so nothing else
+    # loses "Stop".
+    $qtEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     Write-Host "Building Qt launcher..."
     $qtOut = Join-Path $out "qtlauncher"
     # Cleared first. windeployqt only ADDS files, so a runtime left behind by a
@@ -273,6 +295,7 @@ if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
       "-I$qtRoot\include" "-I$qtRoot\include\QtCore" "-I$qtRoot\include\QtGui" `
       "-I$qtRoot\include\QtWidgets" "-I$qtRoot\include\QtNetwork" `
       -m64 -O2 -std=c++17 -mwindows -DQT_NO_DEBUG -DNDEBUG "-DMV_VERSION=\`"$mvVersion\`"" `
+      -Wno-sfinae-incomplete `
       "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network
     if ($LASTEXITCODE -ne 0) { throw "Qt launcher build failed" }
     # ---- THE DEBUG CONSOLE.
@@ -290,6 +313,7 @@ if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
       "-I$qtRoot\include" "-I$qtRoot\include\QtCore" "-I$qtRoot\include\QtGui" `
       "-I$qtRoot\include\QtWidgets" `
       -m64 -O2 -std=c++17 -mwindows -DQT_NO_DEBUG -DNDEBUG "-DMV_VERSION=\`"$mvVersion\`"" `
+      -Wno-sfinae-incomplete `
       "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core
     if ($LASTEXITCODE -ne 0) { throw "debug console build failed" }
 
@@ -303,7 +327,9 @@ if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
     & (Join-Path $qtRoot "bin\windeployqt.exe") --release --no-translations `
       (Join-Path $qtOut "MotionVectorsDebug.exe") | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "windeployqt failed for the debug console" }
+    $ErrorActionPreference = $qtEap
   } catch {
+    if ($qtEap) { $ErrorActionPreference = $qtEap }
     # The output directory is REMOVED rather than left half-built. The comment
     # above records that this folder was once shipped stale for months because
     # nothing regenerated it; a partial build left here would be shipped the
