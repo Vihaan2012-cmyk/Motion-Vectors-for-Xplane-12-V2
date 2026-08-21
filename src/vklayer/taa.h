@@ -181,6 +181,7 @@ struct TaaPush {
     // the two the stale history decays instead of being kept or thrown away.
     float   novecAlpha;
     float   movedDead;
+    float   alphaMoving;
 };
 
 enum {
@@ -189,6 +190,7 @@ enum {
     kTaaFlagNoAccum       = 1 << 2,
     kTaaFlagReactive      = 1 << 3,
     kTaaFlagNoUnjitter    = 1 << 4,
+    kTaaFlagCatmull       = 1 << 5,
     kTaaFlagNoVecByVel    = 1 << 6,
 };
 
@@ -208,6 +210,13 @@ static float taaVarClip()  { return live::f("taa.varclip", "TAA_VARCLIP", 1.25f)
 // correction at or below the floor read as zero, which is what the shader's
 // floorS note asks for; 0.0 restores the old behaviour that pinned a at 1.0.
 static float taaMovedDead(){ return live::f("taa.moved_dead", "TAA_MOVED_DEAD", 0.0f); }
+// Sharp history resampling. Bilinear history fetch is the motion-only,
+// surface-locked blur; see the note at sampleHistory in the shader.
+static bool taaCatmull()   { return live::onoff("taa.hist_catmull", "TAA_HIST_CATMULL", true); }
+// Blend weight while the camera moves. Long history is what anti-aliases a
+// parked frame; it is also what lets a small reprojection error compound into
+// a trail once things move. See the note in the shader.
+static float taaAlphaMoving(){ return live::f("taa.alpha_moving", "TAA_ALPHA_MOVING", 0.35f); }
 static int   taaViz()      { return live::i("taa.viz",   "TAA_VIZ",   0); }
 static float taaVizScale() { return live::f("taa.viz_scale", nullptr, 1.0f); }
 
@@ -1095,11 +1104,13 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.gain     = taaGain();
     pcv.varClip  = taaVarClip();
     pcv.movedDead = taaMovedDead();
+    pcv.alphaMoving = taaAlphaMoving();
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
                  | (taaReactive()      ? kTaaFlagReactive      : 0)
                  | (taaUnjitter()      ? 0 : kTaaFlagNoUnjitter)
+                 | (taaCatmull()       ? kTaaFlagCatmull       : 0)
                  | (live::onoff("taa.novec_by_vel", nullptr, false)
                         ? kTaaFlagNoVecByVel : 0);
     pcv.velScale = taaVelScale();

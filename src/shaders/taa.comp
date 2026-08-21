@@ -138,6 +138,7 @@ layout(push_constant) uniform Params {
     float novecCov;     // coverage below this = unwritten; <0 disables
     float novecAlpha;   // blend weight for pixels with no vector
     float movedDead;    // deadband on the clamp correction, in units of floorS
+    float alphaMoving;  // blend weight while the camera is moving
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -145,6 +146,8 @@ const int FLAG_NO_MOTION      = 2;
 const int FLAG_NO_ACCUM       = 4;
 const int FLAG_REACTIVE       = 8;   // consume the coverage mask in .a
 const int FLAG_NO_UNJITTER    = 16;
+const int FLAG_CATMULL        = 32;  // sharp history resampling; see the
+                                     // note at sampleHistory
 const int FLAG_NOVEC_BY_VEL   = 64;  // legacy: pick unwritten pixels by
                                      // vel==0 instead of by coverage  // sample the raster raw - isolation only
 
@@ -249,6 +252,69 @@ vec3  tm(vec3 c)   { return c / (1.0 + luma(c)); }
 // statistic - the mean, the variance, the box, and the weight derived from them
 // - and every colour that reaches the output stays linear the whole way. See
 // the weight computation in main().
+
+// ---- WHY HISTORY IS NOT FETCHED WITH texture().
+//
+// MEASURED, and by the only instrument that could tell: the smear appears
+// ONLY under camera movement, is absent with the camera parked, and is stuck
+// to the ground surface rather than to the screen. Nothing about WHICH texel
+// history comes from explains that - the vectors were checked against image
+// flow and are right, and scale, clamp width and blend weight were each swept
+// with no effect on it.
+//
+// The filter explains it exactly. history is fetched at uv + vel, a
+// NON-INTEGER offset, through a VK_FILTER_LINEAR sampler. Bilinear is a
+// low-pass filter, so every fetch softens history a little; at alpha 0.05 a
+// sample survives about twenty frames and is therefore resampled about twenty
+// times, each pass compounding the last. Parked, vel is zero, the offset is
+// zero, the filter is an identity and the image stays sharp. Moving, the
+// offset is non-zero every frame, the blur compounds, and because it rides the
+// reprojection it is painted onto the surface. That is the whole symptom.
+//
+// Catmull-Rom is the standard answer: a bicubic with negative lobes, so it
+// preserves the frequencies bilinear removes rather than merely redistributing
+// them. Nine taps arranged as bilinear-assisted pairs, which is the usual
+// 3x3-from-5-fetches trick generalised - the cost is taps, not bandwidth.
+//
+// The negative lobes can ring into negative values on a high-contrast edge.
+// The caller already floors the stored result at zero, and the clamp box
+// bounds it besides, so ringing cannot survive into history.
+vec3 sampleHistory(vec2 uv, float layer, vec2 tsz)
+{
+    if ((pc.flags & FLAG_CATMULL) == 0)
+        return texture(uHistorySampler, vec3(uv, layer)).rgb;
+
+    vec2 samplePos = uv * tsz;
+    vec2 texPos1   = floor(samplePos - 0.5) + 0.5;
+    vec2 f         = samplePos - texPos1;
+
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    vec2 w12      = w1 + w2;
+    vec2 offset12 = w2 / max(w12, vec2(1e-6));
+
+    vec2 p0  = (texPos1 - 1.0)      / tsz;
+    vec2 p3  = (texPos1 + 2.0)      / tsz;
+    vec2 p12 = (texPos1 + offset12) / tsz;
+
+    vec3 r = vec3(0.0);
+    r += texture(uHistorySampler, vec3(p0.x,  p0.y,  layer)).rgb * (w0.x  * w0.y);
+    r += texture(uHistorySampler, vec3(p12.x, p0.y,  layer)).rgb * (w12.x * w0.y);
+    r += texture(uHistorySampler, vec3(p3.x,  p0.y,  layer)).rgb * (w3.x  * w0.y);
+
+    r += texture(uHistorySampler, vec3(p0.x,  p12.y, layer)).rgb * (w0.x  * w12.y);
+    r += texture(uHistorySampler, vec3(p12.x, p12.y, layer)).rgb * (w12.x * w12.y);
+    r += texture(uHistorySampler, vec3(p3.x,  p12.y, layer)).rgb * (w3.x  * w12.y);
+
+    r += texture(uHistorySampler, vec3(p0.x,  p3.y,  layer)).rgb * (w0.x  * w3.y);
+    r += texture(uHistorySampler, vec3(p12.x, p3.y,  layer)).rgb * (w12.x * w3.y);
+    r += texture(uHistorySampler, vec3(p3.x,  p3.y,  layer)).rgb * (w3.x  * w3.y);
+
+    return max(r, vec3(0.0));
+}
 
 void main()
 {
@@ -524,7 +590,7 @@ void main()
         return;
     }
 
-    vec3 hist = texture(uHistorySampler, vec3(hUv, float(layer))).rgb;
+    vec3 hist = sampleHistory(hUv, float(layer), vec2(size));
 
     // History straight to screen, before anything is done to it. If this does
     // not smear along motion when frozen, what is displayed is not the history
@@ -571,7 +637,7 @@ void main()
         // outside every colour around it cannot belong to this pixel, whatever
         // the vector claimed - that single rule is what stops ghosting, and it
         // needs no variance, no gain and no coverage channel.
-        vec3 h = texture(uHistorySampler, vec3(hUv, float(layer))).rgb;
+        vec3 h = sampleHistory(hUv, float(layer), vec2(size));
         h = clamp(h, cmin, cmax);
         // First frame, a reset, or a reprojection that left the screen: take
         // the current frame whole rather than blending against nothing.
@@ -750,7 +816,34 @@ void main()
     // Everything here is a multiply, an add and a clamp - nothing divides by a
     // quantity that can vanish, so there is no configuration of inputs that
     // produces a firefly or a black pixel.
-    float a = clamp(pc.alpha + pc.gain * moved * pc.alpha, pc.alpha, 1.0);
+    // ---- HISTORY MUST BE SHORTER WHILE THE CAMERA MOVES.
+    //
+    // taa.alpha_moving has been in the settings file the whole time, plumbed
+    // NOWHERE - not in this shader, not in the layer. It was meant to do this,
+    // and never did.
+    //
+    // Why it is needed, measured: with alpha 1.0 (no history at all) the smear
+    // is GONE; with alpha 0.05 it is back. So the smear is accumulation, not
+    // reprojection - the vectors were checked against image flow and are right,
+    // and vel_scale, varclip, gain, the resampling filter and unjitter were each
+    // swept with no effect on it.
+    //
+    // At alpha 0.05 a sample survives about twenty frames. The ground moves 12
+    // to 45 px per frame under a pan, so a velocity error of even 2% drifts a
+    // quarter to nine tenths of a pixel per frame and lands 5 to 18 px away by
+    // the time the sample dies. That is the trail, on the ground and along the
+    // trees alike.
+    //
+    // It also explains why the CLAMP could not catch it. A slow drift stays
+    // INSIDE the neighbourhood colour range - it is a plausible value in the
+    // wrong place - so tightening varclip from 8.0 to 1.25 changed nothing.
+    // Only shortening the history does.
+    //
+    // Parked, the long history is exactly what is wanted: that is the jitter
+    // accumulation doing the anti-aliasing, and it is why alpha cannot simply
+    // be raised globally.
+    float aBase = (pc.cameraMoved != 0) ? max(pc.alpha, pc.alphaMoving) : pc.alpha;
+    float a = clamp(aBase + pc.gain * moved * aBase, aBase, 1.0);
 
     // Moving-geometry pixels take the current frame outright - see uFlags.
     if (pc.flagsValid != 0) {
