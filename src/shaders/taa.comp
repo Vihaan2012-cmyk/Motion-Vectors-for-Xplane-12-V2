@@ -177,6 +177,10 @@ const int VIZ_INVALID   = 3;   // which pixels were rejected, and why
 const int VIZ_HISTORY   = 4;   // the history buffer itself
 const int VIZ_WEIGHT    = 5;   // the blend weight actually used
 const int VIZ_CLAMP     = 6;   // how far the clamp moved history, in sigma
+const int VIZ_VIEWDEPTH = 10;  // the crash probe: view-space depth in
+                               // metres, reconstructed in the vertex
+                               // stage as -clip.w and carried out
+                               // through the velocity .z
 const int VIZ_WRITTEN   = 8;   // did ANY shader write velocity here - WHITE
                                // yes, BLACK no. Ungated by every other
                                // setting, deliberately: VIZ_MOTION zeroes the
@@ -487,6 +491,44 @@ void main()
         vec2 px2 = vec2(vel.x, pc.velYSign * vel.y) * vec2(size);
         vec3 c = vec3(0.5) + vec3(px2.x, px2.y, 0.0) * 0.02 * pc.vizScale;
         imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
+        return;
+    }
+    if (pc.viz == VIZ_VIEWDEPTH) {
+        // ---- THE GATE FOR CRASH DESTRUCTION.
+        //
+        // The destruction design classifies vertices in VIEW space, because
+        // that is the one frame every draw shares - which is what removes the
+        // need to identify which draw is the aeroplane. It rests on
+        //
+        //     view.z = -clip.w
+        //
+        // which assumes a PERSPECTIVE projection. An orthographic pass has a
+        // constant clip.w and would report one depth for every vertex in it.
+        //
+        // What to look for, in order of severity:
+        //   a smooth near-to-far ramp        the reconstruction works
+        //   flat bands at one value          an orthographic pass - the design
+        //                                    needs rethinking before Task 8
+        //   noise, or values that swim
+        //   as the camera rotates            clip.w is not what we think
+        //
+        // Scaled so the interesting range - a few metres to a few hundred - is
+        // legible rather than saturating at the horizon.
+        // ---- ABS, BECAUSE clip.w IS ALREADY A POSITIVE DISTANCE.
+        //
+        // The probe writes -clip.w, following the OpenGL convention where view
+        // space runs negative in front of the camera. But clip.w for this
+        // projection IS the positive view distance, so the probe value is
+        // negative and max(depth, 1.0) clamped every pixel to 1, log2(1) = 0,
+        // and the whole frame came out black.
+        //
+        // The probe was right and this line was wrong, which the emission
+        // counters established: 65 vertex modules were carrying the value out
+        // and 132 fragment modules were reading it back while the screen said
+        // nothing at all.
+        float depth = abs(velS.z);
+        imageStore(uHistory, ivec3(px, layer),
+                   vec4(heat(log2(max(depth, 1.0)) / 12.0 * pc.vizScale), 1.0));
         return;
     }
     if (pc.viz == VIZ_WRITTEN) {

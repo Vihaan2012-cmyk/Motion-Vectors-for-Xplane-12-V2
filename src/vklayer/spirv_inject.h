@@ -137,6 +137,31 @@ enum { ExecModel_Vertex = 0, ExecModel_Fragment = 4 };
 // is rigid and packs into a quaternion plus a vec3 - 28 bytes rather than 64.
 static const uint32_t kPushConstantBytes = 144;
 
+// The crash-destruction view-space probe: view depth carried out in
+// currClip.z, and from there into the velocity .z.
+//
+// UNCONDITIONAL, and deliberately so. It was gated on TAA_CRASH_PROBE and the
+// first run came back black, with no way to tell afterwards whether the
+// variable had reached the sim - the shell that set it no longer existed.
+// "Was it armed?" is the question this project keeps losing, and
+// learnings.md records the env-gated-feature trap three separate times.
+//
+// One negate and one insert per vertex is not worth a switch. The only guard
+// is whether a DEBUG mode already owns currClip.z, since those genuinely
+// conflict.
+// How many modules actually emitted the probe. Two runs came back black
+// and each time the next move was a guess about which end failed; a
+// counter answers it instead.
+inline uint64_t &probeVsCount() { static uint64_t n = 0; return n; }
+inline uint64_t &probeFsCount() { static uint64_t n = 0; return n; }
+
+inline bool crashProbeEnabled()
+{
+    static const bool debugOwnsZ = (getenv("TAA_MV_INST") != nullptr) ||
+                                   (getenv("TAA_MV_PID")  != nullptr);
+    return !debugOwnsZ;
+}
+
 // WHERE IT SITS, AND WHY NOT AT ZERO.
 //
 // Push constant memory is ONE BLOCK per command buffer. A VkPushConstantRange
@@ -1230,6 +1255,40 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         body.push_back(idCurrOut); body.push_back(2);
         idCurrOut = idTagged;
     }
+    // ---- CRASH PROBE: VIEW-SPACE DEPTH, CARRIED IN currClip.z
+    //
+    // The crash destruction design classifies vertices by their VIEW-space
+    // position, because view space is the one frame every draw in the frame
+    // shares - which is what removes the need to know which draw is the
+    // aeroplane. The reconstruction is
+    //
+    //     view.z = -clip.w        view.x = clip.x / proj[0]
+    //                             view.y = clip.y / proj[5]
+    //
+    // and the x/y half is arithmetically certain once proj is known. The half
+    // that can FAIL is view.z, because it assumes a perspective projection. An
+    // orthographic pass - a shadow cascade, say - has a constant clip.w, and
+    // every vertex in it would report the same depth. If that happens, the
+    // whole design needs rethinking, and it is far cheaper to learn now than
+    // after the descriptor-set work.
+    //
+    // proj[0] and proj[5] are deliberately NOT fetched here. The push block is
+    // exactly full at 144 bytes and the layer already reports it as TIGHT with
+    // X-Plane's own ranges overlapping ours; growing it would refuse more
+    // pipelines to answer a question this does not need it for.
+    //
+    // currClip.z is free in the normal path - the fragment reads .xy and .w -
+    // so this costs one negate and one insert, and only when the probe is on.
+    if (crashProbeEnabled()) {
+        ++probeVsCount();
+        const uint32_t idViewZ = bound++, idProbeIns = bound++;
+        body.push_back(head(OpFNegate, 4)); body.push_back(idFloat);
+        body.push_back(idViewZ); body.push_back(idPosW);
+        body.push_back(head(OpCompositeInsert, 6)); body.push_back(idV4);
+        body.push_back(idProbeIns); body.push_back(idViewZ);
+        body.push_back(idCurrOut); body.push_back(2);
+        idCurrOut = idProbeIns;
+    }
     body.push_back(head(OpStore, 3)); body.push_back(idOutCurr); body.push_back(idCurrOut);
 
     // ---- SUB-PIXEL JITTER, in clip space.
@@ -1675,7 +1734,17 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // In RGBA mode both arrive together: velocity in xy, depths in zw, so the
     // flow can be predicted from measured depth instead of from an epipolar
     // line that degenerates near the focus of expansion.
-    const uint32_t idCh2 = wantRGBA ? idCw : idConstZero;
+    // With the crash probe armed, the velocity .z carries the view-space depth
+    // the vertex stage reconstructed, so the resolve can display it per pixel.
+    // Otherwise it stays a constant zero, as before.
+    uint32_t idProbeZ = 0;
+    if (crashProbeEnabled()) {
+        ++probeFsCount();
+        idProbeZ = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat);
+        body.push_back(idProbeZ); body.push_back(idLc); body.push_back(2);
+    }
+    const uint32_t idCh2 = wantRGBA ? idCw : (idProbeZ ? idProbeZ : idConstZero);
     // Channel 3 carries the VERTEX shader's tag, which the vertex stage stamped
     // into currClip.z - the component this shader never reads. The fragment's
     // own tag named a stage that only performs a divide; prevClip is computed

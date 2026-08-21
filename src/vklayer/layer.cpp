@@ -10521,6 +10521,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 const uint64_t tot = nBoth + nVertOnly + nFragOnly + nNeither
                                    + nDeclined;
                 if (tot == 500 || (tot % 5000) == 0)
+                    trace("CRASH PROBE: %llu vertex modules carry view depth, %llu fragment modules read it back - zero on either side means the probe never emitted and a black screen says nothing about the geometry",
+                          (unsigned long long)spvinj::probeVsCount(),
+                          (unsigned long long)spvinj::probeFsCount());
                     trace("SPIRV INJECT: pipelines by patch outcome - both %llu, "
                           "vertex only %llu, fragment only %llu, NEITHER %llu, "
                           "declined-by-design %llu (of %llu). Only NEITHER is "
