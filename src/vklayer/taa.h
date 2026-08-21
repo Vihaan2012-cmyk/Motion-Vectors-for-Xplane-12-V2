@@ -182,6 +182,7 @@ struct TaaPush {
     float   novecAlpha;
     float   movedDead;
     float   alphaMoving;
+    float   alphaMovingPx;
 };
 
 enum {
@@ -217,6 +218,9 @@ static bool taaCatmull()   { return live::onoff("taa.hist_catmull", "TAA_HIST_CA
 // parked frame; it is also what lets a small reprojection error compound into
 // a trail once things move. See the note in the shader.
 static float taaAlphaMoving(){ return live::f("taa.alpha_moving", "TAA_ALPHA_MOVING", 0.35f); }
+// Speed, in px/frame, at which alpha_moving is fully applied. The ramp runs
+// from 0 to this, so a parked airframe's tremble reads as stationary.
+static float taaAlphaMovingPx(){ return live::f("taa.alpha_moving_px", "TAA_ALPHA_MOVING_PX", 3.0f); }
 static int   taaViz()      { return live::i("taa.viz",   "TAA_VIZ",   0); }
 static float taaVizScale() { return live::f("taa.viz_scale", nullptr, 1.0f); }
 
@@ -246,7 +250,30 @@ static bool taaObjFlags() { return live::onoff("taa.objflags", nullptr, true); }
 // The C14 reactive mask - on by default for the same reason as the flag
 // override: flicker parked in history is worse than aliasing on the flickering
 // content. taa.reactive=0 isolates its contribution live.
-static bool taaReactive() { return live::onoff("taa.reactive", nullptr, true); }
+// ---- DEFAULT OFF, AND HONESTLY UNDIAGNOSED.
+//
+// The reactive mask forces the blend weight to 1.0 where coverage reads below
+// a half, so those pixels take the raw current frame every frame and never
+// accumulate. It exists for the propeller disc, which flickers by
+// construction. Measured parked, five interleaved rounds, scene verified
+// stable, same view:
+//
+//     reactive ON   4.34x the temporal flicker of TAA-off
+//     reactive OFF  1.65x
+//     detail        identical either way (93%)
+//
+// So it costs well over half the temporal stability and buys nothing
+// measurable. Four separate faults in the coverage path were found and fixed -
+// a zero default where the fragment had no Location 0 output, attachment-0
+// alpha read as opacity in a DEFERRED g-buffer, a variant cache that did not
+// distinguish opaque from alpha-blended, and cleared pixels read as
+// transparent - and none of them moved the number: 4.52 -> 4.34 -> 4.42.
+//
+// Why coverage still reads low across large regions is NOT understood. What is
+// measured is that the mask is not earning its cost, so it is off by default
+// and the knob remains for propeller aircraft, where the artefact it targets
+// is real and this test aircraft has none.
+static bool taaReactive() { return live::onoff("taa.reactive", "TAA_REACTIVE", false); }
 // The unjitter alignment - isolation knob for the aligned sampling, so its
 // contribution can be removed live without touching the jitter itself.
 static bool taaUnjitter() { return live::onoff("taa.unjitter", nullptr, true); }
@@ -1105,6 +1132,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.varClip  = taaVarClip();
     pcv.movedDead = taaMovedDead();
     pcv.alphaMoving = taaAlphaMoving();
+    pcv.alphaMovingPx = taaAlphaMovingPx();
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)

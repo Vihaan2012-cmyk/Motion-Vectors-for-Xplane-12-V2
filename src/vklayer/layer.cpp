@@ -596,7 +596,12 @@ static bool spirvPullsVertices(const std::vector<uint32_t> &w)
     return false;
 }
 // The second half of the key packs the attachment index and the quantised
-typedef std::pair<VkShaderModule, uint32_t> FragKey;
+// Keyed on the blend mode too: an opaque and an alpha-blended pipeline
+// sharing a module need DIFFERENT variants, because only the blended one
+// gets a real coverage gate. Without this the first one to arrive would
+// hand its variant to the other.
+typedef std::pair<VkShaderModule, uint32_t> FragModKey;
+typedef std::pair<FragModKey, bool> FragKey;
 static std::map<FragKey, VkShaderModule> g_fragVariant;
 static uint64_t g_fragVariants = 0, g_fragPatchFail = 0;
 static bool g_patchedWasFrag = false;
@@ -9195,8 +9200,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
                 // against the wrong attachment, reported as a coverage hole and
                 // chased as one, while the location census says 16..31 are
                 // entirely free and 30/31 was never contended at all.
+                // alphaBlended=false: this is only a probe of whether the
+                // patch SUCCEEDS. There is no pipeline here and therefore no
+                // blend state to read; the variant that gets used is built at
+                // pipeline creation, where the real answer is known.
                 r = spvinj::injectFragment(ci->pCode, ci->codeSize, patched,
-                                           spvinj::mvAttachmentIndex());
+                                           spvinj::mvAttachmentIndex(), false);
                 isFrag = true;
             }
 
@@ -9915,9 +9924,9 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
 // ~1500 modules, so without the cache this would re-patch and re-create the
 // same module thousands of times.
 static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
-                                      uint32_t attachmentIndex)
+                                      uint32_t attachmentIndex, bool alphaBlended)
 {
-    FragKey key(orig, attachmentIndex);
+    FragKey key(FragModKey(orig, attachmentIndex), alphaBlended);
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<FragKey, VkShaderModule>::iterator it = g_fragVariant.find(key);
@@ -9935,7 +9944,7 @@ static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
 
     std::vector<uint32_t> patched;
     spvinj::Result fr = spvinj::injectFragment(src.data(), src.size() * 4, patched,
-                                               attachmentIndex);
+                                               attachmentIndex, alphaBlended);
     // The VERTEX module's Location decorations were verified from a dump - 30
     // and 31, both stored. The FRAGMENT module's INPUT locations never were,
     // and a mismatch there would deliver zeros through a varying that looks
@@ -10378,8 +10387,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             bool vertPatched = false;
             for (uint32_t s = 0; !noPatch && s < ci[i].stageCount; ++s) {
                 if (ci[i].pStages[s].stage & VK_SHADER_STAGE_FRAGMENT_BIT) {
+                    // Genuine transparency, read from the pipeline's own blend
+                    // state rather than guessed from a G-buffer channel.
+                    const VkPipelineColorBlendStateCreateInfo *cb =
+                        ci[i].pColorBlendState;
+                    const bool alphaBlended =
+                        cb && cb->attachmentCount > 0 &&
+                        cb->pAttachments[0].blendEnable == VK_TRUE;
                     VkShaderModule use = mvPatchFragment(
-                        device, ci[i].pStages[s].module, mvIndex);
+                        device, ci[i].pStages[s].module, mvIndex, alphaBlended);
                     if (use != VK_NULL_HANDLE) {
                         stages[i][s].module = use;
                         fragPatched = true;

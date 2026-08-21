@@ -139,6 +139,7 @@ layout(push_constant) uniform Params {
     float novecAlpha;   // blend weight for pixels with no vector
     float movedDead;    // deadband on the clamp correction, in units of floorS
     float alphaMoving;  // blend weight while the camera is moving
+    float alphaMovingPx;// px/frame at which alphaMoving is fully applied
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -842,7 +843,27 @@ void main()
     // Parked, the long history is exactly what is wanted: that is the jitter
     // accumulation doing the anti-aliasing, and it is why alpha cannot simply
     // be raised globally.
-    float aBase = (pc.cameraMoved != 0) ? max(pc.alpha, pc.alphaMoving) : pc.alpha;
+    // ---- RAMP ON THIS PIXEL'S SPEED, NOT ON A WHOLE-FRAME FLAG.
+    //
+    // The first version of this keyed on pc.cameraMoved, and that flag is
+    // binary and frame-wide. This file already records why that cannot work:
+    // the airframe trembles on its gear with the engines running, so
+    // cameraMoved is TRUE on a parked aeroplane. Worse, it flickers - so alpha
+    // alternated 0.05 / 0.35 frame to frame, history alternated long / short,
+    // and the picture pumped. Measured parked: flicker 0.310 against 0.080
+    // with the same settings and this term inert, where TAA off is 0.058. It
+    // traded the smear for a shimmer, which is not a fix.
+    //
+    // Per-pixel speed has neither problem. It is continuous, so there is
+    // nothing to alternate; it is local, so a pan that moves the ground 40 px
+    // and the horizon 2 px shortens history only where the error would
+    // actually compound; and a tremble is a fraction of a pixel, which the
+    // ramp reads as stationary.
+    //
+    // Below alphaMovingPx the two blend smoothly, so nothing switches.
+    float speedPx = length(vel * vec2(size));
+    float t       = clamp(speedPx / max(pc.alphaMovingPx, 1e-3), 0.0, 1.0);
+    float aBase   = mix(pc.alpha, max(pc.alpha, pc.alphaMoving), t);
     float a = clamp(aBase + pc.gain * moved * aBase, aBase, 1.0);
 
     // Moving-geometry pixels take the current frame outright - see uFlags.
@@ -861,7 +882,19 @@ void main()
     }
     // Transparent-covered pixels likewise - the C14 reactive mask. See the
     // coverage note at the fetch.
-    if ((pc.flags & FLAG_REACTIVE) != 0 && covMax < 0.5) a = 1.0;
+    // ---- COVERAGE CANNOT BE JUDGED WHERE NOTHING WROTE.
+    //
+    // The velocity attachment is bound on the scene passes only. Anything
+    // drawn outside them leaves the CLEAR value, and the clear sets .x and .y
+    // to the sentinel while .z and .w default to zero. Coverage zero reads as
+    // "fully transparent", so the mask fired on every such pixel, pinned the
+    // blend weight to 1.0, and stopped those pixels accumulating - they never
+    // anti-aliased and they shimmered with the jitter.
+    //
+    // `unwritten` already identifies exactly those pixels, by the sentinel
+    // rather than by inference. Where nothing wrote a vector, nothing wrote a
+    // coverage either, and the mask has no evidence to act on.
+    if ((pc.flags & FLAG_REACTIVE) != 0 && !unwritten && covMax < 0.5) a = 1.0;
 
     // How far the clamp had to move history, in standard deviations. Edges under
     // motion should light up and flat interiors should stay black; a frame that

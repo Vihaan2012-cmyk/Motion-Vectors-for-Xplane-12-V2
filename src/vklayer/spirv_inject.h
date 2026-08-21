@@ -1342,7 +1342,8 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 // is the kind of change that turns a rendering bug into a validation error.
 //
 inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
-                             std::vector<uint32_t> &out, uint32_t attachmentIndex)
+                             std::vector<uint32_t> &out, uint32_t attachmentIndex,
+                             bool alphaBlended)
 {
     if (!code || sizeBytes < 20) return INJ_MALFORMED;
     std::vector<uint32_t> w(code, code + sizeBytes / 4);
@@ -1677,7 +1678,31 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     static const bool fieldChk = getenv("TAA_MV_FIELDCHK") != nullptr;
     static const bool matDump = getenv("TAA_MV_MATDUMP") != nullptr;
     static const bool rawClip = getenv("TAA_MV_RAWCLIP") != nullptr;
-    uint32_t idCh3 = wantRGBA ? idPw : idConstZero;
+    // ---- UNKNOWN COVERAGE MEANS OPAQUE, NOT TRANSPARENT.
+    //
+    // This defaulted to ZERO. The gate below only replaces it when the
+    // fragment has a Location 0 output to read an alpha from, and in a
+    // deferred renderer plenty of G-buffer shaders do not. Every one of those
+    // surfaces therefore wrote coverage 0 - "fully transparent" - and the
+    // resolve's reactive mask fires on coverage below a half, forcing the
+    // blend weight to 1.0. Those pixels took the raw current frame EVERY
+    // FRAME and never accumulated, so they never anti-aliased and they
+    // shimmered with the jitter.
+    //
+    // Measured parked, same view, everything else equal:
+    //     reactive ON   flicker 0.178   4.52x TAA-off
+    //     reactive OFF  flicker 0.074   1.87x TAA-off
+    //     TAA OFF       flicker 0.039
+    // with detail identical either way (46.5 vs 46.2), so the mask was buying
+    // nothing and costing more than half the temporal stability.
+    //
+    // Zero was the wrong default because the two readings are not symmetric.
+    // Guessing "transparent" disables accumulation on geometry that is in fact
+    // opaque - the destructive error. Guessing "opaque" only means a genuinely
+    // transparent surface is treated temporally, which is what happened before
+    // the mask existed at all. The mask is for the propeller disc; it should
+    // fire where coverage is KNOWN low, not where it is unknown.
+    uint32_t idCh3 = wantRGBA ? idPw : idConstOneF;
     uint32_t idMatCz = 0, idMatPz = 0;
     if (matDump || rawClip) {
         idMatCz = bound++; idMatPz = bound++;
@@ -1717,7 +1742,23 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     {
         const bool anyDebug = writeDepth || wantRGBA || fieldChk || matDump ||
                               rawClip || idConstPid;
-        if (!anyDebug && idOut0Var) {
+        // ---- ONLY ALPHA-BLENDED PIPELINES HAVE AN OPACITY TO READ.
+        //
+        // The gate reads the alpha of colour attachment 0 and calls it
+        // coverage. That is a FORWARD-rendering assumption. X-Plane 12 is
+        // DEFERRED: attachment 0 of the G-buffer is not a colour with an
+        // opacity in its alpha, it is whatever that target packs, and reading
+        // it as opacity marks solid geometry as transparent for reasons that
+        // have nothing to do with transparency. The resolve then fires the
+        // reactive mask there, pins the blend weight to 1.0, and that surface
+        // never accumulates - so it never anti-aliases and it shimmers.
+        //
+        // The layer already knows which pipelines are genuinely alpha-blended,
+        // because it enables SRC_ALPHA blending on the velocity attachment for
+        // exactly those. So take the answer from there instead of inferring it
+        // from a channel that does not mean what the inference needs it to.
+        // Opaque pipelines write coverage 1.0 and the mask leaves them alone.
+        if (!anyDebug && idOut0Var && alphaBlended) {
             const uint32_t idA = bound++, idAw = bound++;
             const uint32_t idGE = bound++, idGate = bound++;
             body.push_back(head(OpLoad, 4)); body.push_back(idV4); body.push_back(idA); body.push_back(idOut0Var);
