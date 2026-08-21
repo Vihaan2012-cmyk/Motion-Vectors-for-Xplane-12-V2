@@ -60,3 +60,9 @@ Costs roughly 20 percent of frame rate at 4K.
 
 taa.reactive is off by default. If you fly a propeller aircraft and see
 artefacts around the propeller disc, set taa.reactive=1.
+
+
+LICENCE
+
+GPL-3.0. Source: github.com/Vihaan2012-cmyk/Motion-Vectors-for-Xplane-12-V2
+Full text in LICENSE.txt.

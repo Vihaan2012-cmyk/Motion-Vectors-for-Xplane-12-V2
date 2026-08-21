@@ -105,6 +105,10 @@ if (Test-Path "$root\config\taa_live.ini") {
     Copy-Item "$root\config\taa_live.ini" "$stage\MotionVectors\taa_live.ini.reference"
 }
 
+# GPL-3.0 requires the licence to accompany the binaries, so it ships in the
+# zip rather than living only in the repository.
+Copy-Item "$root\LICENSE" "$stage\LICENSE.txt"
+
 # The README is a FILE, not a here-string. Embedding it here meant every
 # Windows path in it went through two layers of escaping on the way in, and
 # "\64\win.xpl" and "%TEMP%\taa_live.ini" arrived as "4\win.xpl" and a literal
