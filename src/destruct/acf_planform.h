@@ -42,11 +42,14 @@
 //
 // UNITS AND FRAME
 //
-// The .acf is in FEET throughout. Its origin is not X-Plane's render origin -
-// on the 747-200F they differ by 5.18 m along z. That offset is NOT assumed
-// here: the gear appears in both frames, as _gear_x/y/z in the .acf and as
-// acf_Xarm/Yarm/Zarm from datarefs, so datumOffset() measures it from the
-// aircraft in front of it and works for an airframe nobody has tested.
+// The .acf is in FEET throughout, about Plane Maker's origin. X-Plane draws
+// about the DEFAULT CENTRE OF GRAVITY, and on the 747-200F those are 31.83 m
+// apart along the fuselage - nearly half the aeroplane's length.
+//
+// referencePointOffset() converts, from acf_cgY_original and acf_cgZ_original.
+// See the comment on it for how that was distinguished from the two other
+// candidate frames, both of which looked reasonable and one of which was out
+// by 32 m.
 //
 // Copyright (C) 2026 MotionVectors contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -98,6 +101,10 @@ struct Airframe {
     // not be mirrored into a duplicate of itself.
     std::vector<float>   bodyXyz;      // xyz triples
     std::vector<GearLeg> gear;
+    // The pilot's eye, metres, .acf frame. Carried because the sim publishes
+    // the SAME point relative to the CG, so the pair identifies which frame
+    // X-Plane draws in - see the frame probe in plugin.cpp.
+    float pilotEye[3] = { 0.0f, 0.0f, 0.0f };
     bool ok = false;
 };
 
@@ -188,6 +195,24 @@ inline bool parseAcf(const char *path, Airframe &out)
     while (fgets(line, sizeof(line), fh)) {
         if (!acfdetail::splitProp(line, key, val)) continue;
         int idx = 0;
+
+        if (key.compare(0, 12, "acf/_pe_xyz/") == 0) {
+            // The digit test is not defensive padding. This table also carries
+            // "acf/_pe_xyz/count", and atoi("count") is 0 - so the COUNT was
+            // being stored as the x coordinate, and the eye read 3 ft off the
+            // centreline on an aeroplane whose file plainly says 0.
+            //
+            // It survived a first reading because y and z were right; only x
+            // was wrong, and only by an amount that looks like a plausible
+            // offset rather than like a bug. Exactly the same shape as the
+            // "_geo_xyz/i_count" fault above, in a different table.
+            const char *tail = key.c_str() + 12;
+            if (*tail < '0' || *tail > '9') continue;
+            const int a = atoi(tail);
+            if (a >= 0 && a < 3)
+                out.pilotEye[a] = (float)atof(val.c_str()) * kFeetToMetres;
+            continue;
+        }
 
         if (acfdetail::splitIndexed(key, "_wing", idx, field)) {
             if (idx < 0 || idx >= kMaxAcfWings) continue;
@@ -414,33 +439,48 @@ inline bool vertexBounds(const std::vector<float> &v, float lo[3], float hi[3])
     return true;
 }
 
-// ---- THE .acf FRAME IS NOT X-PLANE'S RENDER FRAME.
+// ---- THE .acf FRAME IS NOT THE FRAME X-PLANE DRAWS IN.
 //
-// They differ by 5.18 m along z on the 747-200F. Rather than assume a
-// convention, measure it: the gear exists in both frames, as _gear_x/y/z here
-// and as acf_Xarm/Yarm/Zarm from datarefs. The mean difference over every leg
-// is the offset, and averaging rather than taking one leg means a single
-// mis-entered value moves the answer by a fraction rather than all of it.
+// The .acf stores parts about Plane Maker's origin. X-Plane draws about the
+// DEFAULT CENTRE OF GRAVITY, and on a 747-200F those are 31.83 m apart along
+// the fuselage. Classifying against the wrong one puts the aeroplane half its
+// own length from the grid.
 //
-// Returns false when there is nothing to match, so the caller can fall back
-// instead of silently placing the airframe at the wrong station.
-inline bool datumOffset(const Airframe &a, const float *armX, const float *armY,
-                        const float *armZ, int nArm, float out[3])
+// acf_cgY_original and acf_cgZ_original are the reference point, documented as
+// "The ORIGINAL reference point in PM in feet" - the .acf's units, which is
+// what makes the conversion a subtraction and nothing more.
+//
+// HOW THIS WAS SETTLED, BECAUSE TWO PLAUSIBLE ANSWERS SAT 32 m APART.
+//
+// The gear was tried first: it appears in the .acf as _gear_x/y/z and in the
+// sim as acf_Xarm/Yarm/Zarm, so the difference looked like the offset. It gave
+// a constant (0.00, 2.44, -31.83) across every leg - constant, so a reference
+// point rather than a unit error - but "arm" means distance from the CENTRE OF
+// GRAVITY, and the current CG moves with fuel and payload. Anchoring geometry
+// to it would walk the wings down the fuselage over a long sector.
+//
+// The OBJ files were tried next and cannot answer at all: if X-Plane shifts
+// the drawn objects and the .acf parts by the SAME amount they stay consistent
+// under either hypothesis, so nose and tail overhangs distinguish nothing.
+//
+// The pilot's eye settles it, because it is the one point published in both
+// frames. The .acf puts it at z = 21.00 ft; acf_cgZ_original is 104.44 ft; so
+// a CG-based frame must report (21.00 - 104.44) * 0.3048 = -25.4327 m and a
+// PM-based one +6.40. The sim reports -25.43, and -25.4327 in y's companion
+// term likewise: predicted 5.8217, measured 5.82.
+//
+// That also passes the sanity check the numbers alone do not give: the box it
+// produces puts the nose at -35.5 m and the eye at -25.43, which is a cockpit
+// ten metres aft of the nose - where a 747's upper deck is.
+//
+// There is no acf_cgX_original. Plane Maker's origin is on the centreline, and
+// the .acf's own _part_x values being symmetric about zero is the check that
+// this is so.
+inline void referencePointOffset(float cgYFeet, float cgZFeet, float out[3])
 {
-    out[0] = out[1] = out[2] = 0.0f;
-    if (!armX || !armY || !armZ) return false;
-    const int n = (int)a.gear.size() < nArm ? (int)a.gear.size() : nArm;
-    if (n <= 0) return false;
-    double sx = 0.0, sy = 0.0, sz = 0.0;
-    for (int i = 0; i < n; ++i) {
-        sx += (double)armX[i] - (double)a.gear[(size_t)i].x;
-        sy += (double)armY[i] - (double)a.gear[(size_t)i].y;
-        sz += (double)armZ[i] - (double)a.gear[(size_t)i].z;
-    }
-    out[0] = (float)(sx / n);
-    out[1] = (float)(sy / n);
-    out[2] = (float)(sz / n);
-    return true;
+    out[0] = 0.0f;
+    out[1] = -cgYFeet * kFeetToMetres;
+    out[2] = -cgZFeet * kFeetToMetres;
 }
 
 inline void applyOffset(std::vector<float> &v, const float off[3])

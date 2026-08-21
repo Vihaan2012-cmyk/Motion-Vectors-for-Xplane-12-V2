@@ -1757,7 +1757,8 @@ static void publishCrashGrid(bool force)
 
     static XPLMDataRef rSizeX = nullptr, rSizeZ = nullptr;
     static XPLMDataRef rGearY = nullptr, rGearLeg = nullptr, rGearTyre = nullptr;
-    static XPLMDataRef rArmX = nullptr, rArmY = nullptr, rArmZ = nullptr;
+    static XPLMDataRef rCgY = nullptr, rCgZ = nullptr;
+    static XPLMDataRef rPeX = nullptr, rPeY = nullptr, rPeZ = nullptr;
     static bool resolved = false;
     if (!resolved) {
         resolved  = true;
@@ -1766,11 +1767,24 @@ static void publishCrashGrid(bool force)
         rGearY    = taaFind("sim/aircraft/parts/acf_gear_ynodef");
         rGearLeg  = taaFind("sim/aircraft/parts/acf_gear_leglen");
         rGearTyre = taaFind("sim/aircraft/parts/acf_gear_tirrad");
-        // The gear in the RENDER frame. The .acf lists the same legs in its
-        // own frame, and the difference is the datum offset.
-        rArmX     = taaFind("sim/aircraft/parts/acf_Xarm");
-        rArmY     = taaFind("sim/aircraft/parts/acf_Yarm");
-        rArmZ     = taaFind("sim/aircraft/parts/acf_Zarm");
+        // Plane Maker's reference point, in feet - the origin the .acf's own
+        // part coordinates are measured from, and what separates them from
+        // the render frame X-Plane draws in.
+        rCgY      = taaFind("sim/aircraft/weight/acf_cgY_original");
+        rCgZ      = taaFind("sim/aircraft/weight/acf_cgZ_original");
+        // ---- THE ONE MEASUREMENT THAT SEPARATES THE TWO CANDIDATE FRAMES.
+        //
+        // The .acf stores the pilot's eye in Plane Maker coordinates and the
+        // sim publishes it "relative to CG", so the same point exists in both
+        // frames and the difference between them IS the transform.
+        //
+        // On the 747-200F: PM says z = 21.00 ft = 6.40 m, and cgZ_original is
+        // 104.44 ft. So a CG-based frame must report about -25.43 m and a
+        // PM-based one about +6.40. Thirty-two metres apart - there is no
+        // reading of this that is ambiguous.
+        rPeX      = taaFind("sim/aircraft/view/acf_peX");
+        rPeY      = taaFind("sim/aircraft/view/acf_peY");
+        rPeZ      = taaFind("sim/aircraft/view/acf_peZ");
     }
 
     destruct::AircraftDims d;
@@ -1820,22 +1834,58 @@ static void publishCrashGrid(bool force)
         std::vector<float> verts;
         destruct::airframeVertices(frame, 8, 4, verts);
 
-        // The .acf frame is not the render frame - 5.18 m apart along z on the
-        // 747. Measured from the gear, which appears in both, rather than
-        // assumed: acf_Xarm/Yarm/Zarm are the same legs the .acf lists.
-        if (rArmX && rArmY && rArmZ) {
-            float ax[10] = {0}, ay[10] = {0}, az[10] = {0};
-            const int na = XPLMGetDatavf(rArmX, ax, 0, 10);
-            const int nb = XPLMGetDatavf(rArmY, ay, 0, 10);
-            const int nc = XPLMGetDatavf(rArmZ, az, 0, 10);
-            int nArm = na < nb ? na : nb; if (nc < nArm) nArm = nc;
+        // ---- THE .acf FRAME IS NOT THE RENDER FRAME.
+        //
+        // X-Plane draws everything relative to the DEFAULT centre of gravity -
+        // DataRefs.txt says so of the engine positions: "Engine location,
+        // meters x, y, z, with respect to the default center of gravity". The
+        // .acf stores its parts about Plane Maker's own origin instead, and on
+        // the 747-200F the two are 5.18 m apart along z.
+        //
+        // acf_cgY_original and acf_cgZ_original are that reference point,
+        // documented as "The ORIGINAL reference point in PM in feet" - which is
+        // exactly the conversion wanted, in exactly the units the .acf uses.
+        //
+        // NOT the gear arms, which were tried first. acf_Xarm/Yarm/Zarm are
+        // moment ARMS - distances from the CG - so a mean over the legs gave a
+        // 31.83 m shift, implying a reference near the main gear at 104 ft.
+        // That is the CURRENT centre of gravity, and it MOVES as fuel burns and
+        // payload shifts. Anchoring the airframe to it would have the wings
+        // drift a metre down the fuselage over a long sector, which would show
+        // up as the fragmentation slowly going out of register with the model
+        // and read as a physics bug.
+        //
+        // "Original" is the word that matters: the reference point is a
+        // property of the design and does not move.
+        //
+        // There is no acf_cgX_original because Plane Maker's origin is on the
+        // centreline; the .acf's own _part_x values are symmetric about zero,
+        // which is the cross-check that this is so.
+        if (rPeX && rPeY && rPeZ)
+            xlog("crash grid: FRAME PROBE - pilot eye reads (%.2f %.2f %.2f) m "
+                 "from the sim; the .acf puts it at (%.2f %.2f %.2f) m in Plane "
+                 "Maker coordinates. Equal means the draw frame IS the PM frame "
+                 "and no shift is wanted; differing by the reference point means "
+                 "it is CG-based and the shift is.",
+                 (double)XPLMGetDataf(rPeX), (double)XPLMGetDataf(rPeY),
+                 (double)XPLMGetDataf(rPeZ),
+                 (double)frame.pilotEye[0], (double)frame.pilotEye[1],
+                 (double)frame.pilotEye[2]);
+
+        if (rCgY && rCgZ) {
             float off[3];
-            if (destruct::datumOffset(frame, ax, ay, az, nArm, off)) {
-                destruct::applyOffset(verts, off);
-                xlog("crash grid: .acf datum measured %.2f m off the render "
-                     "frame in z (%.2f x, %.2f y) from %d gear leg(s)",
-                     (double)off[2], (double)off[0], (double)off[1], nArm);
-            }
+            destruct::referencePointOffset(XPLMGetDataf(rCgY),
+                                           XPLMGetDataf(rCgZ), off);
+            destruct::applyOffset(verts, off);
+            xlog("crash grid: Plane Maker reference point at (%.2f %.2f) ft "
+                 "-> airframe shifted (%.2f %.2f %.2f) m into the render frame",
+                 (double)XPLMGetDataf(rCgY), (double)XPLMGetDataf(rCgZ),
+                 (double)off[0], (double)off[1], (double)off[2]);
+        } else {
+            xlog("crash grid: acf_cg*_original not available - the airframe "
+                 "stays in .acf coordinates and will sit off along the "
+                 "fuselage. Classification against it would be precisely "
+                 "wrong rather than obviously wrong.");
         }
 
         if (destruct::vertexBounds(verts, bbMin, bbMax)) {

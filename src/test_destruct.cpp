@@ -870,7 +870,15 @@ int main()
             "P _gear/1/_gear_y -11.100000000\n"
             "P _gear/1/_gear_z 114.080000000\n"
             "P _gear/1/_leg_len 6.896000000\n"
-            "P _gear/1/_tire_radius 2.049999952\n";
+            "P _gear/1/_tire_radius 2.049999952\n"
+            // The eye, and the sibling key that broke reading it: atoi on
+            // "count" is 0, so the COUNT was stored as the x coordinate and
+            // the eye read 3 ft off the centreline of an aeroplane whose
+            // own file says 0.
+            "P acf/_pe_xyz/0 0.000000000\n"
+            "P acf/_pe_xyz/1 11.090000153\n"
+            "P acf/_pe_xyz/2 21.000000000\n"
+            "P acf/_pe_xyz/count 3\n";
 
         const char *tmp = "build/test_synth.acf";
         FILE *fh = fopen(tmp, "wb");
@@ -940,29 +948,59 @@ int main()
               "the left and right panels both appear");
 
         float contact = 0.0f;
+        checkNear(a.pilotEye[0], 0.0, 1e-4,
+                  "the eye is on the centreline - a count is not coordinate 0");
+        checkNear(a.pilotEye[2], 21.0 * 0.3048, 1e-3,
+                  "and its station comes through in metres");
+
         check(destruct::groundContact(a, contact), "the gear gives a floor");
         // Leg 1 reaches -20.046 ft against leg 0's -19.953: the LOWER wins.
         checkNear(contact, -20.045999 * 0.3048, 0.01,
                   "the lowest leg sets the ground, not the first one");
 
-        // The .acf frame is not the render frame. Measured from the gear,
-        // which exists in both, rather than assumed from a convention.
-        const float armX[2] = { 0.0f, 1.917f };      // 6.29 ft, unchanged in x
-        const float armY[2] = { -2.713f, -3.383f };  // unchanged in y
-        const float armZ[2] = { 2.441f, 29.606f };   // 5.179 m forward of .acf
+        // ---- THE FRAME, AND HOW IT WAS TOLD FROM THE WRONG ONE.
+        //
+        // The .acf is about Plane Maker's origin; X-Plane draws about the
+        // DEFAULT centre of gravity. On this aeroplane those are 31.83 m apart
+        // - nearly half its length - so choosing wrongly does not look like a
+        // small error. It looks like the aircraft is not there.
+        //
+        // The gear was tried first and returned the same constant on every
+        // leg, which was persuasive and still wrong to USE: acf_Xarm/Yarm/Zarm
+        // are moment arms from the CURRENT centre of gravity, and that moves as
+        // fuel burns. It agrees today only because the aeroplane is loaded at
+        // its default, so the agreement would have decayed over a long sector
+        // rather than failing where anyone would look for it.
+        //
+        // The pilot's eye is the honest witness: it is published in BOTH
+        // frames, so distinguishing them needs no theory about which X-Plane
+        // uses.
+        const float cgYFeet = -8.01f, cgZFeet = 104.44f;   // the real 747-200F
         float off[3];
-        check(destruct::datumOffset(a, armX, armY, armZ, 2, off),
-              "the datum offset can be measured");
-        checkNear(off[0], 0.0, 0.01, "no shift across the aeroplane");
-        checkNear(off[1], 0.0, 0.01, "and none vertically");
-        checkNear(off[2], -5.179, 0.01, "but 5.18 m along it, as the 747 has");
+        destruct::referencePointOffset(cgYFeet, cgZFeet, off);
+        checkNear(off[0], 0.0, 1e-6,
+                  "no shift across the aeroplane - PM's origin is on the centreline");
+        checkNear(off[1], 2.441, 0.01, "2.44 m vertically");
+        checkNear(off[2], -31.833, 0.01, "and 31.83 m along the fuselage");
+
+        // THE MEASUREMENT ITSELF. The .acf puts the eye at z = 21.00 ft and
+        // y = 11.09 ft; the sim reports acf_peZ = -25.43 m and acf_peY = 5.82.
+        // Checked against the sim's own published numbers rather than against
+        // this file's arithmetic, because the two agreeing is the entire claim.
+        const float eyeAcf[3] = { 0.0f, 11.09f * 0.3048f, 21.00f * 0.3048f };
+        checkNear(eyeAcf[1] + off[1], 5.82, 0.01,
+                  "the eye lands where the sim says it is, vertically");
+        checkNear(eyeAcf[2] + off[2], -25.43, 0.01,
+                  "and along the fuselage - which the PM frame misses by 32 m");
 
         std::vector<float> shifted = v;
         destruct::applyOffset(shifted, off);
         float slo[3], shi[3];
         destruct::vertexBounds(shifted, slo, shi);
-        checkNear(shi[2] - hi[2], -5.179, 0.01,
-                  "applying the offset moves the airframe and not its size");
+        checkNear(shi[2] - hi[2], -31.833, 0.01,
+                  "applying the offset translates the airframe");
+        checkNear((shi[2] - slo[2]) - (hi[2] - lo[2]), 0.0, 1e-3,
+                  "and does not change its size");
     }
 
     printf("\n%s: %d failure(s)\n", g_fail ? "FAILED" : "OK", g_fail);
