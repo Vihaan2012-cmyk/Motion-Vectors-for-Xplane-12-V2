@@ -315,7 +315,6 @@ local function verify_integrity()
         { "Vulkan layer",     first_existing(dll)  or dll[1]  },
         { "Layer manifest",   first_existing(json) or json[1] },
         { "Plugin",           root .. "Resources\\plugins\\MotionVectors\\64\\win.xpl" },
-        { "Live controls",    ini_path() },
     }
     local bad = 0
     logf(C_AMBER, "Verifying files...")
@@ -327,6 +326,31 @@ local function verify_integrity()
             bad = bad + 1
         end
     end
+    -- ---- THE LIVE CONTROL FILE IS NOT AN INSTALLATION FILE.
+    --
+    -- It used to sit in the list above and be counted as a failure, so every
+    -- clean install reported "Integrity check found 1 problem(s)" the first
+    -- time it ran - on an installation with nothing whatsoever wrong with it.
+    --
+    -- Its absence is the NORMAL state before anyone has changed a setting. The
+    -- layer says so itself, in its own words, in the log a few lines earlier:
+    -- "no config at ... - using defaults". A file the layer is documented to
+    -- do without is not part of whether the mod is installed.
+    --
+    -- What IS worth reporting is being unable to create it, because then the
+    -- panel cannot write a setting and every control in it would silently do
+    -- nothing - which is a real fault, and one that looks like the panel being
+    -- broken rather than like a permissions problem.
+    if file_exists(ini_path()) then
+        logf(C_GREEN, "  OK      Live controls")
+    elseif ini_ensure() then
+        logf(C_GREEN, "  OK      Live controls (created - defaults until changed)")
+    else
+        logf(C_RED,   "  PROBLEM Cannot create %s - the panel will not be able "
+                      .. "to save anything", ini_path())
+        bad = bad + 1
+    end
+
     -- The layer being present on disk says nothing about it being LOADED. That
     -- is a separate failure with a separate fix, so it is a separate line.
     -- ---- ATTACHMENT IS NOT KNOWN YET AT SCRIPT LOAD.
