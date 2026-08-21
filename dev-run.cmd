@@ -46,7 +46,7 @@ rem The velocity readback: 63.7 MB over PCIe plus an 8-megapixel CPU scoring
 rem pass per dump - one visibly hitched frame each interval, measured at 19 fps
 rem for that frame. It was the calibration campaign's instrument, and the field
 rem passed acceptance, so it is OFF. Re-arm for a measurement session by
-rem uncommenting, or at runtime: echo 60 > "%%TEMP%%	aa_dump_every.txt".
+rem uncommenting, or at runtime: echo 60 > "%%TEMP%%\taa_dump_every.txt".
 rem set "TAA_VELOCITY_DUMP=60"
 
 rem ---- VRAM pager, restored to the settings V1 shipped and proved.
@@ -73,11 +73,16 @@ rem compare the vectors against the pixel displacement that motion must
 rem produce. This is what turns "does it look right" into a number, and it is
 rem the only way to measure without someone flying.
 rem TAA is now switched from the panel; this only forces it on for debugging.
-rem Velocity pass armed HERE, in the launcher, because passing it via
-rem the environment failed silently twice and a backup restore wipes
-rem this file - both times the layer came up inert while every
-rem measurement looked like a real reading of an empty field.
-set "TAA_VELOCITY=1"
+rem Velocity pass armed HERE, in the launcher, because passing it via
+
+rem the environment failed silently twice and a backup restore wipes
+
+rem this file - both times the layer came up inert while every
+
+rem measurement looked like a real reading of an empty field.
+
+set "TAA_VELOCITY=1"
+
 set "TAA_RESOLVE=1"
 set "TAA_MODE=2"
 rem set "TAA_SHOT_SECONDS=12"   (TAA off - re-enable to resume at mode 1)
@@ -131,9 +136,37 @@ if not defined MVSYNC set "MVSYNC="
 >>"%TEMP%\mv_layer_settings.txt" echo khronos_validation.duplicate_message_limit = 10
 if defined MVSYNC >>"%TEMP%\mv_layer_settings.txt" echo %MVSYNC%
 set "VK_LAYER_SETTINGS_PATH=%TEMP%\mv_layer_settings.txt"
-set "VK_LAYER_PATH=%LAYERDIR%;C:\VulkanSDK.4.357.0\Bin"
-set "VK_INSTANCE_LAYERS=VK_LAYER_mv;VK_LAYER_KHRONOS_validation"
+
+rem ---- TWO BUGS MADE THIS SWITCH DO NOTHING AT ALL.
+rem
+rem The SDK path read C:\VulkanSDK.4.357.0\Bin. The real path is
+rem C:\VulkanSDK\1.4.357.0\Bin - the "\1" had been eaten somewhere, the
+rem same backslash mangling that ate "\t" and "\64" out of the packaged
+rem README. The loader was pointed at a directory that does not exist and
+rem found no validation layer.
+rem
+rem And VK_INSTANCE_LAYERS is the DEPRECATED spelling, which the comment at
+rem the top of this very file says is "ignored silently by loader 1.3.234 and
+rem newer". Even with the path right, nothing would have been enabled.
+rem
+rem So `dev-run.cmd validate` has been printing "Validation: ON" and running
+rem NO VALIDATION AT ALL. That is worse than not having the switch, because
+rem it answers "clean" without looking. learnings.md records that one
+rem instrumented run named a device bug that four hours of config bisecting
+rem could only bracket - and it has been unavailable ever since.
+rem
+rem Discovered rather than hardcoded, so an SDK update cannot quietly
+rem disable it again, and it says so loudly when it cannot find one.
+for /d %%D in ("C:\VulkanSDK\*") do set "MVSDK=%%D\Bin"
+if not exist "%MVSDK%\VkLayer_khronos_validation.json" (
+    echo Validation: REQUESTED BUT UNAVAILABLE - no validation layer found
+    echo   looked in: %MVSDK%
+    goto :noval
+)
+set "VK_LAYER_PATH=%LAYERDIR%;%MVSDK%"
+set "VK_LOADER_LAYERS_ENABLE=VK_LAYER_mv,VK_LAYER_KHRONOS_validation"
 echo Validation: ON  -^> %TEMP%\mv_validation.txt
+echo   sdk: %MVSDK%
 :noval
 
 echo Layer:     %LAYERDIR%

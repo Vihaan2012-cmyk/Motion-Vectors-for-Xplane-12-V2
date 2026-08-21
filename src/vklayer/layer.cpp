@@ -1436,6 +1436,7 @@ static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "mv_target.h"
 #include "spirv_inject.h"
 #include "taa.h"
+#include "destruct_gpu.h"
 
 
 // FSR2 is optional at BUILD time as well as run time. Its static library takes
@@ -5313,6 +5314,19 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
             if (tdi != g_devices.end() && g_mv.ready && g_mv.view != VK_NULL_HANDLE) {
                 gateReach(3);
                 DeviceData &tdd = tdi->second;
+                // ---- CRASH DESTRUCTION RESOURCES.
+                //
+                // Created here because this is the one place that reliably has
+                // both a DeviceData and the device handle, on a path that runs
+                // every frame. ensure() is a no-op after the first success and
+                // latches on failure, so a device that cannot support it is
+                // asked once and never again.
+                //
+                // Nothing binds this yet - the buffer exists and is described,
+                // which is deliberately the whole of this step. Adding a
+                // descriptor set to every pipeline is the invasive part and is
+                // easier to judge when creation is already known good.
+                destructgpu::ensure(tdd, tci->second);
                 // Re-init only on a real change of shape. The scene IMAGE
                 // alternates every frame between two targets, and keying on it
                 // rebuilt everything each frame and destroyed objects still in
