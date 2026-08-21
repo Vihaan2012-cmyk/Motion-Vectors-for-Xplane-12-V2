@@ -40,9 +40,22 @@
 namespace destruct {
 
 // What X-Plane will actually tell us, and nothing it will not.
+//
+// BOTH ARE RADII, NOT WIDTHS. DataRefs.txt describes acf_size_z as "Shadow
+// size, and viewing distance size" - these are the half-extents X-Plane uses
+// to size the shadow footprint and the LOD sphere, not the dimensions of the
+// aeroplane. Reading them as full width and halving them is what put the seed
+// box at +/-20.2 m on a 747 whose wings reach +/-29.6, so the entire outer
+// wing sat outside the grid and could never be discovered.
+//
+// The check that settles it: the 747-200F's .acf planform gives a half-span
+// of 29.63 m (part_x 67.97 ft + semilen 36.7 ft swept and dihedralled), and
+// acf_size_x reports 30.0. Those are the same number. Half-length from the
+// planform is 35.5 m against an acf_size_z of 38.5 - the same number plus the
+// margin a shadow needs.
 struct AircraftDims {
-    float sizeX = 0.0f;      // acf_size_x, full width
-    float sizeZ = 0.0f;      // acf_size_z, full length
+    float sizeX = 0.0f;      // acf_size_x, HALF width
+    float sizeZ = 0.0f;      // acf_size_z, HALF length
     // Lowest point below the aircraft datum, as a NEGATIVE number: gear
     // ynodef minus leg length minus tyre radius. Zero is a legitimate value
     // for a floatplane or a gear-up airframe and is handled by the pad.
@@ -62,10 +75,20 @@ struct AircraftDims {
 // big.
 static const float kSeedPad = 1.35f;
 
-// Height as a multiple of the LONGER horizontal dimension. Only a bracket:
-// pass one measures the real value. Chosen from the extremes rather than the
-// average - a Pitts is about a third, so a half clears everything with room.
-static const float kSeedHeightFactor = 0.5f;
+// Height as a multiple of the LONGER horizontal HALF-extent. Only a bracket:
+// the planform reader or pass one measures the real value.
+//
+// Raised from 0.5 when acf_size_* were found to be radii. The old factor was
+// applied to what was believed to be a full dimension, so reading the same
+// value as a half-extent without changing the factor would have halved the
+// headroom - and the fin is the first thing to fall out of a box that is
+// short.
+//
+// 0.75 clears the three airframes that bracket the range, measured against
+// height above the datum: a 747-200F needs 0.35 of its half-length, a C172
+// 0.49 of its half-span, a Pitts 0.66. The margin is deliberately kept on the
+// generous side because pass two only ever narrows.
+static const float kSeedHeightFactor = 0.75f;
 
 inline void seedBounds(const AircraftDims &d, float bbMin[3], float bbMax[3])
 {
@@ -75,8 +98,9 @@ inline void seedBounds(const AircraftDims &d, float bbMin[3], float bbMax[3])
     float sx = d.sizeX > 0.1f ? d.sizeX : 10.0f;
     float sz = d.sizeZ > 0.1f ? d.sizeZ : 10.0f;
 
-    const float halfX = 0.5f * sx * kSeedPad;
-    const float halfZ = 0.5f * sz * kSeedPad;
+    // No halving: sx and sz are ALREADY half-extents. See AircraftDims.
+    const float halfX = sx * kSeedPad;
+    const float halfZ = sz * kSeedPad;
     const float longer = (sx > sz ? sx : sz);
 
     // Down to whichever is lower: the gear contact point, or a fraction of the

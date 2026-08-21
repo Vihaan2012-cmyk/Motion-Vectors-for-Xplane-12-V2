@@ -54,6 +54,8 @@
 
 #include "share.h"
 #include "vklayer/upscaler_policy.h"
+#include "destruct/bounds.h"
+#include "destruct/acf_planform.h"
 #include "control.h"
 
 #include <windows.h>
@@ -1735,6 +1737,156 @@ static void applyUpscalerRequest()
     g_upscalerRunning = running;
 }
 
+// ---- THE FRAGMENT GRID, BUILT FROM WHAT X-PLANE WILL ADMIT TO.
+//
+// acf_size_x and acf_size_z are the only two dimensions the sim publishes -
+// width and length. There is no height dataref, so the box is deliberately
+// over-sized here and MEASURED by the occupancy pass; see bounds.h for why a
+// constant for the top is wrong for some airframe and wrong quietly.
+//
+// The gear gives a floor: each leg's ynodef minus its leg length minus its
+// tyre radius is a point the aeroplane actually touches the ground at, and the
+// lowest of those is the bottom of the seed.
+//
+// Rebuilt when the aircraft changes, not per frame. The grid is a property of
+// the airframe, and recomputing it every frame would republish it under the
+// layer while the layer was reading it.
+static void publishCrashGrid(bool force)
+{
+    if (!g_share) return;
+
+    static XPLMDataRef rSizeX = nullptr, rSizeZ = nullptr;
+    static XPLMDataRef rGearY = nullptr, rGearLeg = nullptr, rGearTyre = nullptr;
+    static XPLMDataRef rArmX = nullptr, rArmY = nullptr, rArmZ = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved  = true;
+        rSizeX    = taaFind("sim/aircraft/view/acf_size_x");
+        rSizeZ    = taaFind("sim/aircraft/view/acf_size_z");
+        rGearY    = taaFind("sim/aircraft/parts/acf_gear_ynodef");
+        rGearLeg  = taaFind("sim/aircraft/parts/acf_gear_leglen");
+        rGearTyre = taaFind("sim/aircraft/parts/acf_gear_tirrad");
+        // The gear in the RENDER frame. The .acf lists the same legs in its
+        // own frame, and the difference is the datum offset.
+        rArmX     = taaFind("sim/aircraft/parts/acf_Xarm");
+        rArmY     = taaFind("sim/aircraft/parts/acf_Yarm");
+        rArmZ     = taaFind("sim/aircraft/parts/acf_Zarm");
+    }
+
+    destruct::AircraftDims d;
+    if (rSizeX) d.sizeX = XPLMGetDataf(rSizeX);
+    if (rSizeZ) d.sizeZ = XPLMGetDataf(rSizeZ);
+
+    // The lowest point any gear leg reaches. Arrays, because an airframe may
+    // have up to ten legs and the longest is not always the first.
+    if (rGearY && rGearLeg && rGearTyre) {
+        float y[10] = {0}, leg[10] = {0}, tyre[10] = {0};
+        const int n  = XPLMGetDatavf(rGearY,    y,    0, 10);
+        const int n2 = XPLMGetDatavf(rGearLeg,  leg,  0, 10);
+        const int n3 = XPLMGetDatavf(rGearTyre, tyre, 0, 10);
+        const int m = (n < n2 ? n : n2) < n3 ? (n < n2 ? n : n2) : n3;
+        for (int i = 0; i < m; ++i) {
+            const float bottom = y[i] - leg[i] - tyre[i];
+            if (bottom < d.lowestY) d.lowestY = bottom;
+        }
+    }
+
+    // Only republish on a real change of airframe. Comparing the DIMENSIONS
+    // rather than a livery or path string means a reload of the same aircraft
+    // does not disturb a grid the layer is mid-way through reading.
+    static float lastX = -1.0f, lastZ = -1.0f, lastLow = 1.0f;
+    if (!force && d.sizeX == lastX && d.sizeZ == lastZ && d.lowestY == lastLow)
+        return;
+    lastX = d.sizeX; lastZ = d.sizeZ; lastLow = d.lowestY;
+
+    // ---- THE BOX COMES FROM THE .acf, AND FALLS BACK TO THE BRACKET.
+    //
+    // acf_size_x and acf_size_z are radii for the shadow and the LOD sphere;
+    // they bracket the aeroplane and nothing more, and there is no height
+    // among them at all. The .acf planform is the real geometry - it puts a
+    // 747-200F's wingtips at +/-29.66 m against a published 29.82, its nose to
+    // tail at 71.15 against 70.66, and its fin 19.43 m off the ground against
+    // 19.33. Four aircraft, from a C172 to an A330, agree within 3%.
+    //
+    // The OBJ files cannot do this: every exterior object of the 747 fits in a
+    // box 22.5 m wide, because the outer wing is not in them.
+    float bbMin[3], bbMax[3];
+    bool fromPlanform = false;
+    char acfFile[512] = {0}, acfPath[1024] = {0};
+    XPLMGetNthAircraftModel(0, acfFile, acfPath);
+
+    destruct::Airframe frame;
+    if (acfPath[0] && destruct::parseAcf(acfPath, frame)) {
+        std::vector<float> verts;
+        destruct::airframeVertices(frame, 8, 4, verts);
+
+        // The .acf frame is not the render frame - 5.18 m apart along z on the
+        // 747. Measured from the gear, which appears in both, rather than
+        // assumed: acf_Xarm/Yarm/Zarm are the same legs the .acf lists.
+        if (rArmX && rArmY && rArmZ) {
+            float ax[10] = {0}, ay[10] = {0}, az[10] = {0};
+            const int na = XPLMGetDatavf(rArmX, ax, 0, 10);
+            const int nb = XPLMGetDatavf(rArmY, ay, 0, 10);
+            const int nc = XPLMGetDatavf(rArmZ, az, 0, 10);
+            int nArm = na < nb ? na : nb; if (nc < nArm) nArm = nc;
+            float off[3];
+            if (destruct::datumOffset(frame, ax, ay, az, nArm, off)) {
+                destruct::applyOffset(verts, off);
+                xlog("crash grid: .acf datum measured %.2f m off the render "
+                     "frame in z (%.2f x, %.2f y) from %d gear leg(s)",
+                     (double)off[2], (double)off[0], (double)off[1], nArm);
+            }
+        }
+
+        if (destruct::vertexBounds(verts, bbMin, bbMax)) {
+            // Real geometry, so only the margin a mesh needs beyond the
+            // aerodynamic planform: fairings, tip fences, radomes. Nowhere
+            // near the 1.35 a guessed box needs.
+            const float pad = 0.10f;
+            for (int a = 0; a < 3; ++a) {
+                const float m = (bbMax[a] - bbMin[a]) * pad * 0.5f;
+                bbMin[a] -= m; bbMax[a] += m;
+            }
+            // The gear reaches below the lowest airframe vertex, and a crash
+            // fragments the gear too.
+            if (d.lowestY < bbMin[1]) bbMin[1] = d.lowestY;
+            fromPlanform = true;
+            xlog("crash grid: %s -> %d wing segment(s), %d body point(s), "
+                 "%d vertices, span %.2f m, length %.2f m",
+                 acfFile, (int)frame.wings.size(),
+                 (int)(frame.bodyXyz.size() / 3), (int)(verts.size() / 3),
+                 (double)(bbMax[0] - bbMin[0]), (double)(bbMax[2] - bbMin[2]));
+        }
+    }
+
+    if (!fromPlanform) {
+        destruct::seedBounds(d, bbMin, bbMax);
+        xlog("crash grid: could not read a planform from '%s' - falling back "
+             "to the acf_size_* bracket, which is generous rather than "
+             "accurate", acfPath[0] ? acfPath : "(no aircraft path)");
+    }
+
+    const destruct::Grid g = destruct::gridForBounds(bbMin, bbMax);
+
+    g_share->crashGridMin[0] = g.min[0];
+    g_share->crashGridMin[1] = g.min[1];
+    g_share->crashGridMin[2] = g.min[2];
+    g_share->crashCell = g.cell;
+    g_share->crashNx = g.nx;
+    g_share->crashNy = g.ny;
+    g_share->crashNz = g.nz;
+
+    xlog("crash grid: %s box (%.1f %.1f %.1f) to (%.1f %.1f %.1f), "
+         "%d x %d x %d cells of %.2f m (%d total)%s",
+         fromPlanform ? "planform" : "bracketed",
+         (double)bbMin[0], (double)bbMin[1], (double)bbMin[2],
+         (double)bbMax[0], (double)bbMax[1], (double)bbMax[2],
+         g.nx, g.ny, g.nz, (double)g.cell, g.nx * g.ny * g.nz,
+         fromPlanform ? ". This is measured geometry, not a guess."
+                      : ". Deliberately oversized - the occupancy pass has to "
+                        "measure the real one.");
+}
+
 static void registerDatarefs()
 {
     g_myEnabled  = XPLMRegisterDataAccessor("taaimpl/enabled", xplmType_Int, 1,
@@ -2627,6 +2779,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // dataref value is unstable. Same rule as every other read here.
     dumpPagerControls();
     holdArtControls();
+    publishCrashGrid(false);
 
     applyUpscalerRequest();
 
@@ -3754,6 +3907,42 @@ static float matrixCallback(float sinceLast, float, int, void *)
         // near field, where errors are largest. Better to fall back to the world
         // frame, which is at least correct for everything that is not the
         // aeroplane.
+        // ---- CRASH DESTRUCTION: CLIP -> AIRCRAFT-LOCAL, IN ONE MATRIX.
+        //
+        // Mc maps aircraft-local to VIEW. The vertex patch reconstructs view
+        // from the clip position it already has:
+        //
+        //     view = (clip.x / proj[0], clip.y / proj[5], -clip.w)
+        //
+        // which Task 6 verified holds in every pass, and which is LINEAR in
+        // (x, y, w). So the two compose into a single matrix and the shader
+        // does one multiply and no divide - the same trick prevClip uses, for
+        // the same reason.
+        //
+        // Deliberately NOT gated on bodyTrusted or rigid. Those gate
+        // REPROJECTION, which is wrong in an external view because the camera
+        // follows its own damped path. This is not reprojection: it is where
+        // the airframe is relative to the eye, which is just as true from
+        // outside - and outside is where anyone watching a crash will be.
+        {
+            float invMc[16];
+            if (taaInverse(invMc, Mc) &&
+                s->proj[0] != 0.0f && s->proj[5] != 0.0f) {
+                float M4[16];
+                memset(M4, 0, sizeof(M4));
+                M4[0]  = 1.0f / s->proj[0];
+                M4[5]  = 1.0f / s->proj[5];
+                M4[10] = -1.0f;    // view.z = -clip.w
+                M4[15] = 1.0f;
+                taaMul(s->crashAircraftInv, invMc, M4);
+            } else {
+                // Singular, so the shader must not classify against it. An
+                // identity here would silently classify every vertex in CLIP
+                // space and fill the grid with nonsense.
+                memset(s->crashAircraftInv, 0, sizeof(s->crashAircraftInv));
+            }
+        }
+
         if (resolved && bodyTrusted && rigid && taaInverse(invAc, Ac)) {
             taaMul(s->bodyReproj, Ap, invAc);
             s->bodyReprojValid = 1;

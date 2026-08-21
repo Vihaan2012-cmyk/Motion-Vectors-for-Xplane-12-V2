@@ -10,6 +10,7 @@
 #include "destruct/solver.h"
 #include "destruct/gpu_layout.h"
 #include "destruct/bounds.h"
+#include "destruct/acf_planform.h"
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -657,8 +658,10 @@ int main()
     printf("\nthe seed box brackets, the refinement measures\n");
     {
         // A 737-ish airframe: 36 m span, 39 m long, gear 2.5 m below datum.
+        // acf_size_* are RADII, so these are HALVES of those figures - the
+        // bug this pins is exactly the one that read them as full widths.
         destruct::AircraftDims d;
-        d.sizeX = 36.0f; d.sizeZ = 39.0f; d.lowestY = -2.5f;
+        d.sizeX = 18.0f; d.sizeZ = 19.5f; d.lowestY = -2.5f;
         float bbMin[3], bbMax[3];
         destruct::seedBounds(d, bbMin, bbMax);
 
@@ -674,11 +677,36 @@ int main()
         // A Pitts: tiny, and proportionally much taller. The height factor is
         // chosen from this extreme rather than from an airliner average.
         destruct::AircraftDims p;
-        p.sizeX = 6.1f; p.sizeZ = 5.3f; p.lowestY = -1.0f;
+        p.sizeX = 3.05f; p.sizeZ = 2.65f; p.lowestY = -1.0f;
         float pMin[3], pMax[3];
         destruct::seedBounds(p, pMin, pMax);
         check(pMax[1] > 1.8f,
               "a short aerobatic airframe still gets headroom for its fin");
+
+        // ---- THE 747 REGRESSION.
+        //
+        // The real numbers off the aircraft that exposed the bug. acf_size_x
+        // reads 30.0 and acf_size_z 38.5; the .acf planform puts the wingtips
+        // at +/-29.63 m, the nose at z 0 and the fin trailing edge at 71.0 m
+        // with the datum 5.2 m aft of the nose, and the fin top at 13.31 m.
+        //
+        // Read as full widths these gave a box of +/-20.25 m and the entire
+        // outer wing - 9.4 m of it per side - sat outside the grid. Nothing
+        // reported an error: the cells simply were not there to be occupied,
+        // which reads identically to a broken transform.
+        destruct::AircraftDims b747;
+        b747.sizeX = 30.0f; b747.sizeZ = 38.5f; b747.lowestY = -5.2f;
+        float jMin[3], jMax[3];
+        destruct::seedBounds(b747, jMin, jMax);
+
+        check(jMin[0] <= -29.63f && jMax[0] >= 29.63f,
+              "a 747 seed box contains the wingtips the planform reports");
+        check(jMax[1] >= 13.31f,
+              "and reaches over the top of the fin");
+        check(jMin[1] <= -5.2f,
+              "and down to the gear contact point");
+        check(jMin[2] <= -35.5f && jMax[2] >= 35.5f,
+              "and encloses nose to tail");
 
         // Nothing useful reported at all must not produce a degenerate grid.
         destruct::AircraftDims z;   // all zero
@@ -762,6 +790,179 @@ int main()
         check(frac > 0.0f && frac < 1.0f, "occupied fraction is a real fraction");
         const float fracEmpty = destruct::occupiedFraction(g, empty.data());
         check(fracEmpty == 0.0f, "an empty grid reports zero occupancy");
+    }
+
+    // ------------------------------------------- the airframe from the .acf
+    //
+    // The wings are not in the OBJ files - all 70 exterior objects of a
+    // 747-200F fit in a box 22.5 m wide against a real 59.6 - so the geometry
+    // comes from the .acf planform instead. These pin the rules that were read
+    // off a real aircraft's numbers.
+    //
+    // Synthetic file rather than a real one: this suite must run on a machine
+    // with no X-Plane on it. tools/acf_check.exe does the other half of the
+    // job, checking real aeroplanes against their published dimensions.
+    printf("\nthe airframe comes out of the .acf planform\n");
+    {
+        // Segment 4 of the 747-200F, verbatim in feet, plus segment 6 so the
+        // chaining rule has something to predict. If semilen were measured
+        // across the span rather than along the swept and dihedralled
+        // quarter-chord, segment 6's root would land at 52.75 rather than the
+        // 67.97 the file states - so this distinguishes the two readings.
+        //
+        // _geo_xyz data deliberately precedes i_count, because the .acf is
+        // sorted ALPHABETICALLY and that is the order a real file has. Reading
+        // the counts first and bounds-checking against them silently discarded
+        // every body point and produced an aeroplane with no fuselage.
+        const char *acf =
+            "I\n1200 Version\nACF\n\nPROPERTIES_BEGIN\n"
+            "P _wing/4/_part_x -42.659202576\n"
+            "P _wing/4/_part_y -2.372622967\n"
+            "P _wing/4/_part_z 103.690002441\n"
+            "P _wing/4/_Croot 28.799999237\n"
+            "P _wing/4/_Ctip 20.000000000\n"
+            "P _wing/4/_semilen_SEG 33.099998474\n"
+            "P _wing/4/_sweep_design 39.700000763\n"
+            "P _wing/4/_dihed_design 6.300000191\n"
+            "P _wing/4/_is_right_mult -1.000000000\n"
+            "P _wing/5/_part_x 42.659202576\n"
+            "P _wing/5/_part_y -2.372622967\n"
+            "P _wing/5/_part_z 103.690002441\n"
+            "P _wing/5/_Croot 28.799999237\n"
+            "P _wing/5/_Ctip 20.000000000\n"
+            "P _wing/5/_semilen_SEG 33.099998474\n"
+            "P _wing/5/_sweep_design 39.700000763\n"
+            "P _wing/5/_dihed_design 6.300000191\n"
+            "P _wing/5/_is_right_mult 1.000000000\n"
+            // The fin: a segment whose dihedral is 90 degrees.
+            "P _wing/11/_part_x 0.000000000\n"
+            "P _wing/11/_part_y 11.199999809\n"
+            "P _wing/11/_part_z 187.800003052\n"
+            "P _wing/11/_Croot 38.029998779\n"
+            "P _wing/11/_Ctip 13.079999924\n"
+            "P _wing/11/_semilen_SEG 45.689998627\n"
+            "P _wing/11/_sweep_design 44.700000763\n"
+            "P _wing/11/_dihed_design 90.000000000\n"
+            "P _wing/11/_is_right_mult 1.000000000\n"
+            // An unused slot: Plane Maker leaves plenty of these.
+            "P _wing/30/_part_x 0.000000000\n"
+            "P _wing/30/_Croot 0.000000000\n"
+            "P _wing/30/_semilen_SEG 0.000000000\n"
+            // Two body points, data before counts, exactly as a real file has.
+            "P _body/0/_geo_xyz/0,0,0 0.000000000\n"
+            "P _body/0/_geo_xyz/0,0,1 -0.540000021\n"
+            "P _body/0/_geo_xyz/0,0,2 0.100000001\n"
+            "P _body/0/_geo_xyz/9,2,0 6.573009014\n"
+            "P _body/0/_geo_xyz/9,2,1 10.235960960\n"
+            "P _body/0/_geo_xyz/9,2,2 48.704662323\n"
+            "P _body/0/_geo_xyz/i_count 20\n"
+            "P _body/0/_geo_xyz/j_count 18\n"
+            "P _body/0/_part_x 0.000000000\n"
+            "P _body/0/_part_y 0.000000000\n"
+            "P _body/0/_part_z 0.000000000\n"
+            // Gear: the shorter leg must not win the ground contact.
+            "P _gear/0/_gear_x 0.000000000\n"
+            "P _gear/0/_gear_y -8.900000000\n"
+            "P _gear/0/_gear_z 25.000000000\n"
+            "P _gear/0/_leg_len 8.993000000\n"
+            "P _gear/0/_tire_radius 2.059999943\n"
+            "P _gear/1/_gear_x 6.290000000\n"
+            "P _gear/1/_gear_y -11.100000000\n"
+            "P _gear/1/_gear_z 114.080000000\n"
+            "P _gear/1/_leg_len 6.896000000\n"
+            "P _gear/1/_tire_radius 2.049999952\n";
+
+        const char *tmp = "build/test_synth.acf";
+        FILE *fh = fopen(tmp, "wb");
+        check(fh != NULL, "the synthetic .acf can be written");
+        if (fh) { fputs(acf, fh); fclose(fh); }
+
+        destruct::Airframe a;
+        check(destruct::parseAcf(tmp, a), "the .acf parses");
+        check(a.wings.size() == 3,
+              "three real surfaces, and the empty slot is not one of them");
+        check(a.bodyXyz.size() == 6,
+              "body points survive appearing before their own counts");
+        check(a.gear.size() == 2, "both gear legs are read");
+
+        // Find segment 5, the right-hand outboard-of-inboard panel.
+        const destruct::WingSeg *w5 = NULL, *fin = NULL;
+        for (size_t i = 0; i < a.wings.size(); ++i) {
+            if (a.wings[i].index == 5)  w5  = &a.wings[i];
+            if (a.wings[i].index == 11) fin = &a.wings[i];
+        }
+        check(w5 != NULL && fin != NULL, "both named segments are present");
+
+        if (w5) {
+            checkNear(w5->rootX, 13.002, 0.01, "feet become metres on the way in");
+            checkNear(w5->croot, 8.778, 0.01, "and so does the root chord");
+            checkNear(w5->side, 1.0, 1e-6, "_is_right_mult gives the side");
+
+            // THE CHAINING RULE. 67.972526 ft is what the real file states for
+            // segment 6's root, and this predicts it from segment 4 alone.
+            float d[3];
+            destruct::spanVector(*w5, d);
+            checkNear(w5->rootX + d[0], 67.972526 * 0.3048, 0.01,
+                      "semilen runs along the swept, dihedralled span");
+            check(d[1] > 0.0f, "dihedral lifts the tip above the root");
+            check(d[2] > 0.0f, "sweep carries the tip aft");
+        }
+
+        if (fin) {
+            // A fin is not a special case: dihedral 90 drives the span into
+            // +y on its own, and the thickness must then extrude across the
+            // fin in x rather than along it in y.
+            float d[3];
+            destruct::spanVector(*fin, d);
+            checkNear(d[0], 0.0, 0.01, "a fin has no span in x");
+            checkNear(d[1], 45.689999 * cosf(44.700001f * 3.14159265f / 180.0f)
+                            * 0.3048f, 0.02,
+                      "a fin's span goes straight up");
+
+            std::vector<float> fv;
+            destruct::wingVertices(*fin, 4, 2, fv);
+            float flo[3], fhi[3];
+            check(destruct::vertexBounds(fv, flo, fhi),
+                  "the fin generates vertices");
+            check(fhi[0] - flo[0] > 0.05f,
+                  "a fin has thickness across it, not zero width");
+            checkNear(fhi[1], (11.199999 + 45.689999
+                      * cosf(44.700001f * 3.14159265f / 180.0f)) * 0.3048f,
+                      0.05, "and its tip is where the planform says");
+        }
+
+        // Both sides come out of a two-sided wing pair.
+        std::vector<float> v;
+        destruct::airframeVertices(a, 4, 2, v);
+        float lo[3], hi[3];
+        check(destruct::vertexBounds(v, lo, hi), "the airframe has vertices");
+        check(lo[0] < -13.0f && hi[0] > 13.0f,
+              "the left and right panels both appear");
+
+        float contact = 0.0f;
+        check(destruct::groundContact(a, contact), "the gear gives a floor");
+        // Leg 1 reaches -20.046 ft against leg 0's -19.953: the LOWER wins.
+        checkNear(contact, -20.045999 * 0.3048, 0.01,
+                  "the lowest leg sets the ground, not the first one");
+
+        // The .acf frame is not the render frame. Measured from the gear,
+        // which exists in both, rather than assumed from a convention.
+        const float armX[2] = { 0.0f, 1.917f };      // 6.29 ft, unchanged in x
+        const float armY[2] = { -2.713f, -3.383f };  // unchanged in y
+        const float armZ[2] = { 2.441f, 29.606f };   // 5.179 m forward of .acf
+        float off[3];
+        check(destruct::datumOffset(a, armX, armY, armZ, 2, off),
+              "the datum offset can be measured");
+        checkNear(off[0], 0.0, 0.01, "no shift across the aeroplane");
+        checkNear(off[1], 0.0, 0.01, "and none vertically");
+        checkNear(off[2], -5.179, 0.01, "but 5.18 m along it, as the 747 has");
+
+        std::vector<float> shifted = v;
+        destruct::applyOffset(shifted, off);
+        float slo[3], shi[3];
+        destruct::vertexBounds(shifted, slo, shi);
+        checkNear(shi[2] - hi[2], -5.179, 0.01,
+                  "applying the offset moves the airframe and not its size");
     }
 
     printf("\n%s: %d failure(s)\n", g_fail ? "FAILED" : "OK", g_fail);
