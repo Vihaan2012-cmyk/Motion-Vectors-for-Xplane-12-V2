@@ -33,3 +33,6 @@ validation.txt
 third_party/
 build/
 dist/
+
+# The FidelityFX SDK is a 424 MB upstream checkout, fetched not vendored.
+third_party/FidelityFX-SDK/
