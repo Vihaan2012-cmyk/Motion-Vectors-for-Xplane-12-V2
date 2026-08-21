@@ -315,11 +315,55 @@ static uint64_t benchAllocs0 = 0, benchFails0 = 0, benchPipes0 = 0;
 static uint64_t benchElide0 = 0, benchReload0 = 0;
 static uint64_t benchZoneFrames[5] = {0,0,0,0,0};
 
-struct Held { VkDeviceMemory mem; uint64_t size; uint32_t type; uint64_t frame; };
+// ---- WHAT A pNext CHAIN MEANS FOR RECYCLING.
+//
+// poolTake refused every allocation carrying ANY pNext, which sounds safe and
+// threw the subsystem away. Counted over one flight:
+//
+//     pNext skips 84  [1000060000:77  1000072002:7  1000127001:7]
+//
+//     VkMemoryAllocateFlagsInfo      (1000060000)  77 - allocation flags and a
+//                                                  device mask. Benign. The
+//                                                  block is ordinary memory.
+//     VkExportMemoryAllocateInfo     (1000072002)   7 - shared with another
+//                                                  API. Not ours to reuse.
+//     VkMemoryDedicatedAllocateInfo  (1000127001)   7 - bound to ONE image or
+//                                                  buffer by construction.
+//
+// So 77 of 84 were recyclable and refused to avoid the 7 that were not. The
+// flags are part of the block's identity though - a block allocated with a
+// different device mask is not interchangeable - so they join the match key
+// rather than being ignored.
+struct AllocFlags {
+    bool     ok;          // chain contains nothing that forbids reuse
+    uint32_t flags;
+    uint32_t deviceMask;
+};
+
+static AllocFlags chainFlags(const void *pNext)
+{
+    AllocFlags a; a.ok = true; a.flags = 0; a.deviceMask = 0;
+    for (const VkBaseInStructure *b = (const VkBaseInStructure *)pNext;
+         b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO) {
+            const VkMemoryAllocateFlagsInfo *f =
+                (const VkMemoryAllocateFlagsInfo *)b;
+            a.flags      = f->flags;
+            a.deviceMask = f->deviceMask;
+        } else {
+            a.ok = false;      // dedicated, exported, or something unknown
+        }
+    }
+    return a;
+}
+
+struct Held { VkDeviceMemory mem; uint64_t size; uint32_t type; uint64_t frame;
+              uint32_t flags; uint32_t deviceMask; };
 static std::vector<Held> g_pool;
 static uint64_t g_poolBytes = 0;
 
-struct AllocRec { uint64_t size; uint32_t type; bool plain; };
+struct AllocRec { uint64_t size; uint32_t type; bool plain;
+                  bool poolable; uint32_t flags; uint32_t deviceMask; };
 static std::map<VkDeviceMemory, AllocRec> g_allocs;
 
 struct BlockPrio { float best; bool streamedTexOnly; bool demoted; bool aged; };
@@ -933,13 +977,35 @@ static uint8_t protectionOf(VkImage img)
     return it == g_registry.end() ? 0 : it->second.protection;
 }
 
+// Why a poolTake call did not reach the pool. Every one of these was a SILENT
+// return before, so the report showed 0 hits AND 0 misses - which reads as "the
+// pool is empty" when it actually means "the pool was never consulted". A skip
+// that is not counted is indistinguishable from a subsystem that does not exist.
+static uint64_t poolSkipDead = 0, poolSkipOff = 0, poolSkipPnext = 0;
+static std::map<uint32_t, uint64_t> poolSkipPnextType;
+
 static bool poolTake(const VkMemoryAllocateInfo *ai, VkDeviceMemory *out)
 {
-    if (!alive() || !cfg.enable || !cfg.recycle || !ai || ai->pNext) return false;
+    if (!alive())                 { ++poolSkipDead;  return false; }
+    if (!cfg.enable || !cfg.recycle) { ++poolSkipOff; return false; }
+    if (!ai)                      { ++poolSkipDead;  return false; }
+    AllocFlags want = chainFlags(ai->pNext);
+    if (ai->pNext && !want.ok) {
+        ++poolSkipPnext;
+        // Name the structure, because the answer changes what can be done.
+        // A DEDICATED allocation is bound to one image or buffer and genuinely
+        // cannot be recycled; an allocate-flags chain is benign and could be.
+        const VkBaseInStructure *b = (const VkBaseInStructure *)ai->pNext;
+        std::lock_guard<std::mutex> gp(m);
+        for (; b; b = b->pNext) poolSkipPnextType[(uint32_t)b->sType]++;
+        return false;
+    }
     std::lock_guard<std::mutex> g(m);
     for (size_t i = 0; i < g_pool.size(); ++i) {
         if (g_pool[i].type != ai->memoryTypeIndex) continue;
         if (g_pool[i].size != ai->allocationSize)  continue;
+        if (g_pool[i].flags != want.flags)         continue;
+        if (g_pool[i].deviceMask != want.deviceMask) continue;
         *out = g_pool[i].mem;
         g_poolBytes -= g_pool[i].size;
         g_pool.erase(g_pool.begin() + (long)i);
@@ -956,7 +1022,7 @@ static bool poolHold(VkDeviceMemory mem)
     if (!alive() || !cfg.enable || !cfg.recycle) return false;
     std::lock_guard<std::mutex> g(m);
     std::map<VkDeviceMemory, AllocRec>::iterator it = g_allocs.find(mem);
-    if (it == g_allocs.end() || !it->second.plain) return false;
+    if (it == g_allocs.end() || !it->second.poolable) return false;
     bool devLocal = typeRecyclable(it->second.type);
     bool hostOk   = false;
     if (!devLocal && it->second.type < dev.memProps.memoryTypeCount) {
@@ -967,8 +1033,31 @@ static bool poolHold(VkDeviceMemory mem)
                  (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     }
     if (!devLocal && !hostOk) return false;
-    if (zone >= RED && devLocal) return false;
+    // ---- UNDER PRESSURE, HOLD LESS - NOT NOTHING.
+    //
+    // This refused every device-local block at RED or above, which reads as
+    // prudent and means the pool is dead on exactly the machines that need it.
+    // Measured here: the driver reports a 6.52 GB budget against a 7.77 GB
+    // card, usage sits at 6.40 GB, so the zone is CRITICAL permanently. Not an
+    // artefact of our shaping - that is real pressure from the desktop and
+    // other applications. On an 8 GB card at 4K the pool would never retain a
+    // single block.
+    //
+    // The trade is worth taking the other way. Worst allocation latency
+    // measured in this build is 20 ms; a pool hit avoids the driver call
+    // entirely. Giving up a bounded slice of VRAM to avoid a 20 ms hitch is a
+    // better deal than returning every byte and paying the allocation again a
+    // few frames later, which is what the churn counters show happening.
+    //
+    // So pressure SHRINKS the cap rather than abolishing it, and the shrunken
+    // size is a knob rather than a belief.
     uint64_t cap = (uint64_t)cfg.recycleMaxMB * 1048576ull;
+    if (zone >= RED && devLocal) {
+        uint64_t pressureCap =
+            (uint64_t)live::i("vram.recycle_pressure_mb", nullptr, 64) * 1048576ull;
+        if (pressureCap == 0) return false;      // 0 restores the old behaviour
+        if (cap > pressureCap) cap = pressureCap;
+    }
     if (g_poolBytes + it->second.size > cap) return false;
     if (hostOk) {
         std::map<VkDeviceMemory, MapRec>::iterator mr = g_mapped.find(mem);
@@ -981,6 +1070,7 @@ static bool poolHold(VkDeviceMemory mem)
     }
     Held h; h.mem = mem; h.size = it->second.size;
     h.type = it->second.type; h.frame = frameIndex;
+    h.flags = it->second.flags; h.deviceMask = it->second.deviceMask;
     g_pool.push_back(h);
     g_poolBytes += h.size;
     g_blockPrio.erase(mem);
@@ -1030,6 +1120,12 @@ static void noteAlloc(VkDeviceMemory mem, const VkMemoryAllocateInfo *ai)
     std::lock_guard<std::mutex> g(m);
     AllocRec r; r.size = ai->allocationSize; r.type = ai->memoryTypeIndex;
     r.plain = (ai->pNext == nullptr);
+    // Poolable is broader than plain: a chain of nothing but allocate-flags is
+    // still ordinary memory. See chainFlags.
+    AllocFlags af = chainFlags(ai->pNext);
+    r.poolable   = af.ok;
+    r.flags      = af.flags;
+    r.deviceMask = af.deviceMask;
     g_allocs[mem] = r;
 }
 
@@ -1933,6 +2029,23 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
               (unsigned long long)recycleHits, (unsigned long long)recycleMisses,
               g_poolBytes / 1048576.0, (unsigned long long)g_pool.size(),
               (unsigned long long)recycleFlushes);
+
+        {
+            std::string types;
+            for (std::map<uint32_t,uint64_t>::iterator it = poolSkipPnextType.begin();
+                 it != poolSkipPnextType.end(); ++it) {
+                char b[64];
+                snprintf(b, sizeof(b), "%s%u:%llu", types.empty() ? "" : " ",
+                         it->first, (unsigned long long)it->second);
+                types += b;
+            }
+            trace("  recycle skips: dead %llu  disabled %llu  pNext %llu  "
+                  "[sType:count %s] - a skip here never reaches hits or misses",
+                  (unsigned long long)poolSkipDead,
+                  (unsigned long long)poolSkipOff,
+                  (unsigned long long)poolSkipPnext,
+                  types.empty() ? "none" : types.c_str());
+        }
         trace("  priority: %llu tagged at alloc  %llu set at bind  %llu zone "
               "moves  (ext %s, pageable %s)",
               (unsigned long long)prioAllocTagged,
