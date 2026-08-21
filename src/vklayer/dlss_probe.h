@@ -34,7 +34,7 @@
 //   LoadLibrary of a 77 MB DLL while the Vulkan loader holds its lock, or
 //   re-entering the loader from inside one of its own calls.
 //
-// nvngx_dlss.dll is 56 MB, so the same hazard applies and the same discipline
+// nvngx_dlssg.dll is 7.2 MB - far smaller than the 56 MB super-resolution library, so the same hazard applies and the same discipline
 // is needed:
 //
 //   * the library is loaded BEFORE descending into the loader, never from

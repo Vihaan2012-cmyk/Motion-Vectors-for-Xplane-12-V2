@@ -18,10 +18,10 @@
 //
 // ---- RESOLVED BY HAND, FOR THE REASON THE XeSS PROBE GIVES.
 //
-// Linking the NGX import library would make nvngx_dlss.dll a load-time
+// Linking the NGX import library would make nvngx_dlssg.dll a load-time
 // dependency of the whole layer, so a user without it would lose motion vectors
-// and TAA as well as DLSS. Resolved by hand, a missing DLL is exactly the
-// "no-library" verdict the availability policy already has a name for.
+// and TAA as well as frame generation. Resolved by hand, a missing DLL is
+// exactly the "no-library" verdict the policy already has a name for.
 //
 // Copyright (C) 2026 MotionVectors contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -45,7 +45,23 @@ namespace dlssprobe {
 //
 // The values come from nvsdk_ngx_defs.h and are checked against it by
 // tools/dlss_check.cpp rather than trusted.
-enum { NGX_FEATURE_SUPERSAMPLING = 1 };
+// From nvsdk_ngx_defs.h, read rather than remembered:
+//
+//   NVSDK_NGX_Feature_SuperSampling   = 1    DLSS upscaling
+//   NVSDK_NGX_Feature_FrameGeneration = 11   DLSS frame generation
+//
+// FRAME GENERATION IS THE ONE THAT MATTERS HERE, and it is probed first.
+//
+// Super resolution competes with what this layer already does: X-Plane renders
+// at a scale we control and TAA resolves it, so DLSS-SR would replace a working
+// path. Frame generation adds something nothing here does at all - it needs the
+// motion vectors this layer already produces, which is the whole reason those
+// vectors were built.
+//
+// It also needs Ada or newer. That is a hardware verdict the policy already
+// knows how to express, and it is not this file's business to decide.
+enum { NGX_FEATURE_SUPERSAMPLING   = 1 };
+enum { NGX_FEATURE_FRAMEGENERATION = 11 };
 enum { NGX_RESULT_SUCCESS = 1 };
 
 struct NgxVersionedStruct {          // NVSDK_NGX_Version is a plain enum value
@@ -94,7 +110,11 @@ inline NgxVersionedStruct &discovery()
         init = true;
         memset(&d, 0, sizeof(d));
         d.sdkVersion    = 0x0000015; // NVSDK_NGX_Version_API
-        d.featureId     = NGX_FEATURE_SUPERSAMPLING;
+        // Frame generation, not super resolution - see the note on the
+        // feature ids. The requirement sets differ, so asking for the wrong
+        // one would enable the wrong extensions and fail later, somewhere
+        // less obvious.
+        d.featureId     = NGX_FEATURE_FRAMEGENERATION;
         d.identifierType = 0;
         d.applicationId = 0x4D56;    // 'MV' - this layer, not X-Plane
         d.applicationDataPath = L".";
@@ -129,21 +149,22 @@ inline bool instanceStage(const char *sdkPath)
     //
     // The XeSS probe took X-Plane down inside vkCreateDevice, and one of the
     // two suspects was LoadLibrary of a very large DLL while the Vulkan loader
-    // held its lock. nvngx_dlss.dll is 56 MB, so this happens at the TOP of
+    // held its lock. nvngx_dlssg.dll is 7.2 MB - far smaller than the 56 MB super-resolution library, so this happens at the TOP of
     // vkCreateInstance - inside our hook, but before anything nested.
     //
     // Traced before it runs, so if it dies here the log names the step rather
     // than leaving the same two suspects the XeSS crash left.
-    trace("DLSS: loading NGX from '%s' (56 MB - if the sim dies on this line, "
+    trace("DLSS-G: loading NGX frame generation from '%s' (if the sim dies "
           "it is the load and not the query)", sdkPath ? sdkPath : "(default)");
 
     std::string path = sdkPath ? sdkPath : "";
     if (!path.empty() && path[path.size() - 1] != '\\') path += "\\";
-    path += "nvngx_dlss.dll";
+    // The frame generation library, not the super resolution one.
+    path += "nvngx_dlssg.dll";
 
     detail::lib() = LoadLibraryA(path.c_str());
     if (!detail::lib()) {
-        r.why = "nvngx_dlss.dll did not load from '" + path + "'";
+        r.why = "nvngx_dlssg.dll did not load from '" + path + "'";
         trace("DLSS: %s - reporting no-library, which is a verdict and not a "
               "failure", r.why.c_str());
         return false;
