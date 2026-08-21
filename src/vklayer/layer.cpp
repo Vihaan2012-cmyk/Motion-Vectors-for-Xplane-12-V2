@@ -471,6 +471,36 @@ static std::atomic<bool> g_mvClearedAtPresent(false);
 // Declared here, ahead of vkCreateShaderModule, because that is where the
 // original words are stored - and ahead of vkCreateGraphicsPipelines, which is
 // where they are finally patched.
+// Descriptor-set state for crash destruction.
+//
+// g_layoutOurSet records, per pipeline layout, WHICH set index ours ended up
+// at - it is not a constant, because we append at the layout's own
+// setLayoutCount and different layouts declare different counts. The shader
+// patch and the bind both need this number, and getting it wrong means reading
+// a buffer that belongs to X-Plane.
+static uint32_t g_maxBoundSets = 4;
+
+// ---- THE SINGLE CRASH-DESTRUCTION GATE.
+//
+// One function rather than a live::onoff() at each site, because the gate has
+// to cover THREE things that are easy to gate separately and wrong to: whether
+// the descriptor resources exist, whether every pipeline layout is extended to
+// carry them, and whether the set is bound per draw.
+//
+// Gating only the bind - which is what this did first - still appended a
+// descriptor set to every layout X-Plane creates. That is a permanent change
+// to the layout of every pipeline in the sim in exchange for a feature that is
+// switched off, and it is invisible in a trace because nothing reports it.
+// With this, crash.enable=0 means destructgpu::state().ready stays false and
+// all three fall away together.
+static bool crashEnabled()
+{
+    static int on = -1;
+    if (on < 0) on = live::onoff("crash.enable", "TAA_CRASH", false) ? 1 : 0;
+    return on != 0;
+}
+static std::map<VkPipelineLayout, uint32_t> g_layoutOurSet;
+
 static std::map<VkShaderModule, std::vector<uint32_t> > g_moduleCode;
 
 // ---- DOES THIS VERTEX SHADER PULL ITS VERTICES FROM MEMORY?
@@ -5326,7 +5356,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // which is deliberately the whole of this step. Adding a
                 // descriptor set to every pipeline is the invasive part and is
                 // easier to judge when creation is already known good.
-                destructgpu::ensure(tdd, tci->second);
+                if (crashEnabled()) destructgpu::ensure(tdd, tci->second);
                 // Re-init only on a real change of shape. The scene IMAGE
                 // alternates every frame between two targets, and keying on it
                 // rebuilt everything each frame and destroyed objects still in
@@ -9531,7 +9561,48 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreatePipelineLayout(
     ci2.pushConstantRangeCount = (uint32_t)ranges.size();
     ci2.pPushConstantRanges    = ranges.data();
 
+    // ---- APPEND THE DESTRUCTION SET.
+    //
+    // At the layout's OWN setLayoutCount, so sets 0..N-1 keep the exact
+    // layouts X-Plane declared. That matters for more than tidiness: Vulkan
+    // pipeline layout compatibility is defined per set index, and leaving the
+    // lower indices untouched is what stops X-Plane's own bound sets being
+    // disturbed by our layout existing.
+    //
+    // The consequence is that our index VARIES per layout, so it is recorded
+    // rather than assumed. A hardcoded index would read whichever buffer
+    // X-Plane happened to bind there.
+    std::vector<VkDescriptorSetLayout> sets(
+        ci->pSetLayouts, ci->pSetLayouts + ci->setLayoutCount);
+    uint32_t ourSet = UINT32_MAX;
+    if (destructgpu::state().ready) {
+        if (ci->setLayoutCount + 1u <= g_maxBoundSets) {
+            ourSet = ci->setLayoutCount;
+            sets.push_back(destructgpu::state().setLayout);
+            ci2.setLayoutCount = (uint32_t)sets.size();
+            ci2.pSetLayouts    = sets.data();
+            if (++destructgpu::layoutsExtended() % 500 == 1)
+                trace("DESTRUCT: %llu layout(s) carry the fragment set, ours at "
+                      "index %u of %u max",
+                      (unsigned long long)destructgpu::layoutsExtended(),
+                      ourSet, g_maxBoundSets);
+        } else {
+            // Counted, never silent. A layout at the device limit cannot take
+            // our set, and every draw using it will be unable to displace -
+            // which downstream looks exactly like a shader that failed.
+            if (++destructgpu::layoutsTooMany() % 100 == 1)
+                trace("DESTRUCT: %llu layout(s) already at the %u-set device "
+                      "limit - no fragment set, so their draws cannot displace",
+                      (unsigned long long)destructgpu::layoutsTooMany(),
+                      g_maxBoundSets);
+        }
+    }
+
     VkResult r = next(device, &ci2, alloc, out);
+    if (r == VK_SUCCESS && ourSet != UINT32_MAX) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_layoutOurSet[*out] = ourSet;
+    }
     if (r != VK_SUCCESS) {
         // Fall back rather than fail the application's call. A layout we cannot
         // extend is a velocity hole; a layout we fail to create is a crash.
@@ -10965,6 +11036,74 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     }
     g_nextCmdBindPipeline(cb, bind, pipeline);
 
+    // ---- BIND THE FRAGMENT TRANSFORM SET.
+    //
+    // ON EVERY PIPELINE BIND, not once per command buffer. Vulkan only
+    // guarantees a bound descriptor set survives if subsequent binds use a
+    // layout compatible at that index, and X-Plane binds with ITS layout,
+    // which does not contain our set at all. Binding once would work until the
+    // first time X-Plane rebound anything, which is every frame.
+    //
+    // The set index is looked up rather than assumed. We appended at each
+    // layout's OWN setLayoutCount, so ours is index 1 on one layout and 4 on
+    // another; a hardcoded index would bind our buffer over one of X-Plane's,
+    // which is a corruption rather than a missing feature.
+    //
+    // Binding with the PIPELINE'S layout - the extended one, since we extended
+    // it at creation - means sets 0..N-1 are described identically to what
+    // X-Plane declared, so their bindings are not disturbed.
+    // ---- NOT WHILE THE FEATURE IS DORMANT.
+    //
+    // MEASURED: rebinding on every graphics pipeline bind costs 3-4 fps of
+    // 35-38, about 9%. 1085 pipeline binds a frame each gain a descriptor-set
+    // bind, taking that traffic from ~4400 to 5498 per frame.
+    //
+    // That is the correct thing to do WHEN the set is being read, and pure
+    // waste when it is not - and right now no shader reads it and crashActive
+    // is never true. A 9% tax on a dormant feature is not defensible, so the
+    // bind is gated on the feature being switched on at all.
+    //
+    // It cannot be gated on crashActive alone: once a patched shader
+    // statically references the binding, the descriptor has to be valid at
+    // draw time whether or not the branch is taken. crash.enable is the gate
+    // because it also decides whether displacement is patched in.
+    if (crashEnabled() && bind == VK_PIPELINE_BIND_POINT_GRAPHICS &&
+        destructgpu::state().ready) {
+        VkPipelineLayout lay = VK_NULL_HANDLE;
+        uint32_t ourSet = UINT32_MAX;
+        PFN_vkCmdBindDescriptorSets bindSets = nullptr;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<VkPipeline, VkPipelineLayout>::iterator pi =
+                g_pipelineLayoutOf.find(pipeline);
+            if (pi != g_pipelineLayoutOf.end()) {
+                lay = pi->second;
+                std::map<VkPipelineLayout, uint32_t>::iterator li =
+                    g_layoutOurSet.find(lay);
+                if (li != g_layoutOurSet.end()) ourSet = li->second;
+            }
+            // The entry point is per DEVICE, not global - resolved through the
+            // command buffer the same way every other hook here does it.
+            std::map<VkCommandBuffer, VkDevice>::iterator ci =
+                g_cbToDevice.find(cb);
+            if (ci != g_cbToDevice.end()) {
+                std::map<void*, DeviceData>::iterator di =
+                    g_devices.find(dispatchKey(ci->second));
+                if (di != g_devices.end()) bindSets = di->second.cmdBindDescriptorSets;
+            }
+        }
+        if (ourSet != UINT32_MAX && bindSets) {
+            VkDescriptorSet set = destructgpu::state().set;
+            bindSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                     lay, ourSet, 1, &set, 0, nullptr);
+            if (++destructgpu::bindsIssued() % 100000 == 1)
+                trace("DESTRUCT: %llu descriptor set binds (set index %u) - "
+                      "rebound per pipeline bind because X-Plane's own layout "
+                      "does not describe our set and would disturb it",
+                      (unsigned long long)destructgpu::bindsIssued(), ourSet);
+        }
+    }
+
     // Remember whether the compute pipeline now bound is X-Plane's upscaler.
     if (bind == VK_PIPELINE_BIND_POINT_COMPUTE) {
         std::lock_guard<std::mutex> g(g_lock);
@@ -12353,6 +12492,12 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         g_getPhysProps(phys, &pp);
         spvinj::chooseLocations(pp.limits.maxVertexOutputComponents,
                                 pp.limits.maxFragmentInputComponents);
+        // How many descriptor sets a pipeline layout may declare. Appending
+        // ours to a layout already at the limit would make the layout
+        // creation FAIL, and a failed layout is not a velocity hole - it is a
+        // pipeline X-Plane never gets. Captured here because this is the only
+        // place the physical device is in scope.
+        g_maxBoundSets = pp.limits.maxBoundDescriptorSets;
         spvinj::chooseAttachment(pp.limits.maxColorAttachments);
         uint32_t pcOff = spvinj::choosePushOffset(pp.limits.maxPushConstantsSize);
         trace("SPIRV INJECT: push block of %u bytes at offset %u of %u - leaves "
@@ -12564,6 +12709,21 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     {
         std::lock_guard<std::mutex> g(g_lock);
         g_devices[dispatchKey(*out)] = dd;
+    }
+
+    // ---- CRASH DESTRUCTION RESOURCES, HERE AND NOT AT FRAME TIME.
+    //
+    // Pipeline layouts are created during startup, long before the first frame
+    // renders. Creating the descriptor set layout on the per-frame path meant
+    // it did not exist when the layouts that need it were built, so every one
+    // of them would have been silently left unextended - and the symptom would
+    // have been "displacement does nothing", days later, with nothing to
+    // suggest an ordering problem.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(*out));
+        if (crashEnabled() && di != g_devices.end())
+            destructgpu::ensure(di->second, *out);
     }
 
 
