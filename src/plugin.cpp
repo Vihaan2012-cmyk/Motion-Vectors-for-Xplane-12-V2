@@ -1872,8 +1872,11 @@ static void publishCrashGrid(bool force)
                  (double)frame.pilotEye[0], (double)frame.pilotEye[1],
                  (double)frame.pilotEye[2]);
 
+        // Hoisted: the grid FLOOR needs it as well as the vertices, and a
+        // second copy computed in the inner scope is a second thing to keep in
+        // step. Zero is the honest default - no reference point, no shift.
+        float off[3] = { 0.0f, 0.0f, 0.0f };
         if (rCgY && rCgZ) {
-            float off[3];
             destruct::referencePointOffset(XPLMGetDataf(rCgY),
                                            XPLMGetDataf(rCgZ), off);
             destruct::applyOffset(verts, off);
@@ -1898,16 +1901,65 @@ static void publishCrashGrid(bool force)
         }
 
         if (destruct::vertexBounds(verts, bbMin, bbMax)) {
-            // Real geometry, so only the margin a mesh needs beyond the
-            // aerodynamic planform: fairings, tip fences, radomes. Nowhere
-            // near the 1.35 a guessed box needs.
-            const float pad = 0.10f;
+            // ---- THE MARGIN THE DRAWN MESH NEEDS, NOT THE AERO SURFACE.
+            //
+            // 10% was chosen for "fairings, tip fences, radomes" and is far too
+            // tight. The box gates the displacement - a vertex outside it keeps
+            // its own position - and the .acf describes the AERODYNAMIC
+            // aeroplane, while the mesh being drawn carries a great deal that
+            // hangs outside it: extended flaps and slats, engine nacelles slung
+            // under the wing, gear legs and bogies, wingtip devices.
+            //
+            // Those are exactly the parts that sheared. The fuselage sits well
+            // inside the box and stayed intact; the flaps, nacelles and gear
+            // straddle its faces, so one end of a triangle moved and the other
+            // did not.
+            //
+            // 35% covers a 747 with everything deployed. Being generous costs
+            // grid resolution and nothing else - and while the aeroplane is
+            // PARKED it also takes in the runway, which no margin can avoid:
+            // the floor has to reach the gear contact point for the wheels to
+            // be inside, and the tarmac is at that height by definition. The
+            // rigid test therefore only means anything AIRBORNE.
+            // ---- THE MARGIN THE DRAWN MESH NEEDS.
+            //
+            // The .acf describes the AERODYNAMIC aeroplane; the drawn mesh
+            // carries extended flaps, nacelles slung under the wing, gear legs
+            // and bogies that hang outside it. The box GATES the displacement,
+            // so a vertex outside keeps its own position - which is what
+            // sheared those parts at 10%.
+            //
+            // It cannot simply be made huge: at 200% the box swallowed the
+            // terrain and displaced the whole scene into a corner of the
+            // screen. It has to be tight enough to exclude the world and loose
+            // enough to contain the aeroplane, which is a real constraint and
+            // not a tuning preference.
+            const float pad = 0.35f;
             for (int a = 0; a < 3; ++a) {
                 const float m = (bbMax[a] - bbMin[a]) * pad * 0.5f;
                 bbMin[a] -= m; bbMax[a] += m;
             }
-            // The gear reaches below the lowest airframe vertex, and a crash
-            // fragments the gear too.
+            // ---- THE FLOOR MUST CLEAR THE GEAR, MEASURED NOT ESTIMATED.
+            //
+            // The box GATES the displacement: a vertex below its floor keeps
+            // its own position. With the floor at -5.0 m and the gear reaching
+            // below it, the fuselage and wings lifted while the legs, bogies
+            // and engine pylons stayed on the tarmac - stretched into long
+            // struts between the two.
+            //
+            // d.lowestY comes from datarefs and did not reach far enough. The
+            // .acf states it exactly: each leg's attachment minus its length
+            // minus its tyre, in the frame this geometry is already in, so
+            // groundContact() is the same number without a unit or a frame to
+            // get wrong.
+            //
+            // A further half-metre under that, because the DRAWN bogies hang
+            // below the point the flight model touches down on.
+            float contact = 0.0f;
+            if (destruct::groundContact(frame, contact)) {
+                const float floorY = contact + off[1] - 0.5f;
+                if (floorY < bbMin[1]) bbMin[1] = floorY;
+            }
             if (d.lowestY < bbMin[1]) bbMin[1] = d.lowestY;
             fromPlanform = true;
             xlog("crash grid: %s -> %d wing segment(s), %d body point(s), "

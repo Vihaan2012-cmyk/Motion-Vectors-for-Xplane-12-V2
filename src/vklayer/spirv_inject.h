@@ -1655,10 +1655,47 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         // whether the vertex is INSIDE THE GRID; whether discovery is
         // running is none of its business.
         body.push_back(head(OpLogicalNot, 4)); body.push_back(idBool); body.push_back(idInRange); body.push_back(idBadAll);
-        body.push_back(head(OpLogicalAnd, 5)); body.push_back(idBool); body.push_back(idOk1);   body.push_back(idInRange); body.push_back(idOccupied);
+        // ---- OCCUPANCY IS NOT THE GATE FOR A RIGID MOVE.
+        //
+        // Requiring the cell to be occupied tears the aeroplane apart. The
+        // occupancy comes from the .acf AERO geometry and the mesh being drawn
+        // is the detailed OBJ - fin, wingtips, nacelles and gear all reach into
+        // cells the aero surface never fills - so vertices next to each other
+        // in one triangle got different answers. Solid fill and a cell of
+        // dilation narrowed that and cannot close it: the two are different
+        // models of the same aeroplane.
+        //
+        // Occupancy earns its place in Task 11, where each cell carries its own
+        // fragment transform and a torn mesh IS the effect. For a rigid
+        // translation it is the wrong question, and being inside the grid is
+        // the right one.
+        //
+        // Left computed rather than deleted - Task 11 needs it, and the read
+        // must stay ahead of the store either way.
+        (void)idOccupied;
+        body.push_back(head(OpLogicalAnd, 5)); body.push_back(idBool); body.push_back(idOk1);   body.push_back(idInRange); body.push_back(idInRange);
         body.push_back(head(OpLogicalAnd, 5)); body.push_back(idBool); body.push_back(idOkAll); body.push_back(idOk1);     body.push_back(idWantB);
+
+        // ---- AND ONLY IN A PASS THIS MATRIX DESCRIBES.
+        //
+        // clip' = clip + M*d holds only where M built the clip space. M is the
+        // MAIN CAMERA's aircraft-local-to-clip, and this patch is in EVERY
+        // vertex shader - shadow, reflection, cockpit near-field - so without
+        // this the same vertex moved by different amounts in different passes.
+        // That is what bent the wingtips, displaced the nacelles and made the
+        // aeroplane appear to shrink: M*d carries a w component, and a changed
+        // w changes the perspective divide.
+        //
+        // The layer sets block[19] to 1 only for inScene && isGeometry, which
+        // is the same test the jitter uses and for the same reason. idJit is
+        // that push vec4, already loaded above for the jitter.
+        const uint32_t idPassF = bound++, idPassB = bound++, idOkPass = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idPassF); body.push_back(idJit); body.push_back(3);
+        body.push_back(head(OpFOrdNotEqual, 5)); body.push_back(idBool); body.push_back(idPassB); body.push_back(idPassF); body.push_back(idConstZeroF);
+        body.push_back(head(OpLogicalAnd, 5)); body.push_back(idBool); body.push_back(idOkPass); body.push_back(idOkAll); body.push_back(idPassB);
+
         body.push_back(head(OpSelect, 6)); body.push_back(idV4); body.push_back(idPicked);
-        body.push_back(idOkAll); body.push_back(idMoved); body.push_back(idCur);
+        body.push_back(idOkPass); body.push_back(idMoved); body.push_back(idCur);
         body.push_back(head(OpStore, 3)); body.push_back(idPosPtr); body.push_back(idPicked);
 
         ++occupancyVsCount();

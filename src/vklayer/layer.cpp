@@ -542,6 +542,29 @@ static const float *crashTestOffset()
     return off;
 }
 
+// ---- A LIVE NUDGE ON THE GRID ORIGIN.
+//
+// The grid is built by the plugin in ".acf minus the reference point". The
+// shader classifies with crashAircraftInv, which comes from Mc. Nothing has
+// ever confirmed those two frames share an origin, and the evidence says they
+// do not: the GPU discovery measured the airframe at x -27.43 to +33.16 - a
+// width of 60.6 m, which is the aeroplane, centred on +2.87 rather than on 0.
+//
+// That offset pushes one wing toward the +x face of the box, and a vertex
+// outside the box keeps its own position. It is precisely why the right
+// engines, the gear and the tail lag while the middle of the aeroplane moves.
+//
+// Tunable live so the offset can be MEASURED by dialling it until the
+// aeroplane moves as one piece, rather than derived from another theory about
+// which frame X-Plane draws in. Once it is known, it belongs in the plugin
+// next to referencePointOffset().
+static void crashGridNudge(float out[3])
+{
+    out[0] = live::f("crash.offset_x", "TAA_CRASH_OFF_X", 0.0f);
+    out[1] = live::f("crash.offset_y", "TAA_CRASH_OFF_Y", 0.0f);
+    out[2] = live::f("crash.offset_z", "TAA_CRASH_OFF_Z", 0.0f);
+}
+
 static bool crashOccupancy()
 {
     static int on = -1;
@@ -7669,9 +7692,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             // displacement gate then read - and moved the entire screen.
             const float *tOff = crashTestOffset();
             const int    live = 0;
+            float nudge[3];
+            crashGridNudge(nudge);
+            const float gmin[3] = { g_share->crashGridMin[0] + nudge[0],
+                                    g_share->crashGridMin[1] + nudge[1],
+                                    g_share->crashGridMin[2] + nudge[2] };
             destructgpu::uploadHeader(g_share->crashAircraftInv,
                                       g_share->crashAircraftFwd,
-                                      g_share->crashGridMin, g_share->crashCell,
+                                      gmin, g_share->crashCell,
                                       g_share->crashNx, g_share->crashNy,
                                       g_share->crashNz, live,
                                       tOff);
@@ -12185,6 +12213,64 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
                                                : (vt == nfView);
     if ((g_velSnap.bodyReprojValid || provisional) && g_nearFieldM > 0.0f)
         block[18] = g_nearFieldM;
+
+    // ---- block[19]: MAY THIS PASS BE DISPLACED?
+    //
+    // The crash displacement is clip' = clip + M*d, and M is the MAIN CAMERA's
+    // aircraft-local-to-clip. That equation is only true in a pass built from
+    // the same projection. The layer patches EVERY vertex shader - shadow,
+    // reflection, cockpit near-field - so applying one camera's delta in
+    // another's clip space displaced the same vertex by different amounts in
+    // different passes: bent wingtips, displaced nacelles, an aeroplane that
+    // appeared to shrink because M*d carries a w component and a changed w
+    // changes the perspective divide.
+    //
+    // inScene && isGeometry is the same test the jitter already uses, for the
+    // same reason: it is the set of passes the main camera's matrices describe.
+    // Everything else keeps the position its own pass computed.
+    // ---- WHICH PASSES MAY BE DISPLACED, CHOSEN AT RUN TIME.
+    //
+    // inScene && isGeometry matches the jitter exactly - measured, 184908
+    // against 184907 - and the gear, engine pylons and tail still do not move
+    // while the fuselage and wings do. So the lagging parts are among the
+    // 15093 draws this excludes, and the question is WHICH exclusion is
+    // wrong: 11864 draws are isGeometry without inScene, 2022 the reverse.
+    //
+    // Switchable rather than guessed, because guessing at this has cost five
+    // rebuilds tonight:
+    //
+    //   0  inScene && isGeometry   the jitter's test, today's behaviour
+    //   1  isGeometry              drops the scene requirement
+    //   2  inScene                 drops the geometry requirement
+    //   3  everything              proves the gate is the cause, or is not
+    //
+    // 3 will displace full-screen quads and shadow passes - it is a diagnosis,
+    // not a setting.
+    {
+        const int mode = live::i("crash.gate", "TAA_CRASH_GATE", 0);
+        const bool pass = (mode == 1) ? isGeometry
+                        : (mode == 2) ? inScene
+                        : (mode == 3) ? true
+                                      : (inScene && isGeometry);
+        block[19] = pass ? 1.0f : 0.0f;
+    }
+
+    // ---- HOW MANY DRAWS ACTUALLY CARRY THE GATE.
+    //
+    // The tail lags behind the rest of the aeroplane, and there are only two
+    // ways that happens: its vertices are outside the grid, or its draws have
+    // this flag clear. Counting both sides distinguishes them without another
+    // guess - a tail drawn in a pass that is inScene but not isGeometry, or
+    // neither, shows up here as a large "off" count.
+    {
+        static uint64_t nOn = 0, nOff = 0;
+        if (block[19] != 0.0f) ++nOn; else ++nOff;
+        if (((nOn + nOff) % 200000) == 1)
+            trace("DESTRUCT: displace gate - %llu draws ON, %llu OFF "
+                  "(inScene && isGeometry). Geometry drawn with it OFF keeps "
+                  "the position its own pass computed.",
+                  (unsigned long long)nOn, (unsigned long long)nOff);
+    }
 
     // Never silent again. The select being disarmed is invisible from every
     // downstream measurement - the field simply carries world motion on the
