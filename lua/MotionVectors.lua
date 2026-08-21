@@ -806,7 +806,6 @@ end
 
 local show_advanced = false
 
-local win_bg_pushed = 0
 
 local wnd = nil
 local close_requested = false
@@ -890,8 +889,8 @@ local function title_bar()
 end
 
 local function build(w, x, y)
-    -- Balance last frame's push before doing anything else.
-    if win_bg_pushed > 0 then popcol(win_bg_pushed); win_bg_pushed = 0 end
+    -- Nothing to balance. The style stack begins and ends this function at
+    -- the same depth, which is what ImGui requires of every frame.
     if not started then first_frame() end
 
     -- ---- SETTLE THE ATTACH QUESTION ONCE THE ANSWER EXISTS.
@@ -914,9 +913,17 @@ local function build(w, x, y)
     -- on WindowBg arrives too late. A full-size child with ChildBg is what
     -- gives the whole plugin one background, and its alpha is what lets the
     -- scene through the way the reference dialog does.
-    local nWin = pushcol("ChildBg", 0x00000000)   -- the WINDOW carries the tint;
-                                              -- tinting here too stacked two
-                                              -- dark layers into a black band
+    -- ---- THE CHILD CARRIES THE TINT, INSIDE THIS FRAME.
+    --
+    -- This was transparent because WindowBg carried the colour, pushed at the
+    -- end of the previous frame to reach a Begin() FlyWithLua had already
+    -- called. That is what ImGui was objecting to: a frame cannot end one push
+    -- deep, and the next cannot pop what it did not push.
+    --
+    -- Exactly ONE of the two may be tinted - the note that used to sit here
+    -- recorded that tinting both stacked two dark layers into a black band -
+    -- so the colour moves here, where it belongs to the frame that draws it.
+    local nWin = pushcol("ChildBg", C_PANEL)
     imgui.BeginChild("panel", -1, -1, false)
     title_bar()
     -- Drag strips live in genuinely empty space, so they can never sit on top
@@ -1056,10 +1063,6 @@ local function build(w, x, y)
 
     imgui.EndChild()
     popcol(nWin)
-
-    -- Applies to the NEXT Begin(), which is the only way to reach a window
-    -- FlyWithLua has already opened. Popped at the top of the next frame.
-    win_bg_pushed = pushcol("WindowBg", C_PANEL)
 end
 
 function mv_open()
