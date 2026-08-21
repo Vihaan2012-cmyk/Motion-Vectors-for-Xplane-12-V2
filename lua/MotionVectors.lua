@@ -77,7 +77,7 @@ local C_LOG       = 0x6A101010   -- log box, translucent like the panel
 
 -- Version the panel reports, and the newest X-Plane this build has been tested
 -- against. No network check: bump this constant per release.
-local MOD_VERSION      = "0.0.18"
+local MOD_VERSION      = "0.0.21"
 local MAX_TESTED_XP    = "12.43.11"
 
 -- A style push that cannot quarantine the script.
@@ -366,6 +366,11 @@ local win_bg_pushed = 0
 
 local wnd = nil
 local close_requested = false
+-- Set by build() once it has run a frame WITHOUT the trailing WindowBg push,
+-- so the ImGui colour stack is balanced before the window is destroyed. See
+-- the close sequence at the bottom of build().
+local safe_to_close = false
+local close_ticks   = 0
 
 -- Window geometry, tracked here because FlyWithLua can set it but not report
 -- it. XPLM screen coordinates: origin bottom-left, so top > bottom.
@@ -627,17 +632,39 @@ local function build(w, x, y)
     imgui.EndChild()
     popcol(nWin)
 
-    -- Applies to the NEXT Begin(), which is the only way to reach a window
-    -- FlyWithLua has already opened. Popped at the top of the next frame.
-    win_bg_pushed = pushcol("WindowBg", C_PANEL)
+    -- ---- THE CROSS-FRAME PUSH, AND WHY CLOSING HAS TO BE STAGED.
+    --
+    -- This applies to the NEXT Begin(), which is the only way to reach a
+    -- window FlyWithLua has already opened, and it is popped at the top of the
+    -- next frame. That works for as long as there IS a next frame.
+    --
+    -- Destroying the window means build() never runs again, so the last push
+    -- is never popped and a dangling entry is left on ImGui's colour stack.
+    -- Reopening then pops against a stack that no longer holds it, and
+    -- PopStyleColor on an empty stack is a pop_back() on an empty vector - it
+    -- took X-Plane down every time the panel was reopened.
+    --
+    -- So the close is staged: on the frame a close is pending we skip the
+    -- push, leaving the stack balanced, and only then is the window allowed to
+    -- be destroyed. mv_tick() waits for safe_to_close before destroying.
+    if close_requested then
+        win_bg_pushed = 0
+        safe_to_close = true
+    else
+        win_bg_pushed = pushcol("WindowBg", C_PANEL)
+    end
 end
 
 function mv_open()
     if wnd then
-        float_wnd_destroy(wnd)
-        wnd = nil
+        -- Request, do not destroy. Tearing the window down here skips the
+        -- balancing frame and leaves the colour stack dangling, which is the
+        -- crash described at the bottom of build().
+        close_requested = true
         return
     end
+    safe_to_close = false
+    close_ticks   = 0
     -- decoration 0: no X-Plane frame. Its colour cannot be changed, so the
     -- only way to make the border match the panel is not to have one.
     wnd = float_wnd_create(WIN_W, WIN_H, 0, true)
@@ -651,14 +678,31 @@ end
 
 function onclose(w)
     wnd = nil
+    -- Closed from outside our own sequence, so the balancing frame never ran
+    -- and a push may still be on the stack. Forgetting it leaks one entry;
+    -- remembering it makes the next build() pop a stack that may no longer
+    -- hold it, which is the crash. A cosmetic leak beats a crash.
+    win_bg_pushed = 0
+    close_requested = false
+    safe_to_close   = false
 end
 
 -- Destroying the window from inside its own ImGui builder is not safe, so the
 -- close box only sets a flag and the deferred callback acts on it.
 function mv_tick()
     if close_requested then
-        close_requested = false
-        if wnd then float_wnd_destroy(wnd); wnd = nil end
+        -- Wait for build() to run its balancing frame. If it never does - the
+        -- window is not being drawn at all - close anyway rather than leave a
+        -- panel that will not shut, and drop the count instead of popping a
+        -- stack we can no longer reason about.
+        close_ticks = close_ticks + 1
+        if safe_to_close or close_ticks > 4 then
+            if not safe_to_close then win_bg_pushed = 0 end
+            close_requested = false
+            safe_to_close   = false
+            close_ticks     = 0
+            if wnd then float_wnd_destroy(wnd); wnd = nil end
+        end
     end
 end
 do_often("mv_tick()")

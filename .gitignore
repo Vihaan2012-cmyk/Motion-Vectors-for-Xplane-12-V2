@@ -22,8 +22,6 @@ tools/*.exe
 tools/inject_test.exe
 xp-shot.ps1
 __pycache__/
-<<<<<<< HEAD
-=======
 validation.txt
 
 # Vendor upscaler SDKs. Not ours to redistribute - this project is
@@ -38,4 +36,3 @@ dist/
 
 # The FidelityFX SDK is a 424 MB upstream checkout, fetched not vendored.
 third_party/FidelityFX-SDK/
->>>>>>> d2fcf7a (tools: generate FidelityFX shader permutations without MSVC)

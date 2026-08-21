@@ -6584,7 +6584,19 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                     std::map<VkImage, ColorTarget>::iterator ct =
                         g_colorImages.find(vi->second);
                     if (ct == g_colorImages.end()) continue;          // not a render target
-                    if (ct->second.w < 1920) continue;                // not full-window
+                    // ---- NOT A FIXED 1920, WHICH ASSUMED 1440p OR BETTER.
+                    //
+                    // This filters which images the diagnostic reports, and a
+                    // hard 1920 floor silently drops the whole thing at 1080p
+                    // with any render scale below 1.0 - the same run logs
+                    // 960x540 passes, so that is not hypothetical. A diagnostic
+                    // that goes quiet at exactly the resolutions you are trying
+                    // to debug is worse than no diagnostic.
+                    //
+                    // 1280 matches the floor the FSR blit path already uses and
+                    // still excludes thumbnails and lookup tables, which is all
+                    // this was ever meant to do.
+                    if (ct->second.w < 1280) continue;                // not full-window
                     if (reported.size() >= 12 || reported.count(vi->second)) continue;
                     reported.insert(vi->second);
                     trace("SWAP PASS SAMPLES: %p fmt=%d %ux%u  (our scene target is "
@@ -7575,9 +7587,46 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                   (void*)g_sceneColor.image, g_sceneColor.w, g_sceneColor.h,
                   g_sceneColorStable);
     }
-    if (velOrInjected && stableEnough && !g_mv.ready && !g_mv.failed &&
+    // ---- AND REBUILT WHEN THE SCENE RESOLUTION MOVES.
+    //
+    // This was gated on !g_mv.ready alone, so the velocity target was sized
+    // ONCE from the first scene target that held still and then never again.
+    // Change the render resolution afterwards and the target keeps its old
+    // dimensions forever, while the gate below demands
+    //
+    //     passInfo.w == g_mv.w && passInfo.h == g_mv.h
+    //
+    // so every real scene pass is refused on size and NOTHING resolves:
+    //
+    //     TAA GATE: candidate rejected on SIZE alone -
+    //               pass 2560x1440 vs velocity target 3840x2160
+    //
+    // measured at 1440p on a 4K swapchain. Every health flag still reads
+    // green - spirvLive, depth, jitter, the injected shaders all fine - which
+    // is why this presents as "TAA just does not work at that resolution"
+    // rather than as an error anybody could act on.
+    //
+    // mvCreate ALREADY handles the resize: it returns early when the size
+    // matches and tears down first when it does not. Only the caller never
+    // asked a second time. Rebuilding is safe because it bumps g_mv.gen, and
+    // the resolve's needInit clause compares g_taa.velGen against that
+    // generation - so the descriptors are rewritten against the new view
+    // instead of keeping a handle to a destroyed one.
+    //
+    // Still behind g_sceneColorStable >= 120: a resolution change churns the
+    // HDR target set, which resets that counter, so the rebuild waits for the
+    // new size to settle rather than chasing every intermediate one.
+    const bool mvSizeStale = g_mv.ready &&
+                             (g_mv.w != g_sceneColor.w || g_mv.h != g_sceneColor.h);
+    if (velOrInjected && stableEnough && (!g_mv.ready || mvSizeStale) &&
+        !g_mv.failed &&
         g_sceneColor.image != VK_NULL_HANDLE && g_sceneColor.w && g_sceneColor.h &&
         g_sceneColorStable >= 120) {
+        if (mvSizeStale)
+            trace("MV TARGET: scene is now %ux%u but the velocity target is "
+                  "%ux%u - rebuilding. Left stale, every scene pass is "
+                  "rejected on size and the resolve never runs.",
+                  g_sceneColor.w, g_sceneColor.h, g_mv.w, g_mv.h);
         std::map<void*, DeviceData>::iterator mvi = g_devices.begin();
         if (mvi != g_devices.end())
             mvCreate(mvi->second, mvi->second.device, mvi->second.phys,
@@ -11926,6 +11975,24 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         // path must add VK_KHR_present_id with them.
         static const bool wantLowLatency = getenv("TAA_SL_LOW_LATENCY") &&
                                            atoi(getenv("TAA_SL_LOW_LATENCY")) != 0;
+
+        // ---- TAA_DLSS_EXT: the DLSS-G / Streamline extensions, OFF by default.
+        //
+        // These sit on the device create for frame generation, which this layer
+        // does not run. VK_NV_optical_flow, VK_KHR_format_feature_flags2 (which
+        // the optical flow spec requires) and VK_EXT_private_data (Streamline's
+        // swap chain state) buy nothing while DLSS-G is absent, and every
+        // extension enabled is driver code the sim would otherwise not run at
+        // all - on a device that has already been made invalid once by an
+        // addition of ours.
+        //
+        // VK_EXT_dynamic_rendering_unused_attachments is deliberately NOT in
+        // this set: the velocity attachment depends on it, so motion vectors
+        // and TAA go with it. Only the frame generation names are gated.
+        //
+        // TAA_DLSS_EXT=1 re-arms them for whoever takes the DLSS-G path up.
+        static const bool wantDlssExt = getenv("TAA_DLSS_EXT") &&
+                                        atoi(getenv("TAA_DLSS_EXT")) != 0;
         for (size_t k = 0; k < sizeof(kWanted)/sizeof(kWanted[0]); ++k) {
             if (!wantLowLatency &&
                 (!strcmp(kWanted[k], "VK_NV_low_latency2") ||
@@ -11933,6 +12000,15 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
                 trace("DEVICE: NOT enabling %s - it requires VK_KHR_present_id, "
                       "which nothing here provides, and an extension enabled "
                       "without its dependency makes the DEVICE invalid",
+                      kWanted[k]);
+                continue;
+            }
+            if (!wantDlssExt &&
+                (!strcmp(kWanted[k], "VK_NV_optical_flow") ||
+                 !strcmp(kWanted[k], "VK_KHR_format_feature_flags2") ||
+                 !strcmp(kWanted[k], "VK_EXT_private_data"))) {
+                trace("DEVICE: NOT enabling %s - DLSS-G/Streamline only, and this "
+                      "layer runs neither. TAA_DLSS_EXT=1 re-arms it.",
                       kWanted[k]);
                 continue;
             }
@@ -11953,7 +12029,11 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         }
 
         // The same treatment for Streamline's list.
-        for (size_t k = 0; k < slWanted.size(); ++k) {
+        if (!wantDlssExt && !slWanted.empty())
+            trace("DEVICE: skipping Streamline's %u requirement(s) - DLSS-G is "
+                  "not running, so its device extensions are not added. TAA_DLSS_EXT=1.",
+                  (unsigned)slWanted.size());
+        for (size_t k = 0; wantDlssExt && k < slWanted.size(); ++k) {
             // The same exclusion as above, and it has to be here too:
             // kSlDeviceExt carries VK_NV_low_latency2 as well, so filtering
             // only kWanted would leave the extension enabled by this loop and
