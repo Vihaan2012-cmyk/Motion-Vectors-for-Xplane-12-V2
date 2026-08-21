@@ -35,6 +35,38 @@ $mvVersion = (Get-Content (Join-Path $root "VERSION") -Raw).Trim()
 if ($Dev) { $mvVersion = "$mvVersion-dev" }
 
 Write-Host "Motion Vectors $mvVersion"
+
+# ---- WHICH VENDOR UPSCALER SDKs THIS BUILD CAN SEE.
+#
+# Detected from the filesystem, never hardcoded. upscaler_policy.h deliberately
+# leaves MV_HAVE_* to the build system precisely so a backend cannot CLAIM to
+# be present without the code actually being there - editing a constant in a
+# header would be a one-line lie that survives all the way to the UI.
+#
+# Each probe looks for the specific file the compile would fail without, not
+# merely for the directory. The FSR 2 and DLSS archives that landed here first
+# were prebuilt samples: they had the directory, the DLLs and even the Vulkan
+# import library, and zero API headers. A directory-existence check would have
+# reported both as available and then failed at the first #include.
+$sdkRoot   = Join-Path $root "third_party"
+$haveFsr2  = Test-Path (Join-Path $sdkRoot "FSR2\vk\ffx_fsr2_vk.h")
+$haveDlss  = Test-Path (Join-Path $sdkRoot "DLSS\nvsdk_ngx_vk.h")
+$haveXess  = Test-Path (Join-Path $sdkRoot "XeSS\xess\xess_vk.h")
+
+$sdkDefines = @()
+if ($haveFsr2) { $sdkDefines += "-DMV_HAVE_FSR2_SDK=1" }
+if ($haveDlss) { $sdkDefines += "-DMV_HAVE_DLSS_SDK=1" }
+if ($haveXess) { $sdkDefines += "-DMV_HAVE_XESS_SDK=1" }
+
+$sdkIncludes = @()
+if ($haveFsr2) { $sdkIncludes += "-I`"$sdkRoot\FSR2`"" }
+if ($haveDlss) { $sdkIncludes += "-I`"$sdkRoot\DLSS`"" }
+if ($haveXess) { $sdkIncludes += "-I`"$sdkRoot\XeSS`"" }
+
+Write-Host ("  SDKs: FSR2={0} DLSS={1} XeSS={2}" -f `
+            $(if ($haveFsr2) { "yes" } else { "no" }),
+            $(if ($haveDlss) { "yes" } else { "no" }),
+            $(if ($haveXess) { "yes" } else { "no" }))
 if ($Dev) { Write-Host "  DEVELOPER BUILD - launcher shows all dev surfaces" -ForegroundColor Cyan }
 
 $src   = Join-Path $root "src"
@@ -48,6 +80,7 @@ New-Item -ItemType Directory -Force (Join-Path $out "vklayer") | Out-Null
 Write-Host "Building plugin..."
 & g++ -shared -o "$out\MotionVectors.xpl" "$src\plugin.cpp" `
   -I"$root\SDK\CHeaders\XPLM" -DIBM=1 "-DMV_VERSION=\`"$mvVersion\`"" -m64 -O2 -std=c++17 `
+  @sdkDefines @sdkIncludes `
   -static -static-libgcc -static-libstdc++ `
   -L"$root\SDK\Libraries\Win" -lXPLM_64
 if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
@@ -105,6 +138,7 @@ Write-Host "  taa_spv.h: $($words.Count) words"
 Write-Host "Building Vulkan layer..."
 & g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
   -I"$vksdk\Include" -m64 -O2 -std=c++17 `
+  @sdkDefines @sdkIncludes `
   -static -static-libgcc -static-libstdc++
 if ($LASTEXITCODE -ne 0) { throw "layer build failed" }
 Copy-Item "$src\vklayer\VkLayer_mv.json" "$out\vklayer" -Force

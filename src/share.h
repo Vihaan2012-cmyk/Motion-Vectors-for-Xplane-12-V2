@@ -79,7 +79,8 @@
 #include <math.h>
 
 #define TAA_MAGIC       0x4D414154u            // 'TAAM'
-#define TAA_VERSION     8      // 8: crash destruction state (grid, transform)
+#define TAA_VERSION     9      // 9: XeSS slot widens availability[]
+                               // 8: crash destruction state (grid, transform)
 
 // Which temporal backend to run. All of them consume the SAME inputs - velocity
 // buffer, jitter sequence, insertion point - which is the whole reason the
@@ -90,12 +91,25 @@ enum TaaUpscaler {
     TAA_UPSCALER_TAA   = 1,   // ours; no SDK, native resolution only
     // FSR 2, not 3. FSR2 is the version with a first-class NATIVE VULKAN
     // backend in AMD's standalone repo, which is what makes it usable from a
-    // Vulkan layer at all; the newer FidelityFX SDK is DX12-only. This slot is
-    // named for what is actually integrated rather than for the newest number.
+    // Vulkan layer at all. This slot is named for what is actually integrated
+    // rather than for the newest number.
+    //
+    // CORRECTION: this comment used to say the newer FidelityFX SDK is
+    // DX12-only. That was true of the original SDK release and stopped being
+    // true when FSR 3.1 added a Vulkan backend. FSR 2 is still the simpler and
+    // smaller integration, which is why the slot stays, but the stated reason
+    // was out of date and would have justified the choice on a false premise.
     TAA_UPSCALER_FSR2  = 2,   // AMD FidelityFX Super Resolution 2, any GPU
     TAA_UPSCALER_FSR4  = 3,   // AMD FSR 4 - RDNA 4 ONLY, see caps below
     TAA_UPSCALER_DLSS  = 4,   // NVIDIA DLSS Super Resolution, RTX only
-    TAA_UPSCALER_COUNT = 5
+    // Intel XeSS. Listed last because it was added last, NOT because it is the
+    // least useful - it is the only one of the three vendor upscalers that is
+    // cross-vendor in practice. Arc gets the XMX path; everything else with
+    // DP4a (NVIDIA Pascal and later, AMD RDNA and later) gets a slower path
+    // that still runs. On this project's own development machine, a 4060, it
+    // is the only vendor backend whose hardware verdict is yes.
+    TAA_UPSCALER_XESS  = 5,   // Intel XeSS, cross-vendor via DP4a
+    TAA_UPSCALER_COUNT = 6
 };
 
 // Why a backend cannot be used. Reported by the LAYER (which is the only half

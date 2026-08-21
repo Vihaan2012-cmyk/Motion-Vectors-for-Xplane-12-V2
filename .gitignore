@@ -23,3 +23,11 @@ tools/inject_test.exe
 xp-shot.ps1
 __pycache__/
 validation.txt
+
+# Vendor upscaler SDKs. Not ours to redistribute - this project is
+# GPL-3.0 and DLSS in particular ships under NVIDIA's own terms - and
+# they are 450 MB of headers, import libraries and runtime DLLs that
+# every clone would otherwise pay for. build.ps1 detects whatever is
+# present and compiles the matching backend; absent means the backend
+# reports no-library, which is a correct answer rather than an error.
+third_party/

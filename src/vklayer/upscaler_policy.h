@@ -51,20 +51,38 @@ struct DeviceCaps {
     bool     valid      = false;   // false until a device has actually answered
 };
 
-// Whether this BUILD carries each vendor runtime.
+// ---- TWO SEPARATE FACTS, AND THEY ARE NOT THE SAME FACT.
 //
-// Defined by the build system, not by this header, so that adding an SDK is a
-// build change and cannot be faked by editing a constant here. Absent means
-// absent - which is the honest answer today for all three.
-#ifndef MV_HAVE_FSR2
-#define MV_HAVE_FSR2 0
+// MV_HAVE_*_SDK   the build found the vendor's headers and import library
+// MV_BACKEND_*    this layer contains an implementation that uses them
+//
+// Collapsing these into one flag is a mistake this file made for exactly one
+// build. The moment SDK detection was wired up, three SDKs were found, the
+// single flag went to 1, and the availability report would have told the panel
+// that FSR 2, DLSS and XeSS were all ready - while no record() existed for any
+// of them. The user would have selected XeSS and got silence.
+//
+// Having the headers is not having the code. The SDK half is answered by the
+// build system, because a header either is on disk or is not. The backend half
+// is answered here, because it is a statement about this source tree.
+#ifndef MV_HAVE_FSR2_SDK
+#define MV_HAVE_FSR2_SDK 0
 #endif
-#ifndef MV_HAVE_FSR4
-#define MV_HAVE_FSR4 0
+#ifndef MV_HAVE_FSR4_SDK
+#define MV_HAVE_FSR4_SDK 0
 #endif
-#ifndef MV_HAVE_DLSS
-#define MV_HAVE_DLSS 0
+#ifndef MV_HAVE_DLSS_SDK
+#define MV_HAVE_DLSS_SDK 0
 #endif
+#ifndef MV_HAVE_XESS_SDK
+#define MV_HAVE_XESS_SDK 0
+#endif
+
+// Flip one of these to 1 in the same commit that adds its record(). Not before.
+#define MV_BACKEND_FSR2 0
+#define MV_BACKEND_FSR4 0
+#define MV_BACKEND_DLSS 0
+#define MV_BACKEND_XESS 0
 
 // ---- HARDWARE VERDICT.
 //
@@ -93,21 +111,53 @@ inline bool hardwareCanRun(int upscaler, const DeviceCaps &c)
         // NGX runs on NVIDIA only. Turing-or-later is a further restriction
         // that NGX itself answers for at init; we do not guess it here.
         return c.vendorId == VENDOR_ID_NVIDIA;
+
+    case TAA_UPSCALER_XESS:
+        // Cross-vendor, and deliberately not gated on Intel. XeSS takes the
+        // XMX path on Arc and a DP4a path everywhere else, so gating it on
+        // vendorId would refuse it on the majority of cards that can run it.
+        //
+        // The real floor is DP4a, which is a shader capability rather than a
+        // vendor - and the runtime answers for it at init through its own
+        // query. Guessing it here from a vendor id is exactly the inference
+        // this file exists to avoid.
+        return true;
     }
     return false;
 }
 
-// ---- LIBRARY VERDICT.
-inline bool libraryPresent(int upscaler)
+// ---- LIBRARY VERDICT: is the vendor SDK on disk for this build.
+inline bool sdkPresent(int upscaler)
 {
     switch (upscaler) {
     case TAA_UPSCALER_OFF:
     case TAA_UPSCALER_TAA:  return true;
-    case TAA_UPSCALER_FSR2: return MV_HAVE_FSR2 != 0;
-    case TAA_UPSCALER_FSR4: return MV_HAVE_FSR4 != 0;
-    case TAA_UPSCALER_DLSS: return MV_HAVE_DLSS != 0;
+    case TAA_UPSCALER_FSR2: return MV_HAVE_FSR2_SDK != 0;
+    case TAA_UPSCALER_FSR4: return MV_HAVE_FSR4_SDK != 0;
+    case TAA_UPSCALER_DLSS: return MV_HAVE_DLSS_SDK != 0;
+    case TAA_UPSCALER_XESS: return MV_HAVE_XESS_SDK != 0;
     }
     return false;
+}
+
+// ---- IMPLEMENTATION VERDICT: does a record() exist here at all.
+inline bool backendImplemented(int upscaler)
+{
+    switch (upscaler) {
+    case TAA_UPSCALER_OFF:
+    case TAA_UPSCALER_TAA:  return true;
+    case TAA_UPSCALER_FSR2: return MV_BACKEND_FSR2 != 0;
+    case TAA_UPSCALER_FSR4: return MV_BACKEND_FSR4 != 0;
+    case TAA_UPSCALER_DLSS: return MV_BACKEND_DLSS != 0;
+    case TAA_UPSCALER_XESS: return MV_BACKEND_XESS != 0;
+    }
+    return false;
+}
+
+// Both halves. Kept for callers that only care whether it can run.
+inline bool libraryPresent(int upscaler)
+{
+    return sdkPresent(upscaler) && backendImplemented(upscaler);
 }
 
 // ---- THE REPORTED ANSWER.
@@ -124,9 +174,15 @@ inline int availability(int upscaler, const DeviceCaps &c)
     if (upscaler == TAA_UPSCALER_OFF || upscaler == TAA_UPSCALER_TAA)
         return TAA_AVAIL_OK;
 
-    if (!c.valid)              return TAA_AVAIL_UNKNOWN;
+    if (!c.valid)                     return TAA_AVAIL_UNKNOWN;
     if (!hardwareCanRun(upscaler, c)) return TAA_AVAIL_NO_GPU;
-    if (!libraryPresent(upscaler))    return TAA_AVAIL_NO_LIBRARY;
+    // Order matters. NO_SUPPORT means "this layer has no code for it", which is
+    // a developer's problem; NO_LIBRARY means "install the runtime", which is
+    // the user's. Reporting the missing SDK first on a build that also has no
+    // backend would send the user to download something that still would not
+    // work.
+    if (!backendImplemented(upscaler)) return TAA_AVAIL_NO_SUPPORT;
+    if (!sdkPresent(upscaler))         return TAA_AVAIL_NO_LIBRARY;
     return TAA_AVAIL_OK;
 }
 
@@ -188,6 +244,7 @@ inline const char *name(int upscaler)
     case TAA_UPSCALER_FSR2: return "FSR 2";
     case TAA_UPSCALER_FSR4: return "FSR 4";
     case TAA_UPSCALER_DLSS: return "DLSS";
+    case TAA_UPSCALER_XESS: return "XeSS";
     }
     return "?";
 }
