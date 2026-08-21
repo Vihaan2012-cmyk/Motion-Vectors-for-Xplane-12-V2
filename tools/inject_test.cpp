@@ -152,6 +152,13 @@ static size_t countReturns(const std::vector<uint32_t> &w)
 int main(int argc, char **argv)
 {
     const char *root = argc > 1 ? argv[1] : "D:\\shaders\\spv";
+    // Third argument: the descriptor set index to emit the crash-
+    // destruction occupancy write at, or -1 for none. Passing it here means
+    // the whole corpus can be validated WITH the destruction code in it,
+    // before a single patched module reaches a driver. An invalid module is
+    // a black screen across 15000 pipelines; finding that at a command line
+    // costs nothing.
+    const int dsSet = argc > 3 ? atoi(argv[3]) : -1;
     const char *val  = argc > 2 ? argv[2]
                                 : "C:\\VulkanSDK\\1.4.357.0\\Bin\\spirv-val.exe";
 
@@ -207,8 +214,11 @@ int main(int argc, char **argv)
                 }
             }
             std::vector<uint32_t> fout;
+            // alphaBlended: the coverage gate is restricted to alpha-blended
+            // pipelines, and a corpus run has no pipeline state to consult.
+            // Both values are exercised so neither path goes untested.
             spvinj::Result fr = spvinj::injectFragment(in.data(), in.size() * 4,
-                                                       fout, maxLoc);
+                                                       fout, maxLoc, false);
             if (fr != spvinj::INJ_OK) continue;
             ++nFragPatched;
             fs::path o = tmp / ("f_" + p.filename().string());
@@ -244,7 +254,7 @@ int main(int argc, char **argv)
 
         std::vector<uint32_t> out;
         uint32_t loc = 0;
-        spvinj::Result r = spvinj::inject(in.data(), in.size() * 4, out, &loc);
+        spvinj::Result r = spvinj::inject(in.data(), in.size() * 4, out, &loc, dsSet);
         ++reasons[(int)r];
         if (r != spvinj::INJ_OK) continue;
         ++nPatched;

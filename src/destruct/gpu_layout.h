@@ -55,7 +55,28 @@ static const uint32_t kOffAircraftInv = 0;
 static const uint32_t kOffGridMinCell = 64;
 static const uint32_t kOffGridDim     = 80;
 static const uint32_t kOffOccupancy   = 96;
-static const uint32_t kOffXform       = kOffOccupancy + kMaxCells * 4u;
+
+// ---- THE DISCARD SLOT, AND WHY A BRANCH-FREE SHADER NEEDS ONE.
+//
+// The vertex patch has to skip the occupancy write for any vertex outside the
+// grid, and for every vertex at all when discovery is off. The obvious way is
+// a branch - and emitting a branch means creating new basic blocks inside a
+// function somebody else wrote, splitting the block the injection lands in and
+// fixing up its terminator. That is the most invasive thing this injector
+// could do to a module, in 15000 pipelines, where a mistake is a black screen.
+//
+// So the shader is branch-free: it computes the cell index, computes whether
+// that index is legal, and OpSelects between the real index and THIS slot. The
+// store then happens unconditionally. A rejected vertex writes a 1 into a word
+// nothing ever reads.
+//
+// It has to be its own word rather than a reused cell: writing rejects into
+// cell 0 would mark the aeroplane's first cell occupied from anywhere in the
+// world, and writing them into the transform region would corrupt a fragment.
+//
+// Padded to 16 so the transforms stay vector-aligned.
+static const uint32_t kOffDiscard     = kOffOccupancy + kMaxCells * 4u;
+static const uint32_t kOffXform       = kOffDiscard + 16u;
 static const uint32_t kBufferBytes    = kOffXform + kMaxGpuFragments * 16u;
 
 // Word (4-byte) indices, which is how the SPIR-V addresses the block: a
@@ -63,7 +84,16 @@ static const uint32_t kBufferBytes    = kOffXform + kMaxGpuFragments * 16u;
 // getting that conversion wrong once cost a whole debugging session on the
 // velocity buffer.
 static const uint32_t kWordOccupancy = kOffOccupancy / 4u;
+static const uint32_t kWordDiscard   = kOffDiscard / 4u;
 static const uint32_t kWordXform     = kOffXform / 4u;
+
+// The shader addresses one flat uint array that begins at kOffOccupancy, so
+// every index it uses is relative to THAT, not to the buffer. Keeping the two
+// conversions here rather than in the emitter is the same rule as the cell
+// formula: one place, testable.
+static const uint32_t kDataWords     = (kBufferBytes - kOffOccupancy) / 4u;
+static const uint32_t kDataDiscard   = kWordDiscard - kWordOccupancy;
+static const uint32_t kDataXform     = kWordXform   - kWordOccupancy;
 
 // ---- THE CLASSIFICATION THE SHADER PERFORMS.
 //
@@ -91,6 +121,23 @@ inline int gpuCellIndex(const float local[3], const float gmin[3],
 inline int gpuCellIndex(const Grid &g, const float local[3])
 {
     return gpuCellIndex(local, g.min, g.cell, g.nx, g.ny, g.nz);
+}
+
+// ---- WHAT THE SHADER STORES TO, INCLUDING THE REJECT CASE.
+//
+// Mirrors the OpSelect chain the emitter produces. Given a point and the grid,
+// returns the DATA-RELATIVE word index the shader will write a 1 into: the
+// cell when the point is inside and discovery is on, the discard slot
+// otherwise. Tested against gridClassify so the reject path is covered too,
+// not just the accept path.
+inline uint32_t gpuStoreIndex(const float local[3], const float gmin[3],
+                              float cell, int nx, int ny, int nz, int active)
+{
+    if (!active) return kDataDiscard;
+    const int c = gpuCellIndex(local, gmin, cell, nx, ny, nz);
+    if (c < 0) return kDataDiscard;
+    if ((uint32_t)c >= kMaxCells) return kDataDiscard;
+    return (uint32_t)c;
 }
 
 // How many cells a grid actually uses. Anything at or above this in the

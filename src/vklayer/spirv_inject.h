@@ -56,6 +56,7 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include "../destruct/gpu_layout.h"
 
 namespace spvinj {
 
@@ -75,11 +76,22 @@ enum {
     OpFSub = 131, OpFDiv = 136, OpVectorTimesScalar = 142,
     OpFNegate = 127, OpFAdd = 129, OpFMul = 133,
     OpSelect = 169, OpFOrdLessThan = 184, OpFOrdGreaterThanEqual = 190,
+    // Added for the crash-destruction occupancy write. The three above were
+    // already here and their numbers match the specification exactly, which is
+    // the cheapest available check that this block is numbered right.
+    OpTypeArray = 28, OpTypeRuntimeArray = 29,
+    OpConvertFToS = 110, OpIAdd = 128, OpIMul = 132,
+    OpLogicalOr = 166, OpLogicalNot = 168,
+    OpINotEqual = 171, OpSGreaterThanEqual = 175,
     OpReturn = 253
 };
-enum { SC_Input = 1, SC_Output = 3, SC_PushConstant = 9 };
-enum { Deco_Block = 2, Deco_ColMajor = 5, Deco_MatrixStride = 7,
-       Deco_BuiltIn = 11, Deco_Location = 30, Deco_Offset = 35 };
+enum { SC_Input = 1, SC_Output = 3, SC_PushConstant = 9,
+       // 1.3 and later. X-Plane's modules are 1.6, so no extension is
+       // needed to name this storage class.
+       SC_StorageBuffer = 12 };
+enum { Deco_Block = 2, Deco_ArrayStride = 6, Deco_ColMajor = 5,
+       Deco_MatrixStride = 7, Deco_BuiltIn = 11, Deco_Location = 30,
+       Deco_Binding = 33, Deco_DescriptorSet = 34, Deco_Offset = 35 };
 enum { BuiltIn_Position = 0 };
 enum { ExecModel_Vertex = 0, ExecModel_Fragment = 4 };
 
@@ -155,8 +167,12 @@ static const uint32_t kPushConstantBytes = 144;
 inline uint64_t &probeVsCount() { static uint64_t n = 0; return n; }
 inline uint64_t &probeFsCount() { static uint64_t n = 0; return n; }
 
-inline bool crashProbeEnabled()
-{
+// How many vertex modules carry the occupancy write. Zero while the feature
+// is off; a number that stays zero with it ON means the emission never ran,
+// which downstream looks exactly like an aeroplane that refuses to break.
+inline uint64_t &occupancyVsCount() { static uint64_t n = 0; return n; }
+
+inline bool crashProbeEnabled() {
     static const bool debugOwnsZ = (getenv("TAA_MV_INST") != nullptr) ||
                                    (getenv("TAA_MV_PID")  != nullptr);
     return !debugOwnsZ;
@@ -522,8 +538,14 @@ enum Result {
 
 // Returns INJ_OK and fills `out` on success. `location` receives the varying
 // location chosen, which the paired fragment shader has to read from.
+// destructSet: the descriptor set index to declare the crash-destruction
+// storage buffer at, or -1 to emit nothing at all. It is a parameter rather
+// than a global because "off" has to mean the instructions do not exist, not
+// that they exist and are skipped - a module with no reference to the buffer is
+// a module that cannot be broken by the buffer.
 inline Result inject(const uint32_t *code, size_t sizeBytes,
-                     std::vector<uint32_t> &out, uint32_t *location)
+                     std::vector<uint32_t> &out, uint32_t *location,
+                     int destructSet)
 {
     if (!code || sizeBytes < 20) return INJ_MALFORMED;
     std::vector<uint32_t> w(code, code + sizeBytes / 4);
@@ -776,6 +798,30 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     uint32_t newBool = 0;
     if (!idBool) { newBool = bound++; idBool = newBool; }
 
+    // ---- CRASH-DESTRUCTION OCCUPANCY. All zero when destructSet < 0, and
+    // nothing below emits anything in that case.
+    const bool wantDestruct = (destructSet >= 0);
+    uint32_t idIV4 = 0, idArrData = 0, idStructDS = 0, idPtrDSStruct = 0;
+    uint32_t idDSVar = 0, idPtrDSInt = 0, idPtrDSMat4 = 0, idPtrDSV4 = 0;
+    uint32_t idPtrDSIV4 = 0, idConstDataN = 0, idConstDiscard = 0;
+    uint32_t idConst2DS = 0, idConst3DS = 0, idConstZeroF = 0;
+    if (wantDestruct) {
+        idIV4          = bound++;
+        idArrData      = bound++;
+        idStructDS     = bound++;
+        idPtrDSStruct  = bound++;
+        idDSVar        = bound++;
+        idPtrDSInt     = bound++;
+        idPtrDSMat4    = bound++;
+        idPtrDSV4      = bound++;
+        idPtrDSIV4     = bound++;
+        idConstDataN   = bound++;
+        idConstDiscard = bound++;
+        idConst2DS     = bound++;
+        idConst3DS     = bound++;
+        idConstZeroF   = bound++;
+    }
+
     // A float 1.0, for the view vector's w. It is a literal so that nothing can
     // cancel: the clip-to-clip form this replaces recovered w as a difference
     // and lost all precision on distant geometry.
@@ -830,6 +876,21 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructPC); annos.push_back(2); annos.push_back(Deco_Offset); annos.push_back(pushConstantOffset() + 80);
     annos.push_back(head(OpMemberDecorate, 4)); annos.push_back(idStructPC); annos.push_back(2); annos.push_back(Deco_ColMajor);
     annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructPC); annos.push_back(2); annos.push_back(Deco_MatrixStride); annos.push_back(16);
+    if (wantDestruct) {
+        // std430 over one flat array. ArrayStride 4 and the member offsets come
+        // from gpu_layout.h so the shader and the C++ that fills the buffer
+        // cannot disagree about where anything lives.
+        annos.push_back(head(OpDecorate, 4)); annos.push_back(idArrData); annos.push_back(Deco_ArrayStride); annos.push_back(4);
+        annos.push_back(head(OpDecorate, 3)); annos.push_back(idStructDS); annos.push_back(Deco_Block);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(0); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffAircraftInv);
+        annos.push_back(head(OpMemberDecorate, 4)); annos.push_back(idStructDS); annos.push_back(0); annos.push_back(Deco_ColMajor);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(0); annos.push_back(Deco_MatrixStride); annos.push_back(16);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(1); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffGridMinCell);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(2); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffGridDim);
+        annos.push_back(head(OpMemberDecorate, 5)); annos.push_back(idStructDS); annos.push_back(3); annos.push_back(Deco_Offset); annos.push_back(destruct::kOffOccupancy);
+        annos.push_back(head(OpDecorate, 4)); annos.push_back(idDSVar); annos.push_back(Deco_DescriptorSet); annos.push_back((uint32_t)destructSet);
+        annos.push_back(head(OpDecorate, 4)); annos.push_back(idDSVar); annos.push_back(Deco_Binding); annos.push_back(0);
+    }
     annos.push_back(head(OpDecorate, 4)); annos.push_back(idOutCurr); annos.push_back(Deco_Location); annos.push_back(currClipLocation());
     annos.push_back(head(OpDecorate, 4)); annos.push_back(idOutPrev); annos.push_back(Deco_Location); annos.push_back(prevClipLocation());
 
@@ -856,6 +917,33 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrPCMat4);   globals.push_back(SC_PushConstant); globals.push_back(idMat4);
     if (newPtrPCV4) { globals.push_back(head(OpTypePointer, 4)); globals.push_back(newPtrPCV4); globals.push_back(SC_PushConstant); globals.push_back(idV4); }
     globals.push_back(head(OpVariable, 4));    globals.push_back(idPtrPCStruct); globals.push_back(idPCVar);  globals.push_back(SC_PushConstant);
+
+    if (wantDestruct) {
+        // A FIXED-SIZE array rather than a runtime array. A runtime array is
+        // the idiomatic tail of a storage buffer, but its length is only known
+        // through OpArrayLength, and every index here is a compile-time
+        // constant offset into a buffer whose size this layer chose. Fixed
+        // size keeps the whole thing constant-folded and keeps the emitter
+        // from needing a length instruction it would otherwise have to place.
+        globals.push_back(head(OpTypeVector, 4)); globals.push_back(idIV4); globals.push_back(idInt); globals.push_back(4);
+        globals.push_back(head(OpConstant, 4));   globals.push_back(idInt); globals.push_back(idConstDataN);   globals.push_back(destruct::kDataWords);
+        globals.push_back(head(OpConstant, 4));   globals.push_back(idInt); globals.push_back(idConstDiscard); globals.push_back(destruct::kDataDiscard);
+        globals.push_back(head(OpConstant, 4));   globals.push_back(idInt); globals.push_back(idConst2DS);     globals.push_back(2);
+        globals.push_back(head(OpConstant, 4));   globals.push_back(idInt); globals.push_back(idConst3DS);     globals.push_back(3);
+        {
+            const float zero = 0.0f; uint32_t bits; memcpy(&bits, &zero, 4);
+            globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(idConstZeroF); globals.push_back(bits);
+        }
+        globals.push_back(head(OpTypeArray, 4));  globals.push_back(idArrData); globals.push_back(idInt); globals.push_back(idConstDataN);
+        globals.push_back(head(OpTypeStruct, 6)); globals.push_back(idStructDS);
+        globals.push_back(idMat4); globals.push_back(idV4); globals.push_back(idIV4); globals.push_back(idArrData);
+        globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrDSStruct); globals.push_back(SC_StorageBuffer); globals.push_back(idStructDS);
+        globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrDSInt);    globals.push_back(SC_StorageBuffer); globals.push_back(idInt);
+        globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrDSMat4);   globals.push_back(SC_StorageBuffer); globals.push_back(idMat4);
+        globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrDSV4);     globals.push_back(SC_StorageBuffer); globals.push_back(idV4);
+        globals.push_back(head(OpTypePointer, 4)); globals.push_back(idPtrDSIV4);    globals.push_back(SC_StorageBuffer); globals.push_back(idIV4);
+        globals.push_back(head(OpVariable, 4));    globals.push_back(idPtrDSStruct); globals.push_back(idDSVar); globals.push_back(SC_StorageBuffer);
+    }
     globals.push_back(head(OpVariable, 4)); globals.push_back(idPtrOutV4); globals.push_back(idOutCurr); globals.push_back(SC_Output);
     globals.push_back(head(OpVariable, 4)); globals.push_back(idPtrOutV4); globals.push_back(idOutPrev); globals.push_back(SC_Output);
 
@@ -1340,12 +1428,18 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
             // Input and Output. Getting this wrong is a validation error rather
             // than a silent one, which is a mercy.
             bool needPC = (version >= 0x00010400u);
-            uint16_t extra = needPC ? 3 : 2;
+            // The storage buffer is a global variable too, so from 1.4 it has
+            // to be listed here as well. Omitting it is a validation error
+            // rather than a silent one, which is the mercy noted above - but it
+            // would be a validation error in fifteen thousand pipelines.
+            const bool needDS = needPC && wantDestruct;
+            uint16_t extra = (uint16_t)(2 + (needPC ? 1 : 0) + (needDS ? 1 : 0));
             out.push_back(head(OpEntryPoint, (uint16_t)(len + extra)));
             for (uint16_t k = 1; k < len; ++k) out.push_back(w[i + k]);
             out.push_back(idOutCurr);
             out.push_back(idOutPrev);
             if (needPC) out.push_back(idPCVar);
+            if (needDS) out.push_back(idDSVar);
             i += len;
             continue;
         }
@@ -1356,6 +1450,117 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         if (i == annotationsEnd) for (size_t k = 0; k < annos.size();   ++k) out.push_back(annos[k]);
         if (i == globalsEnd)     for (size_t k = 0; k < globals.size(); ++k) out.push_back(globals[k]);
         if (i == injectAt)       for (size_t k = 0; k < body.size();    ++k) out.push_back(body[k]);
+    }
+
+
+    // ================= CRASH DESTRUCTION: WHICH CELL IS THIS VERTEX IN =====
+    //
+    // Emitted only when destructSet >= 0, which means crash.enable was on when
+    // the device came up. When it is off these instructions do not exist, so
+    // normal flight cannot be affected by a bug in them.
+    //
+    // BRANCH-FREE ON PURPOSE. The natural shape is "if inside, store" - but a
+    // branch means splitting the basic block this injection lands in, giving
+    // the old half a terminator and building new labels inside a function
+    // somebody else wrote. That is the most invasive thing this injector could
+    // do, across 15000 pipelines, where being wrong is a black screen.
+    //
+    // So: compute the index, compute whether it is legal, OpSelect between the
+    // real cell and a discard word nothing reads, and store unconditionally.
+    // gpuStoreIndex() in gpu_layout.h is this same select chain in C, and the
+    // test suite runs it against gridClassify() including the reject path.
+    if (wantDestruct) {
+        // gl_Position's x, y and w. The same three components prevClip is
+        // built from, and for the same reason: the reconstruction is linear in
+        // (x, y, w), so a matrix can carry clip space all the way to
+        // aircraft-local without the shader ever knowing the projection.
+        const uint32_t idCX = bound++, idCY = bound++, idCW = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idCX); body.push_back(idLoadedPos); body.push_back(0);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idCY); body.push_back(idLoadedPos); body.push_back(1);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idCW); body.push_back(idLoadedPos); body.push_back(3);
+
+        const uint32_t idClipV = bound++;
+        body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idClipV);
+        body.push_back(idCX); body.push_back(idCY); body.push_back(idCW); body.push_back(idConstOneV);
+
+        // clipToLocal, composed on the CPU from the aircraft transform and the
+        // projection, so the shader does one matrix multiply and no division.
+        const uint32_t idPM = bound++, idM = bound++, idLocal = bound++;
+        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrDSMat4); body.push_back(idPM); body.push_back(idDSVar); body.push_back(idConst0);
+        body.push_back(head(OpLoad, 4)); body.push_back(idMat4); body.push_back(idM); body.push_back(idPM);
+        body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4); body.push_back(idLocal); body.push_back(idM); body.push_back(idClipV);
+
+        // Grid origin and cell size, then the integer dimensions.
+        const uint32_t idPG = bound++, idG = bound++, idCell = bound++;
+        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrDSV4); body.push_back(idPG); body.push_back(idDSVar); body.push_back(idConst1);
+        body.push_back(head(OpLoad, 4)); body.push_back(idV4); body.push_back(idG); body.push_back(idPG);
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idCell); body.push_back(idG); body.push_back(3);
+
+        const uint32_t idPD = bound++, idD = bound++;
+        body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrDSIV4); body.push_back(idPD); body.push_back(idDSVar); body.push_back(idConst2DS);
+        body.push_back(head(OpLoad, 4)); body.push_back(idIV4); body.push_back(idD); body.push_back(idPD);
+
+        // Per axis: subtract the origin, divide by the cell, reject negative
+        // BEFORE the truncation, truncate, reject at or above the dimension.
+        // The order matches gridClassify() exactly - OpConvertFToS rounds
+        // toward zero, which only equals floor() for non-negative input, so
+        // testing the sign after the cast would classify -0.5 as cell 0.
+        uint32_t idC[3], idBad[3], idN[3];
+        for (int a = 0; a < 3; ++a) {
+            const uint32_t idLA = bound++, idMA = bound++, idSub = bound++, idF = bound++;
+            body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idLA); body.push_back(idLocal); body.push_back((uint32_t)a);
+            body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idMA); body.push_back(idG);     body.push_back((uint32_t)a);
+            body.push_back(head(OpFSub, 5)); body.push_back(idFloat); body.push_back(idSub); body.push_back(idLA); body.push_back(idMA);
+            body.push_back(head(OpFDiv, 5)); body.push_back(idFloat); body.push_back(idF);   body.push_back(idSub); body.push_back(idCell);
+
+            const uint32_t idNeg = bound++;
+            body.push_back(head(OpFOrdLessThan, 5)); body.push_back(idBool); body.push_back(idNeg); body.push_back(idF); body.push_back(idConstZeroF);
+
+            idC[a] = bound++;
+            body.push_back(head(OpConvertFToS, 4)); body.push_back(idInt); body.push_back(idC[a]); body.push_back(idF);
+
+            idN[a] = bound++;
+            body.push_back(head(OpCompositeExtract, 5)); body.push_back(idInt); body.push_back(idN[a]); body.push_back(idD); body.push_back((uint32_t)a);
+
+            const uint32_t idHigh = bound++;
+            body.push_back(head(OpSGreaterThanEqual, 5)); body.push_back(idBool); body.push_back(idHigh); body.push_back(idC[a]); body.push_back(idN[a]);
+
+            idBad[a] = bound++;
+            body.push_back(head(OpLogicalOr, 5)); body.push_back(idBool); body.push_back(idBad[a]); body.push_back(idNeg); body.push_back(idHigh);
+        }
+
+        // Any axis out of range, or discovery switched off, sends the write to
+        // the discard slot.
+        const uint32_t idBad01 = bound++, idBadAll = bound++;
+        body.push_back(head(OpLogicalOr, 5)); body.push_back(idBool); body.push_back(idBad01);  body.push_back(idBad[0]); body.push_back(idBad[1]);
+        body.push_back(head(OpLogicalOr, 5)); body.push_back(idBool); body.push_back(idBadAll); body.push_back(idBad01);  body.push_back(idBad[2]);
+
+        const uint32_t idAct = bound++, idActive = bound++, idInactive = bound++, idSkip = bound++;
+        body.push_back(head(OpCompositeExtract, 5)); body.push_back(idInt); body.push_back(idAct); body.push_back(idD); body.push_back(3);
+        body.push_back(head(OpINotEqual, 5)); body.push_back(idBool); body.push_back(idActive); body.push_back(idAct); body.push_back(idConst0);
+        body.push_back(head(OpLogicalNot, 4)); body.push_back(idBool); body.push_back(idInactive); body.push_back(idActive);
+        body.push_back(head(OpLogicalOr, 5)); body.push_back(idBool); body.push_back(idSkip); body.push_back(idBadAll); body.push_back(idInactive);
+
+        // index = cx + cy*nx + cz*nx*ny, the same expression gridClassify uses.
+        const uint32_t idT1 = bound++, idNXY = bound++, idT2 = bound++;
+        const uint32_t idSum1 = bound++, idIdx = bound++;
+        body.push_back(head(OpIMul, 5)); body.push_back(idInt); body.push_back(idT1);  body.push_back(idC[1]); body.push_back(idN[0]);
+        body.push_back(head(OpIMul, 5)); body.push_back(idInt); body.push_back(idNXY); body.push_back(idN[0]); body.push_back(idN[1]);
+        body.push_back(head(OpIMul, 5)); body.push_back(idInt); body.push_back(idT2);  body.push_back(idC[2]); body.push_back(idNXY);
+        body.push_back(head(OpIAdd, 5)); body.push_back(idInt); body.push_back(idSum1); body.push_back(idC[0]);  body.push_back(idT1);
+        body.push_back(head(OpIAdd, 5)); body.push_back(idInt); body.push_back(idIdx);  body.push_back(idSum1);  body.push_back(idT2);
+
+        // OpSelect returns the SECOND operand when the condition is true.
+        const uint32_t idFinal = bound++;
+        body.push_back(head(OpSelect, 6)); body.push_back(idInt); body.push_back(idFinal);
+        body.push_back(idSkip); body.push_back(idConstDiscard); body.push_back(idIdx);
+
+        const uint32_t idPStore = bound++;
+        body.push_back(head(OpAccessChain, 6)); body.push_back(idPtrDSInt); body.push_back(idPStore);
+        body.push_back(idDSVar); body.push_back(idConst3DS); body.push_back(idFinal);
+        body.push_back(head(OpStore, 3)); body.push_back(idPStore); body.push_back(idConst1);
+
+        ++occupancyVsCount();
     }
 
     // ---- DUMP THE PATCHED MODULE, NOT JUST THE ORIGINAL.
@@ -1418,6 +1623,13 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 // also mean extending each pipeline layout with a fragment-visible range, which
 // is the kind of change that turns a rendering bug into a validation error.
 //
+// The original arity, for callers that do not care about destruction.
+inline Result inject(const uint32_t *code, size_t sizeBytes,
+                     std::vector<uint32_t> &out, uint32_t *location)
+{
+    return inject(code, sizeBytes, out, location, -1);
+}
+
 inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
                              std::vector<uint32_t> &out, uint32_t attachmentIndex,
                              bool alphaBlended)

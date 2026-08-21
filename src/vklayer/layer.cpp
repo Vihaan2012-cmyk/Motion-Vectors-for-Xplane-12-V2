@@ -118,6 +118,7 @@ static void trace(const char *fmt, ...)
 // calls trace() and live::, both defined above.
 #include "vram.h"
 #include "upscaler_policy.h"
+#include "xess_probe.h"
 
 // ------------------------------------------------------- shared memory
 
@@ -9301,7 +9302,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
             // Vertex first; if it is not a vertex shader, try the fragment
             // transform on the same module. One of the two applies, or neither
             // does and it is a compute shader we have no business touching.
-            spvinj::Result r = spvinj::inject(ci->pCode, ci->codeSize, patched, &loc);
+            // The set index is passed rather than assumed. -1 means emit nothing at
+            // all, so with crash.enable off the occupancy instructions do not
+            // exist in the module and cannot affect normal flight.
+            const int dsSet = (crashEnabled() && destructgpu::state().ready)
+                                ? (int)destructgpu::state().setIndex : -1;
+            spvinj::Result r = spvinj::inject(ci->pCode, ci->codeSize, patched, &loc, dsSet);
             if (r == spvinj::INJ_NOT_VERTEX) {
                 // USE THE REAL ATTACHMENT INDEX, NOT A NOMINAL 1.
                 //
@@ -10070,7 +10076,9 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
     std::vector<uint32_t> patched;
     uint32_t loc = 0;
     VkShaderModule out = VK_NULL_HANDLE;
-    spvinj::Result ir = spvinj::inject(src.data(), src.size() * 4, patched, &loc);
+    const int dsSet2 = (crashEnabled() && destructgpu::state().ready)
+                         ? (int)destructgpu::state().setIndex : -1;
+    spvinj::Result ir = spvinj::inject(src.data(), src.size() * 4, patched, &loc, dsSet2);
     mvNoteInjectReason(ir);
     if (ir == spvinj::INJ_OK) mvMaybeDumpSpirv(patched, "vert");
     if (ir == spvinj::INJ_OK) {
@@ -12060,6 +12068,35 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
             g_nextEnumDeviceExt(phys, nullptr, &n, have.data());
         }
         trace("DEVICE: driver offers %zu device extensions", have.size());
+
+        // ---- ASK XeSS WHAT IT WOULD NEED, WHILE A DEVICE CAN STILL BE GIVEN IT.
+        //
+        // xessVKCreateContext takes a device that was ALREADY created with the
+        // extensions and features XeSS requires, so this is the only moment the
+        // answer can be acted on - afterwards X-Plane's device exists and a
+        // layer cannot go back and add to it.
+        //
+        // Reported whether or not it succeeds. "XeSS wants three extensions
+        // this driver does not have" and "libxess.dll is missing" are different
+        // problems, and the availability report has different names for them.
+        {
+            xessprobe::query(g_firstInstance, phys);
+            const xessprobe::Requirements &xr = xessprobe::state();
+            if (xr.queried) {
+                trace("XESS: runtime %u.%u.%u wants %zu device extension(s)",
+                      xr.major, xr.minor, xr.patch, xr.deviceExts.size());
+                for (size_t xi = 0; xi < xr.deviceExts.size(); ++xi) {
+                    bool present = false;
+                    for (size_t k = 0; k < have.size(); ++k)
+                        if (strcmp(have[k].extensionName,
+                                   xr.deviceExts[xi].c_str()) == 0) { present = true; break; }
+                    trace("XESS:   %-52s %s", xr.deviceExts[xi].c_str(),
+                          present ? "offered by the driver" : "NOT OFFERED - XeSS cannot run here");
+                }
+            } else {
+                trace("XESS: not usable - %s", xr.why);
+            }
+        }
 
         // ---- UPSCALER CAPABILITY, RECORDED WHILE THE LIST IS IN SCOPE.
         //

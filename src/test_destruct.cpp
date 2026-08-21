@@ -554,9 +554,11 @@ int main()
     {
         check(destruct::kOffOccupancy == 96,
               "the header is 96 bytes and occupancy starts after it");
-        check(destruct::kOffXform ==
+        check(destruct::kOffDiscard ==
                   destruct::kOffOccupancy + destruct::kMaxCells * 4u,
-              "transforms start after the whole occupancy region");
+              "the discard slot sits immediately after the occupancy region");
+        check(destruct::kOffXform >= destruct::kOffDiscard + 4u,
+              "transforms start after the discard slot, not on top of it");
         check(destruct::kWordOccupancy * 4u == destruct::kOffOccupancy,
               "word and byte offsets agree for occupancy");
         check(destruct::kWordXform * 4u == destruct::kOffXform,
@@ -574,6 +576,74 @@ int main()
         huge.cell = 0.4f; huge.nx = 200; huge.ny = 200; huge.nz = 200;
         check(destruct::gpuCellCount(huge) == destruct::kMaxCells,
               "an oversized grid clamps to the buffer rather than overrunning it");
+    }
+
+
+    // -------------------------------------------- the branch-free reject path
+    //
+    // The shader has no branch: it OpSelects between the real cell and a
+    // discard slot and then stores unconditionally. That makes the REJECT path
+    // as important to test as the accept path, because a wrong select does not
+    // fail loudly - it marks a cell occupied from somewhere in the world, and
+    // the aeroplane grows a fragment in mid-air.
+    printf("\ndiscovery rejects land in the discard slot\n");
+    {
+        float bbMin[3] = { -18.0f, -4.0f, -21.0f };
+        float bbMax[3] = {  18.0f,  7.0f,  21.0f };
+        destruct::Grid g = destruct::gridForBounds(bbMin, bbMax);
+
+        // Dead centre of the box: inside, and must map to its real cell.
+        float mid[3] = { 0.0f, 1.5f, 0.0f };
+        const int midCell = destruct::gridClassify(g, mid);
+        check(midCell >= 0, "the centre of the box is inside the grid");
+        check(destruct::gpuStoreIndex(mid, g.min, g.cell, g.nx, g.ny, g.nz, 1)
+                  == (uint32_t)midCell,
+              "an inside vertex stores to its own cell");
+
+        // Same vertex with discovery off must not touch that cell.
+        check(destruct::gpuStoreIndex(mid, g.min, g.cell, g.nx, g.ny, g.nz, 0)
+                  == destruct::kDataDiscard,
+              "with discovery off even an inside vertex goes to the discard slot");
+
+        // Far outside in every direction.
+        float far1[3] = { 1000.0f, 1000.0f, 1000.0f };
+        float far2[3] = { -1000.0f, -1000.0f, -1000.0f };
+        check(destruct::gpuStoreIndex(far1, g.min, g.cell, g.nx, g.ny, g.nz, 1)
+                  == destruct::kDataDiscard,
+              "a vertex far above the grid is discarded");
+        check(destruct::gpuStoreIndex(far2, g.min, g.cell, g.nx, g.ny, g.nz, 1)
+                  == destruct::kDataDiscard,
+              "a vertex far below the grid is discarded");
+
+        // The specific trap: a reject must NOT land in cell 0. If it did, the
+        // aeroplane's first cell would read occupied from anywhere on earth.
+        check(destruct::kDataDiscard != 0,
+              "the discard slot is not cell 0");
+        bool anyRejectHitsZero = false;
+        unsigned seed = 99u;
+        for (int t = 0; t < 5000; ++t) {
+            seed = seed * 1664525u + 1013904223u;
+            float p[3];
+            for (int a = 0; a < 3; ++a) {
+                seed = seed * 1664525u + 1013904223u;
+                const float u = (float)((seed >> 8) & 0xFFFF) / 65535.0f;
+                p[a] = -400.0f + u * 800.0f;
+            }
+            if (destruct::gridClassify(g, p) < 0 &&
+                destruct::gpuStoreIndex(p, g.min, g.cell, g.nx, g.ny, g.nz, 1) == 0)
+                anyRejectHitsZero = true;
+        }
+        check(!anyRejectHitsZero,
+              "no rejected vertex out of 5000 lands in cell 0");
+
+        // And the discard slot must be inside the buffer but outside both the
+        // cells the CPU reads and the transforms.
+        check(destruct::kDataDiscard >= destruct::gpuCellCount(g),
+              "the discard slot is past every cell this grid uses");
+        check(destruct::kDataDiscard < destruct::kDataXform,
+              "and before the transform region, so a reject cannot corrupt one");
+        check(destruct::kDataXform < destruct::kDataWords,
+              "the transform region is inside the buffer");
     }
 
     printf("\n%s: %d failure(s)\n", g_fail ? "FAILED" : "OK", g_fail);
