@@ -62,6 +62,21 @@ taa.reactive is off by default. If you fly a propeller aircraft and see
 artefacts around the propeller disc, set taa.reactive=1.
 
 
+ANTIVIRUS
+
+Some scanners flag MotionVectorsLauncher.exe. It is a false positive, and
+the reason is structural rather than suspicious: the launcher sets two
+environment variables and starts X-Plane.exe, which is the same shape as a
+loader, and it is small, new and unsigned.
+
+The whole thing is 132 lines of source, in the repository, and the built
+binary imports exactly four Windows functions - SetEnvironmentVariableA,
+CreateProcessA, and LoadLibraryA/GetProcAddress from the C runtime. No
+networking, no registry, no file writes.
+
+You can build it yourself from source if you would rather not take that on
+trust.
+
 LICENCE
 
 GPL-3.0. Source: github.com/Vihaan2012-cmyk/Motion-Vectors-for-Xplane-12-V2

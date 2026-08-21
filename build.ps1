@@ -114,7 +114,7 @@ Write-Host "Building launcher..."
 # starts the sim, so the layer is EXPLICIT and is never loaded into any other
 # Vulkan application.
 & g++ -o "$out\MotionVectorsLauncher.exe" "$src\launcher.cpp" `
-  -m64 -O2 -std=c++17 -mwindows -static -static-libgcc -static-libstdc++
+  -m64 -O2 -std=c++17 -mwindows -static -static-libgcc -static-libstdc++ -s
 if ($LASTEXITCODE -ne 0) { throw "launcher build failed" }
 
 
