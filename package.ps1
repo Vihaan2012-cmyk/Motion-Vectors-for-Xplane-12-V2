@@ -98,7 +98,23 @@ Copy-Item "$root\build\MotionVectors.xpl" "$stage\Resources\plugins\MotionVector
 # The panel is a FlyWithLua script. Shipped, but optional - the mod runs without
 # it; it only provides the in-sim controls.
 if (Test-Path "$root\lua\MotionVectors.lua") {
-    Copy-Item "$root\lua\MotionVectors.lua" "$stage\Resources\plugins\FlyWithLua\Scripts\"
+    # STAMPED FROM VERSION, exactly as build.ps1 does on install.
+    #
+    # A plain copy shipped a panel reporting 0.0.18 inside the 0.0.20 zip: the
+    # settings and the code were current and only the constant was stale, which
+    # is the worst version of this bug because everything else looks right. The
+    # release that goes to users is the one place that must not disagree with
+    # itself about what it is.
+    #
+    # Written without a BOM: PowerShell 5.1's -Encoding utf8 writes one and
+    # FlyWithLua's Lua 5.1 cannot parse past it, which quarantines the script.
+    $luaText = Get-Content "$root\lua\MotionVectors.lua" -Raw
+    $luaOut  = [regex]::Replace($luaText,
+                   'local MOD_VERSION\s*=\s*"[^"]*"',
+                   ('local MOD_VERSION      = "' + $ver + '"'))
+    [System.IO.File]::WriteAllText(
+        "$stage\Resources\plugins\FlyWithLua\Scripts\MotionVectors.lua",
+        $luaOut, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 # The tuned settings, for reference. NOT required: every value here is also a
