@@ -79,7 +79,7 @@
 #include <math.h>
 
 #define TAA_MAGIC       0x4D414154u            // 'TAAM'
-#define TAA_VERSION     7      // 7: VRAM system state (zone, shaped budget, ...)
+#define TAA_VERSION     8      // 8: crash destruction state (grid, transform)
 
 // Which temporal backend to run. All of them consume the SAME inputs - velocity
 // buffer, jitter sequence, insertion point - which is the whole reason the
@@ -580,6 +580,53 @@ struct TaaShare {
     uint32_t measDisplayW, measDisplayH;
 
     int32_t valid;            // 0 until two frames of history exist
+
+    // ---- CRASH DESTRUCTION (v8)
+    //
+    // APPENDED, never inserted. Every field above keeps the offset it had in
+    // v7, so a layer and a plugin built at different times disagree on
+    // structSize and bail cleanly rather than reading the wrong bytes and
+    // producing a plausible-looking wrong answer.
+    //
+    // The plugin owns the simulation and the layer owns the pixels, so this is
+    // the whole contract between them: the plugin publishes where the airframe
+    // is and how it is divided, and the layer classifies vertices against it.
+
+    // 1 while wreckage exists. The shader's per-vertex work is gated on this,
+    // so normal flight pays for one uniform branch and nothing else.
+    int32_t crashActive;
+
+    // Severity from the trigger: 0 none, 1 hard, 2 structural, 3 breakup.
+    // Published so the layer can scale scorching without re-deriving it.
+    int32_t crashSeverity;
+
+    // VIEW space -> airframe-local. The vertex shader reconstructs view space
+    // from gl_Position (measured to hold across every pass - see the viz=10
+    // probe) and multiplies by this to reach the frame the grid is defined in.
+    // Column-major, same convention as the reprojection matrices above.
+    float crashAircraftInv[16];
+
+    // The grid, in airframe-local metres. gridClassify in destruct/grid.h and
+    // the shader perform the IDENTICAL arithmetic on these; if the two ever
+    // disagree, the physics acts on one set of fragments and the picture shows
+    // another.
+    float   crashGridMin[3];
+    float   crashCell;
+    int32_t crashNx, crashNy, crashNz;
+
+    // How many OCCUPIED cells have transforms. An airliner's bounding box is
+    // mostly air, so this is a few percent of nx*ny*nz.
+    int32_t crashPartCount;
+
+    // One plane for the whole debris field, probed once at the impact point.
+    // Per-fragment terrain probes would be 2000 a frame for a difference
+    // nobody can see over a few tens of metres.
+    float crashGroundHeight;
+
+    // Where the impact landed, airframe-local. Fragment energy radiates from
+    // here, and the scorching in the fragment shader is keyed on distance from
+    // it, so the burn pattern stays attached to the wreckage.
+    float crashImpactLocal[3];
 };
 
 // ------------------------------------------------------------ matrix helpers

@@ -196,9 +196,24 @@ def main(d):
     # ------------------------------------------------------ passes
     section("velocity target binding")
 
+    # ---- "SCENE - binding" CAN BE STARVED, SO FALL BACK TO MV BINDS.
+    #
+    # The distinct-shape logger is capped at 40 shapes, and early in a run the
+    # velocity target is still 0x0, so forty NOT-the-scene shapes can fill the
+    # set before a single scene pass registers. The binding is then perfectly
+    # healthy and this check reports BAD, which is the bench inventing a fault.
+    #
+    # MV BINDS counts passes that ACTUALLY bound the target in a frame, and is
+    # not capped, so it is the authority. The shape lines stay as the richer
+    # answer when they are present.
     bound = sorted(set(re.findall(r"pass shape (\d+x\d+) colour=(\d+) depth=yes -> SCENE", tx))) if haveTrace else []
+    binds = re.findall(r"MV BINDS: (\d+) pass\(es\) bound", tx) if haveTrace else []
     if not haveTrace:
         line(VOID, "scene passes bound", "no trace")
+    elif not bound and binds:
+        line(OK, "scene passes bound",
+             "%s passes bound per frame (shape lines starved by the 40-shape cap)"
+             % max(int(b) for b in binds))
     elif bound:
         line(OK if len(bound) >= 2 else BAD, "scene passes bound",
              ", ".join("%s c=%s" % (s, c) for s, c in bound))
