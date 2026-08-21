@@ -1,52 +1,5 @@
 ﻿#pragma once
 
-// ============================================================ THE VRAM SYSTEM
-//
-// The Engineering Plan (VRAM_STUDY.md, local doc, maps it against the engine),
-// implemented in the layer. X-Plane HAS the mechanisms - VMA, a budget query,
-// a defragmenter, a global-scale texture pager - but it does not DO the plan:
-// no zones, no hysteresis worth the name (measured: scale 1.0 -> 2.0 -> 1.0 in
-// one second with headroom collapsing to zero), no memory priorities (the
-// extension is enabled and never used), no deferred-free recycling, no upload
-// pacing, no prediction. This file is those pieces, built where the layer sits:
-// between every call X-Plane makes and the driver that answers it.
-//
-// The actuators, and why each lives where it does:
-//
-//   BUDGET SHAPER   - vkGetPhysicalDeviceMemoryProperties2 is the ONE number
-//                     X-Plane's whole memory stack reads (VMA's heapBudget
-//                     feeds the memory controller feeds the texture pager's
-//                     evaluate()). Shaping it steers the engine without
-//                     touching a byte of engine state.
-//   ZONES           - GREEN/YELLOW/ORANGE/RED/CRITICAL from projected usage,
-//                     with split enter/exit thresholds and dwell, so every
-//                     other actuator has one word to key from instead of five
-//                     raw numbers.
-//   RECYCLE POOL    - deferred free + reuse of device-local allocations. The
-//                     plan's SS19 retire queue, at the only level the layer
-//                     truly owns.
-//   PRIORITY ENGINE - VkMemoryPriorityAllocateInfoEXT at allocation and
-//                     vkSetDeviceMemoryPriorityEXT at first bind. Measured:
-//                     the engine enables VK_EXT_memory_priority and never sets
-//                     one, so under WDDM pressure the driver demotes render
-//                     targets as blindly as stale autogen. This fixes that.
-//   UPLOAD GOVERNOR - caps bytes submitted per frame on the transfer-only
-//                     queue under pressure, holding whole submissions in FIFO
-//                     and releasing them on a budget - with flush triggers on
-//                     every wait path so nothing can deadlock (SS below).
-//   PREDICTOR      -  camera speed and teleport detection from the camera
-//                     delta the layer already receives per frame. No datarefs,
-//                     no art controls - this system runs entirely from what
-//                     passes through the layer.
-//   EMERGENCY       - on VK_ERROR_OUT_OF_DEVICE_MEMORY: flush the recycle
-//                     pool (real bytes back to the driver), deflate the shaped
-//                     budget so the engine's own pager cuts on its next
-//                     evaluate, then let the caller retry.
-//
-// Everything is live-controllable (vram.* keys in taa_live.ini), defaults ON -
-// the env-gated-feature trap is documented three times in learnings.md and is
-// not being walked into a fourth.
-
 #include <vulkan/vulkan.h>
 #include <windows.h>
 #include <algorithm>
@@ -62,52 +15,39 @@
 
 namespace vram {
 
-// ------------------------------------------------------------------ config
-// Read through live:: (file > env > default). Cached per frame in onPresent so
-// hot paths never touch the live mutex.
 struct Config {
-    bool  enable;            // vram.enable          master switch
-    bool  shape;             // vram.shape           budget shaping on/off
-    bool  recycle;           // vram.recycle         deferred-free pool
-    bool  priority;          // vram.priority        memory priorities
-    bool  governor;          // vram.governor        upload pacing
-    float budgetAlpha;       // vram.budget_alpha    low-pass per query
-    int   reserveMB[5];      // vram.reserve_g/y/o/r/c
-    int   deflateMB;         // vram.deflate_mb      emergency budget cut
-    int   deflateFrames;     // vram.deflate_frames  how long the cut lasts
-    int   recycleMaxMB;      // vram.recycle_max_mb
-    int   recycleHoldFrames; // vram.recycle_hold_frames
-    int   uploadBudgetMB[5]; // vram.upload_g/y/o/r/c   per-frame transfer cap
-    int   uploadMaxHold;     // vram.upload_max_hold    frames a submit may wait
-    float teleportM;         // vram.teleport_m         camera jump threshold
-    int   teleportFrames;    // vram.teleport_frames    zone bias duration
-    int   traceEvery;        // vram.trace_every        heartbeat cadence
-    float speedReserve;      // vram.speed_reserve      reserve growth per m/frame
-    bool  adaptive;          // vram.adaptive           frame-time feedback
-    bool  uploadCache;       // vram.upload_cache       content elision (SS23)
-    int   warmupFrames;      // vram.warmup_frames      SS73 progressive fill
-    int   warmupMB;          // vram.warmup_mb          extra reserve at frame 0
-    int   holdMaxMB;         // vram.hold_max_mb        governor backpressure
-    int   lookaheadFrames;   // vram.lookahead          SS85 trend horizon
-    int   ageFrames;         // vram.age_frames         SS86 staleness window
+    bool  enable;
+    bool  shape;
+    bool  recycle;
+    bool  priority;
+    bool  governor;
+    float budgetAlpha;
+    int   reserveMB[5];
+    int   deflateMB;
+    int   deflateFrames;
+    int   recycleMaxMB;
+    int   recycleHoldFrames;
+    int   uploadBudgetMB[5];
+    int   uploadMaxHold;
+    float teleportM;
+    int   teleportFrames;
+    int   traceEvery;
+    float speedReserve;
+    bool  adaptive;
+    bool  uploadCache;
+    int   warmupFrames;
+    int   warmupMB;
+    int   holdMaxMB;
+    int   lookaheadFrames;
+    int   ageFrames;
 };
-// BOOT-SAFE DEFAULTS: every actuator starts OFF and flips to its live-file /
-// env / built-in value at the first refreshConfig. The old initializers left
-// elision, recycling and priority tagging live for the splash-screen seconds
-// before the first poll - an untested window that ran on every launch and
-// could never be switched off. Telemetry (enable) boots on; actuation waits
-// for configuration.
+
 static Config cfg = { true, false, false, false, false,
                       0.02f, {128,256,384,512,768}, 512, 600,
                       256, 180, {0,0,64,24,8}, 2,
                       2000.0f, 900, 600, 0.01f, true,
                       false, 900, 512, 512, 300, 1800 };
 
-// ---- TOTAL KILL: TAA_VRAM_HOOKS=0 makes every entry point in this file an
-// early-out - not just the dispatch hooks but the in-hook additions too, so
-// the layer's behavior is byte-equivalent to the pre-VRAM build. The bisect
-// demanded it: crashes survived dispatch-stripping, so the knife must cut
-// beneath it.
 static bool alive()
 {
     static int a = -1;
@@ -118,7 +58,6 @@ static bool alive()
     return a != 0;
 }
 
-// ------------------------------------------------------------------ zones
 enum Zone { GREEN = 0, YELLOW, ORANGE, RED, CRITICAL };
 static const char *zoneName(int z)
 {
@@ -129,45 +68,39 @@ static const char *zoneName(int z)
     }
 }
 
-// ------------------------------------------------------------------ state
-static std::mutex m;                 // guards everything below except atomics
+static std::mutex m;
 
 struct Dev {
     VkDevice         dev  = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
-    PFN_vkGetPhysicalDeviceMemoryProperties2 memProps2 = nullptr;  // down-chain
-    PFN_vkFreeMemory                 freeMemory  = nullptr;        // down-chain
-    PFN_vkUnmapMemory                unmapMemory = nullptr;        // down-chain
-    PFN_vkQueueSubmit                queueSubmit = nullptr;        // down-chain
-    PFN_vkSetDeviceMemoryPriorityEXT setPriority = nullptr;        // down-chain
-    bool priorityExt = false;        // VK_EXT_memory_priority enabled on device
-    bool pageableExt = false;        // VK_EXT_pageable_device_local_memory
-    VkPhysicalDeviceMemoryProperties memProps;   // cached, for type properties
-    uint32_t transferFamily = ~0u;   // the transfer-ONLY family, if any
+    PFN_vkGetPhysicalDeviceMemoryProperties2 memProps2 = nullptr;
+    PFN_vkFreeMemory                 freeMemory  = nullptr;
+    PFN_vkUnmapMemory                unmapMemory = nullptr;
+    PFN_vkQueueSubmit                queueSubmit = nullptr;
+    PFN_vkSetDeviceMemoryPriorityEXT setPriority = nullptr;
+    bool priorityExt = false;
+    bool pageableExt = false;
+    VkPhysicalDeviceMemoryProperties memProps;
+    uint32_t transferFamily = ~0u;
 } dev;
 
-// Queues, recorded from vkGetDeviceQueue. Only transfer-only-family queues are
-// governed; everything else passes through untouched.
 static std::set<VkQueue> g_transferQueues;
-// Per-governed-queue submit serialisation. VkQueue is externally synchronised;
-// once the layer can submit to a queue from two threads (the app's and a flush
-// trigger's), the layer must provide the exclusion the spec assumes.
+
 static std::map<VkQueue, std::mutex*> g_queueLock;
 
-// ---- telemetry (atomics where hot paths touch them)
-static uint64_t heapSize = 0;        // device-local heap, bytes
-static uint64_t rawBudget = 0, rawUsage = 0;      // driver's latest
-static double   filteredBudget = 0.0;             // low-passed
-static uint64_t lastReported = 0;                 // monotone-under-free clamp
-static uint64_t lastLedgerBytes = 0;              // app trend detection
-static std::atomic<uint64_t> ledgerBytesNow(0);   // fed from layer ledger
+static uint64_t heapSize = 0;
+static uint64_t rawBudget = 0, rawUsage = 0;
+static double   filteredBudget = 0.0;
+static uint64_t lastReported = 0;
+static uint64_t lastLedgerBytes = 0;
+static std::atomic<uint64_t> ledgerBytesNow(0);
 static int      zone = GREEN;
-static int      zoneDwell = 0;                    // frames since last change
-static int      deflateLeft = 0;                  // frames of emergency cut
-static int      teleportLeft = 0;                 // frames of teleport bias
+static int      zoneDwell = 0;
+static int      deflateLeft = 0;
+static int      teleportLeft = 0;
 static uint64_t frameIndex = 0;
 
-static std::atomic<uint64_t> upBytesFrame(0);     // charged at record time
+static std::atomic<uint64_t> upBytesFrame(0);
 static uint64_t upBytesLast = 0, upBytesPeak = 0;
 static std::atomic<uint64_t> allocsTotal(0), freesTotal(0), allocFails(0);
 static std::atomic<uint64_t> allocLatWorstUs(0);
@@ -179,24 +112,15 @@ static uint64_t sparseBinds = 0;
 static double   camSpeedEma = 0.0;
 static uint64_t teleports = 0;
 
-// ---- frame-time statistics (plan SS29/30): the primary metric is
-// consistency, not average. A ring of present-to-present times feeds an EMA
-// for the adaptive upload notch and percentiles for the report.
 static double        g_ftRing[512];
 static int           g_ftAt = 0, g_ftN = 0;
 static LARGE_INTEGER g_lastPresentQpc;
 static bool          g_havePresentQpc = false;
-static double        frameAvgMs = 0.0;     // EMA, alpha 0.05
-static double        frameBestMs = 1e9;    // best recent EMA, decays upward
-static int           uploadNotch = 0;      // halves the upload budget per step
-static uint64_t      notchCalm = 0;        // clean frames since last notch
+static double        frameAvgMs = 0.0;
+static double        frameBestMs = 1e9;
+static int           uploadNotch = 0;
+static uint64_t      notchCalm = 0;
 
-// ---- churn (SS50/51): a texture that cycles resident->evicted->resident is
-// the classic streaming failure. Identity is the creation shape - the reload
-// creates a NEW VkImage, so the handle cannot carry it, but dims+format+mips
-// can. A key seen destroyed and re-created within the window is a cycle;
-// three cycles make the shape HOT, and hot images take a higher memory
-// priority at bind so the driver stops demoting exactly them.
 struct ChurnKey {
     uint32_t w, h, fmt, mips;
     bool operator<(const ChurnKey &o) const {
@@ -209,20 +133,14 @@ struct ChurnKey {
 struct ChurnRec {
     uint32_t creates = 0, destroys = 0, cycles = 0;
     uint64_t lastDestroyFrame = 0, bytes = 0;
-    uint8_t  lastDrop = 0;      // mips the pager cut at the last creation
+    uint8_t  lastDrop = 0;
 };
-static uint64_t mipRestorations = 0;   // shapes re-created at full quality
+static uint64_t mipRestorations = 0;
 static uint64_t perResProtected = 0, perResExtraCut = 0;
-static uint64_t zoneFlips = 0;         // transitions, for thrash learning
+static uint64_t zoneFlips = 0;
 static std::map<ChurnKey, ChurnRec> g_churn;
 static uint64_t churnCycles = 0;
 
-// ---- THE RESOURCE REGISTRY. One record per tracked image - the old shape
-// map absorbed rather than duplicated - carrying the intelligence layer's
-// whole view: a stable ResourceID that survives nothing (the SHAPE survives,
-// via g_churn), classification, protection, residency state, and the last
-// computed score. The ledger (layer-side) stays the byte-accounting truth;
-// this is the decision-making truth.
 enum ResClass {
     RC_UNKNOWN = 0, RC_RENDER_TARGET, RC_DEPTH, RC_SHADOW, RC_STORAGE,
     RC_CLOUD_VOLUME, RC_AIRCRAFT_COCKPIT, RC_SCENERY_STREAMED,
@@ -244,11 +162,11 @@ static const char *resClassName(int c)
     }
 }
 enum ResState {
-    RS_FULL = 0,            // full-quality physical representation resident
-    RS_REDUCED_AT_CREATE,   // pager capped its mips at creation
-    RS_DEMOTED,             // zone walk pushed its priority down
-    RS_AGED,                // aging walk decayed it for disuse
-    RS_DESTROYED            // logical identity lives on in g_churn/g_deadContent
+    RS_FULL = 0,
+    RS_REDUCED_AT_CREATE,
+    RS_DEMOTED,
+    RS_AGED,
+    RS_DESTROYED
 };
 static const char *resStateName(int s)
 {
@@ -260,25 +178,22 @@ static const char *resStateName(int s)
     }
 }
 struct ResRec {
-    uint64_t id;            // stable within the handle's lifetime
-    ChurnKey shape;         // identity that survives reloads (keys g_churn)
+    uint64_t id;
+    ChurnKey shape;
     uint64_t bytes;
     uint64_t createdFrame;
-    uint8_t  cls;           // ResClass
-    uint8_t  state;         // ResState
-    uint8_t  protection;    // 0 expendable .. 3 never touch
+    uint8_t  cls;
+    uint8_t  state;
+    uint8_t  protection;
     bool     streamed;
-    float    score;         // last computed unified score
-    // SPATIAL MAPPING: a resource is born where the camera was when its
-    // region loaded - the one world-position signal a layer can observe.
-    // Burst id groups resources created in the same loading wave: one
-    // scenery tile's textures arrive together.
+    float    score;
+
     float    birthX, birthY, birthZ;
     uint32_t burst;
 };
-// Camera state for the spatial terms, fed per present from the shared block.
+
 static float  g_camX = 0, g_camY = 0, g_camZ = 0;
-static float  g_camVX = 0, g_camVY = 0, g_camVZ = 0;   // m/frame EMA
+static float  g_camVX = 0, g_camVY = 0, g_camVZ = 0;
 static bool   g_camValid = false;
 static uint32_t g_burstId = 0;
 static uint64_t g_lastCreateFrame = 0;
@@ -286,57 +201,28 @@ static std::map<VkImage, ResRec> g_registry;
 static uint64_t g_nextResId = 1;
 static std::set<VkImage> g_hotImgs;
 
-// ---- pipeline creation (SS59): JIT pipeline compiles are a classic stutter
-// source. Counted and timed; creations after the first present are "live"
-// and the per-frame peak is the number that indicts a hitch.
 static std::atomic<uint64_t> pipesTotal(0), pipesLive(0), pipesFrame(0);
 static std::atomic<uint64_t> pipeUsTotal(0);
 static uint64_t pipesFramePeak = 0, pipesFramePeakAt = 0;
 
-// ---- descriptor churn (SS35): counters only - the engine owns its
-// descriptors; the layer's job is to know whether they are a problem.
 static std::atomic<uint64_t> descUpdFrame(0), descAllocFrame(0);
 static uint64_t descUpdPeak = 0, descAllocPeak = 0;
 
-// ---- duplicate uploads (SS52): the same image mip uploaded twice in one
-// frame is wasted PCIe bandwidth. Detected per frame, cleared at present.
 static std::set<std::pair<uint64_t, uint32_t> > g_upSeen;
 static uint64_t dupUploads = 0;
 
-// ---- render-target bytes (SS34): fed from the ledger each frame; the sum of
-// RT + depth + storage is the theoretical upper bound transient aliasing
-// could reclaim, reported so the investigation the plan asks for has its
-// number.
 static uint64_t rtBytesNow = 0;
 
-// ---- persistence (SS77): a small state file carries what a session learned
-// - allocation failures ever seen become a standing reserve bias, so a
-// machine that has hit the wall keeps more margin from the next launch on.
 static int      reserveBiasMB = 0;
 static uint64_t failsEver = 0;
-static int      ageBiasFrames = 0;   // learned: restores soon after decay
-static double   camRotEma = 0.0;     // deg/frame, scene-turn signal
+static int      ageBiasFrames = 0;
+static double   camRotEma = 0.0;
 
-// ---- host-pointer and binding tracking, the legal route into upload
-// contents. VMA maps its staging blocks through vkMapMemory, which passes
-// through the layer - so the pointer the APP holds is recorded here, and
-// reading through it at record time is reading our own process memory.
-// A second vkMapMemory would be a spec violation; remembering the first is
-// not.
 struct MapRec  { uint8_t *ptr; VkDeviceSize offset, size; };
 static std::map<VkDeviceMemory, MapRec> g_mapped;
 struct BufBind { VkDeviceMemory mem; VkDeviceSize offset; };
 static std::map<VkBuffer, BufBind> g_bufBind;
 
-// ---- the upload content cache (SS23/24). Two levels:
-//   LIVE:  (image, mip) -> content hash. A re-upload of identical bytes into
-//          the same subresource is ELIDED - the texels are already there and
-//          the PCIe transfer buys nothing.
-//   DEAD:  (shape, mip) -> content hash of destroyed images. When the engine
-//          reloads a texture from disk after eviction (new VkImage, same
-//          shape) and uploads the same bytes, the match is counted: that is
-//          the measured cost of the engine's missing CPU cache, stated in
-//          bytes rather than argued.
 struct MipKey {
     uint64_t img; uint32_t mip;
     bool operator<(const MipKey &o) const {
@@ -354,15 +240,9 @@ struct ShapeMip {
     }
 };
 static std::map<MipKey, uint64_t>   g_liveContent;
-static std::atomic<uint32_t>        g_liveContentCount(0);  // lock-free gate
+static std::atomic<uint32_t>        g_liveContentCount(0);
 static std::map<ShapeMip, uint64_t> g_deadContent;
-// ---- THE SERVING CACHE'S STORAGE (runtime-restoration prerequisite). When
-// the pager drops a mip's upload, the payload the engine decoded is the LAST
-// time those bytes exist outside the disk - so they are retained here,
-// bounded, keyed by shape+mip. A REDUCED resource whose top mips are retained
-// is RESTORE-READY: the migration executor (next slice, see the map) can
-// rebuild full quality without any disk round trip. Until then this is real
-// stored data, not measurement.
+
 static std::map<ShapeMip, std::vector<uint8_t> > g_retained;
 static uint64_t retainedBytes = 0, retainStores = 0, retainRefused = 0;
 
@@ -390,34 +270,24 @@ static void retainPayload(uint32_t w, uint32_t h, uint32_t fmt, uint32_t mip,
 static bool restoreReady(uint32_t w, uint32_t h, uint32_t fmt)
 {
     ShapeMip k; k.w = w; k.h = h; k.fmt = fmt; k.mip = 0;
-    return g_retained.count(k) != 0;      // m held by caller (report path)
+    return g_retained.count(k) != 0;
 }
 
 static uint64_t elidedUploads = 0, elidedBytes = 0;
 static uint64_t reloadIdenticalCount = 0, reloadIdenticalBytes = 0;
 static uint64_t hostRecycleUnmaps = 0;
 
-// ---- usage-trend prediction (SS85): the direction usage is moving, so
-// degradation can begin BEFORE the peak instead of at it.
-static double   usageTrendBytes = 0.0;     // EMA of per-frame usage delta
+static double   usageTrendBytes = 0.0;
 static uint64_t prevRawUsage = 0;
 
-// ---- warmup (SS73): an extra reserve that decays to zero over the first
-// frames, so startup fills VRAM progressively instead of spiking into it.
 static uint64_t warmupStartFrame = 0;
 
-// ---- aircraft change (SS76): a burst of large preloaded-texture
-// destructions is a livery or aircraft swap. Response mirrors a teleport.
 static double   bigDestroyScore = 0.0;
 static uint64_t aircraftChanges = 0, aircraftChangeCooldown = 0;
 
-// ---- pipeline bind census (SS60): binds per frame, for the usage-frequency
-// picture the plan wants specialization decisions fed by.
 static std::atomic<uint64_t> pipeBindsFrame(0);
 static uint64_t pipeBindsPeak = 0;
 
-// ---- benchmark harness (SS99): vram.bench=1 opens a measurement window,
-// vram.bench=0 closes it and dumps every metric the plan lists.
 static bool     benchOn = false;
 static uint64_t benchStartFrame = 0;
 static double   benchFtSum = 0, benchFtWorst = 0;
@@ -427,30 +297,21 @@ static uint64_t benchAllocs0 = 0, benchFails0 = 0, benchPipes0 = 0;
 static uint64_t benchElide0 = 0, benchReload0 = 0;
 static uint64_t benchZoneFrames[5] = {0,0,0,0,0};
 
-// ---- recycle pool
 struct Held { VkDeviceMemory mem; uint64_t size; uint32_t type; uint64_t frame; };
-static std::vector<Held> g_pool;                  // FIFO by frame
+static std::vector<Held> g_pool;
 static uint64_t g_poolBytes = 0;
-// Every allocation we saw, so free knows whether recycling is legal.
-struct AllocRec { uint64_t size; uint32_t type; bool plain; };  // plain: pNext==NULL
+
+struct AllocRec { uint64_t size; uint32_t type; bool plain; };
 static std::map<VkDeviceMemory, AllocRec> g_allocs;
 
-// ---- priority engine
 struct BlockPrio { float best; bool streamedTexOnly; bool demoted; bool aged; };
 static std::map<VkDeviceMemory, BlockPrio> g_blockPrio;
 
-// ---- per-resource aging (SS21's age weight, SS86/87 recency AND frequency).
-// Usage is sampled at descriptor-bind time (1 in 64 binds - aging needs "used
-// this minute", not "used this draw"), and blocks whose images have gone
-// unused decay to a lower priority so the driver demotes exactly the stale
-// ones. Frequently-used resources age at half speed - a texture touched every
-// two seconds outranks one touched once a second ago, which is SS87 verbatim.
 struct UseRec { uint64_t last; uint32_t count; uint32_t sceneCount; };
 static std::map<VkImage, UseRec>         g_imgLastUse;
 static std::map<VkImage, VkDeviceMemory> g_imgMem;
 static uint64_t agedDemotions = 0, agedRestores = 0;
 
-// ---- upload governor
 struct HeldOne {
     std::vector<VkSemaphore>          waits;
     std::vector<VkPipelineStageFlags> waitStages;
@@ -463,24 +324,19 @@ struct HeldSubmit {
     VkQueue q; VkFence fence; uint64_t bytes; uint64_t frame;
     std::vector<HeldOne> subs;
 };
-static std::vector<HeldSubmit> g_heldSubmits;                 // FIFO
-static std::set<VkFence>     g_heldFences;                    // fast trigger check
-static std::map<VkSemaphore, uint64_t> g_heldSignals;         // sem -> max value (0=binary)
-static std::set<VkSemaphore> g_everWaited;    // any wait list, ever - see the
-                                              // wait-before-signal rule below
-static std::map<VkCommandBuffer, uint64_t> g_cbBytes;         // recorded copy bytes
-static std::map<VkCommandBuffer, uint8_t>  g_cbProt;          // max protection seen
-static uint64_t governorBypassed = 0;                          // protected uploads
-static uint64_t g_frameUploadSpent = 0;                       // released this frame
+static std::vector<HeldSubmit> g_heldSubmits;
+static std::set<VkFence>     g_heldFences;
+static std::map<VkSemaphore, uint64_t> g_heldSignals;
+static std::set<VkSemaphore> g_everWaited;
 
-// ------------------------------------------------------------------ helpers
+static std::map<VkCommandBuffer, uint64_t> g_cbBytes;
+static std::map<VkCommandBuffer, uint8_t>  g_cbProt;
+static uint64_t governorBypassed = 0;
+static uint64_t g_frameUploadSpent = 0;
+
 static bool typeRecyclable(uint32_t typeIndex)
 {
-    // Device-local and NOT host-visible: nothing can hold a persistent map on
-    // it, so handing the same VkDeviceMemory to a new owner is legal (contents
-    // of a fresh allocation are undefined anyway). VMA persistently maps every
-    // host-visible block it owns, and a second vkMapMemory on a recycled one
-    // would be a spec violation - so host-visible never enters the pool.
+
     if (typeIndex >= dev.memProps.memoryTypeCount) return false;
     VkMemoryPropertyFlags f = dev.memProps.memoryTypes[typeIndex].propertyFlags;
     return (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
@@ -489,22 +345,16 @@ static bool typeRecyclable(uint32_t typeIndex)
 
 static float prioOfCat(int cat, bool streamed)
 {
-    // Categories are layer.cpp's VRAM_* enum, passed as int so this header
-    // stays self-contained. Order of importance is the plan's SS8: the frame's
-    // own attachments above everything, streamed scenery below everything that
-    // is expensive to lose.
+
     switch (cat) {
-        case 1: /*RT*/      case 2: /*DEPTH*/   return 1.0f;
-        case 3: /*STORAGE*/                     return 0.9f;
-        case 6: /*BUF_UNIFORM*/                 return 0.8f;
-        case 5: /*BUF_GEOM*/                    return 0.7f;
-        case 0: /*TEX*/     return streamed ? 0.35f : 0.6f;
-        case 7: /*BUF_STAGING*/                 return 0.2f;
-        // IMG_OTHER is arrays and 3D volumes. Preloaded ones are engine
-        // infrastructure (cloud volumes carry STORAGE usage and classify
-        // higher already); streamed sampled arrays are scenery mega-texture
-        // pages and rank with streamed scenery.
-        case 4: /*IMG_OTHER*/ return streamed ? 0.4f : 0.6f;
+        case 1:       case 2:    return 1.0f;
+        case 3:                      return 0.9f;
+        case 6:                  return 0.8f;
+        case 5:                     return 0.7f;
+        case 0:      return streamed ? 0.35f : 0.6f;
+        case 7:                  return 0.2f;
+
+        case 4:  return streamed ? 0.4f : 0.6f;
         default:                                return 0.5f;
     }
 }
@@ -513,9 +363,7 @@ static uint64_t zoneUploadBudget()
 {
     int mb = cfg.uploadBudgetMB[zone];
     if (mb <= 0) {
-        // Unlimited by zone - but the adaptive notch still applies: frame-time
-        // pressure caps uploads even in GREEN (plan SS29: a theoretically
-        // perfect streaming system can still cause stutters).
+
         if (uploadNotch <= 0) return ~0ull;
         return (uint64_t)(256 >> uploadNotch) * 1048576ull;
     }
@@ -523,11 +371,8 @@ static uint64_t zoneUploadBudget()
     return b >> (uploadNotch > 3 ? 3 : uploadNotch);
 }
 
-// ==================================================== registry + churn
-// Classification (task SS3): observable Vulkan behaviour only, probabilistic
-// where uncertain, conservative for unknowns. No filenames exist to read.
 static bool fmtIsCompressed(uint32_t f)
-{   // BC1..BC7 block range - disk-authored artwork
+{
     return f >= 131 && f <= 146;
 }
 
@@ -536,22 +381,19 @@ static uint8_t classify(int cat, VkImageUsageFlags usage, uint32_t layers,
                         uint32_t fmt)
 {
     switch (cat) {
-        case 1: /*RT*/      return RC_RENDER_TARGET;
-        case 2: /*DEPTH*/
-            // A sampled square depth image is a shadow map; the scene depth
-            // is screen-shaped and rarely square.
+        case 1:       return RC_RENDER_TARGET;
+        case 2:
+
             return (usage & VK_IMAGE_USAGE_SAMPLED_BIT) && w == h && w >= 1024
                  ? RC_SHADOW : RC_DEPTH;
-        case 3: /*STORAGE*/ return is3D ? RC_CLOUD_VOLUME : RC_STORAGE;
-        case 0: /*TEX*/
-            // Format as a class signal: block-compressed is disk-authored
-            // artwork; uncompressed sampled textures are generated surfaces
-            // (panels, overlays) and rank with UI up to 512px.
+        case 3:  return is3D ? RC_CLOUD_VOLUME : RC_STORAGE;
+        case 0:
+
             if (w <= 256 && h <= 256) return RC_UI_SMALL;
             if (!fmtIsCompressed(fmt) && w <= 512 && h <= 512)
                 return RC_UI_SMALL;
             return streamed ? RC_SCENERY_STREAMED : RC_AIRCRAFT_COCKPIT;
-        case 4: /*IMG_OTHER*/
+        case 4:
             if (is3D) return RC_CLOUD_VOLUME;
             if (layers > 1 && (usage & VK_IMAGE_USAGE_SAMPLED_BIT))
                 return RC_TERRAIN_ARRAY;
@@ -560,8 +402,6 @@ static uint8_t classify(int cat, VkImageUsageFlags usage, uint32_t layers,
     }
 }
 
-// Protection (task SS8): 3 = never touch, 0 = expendable. Unknown is 2 -
-// "when uncertain, keep the resource resident."
 static uint8_t protectionOfClass(uint8_t cls)
 {
     switch (cls) {
@@ -575,9 +415,6 @@ static uint8_t protectionOfClass(uint8_t cls)
     }
 }
 
-// The unified score (task SS4): higher = keep. Weights live-configurable.
-// Consumers rank by it; the actuation values (priority anchors, pager caps)
-// are unchanged - the score decides ORDER and the log explains WHY.
 static float scoreOf(const ResRec &r, uint64_t lastUse, uint32_t useCount,
                      uint32_t churnCyclesOfShape, uint32_t sceneCount = 0)
 {
@@ -596,19 +433,13 @@ static float scoreOf(const ResRec &r, uint64_t lastUse, uint32_t useCount,
         rec = age < 60 ? 1.0f : age < 600 ? 0.6f : age < 3600 ? 0.25f : 0.0f;
     }
     float freq = useCount > 200 ? 1.0f : (float)useCount / 200.0f;
-    // Screen-space importance: the fraction of samples that came from the
-    // scene pass. A shadow-only texture is half as valuable per use.
+
     if (useCount)
         freq = 0.5f * freq + 0.5f * ((float)sceneCount / (float)useCount);
 
-    // FORWARD-LOOKING SPATIAL TERM: distance from the resource's birth
-    // position to where the camera WILL BE (velocity projected three
-    // seconds out). Resources along the path score high - prefetched
-    // protection; resources behind the camera decay toward eviction. Only
-    // meaningful for streamed scenery with a valid camera.
     float spat = 0.5f;
     if (g_camValid && r.streamed) {
-        float px = g_camX + g_camVX * 180.0f;     // ~3 s at 60 fps
+        float px = g_camX + g_camVX * 180.0f;
         float py = g_camY + g_camVY * 180.0f;
         float pz = g_camZ + g_camVZ * 180.0f;
         float dx = r.birthX - px, dy = r.birthY - py, dz = r.birthZ - pz;
@@ -617,17 +448,13 @@ static float scoreOf(const ResRec &r, uint64_t lastUse, uint32_t useCount,
              : d < 60000.0f ? 0.3f : 0.0f;
     }
     float cost = churnCyclesOfShape >= 3 ? 1.0f
-               : (float)churnCyclesOfShape / 3.0f;   // churners are expensive
+               : (float)churnCyclesOfShape / 3.0f;
     float sizePen = r.bytes > (64ull << 20) ? 1.0f
                   : (float)r.bytes / (float)(64ull << 20);
     return wCat * cat + wRec * rec + wFreq * freq + wCost * cost
          + wSpat * spat - wSize * sizePen;
 }
 
-// ============================================== TRUE-RESIDENCY SCAFFOLD
-// The appImage -> physImage indirection table the migration executor will
-// write. Identity (absent = itself) until then, so wiring it through the
-// hooks is provably zero-change - the soak the map's slice plan requires.
 static std::map<VkImage, VkImage> g_physOf;
 static VkImage phys(VkImage app)
 {
@@ -636,13 +463,6 @@ static VkImage phys(VkImage app)
     return it == g_physOf.end() ? app : it->second;
 }
 
-// ============================================== MIGRATION EXECUTOR, STAGE 1
-// vram.migrate: 0 = off, 1 = DRY RUN (default) - the selection engine runs
-// live, logs every migration it WOULD perform with the full reasoning, and
-// accounts the projected savings; 2 is reserved for execution, which lands
-// only after dry-run flight data proves the selections sound (the staged
-// gate this feature was specified with). Eligibility is the safest class
-// only: streamed sampled 2D textures, mips > 1, no protection.
 static uint64_t migCandidates = 0, migProjSaveBytes = 0, migRestoreProj = 0;
 static void decide(const ResRec &r, const char *action, const char *reason);
 static void migrationTick()
@@ -654,10 +474,7 @@ static void migrationTick()
     if (frameIndex % (uint64_t)every) return;
 
     std::lock_guard<std::mutex> g(m);
-    // DEMOTE candidate: under pressure, the worst-scoring full-quality
-    // streamed texture - dropping its top mip frees 75% of its bytes.
-    // RESTORE candidate: in GREEN, the best-scoring REDUCED resource whose
-    // retained payloads make it rebuildable without the disk.
+
     const ResRec *demote = nullptr, *restore = nullptr;
     for (std::map<VkImage, ResRec>::const_iterator it = g_registry.begin();
          it != g_registry.end(); ++it) {
@@ -692,7 +509,7 @@ static void noteCamera(float x, float y, float z)
     if (!alive()) return;
     if (g_camValid) {
         float vx = x - g_camX, vy = y - g_camY, vz = z - g_camZ;
-        if (vx*vx + vy*vy + vz*vz < 1e8f) {      // ignore teleports here
+        if (vx*vx + vy*vy + vz*vz < 1e8f) {
             g_camVX += (vx - g_camVX) * 0.1f;
             g_camVY += (vy - g_camVY) * 0.1f;
             g_camVZ += (vz - g_camVZ) * 0.1f;
@@ -702,9 +519,6 @@ static void noteCamera(float x, float y, float z)
     g_camValid = true;
 }
 
-// The decision engine (task SS19): every residency decision names its
-// resource, fields and reason. vram.explain=0 silences, 1 traces decisions,
-// 2 adds restores.
 static uint64_t decisionsDemote = 0, decisionsRestore = 0;
 static void decide(const ResRec &r, const char *action, const char *reason)
 {
@@ -713,7 +527,7 @@ static void decide(const ResRec &r, const char *action, const char *reason)
     if (isRestore) ++decisionsRestore; else ++decisionsDemote;
     if (verb < 1 || (isRestore && verb < 2)) return;
     static uint64_t said = 0;
-    if (++said > 2000 && verb < 2) return;          // never spam forever
+    if (++said > 2000 && verb < 2) return;
     trace("VRAMSYS DECIDE #%llu %s: %s %ux%u fmt=%u %.1f MB score=%.2f "
           "state=%s prot=%u zone=%s - %s",
           (unsigned long long)r.id, action, resClassName(r.cls),
@@ -733,19 +547,16 @@ static void noteImageCreate(VkImage img, uint32_t w, uint32_t h, uint32_t fmt,
     ChurnRec &r = g_churn[k];
     ++r.creates;
     r.bytes = bytes;
-    // A re-create within ten seconds of a destroy of the same shape is the
-    // cycle the plan's SS50 describes.
+
     if (r.destroys && frameIndex - r.lastDestroyFrame < 600) {
         ++r.cycles;
         ++churnCycles;
     }
-    // Dynamic mip restoration, observed: a shape the pager previously cut,
-    // re-created at full quality, is the engine's own reload loop restoring
-    // detail once the shaped budget widened. Counted, so the loop is visible.
+
     if (r.lastDrop > 0 && droppedMips == 0) ++mipRestorations;
     r.lastDrop = (uint8_t)droppedMips;
 
-    bool streamed = frameIndex > 900;   // in-flight creation
+    bool streamed = frameIndex > 900;
     ResRec rec;
     rec.id = g_nextResId++;
     rec.shape = k;
@@ -756,8 +567,7 @@ static void noteImageCreate(VkImage img, uint32_t w, uint32_t h, uint32_t fmt,
     rec.state = droppedMips ? RS_REDUCED_AT_CREATE : RS_FULL;
     rec.streamed = streamed;
     rec.score = 0.0f;
-    // Spatial stamp: birth position and load burst. A gap of two seconds
-    // between creations starts a new burst - the next scenery tile.
+
     if (frameIndex - g_lastCreateFrame > 120) ++g_burstId;
     g_lastCreateFrame = frameIndex;
     rec.birthX = g_camX; rec.birthY = g_camY; rec.birthZ = g_camZ;
@@ -778,10 +588,7 @@ static void noteImageDestroy(VkImage img)
         ChurnRec &r = g_churn[it->second.shape];
         ++r.destroys;
         r.lastDestroyFrame = frameIndex;
-        // Content identity outlives the handle (SS24's L2): the destroyed
-        // image's mip hashes move to the dead-shape memory so a disk reload
-        // of the same bytes can be recognised - and costed - when it arrives
-        // in a fresh VkImage.
+
         uint64_t base = (uint64_t)(uintptr_t)img;
         MipKey from; from.img = base; from.mip = 0;
         for (std::map<MipKey, uint64_t>::iterator ci =
@@ -797,9 +604,7 @@ static void noteImageDestroy(VkImage img)
         }
         g_liveContentCount.store((uint32_t)g_liveContent.size(),
                                  std::memory_order_relaxed);
-        // A burst of large preload-class destructions is an aircraft or
-        // livery change (SS76). Score decays at present; the threshold fires
-        // the same protective response as a teleport.
+
         if (it->second.shape.w >= 2048 && frameIndex > 900)
             bigDestroyScore += 1.0;
         g_registry.erase(it);
@@ -816,14 +621,6 @@ static bool churnHot(VkImage img)
     return g_hotImgs.count(img) != 0;
 }
 
-// PER-RESOURCE QUALITY DECISION (the pager's global caps refined by what the
-// registry knows about THIS shape). Called at creation time with the base
-// drop the global policy chose; returns the final drop.
-//   - A churn-hot shape is PROTECTED: cutting it is what caused its reload
-//     cycling, so it keeps full quality whatever the zone.
-//   - Under pressure, LARGE streamed shapes take an extra cut before small
-//     ones are touched at all - the byte-weighted degradation the global
-//     scale cannot express.
 static uint32_t refineDrop(uint32_t baseDrop, uint32_t w, uint32_t h,
                            uint32_t fmt, uint32_t mips, bool streamed)
 {
@@ -833,33 +630,29 @@ static uint32_t refineDrop(uint32_t baseDrop, uint32_t w, uint32_t h,
     std::map<ChurnKey, ChurnRec>::iterator it = g_churn.find(k);
     if (it != g_churn.end() && it->second.cycles >= 3) {
         if (baseDrop) ++perResProtected;
-        return 0;                                   // churner: never cut
+        return 0;
     }
     if (!streamed || zone < ORANGE) return baseDrop;
-    // The pager's non-power-of-two guard holds here too: X-Plane's own scale
-    // produces non-pow2 sizes whose BC block layout a further halving
-    // corrupts - measured as a crash, documented at pagerDropLevels. No
-    // extra cut for those, ever.
+
     if ((w & (w - 1)) != 0 || (h & (h - 1)) != 0) return baseDrop;
     uint64_t bytes = it != g_churn.end() && it->second.bytes
                    ? it->second.bytes : (uint64_t)w * h * 4;
     uint32_t extra = 0;
     if (zone == ORANGE)      extra = bytes > (32ull << 20) ? 1 : 0;
     else if (zone == RED)    extra = bytes > (16ull << 20) ? 1 : 0;
-    else /* CRITICAL */      extra = bytes > (8ull << 20) ? 2 : 1;
+    else       extra = bytes > (8ull << 20) ? 2 : 1;
     uint32_t total = baseDrop + extra;
     if (total >= mips) total = mips > 1 ? mips - 1 : 0;
     if (total > baseDrop) ++perResExtraCut;
     return total;
 }
 
-// ============================================================ misc telemetry
 static void notePipelines(uint32_t count, uint64_t us)
 {
     if (!alive()) return;
     pipesTotal.fetch_add(count);
     pipeUsTotal.fetch_add(us);
-    if (frameIndex > 0) {                 // after the first present = in flight
+    if (frameIndex > 0) {
         pipesLive.fetch_add(count);
         pipesFrame.fetch_add(count);
     }
@@ -876,10 +669,7 @@ static void noteImageUse(VkImage img, bool inScenePass = false)
     UseRec &r = g_imgLastUse[img];
     r.last = frameIndex;
     if (r.count < 0xFFFFFFFFu) ++r.count;
-    // SCREEN-SPACE IMPORTANCE, the observable form: a resource sampled by
-    // the SCENE pass contributes to the frame the user sees; one sampled
-    // only by shadow/reflection/utility passes does not. The ratio is the
-    // visibility weight the score consumes.
+
     if (inScenePass && r.sceneCount < 0xFFFFFFFFu) ++r.sceneCount;
 }
 
@@ -890,7 +680,6 @@ static void noteImageMem(VkImage img, VkDeviceMemory mem)
     g_imgMem[img] = mem;
 }
 
-// ============================================================ map + bind maps
 static void noteMap(VkDeviceMemory mem, VkDeviceSize offset, VkDeviceSize size,
                     void *ptr)
 {
@@ -926,8 +715,6 @@ static void noteBufferGone(VkBuffer buf)
     g_bufBind.erase(buf);
 }
 
-// The host pointer a buffer's byte range lives at, if its memory is mapped.
-// nullptr when unmapped, unknown, or out of the mapped range.
 static const uint8_t *bufferBytes(VkBuffer buf, VkDeviceSize bufOffset,
                                   VkDeviceSize len)
 {
@@ -943,9 +730,6 @@ static const uint8_t *bufferBytes(VkBuffer buf, VkDeviceSize bufOffset,
     return mr->second.ptr + rel;
 }
 
-// ============================================================ content cache
-// FNV-1a over strided samples plus the length: 4 KB of reads bounds the cost
-// on a 30 MB upload while still touching every region of it.
 static uint64_t contentHash(const uint8_t *p, uint64_t len)
 {
     uint64_t h = 1469598103934665603ull ^ len;
@@ -953,14 +737,12 @@ static uint64_t contentHash(const uint8_t *p, uint64_t len)
     if (!stride) stride = 1;
     for (uint64_t i = 0; i < len; i += stride)
         h = (h ^ p[i]) * 1099511628211ull;
-    // The tail, always - truncation artefacts live there.
+
     for (uint64_t i = len > 64 ? len - 64 : 0; i < len; ++i)
         h = (h ^ p[i]) * 1099511628211ull;
     return h;
 }
 
-// Verdict on one full-subresource upload. Returns true when the copy can be
-// ELIDED - the identical bytes are already in that image mip.
 static bool cacheUpload(VkImage img, uint32_t mip, uint64_t hash,
                         uint64_t bytes)
 {
@@ -975,7 +757,7 @@ static bool cacheUpload(VkImage img, uint32_t mip, uint64_t hash,
     g_liveContent[k] = hash;
     g_liveContentCount.store((uint32_t)g_liveContent.size(),
                              std::memory_order_relaxed);
-    // Did the engine just reload from disk what a destroyed image held?
+
     std::map<VkImage, ResRec>::iterator ck = g_registry.find(img);
     if (ck != g_registry.end()) {
         ShapeMip s; s.w = ck->second.shape.w; s.h = ck->second.shape.h;
@@ -989,20 +771,10 @@ static bool cacheUpload(VkImage img, uint32_t mip, uint64_t hash,
     return false;
 }
 
-// (Image teardown's content transfer lives inside noteImageDestroy - one
-// mutex acquisition, one entry point.)
-
-// A transition FROM UNDEFINED legally discards an image's contents. Any
-// cached content identity for that image is dead the moment such a barrier
-// is recorded - eliding an upload after it would leave garbage texels. The
-// barrier hooks call this for every oldLayout==UNDEFINED image barrier.
 static void contentInvalidate(VkImage img)
 {
     if (!alive() || !img) return;
-    // Lock-free fast path: the barrier hooks call this from every recording
-    // thread for every UNDEFINED transition, and a global mutex on that path
-    // is the 9-fps mistake this project has already made once. The counter
-    // makes the common case (no cached content) a single atomic load.
+
     if (g_liveContentCount.load(std::memory_order_relaxed) == 0) return;
     std::lock_guard<std::mutex> g(m);
     if (g_liveContent.empty()) return;
@@ -1024,7 +796,6 @@ static void noteUploadRegion(uint64_t imgHandle, uint32_t mip)
 
 static void ledgerRt(uint64_t bytes) { rtBytesNow = bytes; }
 
-// ============================================================ persistence
 static const char *statePath()
 {
     static char p[MAX_PATH] = {0};
@@ -1071,7 +842,6 @@ static void stateSave()
     fclose(f);
 }
 
-// A memory type's property flags, for the enriched failure log (SS69).
 static const char *typeFlagsText(uint32_t typeIndex)
 {
     static char buf[96];
@@ -1086,8 +856,6 @@ static const char *typeFlagsText(uint32_t typeIndex)
     return buf;
 }
 
-// ============================================================ device binding
-// Called from TAA_CreateDevice once the down-chain pointers exist.
 static void bindDevice(VkDevice d, VkPhysicalDevice p,
                        PFN_vkGetPhysicalDeviceMemoryProperties2 mp2,
                        PFN_vkFreeMemory freeMem, PFN_vkUnmapMemory unmapMem,
@@ -1126,28 +894,19 @@ static void noteQueue(uint32_t family, VkQueue q)
     }
 }
 
-// ============================================================ ledger feed
-// layer.cpp's ledger calls these so the shaper can see the app's trend without
-// this header reaching into layer globals.
 static void ledgerTotal(uint64_t bytes) { ledgerBytesNow.store(bytes); }
 
-// ============================================================ upload charge
 static void chargeCopy(VkCommandBuffer cb, uint64_t bytes, uint8_t prot = 0)
 {
     if (!alive() || !cfg.enable) return;
     upBytesFrame.fetch_add(bytes);
     std::lock_guard<std::mutex> g(m);
     g_cbBytes[cb] += bytes;
-    // Upload priority classes (task SS9): the command buffer carries the
-    // highest protection of anything it uploads to. Protected-class uploads
-    // (cockpit, aircraft, render infrastructure) bypass the governor -
-    // CRITICAL never waits behind autogen.
+
     uint8_t &p = g_cbProt[cb];
     if (prot > p) p = prot;
 }
 
-// Protection of a live image, for the copy hook. 0 when unknown - unknown
-// uploads pace normally, which is the conservative direction here.
 static uint8_t protectionOf(VkImage img)
 {
     if (!alive()) return 0;
@@ -1156,37 +915,24 @@ static uint8_t protectionOf(VkImage img)
     return it == g_registry.end() ? 0 : it->second.protection;
 }
 
-// ============================================================ recycle pool
-// Try to satisfy an allocation from the pool. Returns true and fills *out on a
-// hit; the caller skips the driver entirely.
 static bool poolTake(const VkMemoryAllocateInfo *ai, VkDeviceMemory *out)
 {
     if (!alive() || !cfg.enable || !cfg.recycle || !ai || ai->pNext) return false;
     std::lock_guard<std::mutex> g(m);
     for (size_t i = 0; i < g_pool.size(); ++i) {
         if (g_pool[i].type != ai->memoryTypeIndex) continue;
-        if (g_pool[i].size != ai->allocationSize)  continue;   // exact only
+        if (g_pool[i].size != ai->allocationSize)  continue;
         *out = g_pool[i].mem;
         g_poolBytes -= g_pool[i].size;
         g_pool.erase(g_pool.begin() + (long)i);
         ++recycleHits;
-        // The block re-enters service; its record stays in g_allocs (same
-        // size/type, still plain), so a later free can hold it again.
+
         return true;
     }
     ++recycleMisses;
     return false;
 }
 
-// Free path. Returns true if the block was pooled (caller must NOT free it).
-// Host-visible blocks are recyclable too (SS15's staging pool, at our level)
-// with one legality step: if the app still holds a mapping, the block is
-// explicitly unmapped BEFORE it enters the pool - vkFreeMemory would have
-// unmapped implicitly, and a recycled block carrying a live mapping would
-// make the next owner's vkMapMemory a spec violation. The unmap happens
-// under our mutex, before the block becomes takeable, so no thread can
-// receive a still-mapped block. (Calling the down-chain unmap under m is
-// safe: m is ours alone; the driver cannot re-enter the layer.)
 static bool poolHold(VkDeviceMemory mem)
 {
     if (!alive() || !cfg.enable || !cfg.recycle) return false;
@@ -1198,12 +944,12 @@ static bool poolHold(VkDeviceMemory mem)
     if (!devLocal && it->second.type < dev.memProps.memoryTypeCount) {
         VkMemoryPropertyFlags f =
             dev.memProps.memoryTypes[it->second.type].propertyFlags;
-        // Host-visible, host-coherent staging - the class VMA churns.
+
         hostOk = (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
                  (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     }
     if (!devLocal && !hostOk) return false;
-    if (zone >= RED && devLocal) return false;         // pressure: give it back
+    if (zone >= RED && devLocal) return false;
     uint64_t cap = (uint64_t)cfg.recycleMaxMB * 1048576ull;
     if (g_poolBytes + it->second.size > cap) return false;
     if (hostOk) {
@@ -1219,12 +965,10 @@ static bool poolHold(VkDeviceMemory mem)
     h.type = it->second.type; h.frame = frameIndex;
     g_pool.push_back(h);
     g_poolBytes += h.size;
-    g_blockPrio.erase(mem);          // ownership identity ends here
+    g_blockPrio.erase(mem);
     return true;
 }
 
-// Drop pooled blocks - aged ones each frame, everything under pressure.
-// Called with m NOT held; takes it, collects, frees outside.
 static void poolTrim(bool everything)
 {
     std::vector<VkDeviceMemory> toFree;
@@ -1247,17 +991,13 @@ static void poolTrim(bool everything)
             dev.freeMemory(dev.dev, toFree[i], nullptr);
 }
 
-// ============================================================ priority engine
-// Allocation-time tag. Builds a shallow copy of the app's info with our
-// priority struct spliced at the head of the chain; the app's own chain is
-// untouched (it is const and stays const).
 struct PrioChain { VkMemoryPriorityAllocateInfoEXT info; VkMemoryAllocateInfo ai; };
 static bool prioTag(const VkMemoryAllocateInfo *ai, PrioChain *pc)
 {
     if (!alive() || !cfg.enable || !cfg.priority || !dev.priorityExt) return false;
     pc->info.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
     pc->info.pNext = (void*)ai->pNext;
-    pc->info.priority = 0.5f;        // neutral until a bind says what it holds
+    pc->info.priority = 0.5f;
     pc->ai = *ai;
     pc->ai.pNext = &pc->info;
     ++prioAllocTagged;
@@ -1284,11 +1024,6 @@ static void noteFreeGone(VkDeviceMemory mem)
     g_blockPrio.erase(mem);
 }
 
-// First-bind classification: the resource's category names what the block
-// holds, and the block takes the highest priority of anything bound into it.
-// A churn-hot resource (SS50: cycling resident->evicted->resident) takes at
-// least 0.65 whatever its class - "increase its retention priority", made
-// literal at the driver level.
 static void onBind(VkDeviceMemory mem, int cat, bool streamed, bool hot = false)
 {
     if (!cfg.enable || !cfg.priority || !dev.pageableExt || !dev.dev) return;
@@ -1298,7 +1033,7 @@ static void onBind(VkDeviceMemory mem, int cat, bool streamed, bool hot = false)
     {
         std::lock_guard<std::mutex> g(m);
         BlockPrio &bp = g_blockPrio[mem];
-        if (bp.best == 0.0f) {       // fresh entry
+        if (bp.best == 0.0f) {
             bp.best = p; bp.streamedTexOnly = (cat == 0 && streamed);
             bp.demoted = false; set = true;
         } else {
@@ -1309,23 +1044,13 @@ static void onBind(VkDeviceMemory mem, int cat, bool streamed, bool hot = false)
     if (set) { dev.setPriority(dev.dev, mem, p); ++prioBindSet; }
 }
 
-// Zone modulation: in RED and worse, push streamed-texture-only blocks further
-// down so the driver demotes THOSE first - LARGEST blocks first (SS21's size
-// weight, SS22: the most memory back per priority move); lift them again in
-// GREEN. Bounded per call so a zone flip never stalls a present.
 static void prioZoneWalk()
 {
     if (!cfg.enable || !cfg.priority || !dev.pageableExt || !dev.dev) return;
     std::vector<std::pair<VkDeviceMemory, float> > moves;
     {
         std::lock_guard<std::mutex> g(m);
-        // Candidates ranked by the UNIFIED SCORE (eviction engine, task SS8):
-        // worst score demoted first, best score restored first. The score
-        // already weighs importance, recency, frequency, recreation cost and
-        // size, so this one ordering realises the whole eviction policy.
-        // The block-level view maps to resources through g_imgMem/g_registry;
-        // a block with no registry image keeps the old size-only ranking via
-        // score 0.
+
         std::map<VkDeviceMemory, float> blockScore;
         for (std::map<VkImage, VkDeviceMemory>::iterator im = g_imgMem.begin();
              im != g_imgMem.end(); ++im) {
@@ -1346,12 +1071,12 @@ static void prioZoneWalk()
             std::map<VkDeviceMemory, float>::iterator bs =
                 blockScore.find(im->second);
             if (bs == blockScore.end() || s > bs->second)
-                blockScore[im->second] = s;      // block keeps its BEST score
+                blockScore[im->second] = s;
         }
         std::vector<std::pair<float, VkDeviceMemory> > cand;
         for (std::map<VkDeviceMemory, BlockPrio>::iterator it = g_blockPrio.begin();
              it != g_blockPrio.end(); ++it) {
-            if (!it->second.streamedTexOnly) continue;   // protection >= 1
+            if (!it->second.streamedTexOnly) continue;
             bool wantDemote  = zone >= RED  && !it->second.demoted;
             bool wantRestore = zone == GREEN && it->second.demoted;
             if (!wantDemote && !wantRestore) continue;
@@ -1359,8 +1084,7 @@ static void prioZoneWalk()
             float s = bs != blockScore.end() ? bs->second : 0.0f;
             cand.push_back(std::make_pair(wantDemote ? s : -s, it->first));
         }
-        // Ascending: demotions see worst-score first, restores see best first
-        // (negated), and the per-frame budget is spent where it matters most.
+
         std::sort(cand.begin(), cand.end());
         int budget = 64;
         for (size_t i = 0; i < cand.size() && budget > 0; ++i, --budget) {
@@ -1376,7 +1100,7 @@ static void prioZoneWalk()
                     it->second.aged ? 0.25f : it->second.best));
             }
         }
-        // Registry state + decision log for every image on a moved block.
+
         for (size_t i = 0; i < moves.size(); ++i) {
             bool demote = moves[i].second <= 0.21f;
             for (std::map<VkImage, VkDeviceMemory>::iterator im = g_imgMem.begin();
@@ -1396,12 +1120,6 @@ static void prioZoneWalk()
     prioZoneMoves += moves.size();
 }
 
-// The aging walk (SS86-88): a rotating cursor visits sampled-use records, 64
-// a frame. A streamed-texture block whose images have gone unused for the age
-// window decays to 0.25; the window DOUBLES for frequently-used resources
-// (SS87 - recency alone is the wrong statistic). First use after decay
-// restores the class priority. Hysteresis is inherent: the window is minutes,
-// the restore is immediate on use.
 static void agingWalk()
 {
     if (!cfg.enable || !cfg.priority || !dev.pageableExt || !dev.dev) return;
@@ -1418,21 +1136,17 @@ static void agingWalk()
             std::map<VkDeviceMemory, BlockPrio>::iterator bp =
                 g_blockPrio.find(im->second);
             if (bp == g_blockPrio.end() || !bp->second.streamedTexOnly) continue;
-            // Prediction grace: a freshly created resource is the streamer
-            // answering upcoming demand - aging never touches the first ten
-            // seconds of its life, whatever its use count says.
+
             {
                 std::map<VkImage, ResRec>::iterator rg = g_registry.find(cursor);
                 if (rg != g_registry.end()) {
                     if (frameIndex - rg->second.createdFrame < 600) continue;
-                    // Spatial protection: a resource on the predicted flight
-                    // path never ages out, whatever its recent use - the
-                    // camera is about to need it.
+
                     if (rg->second.score > 0.6f) continue;
                 }
             }
             uint64_t window = (uint64_t)cfg.ageFrames + (uint64_t)ageBiasFrames;
-            if (it->second.count > 100) window *= 2;       // frequency (SS87)
+            if (it->second.count > 100) window *= 2;
             bool stale = frameIndex > it->second.last &&
                          frameIndex - it->second.last > window;
             if (stale && !bp->second.aged && !bp->second.demoted) {
@@ -1462,23 +1176,9 @@ static void agingWalk()
         dev.setPriority(dev.dev, moves[i].first, moves[i].second);
 }
 
-// ============================================================ upload governor
-//
-// DEADLOCK-PROOFING, stated once and honoured everywhere: a held submission is
-// released BEFORE any code path that could wait on its results -
-//   - vkWaitForFences / vkGetFenceStatus / vkResetFences on its fence
-//   - vkWaitSemaphores on any semaphore it signals (timeline value compared)
-//   - any OTHER submission (any queue) or sparse bind that waits on a
-//     semaphore it signals
-//   - vkQueueWaitIdle / vkDeviceWaitIdle
-//   - age: nothing is held longer than cfg.uploadMaxHold presents
-// A submission with a pNext we do not fully understand is never held at all.
-
-static void flushLocked(std::vector<HeldSubmit> &out, VkQueue only /*or null*/)
+static void flushLocked(std::vector<HeldSubmit> &out, VkQueue only )
 {
-    // Collect FIFO holds (all for a queue, or all queues) under m; the caller
-    // submits them outside the lock. FIFO per queue is preserved because the
-    // vector is FIFO and we take every match.
+
     for (size_t i = 0; i < g_heldSubmits.size();) {
         if (only == VK_NULL_HANDLE || g_heldSubmits[i].q == only) {
             out.push_back(g_heldSubmits[i]);
@@ -1488,7 +1188,7 @@ static void flushLocked(std::vector<HeldSubmit> &out, VkQueue only /*or null*/)
     if (only == VK_NULL_HANDLE || g_heldSubmits.empty()) {
         if (only == VK_NULL_HANDLE) { g_heldFences.clear(); g_heldSignals.clear(); }
     }
-    // Rebuild trigger indices for what remains.
+
     g_heldFences.clear(); g_heldSignals.clear();
     heldNow = g_heldSubmits.size(); heldBytesNow = 0;
     for (size_t i = 0; i < g_heldSubmits.size(); ++i) {
@@ -1561,7 +1261,6 @@ static void flushAll(uint64_t *counter)
     submitHeld(out);
 }
 
-// Trigger: a fence the app is about to wait on / query / reset.
 static void touchFences(uint32_t count, const VkFence *fences)
 {
     if (!alive() || !count || !fences) return;
@@ -1575,18 +1274,15 @@ static void touchFences(uint32_t count, const VkFence *fences)
     if (hit) flushAll(&flushOnWait);
 }
 
-// Trigger: semaphores the app is about to wait on (vkWaitSemaphores, or the
-// wait list of another submission / sparse bind).
 static bool anyHeldSignalLocked(uint32_t count, const VkSemaphore *sems,
                                 const uint64_t *values)
 {
     for (uint32_t i = 0; i < count; ++i) {
         std::map<VkSemaphore, uint64_t>::iterator it = g_heldSignals.find(sems[i]);
         if (it == g_heldSignals.end()) continue;
-        if (!values || !it->second) return true;       // binary, or no values
-        if (values[i] <= it->second) return true;      // wait <= held signal
-        // waiting for a value beyond what we hold still needs our signal to
-        // make progress toward it on the same timeline:
+        if (!values || !it->second) return true;
+        if (values[i] <= it->second) return true;
+
         return true;
     }
     return false;
@@ -1607,23 +1303,16 @@ static void touchSemaphores(uint32_t count, const VkSemaphore *sems,
     if (hit) flushAll(&flushOnDep);
 }
 
-// The submit path. Returns true when the layer has fully handled the call and
-// *result carries the answer; false means the caller must pass it down.
 static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
                      VkFence fence, VkResult *result)
 {
     if (!alive() || !cfg.enable) return false;
 
-    // ANY submission's wait list can depend on a held signal - graphics
-    // waiting on the transfer timeline is the normal case. Check first,
-    // whatever the queue.
     if (submits) {
         bool dep = false;
         {
             std::lock_guard<std::mutex> g(m);
-            // Record every wait semaphore ever seen - the structural input to
-            // the never-hold-a-waited-signal rule (bounded: the engine reuses
-            // a fixed set of semaphores).
+
             for (uint32_t s = 0; s < count; ++s)
                 for (uint32_t w = 0; w < submits[s].waitSemaphoreCount; ++w)
                     if (g_everWaited.size() < 4096)
@@ -1644,11 +1333,6 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
         if (dep) flushAll(&flushOnDep);
     }
 
-    // Bytes this submission carries, from the copies recorded into its
-    // command buffers. Collected - and ERASED - for every queue, or the map
-    // would grow forever on graphics-queue uploads and command-buffer reuse
-    // would accumulate stale charges. Unknown buffers count zero - pacing
-    // needs an estimate, not an audit.
     uint64_t bytes = 0;
     uint8_t  maxProt = 0;
     bool holdable = true;
@@ -1665,8 +1349,7 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
                 g_cbProt.erase(pt);
             }
         }
-        // Only a bare chain or a single timeline struct is understood well
-        // enough to reconstruct. Anything else must not be held.
+
         for (const VkBaseInStructure *p =
                  (const VkBaseInStructure*)submits[s].pNext; p; p = p->pNext)
             if (p->sType != VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
@@ -1687,42 +1370,24 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
         mustQueueBehind = false;
         for (size_t i = 0; i < g_heldSubmits.size(); ++i)
             if (g_heldSubmits[i].q == q) { mustQueueBehind = true; break; }
-        // Backpressure (SS96): every queue needs a maximum size. Past the
-        // cap the governor stops holding and passes work through - a bounded
-        // delay line, never an unbounded backlog that bursts.
+
         bool overCap = heldBytesNow + bytes >
                        (uint64_t)cfg.holdMaxMB * 1048576ull;
         bool over = (g_frameUploadSpent + bytes) > budget;
-        // ---- THE WAIT-BEFORE-SIGNAL HOLE, measured as a GPU crash on the
-        // first flight (VK_ERROR_DEVICE_LOST at 0:02:15, TDR profile).
-        // Timeline semaphores allow the WAITER to be submitted before the
-        // SIGNALER: graphics waits value N, then the transfer signaling N
-        // arrives - and holding it stalls the GPU on a wait nothing will
-        // satisfy, presents stop, the present-driven release never runs, and
-        // Windows resets the device. The dependency scan cannot see waits
-        // already on the GPU, so the rule is structural: a submission that
-        // signals any semaphore ever seen in ANY wait list is NEVER held.
-        // In practice X-Plane reuses its transfer timelines every frame, so
-        // holds now apply only to fence-only submissions - the governor is
-        // observe-and-bypass for everything else, which is the correct
-        // failure direction. vram.governor=2 was the hold mode; it now also
-        // obeys this rule.
+
         if (holdable)
             for (uint32_t s = 0; s < count && holdable; ++s)
                 for (uint32_t k = 0; k < submits[s].signalSemaphoreCount; ++k)
                     if (g_everWaited.count(submits[s].pSignalSemaphores[k]))
                         { holdable = false; break; }
-        // Upload class CRITICAL/HIGH (protection >= 2): cockpit, aircraft
-        // and render-infrastructure uploads are never paced - only order
-        // (mustQueueBehind) can delay them, and only until the flush below.
+
         if (maxProt >= 2) { over = false; ++governorBypassed; }
         if ((!over && !mustQueueBehind) || !holdable || overCap ||
             zone < ORANGE) {
-            // Passes now. If order requires it, everything held for this queue
-            // goes first - budget or not, order beats pacing.
+
             g_frameUploadSpent += bytes;
         } else {
-            // Hold it.
+
             HeldSubmit h; h.q = q; h.fence = fence; h.bytes = bytes;
             h.frame = frameIndex;
             for (uint32_t s = 0; s < count; ++s) {
@@ -1767,11 +1432,10 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
             heldNow = g_heldSubmits.size();
             heldBytesNow += bytes;
             *result = VK_SUCCESS;
-            return true;                       // handled: held
+            return true;
         }
     }
 
-    // Passing through - but order first if anything is still held for q.
     if (mustQueueBehind) {
         std::vector<HeldSubmit> out;
         {
@@ -1795,8 +1459,6 @@ static bool onSubmit(VkQueue q, uint32_t count, const VkSubmitInfo *submits,
     return true;
 }
 
-// ============================================================ budget shaping
-// Applied to every VkPhysicalDeviceMemoryBudgetPropertiesEXT the app receives.
 static void shapeReport(const VkPhysicalDeviceMemoryProperties *mp,
                         VkPhysicalDeviceMemoryBudgetPropertiesEXT *b,
                         float legacyScale)
@@ -1811,7 +1473,7 @@ static void shapeReport(const VkPhysicalDeviceMemoryProperties *mp,
         rawUsage  = b->heapUsage[i];
 
         if (!cfg.enable || !cfg.shape) {
-            // Legacy scale still honoured with shaping off.
+
             if (legacyScale > 1.0f) {
                 VkDeviceSize want = (VkDeviceSize)(b->heapBudget[i] * legacyScale);
                 if (want > heapSize) want = heapSize;
@@ -1820,40 +1482,23 @@ static void shapeReport(const VkPhysicalDeviceMemoryProperties *mp,
             break;
         }
 
-        // Low-pass. The driver's figure can step hundreds of MB in one query
-        // under external pressure; the engine then feeds the step straight
-        // into evaluate() and rescales the world. Smooth it at the source.
         if (filteredBudget <= 0.0) filteredBudget = (double)rawBudget;
         filteredBudget += ((double)rawBudget - filteredBudget) * cfg.budgetAlpha;
 
         uint64_t report = (uint64_t)filteredBudget;
 
-        // Monotone under free: while the app's own footprint is falling, the
-        // budget it sees must not fall with it. "Available fell as it freed"
-        // is the measured death spiral (V1 log: 2.45 gb of 2.44 gb available,
-        // shrinking as textures were released).
         uint64_t led = ledgerBytesNow.load();
-        bool appFreeing = led + (16ull << 20) < lastLedgerBytes;   // 16 MB slack
+        bool appFreeing = led + (16ull << 20) < lastLedgerBytes;
         lastLedgerBytes = led;
         if (appFreeing && lastReported && report < lastReported)
-            report = lastReported - lastReported / 1000;           // decay 0.1%
+            report = lastReported - lastReported / 1000;
 
-        // Zone reserve - the split thresholds the engine's pager lacks. In
-        // GREEN almost everything is offered; each zone up withholds more, so
-        // the engine starts adapting BEFORE the wall, not at it. Two
-        // modulations on top: the persistent bias a session that ever hit an
-        // allocation failure carries forward (SS77), and camera speed - a fast
-        // camera is about to demand scenery, so the reserve grows with it
-        // (SS11/49, prediction without a single dataref).
         double speedFactor = camSpeedEma * cfg.speedReserve;
         if (speedFactor > 1.0) speedFactor = 1.0;
         uint64_t reserve = (uint64_t)(((double)cfg.reserveMB[zone] +
                                        (double)reserveBiasMB) *
                                       (1.0 + speedFactor)) * 1048576ull;
 
-        // Warmup (SS73): an extra reserve, largest at device creation and
-        // decaying linearly to nothing, so startup fills VRAM progressively -
-        // "do not attempt to fully populate VRAM immediately."
         uint64_t warmFrames = (uint64_t)(cfg.warmupFrames > 0
                                          ? cfg.warmupFrames : 0);
         if (warmFrames && frameIndex - warmupStartFrame < warmFrames) {
@@ -1863,8 +1508,6 @@ static void shapeReport(const VkPhysicalDeviceMemoryProperties *mp,
         }
         report = report > reserve ? report - reserve : 0;
 
-        // Emergency deflate after an allocation failure: make the engine's
-        // next evaluate() see genuine scarcity.
         if (deflateLeft > 0) {
             uint64_t cut = (uint64_t)cfg.deflateMB * 1048576ull;
             report = report > cut ? report - cut : 0;
@@ -1875,22 +1518,16 @@ static void shapeReport(const VkPhysicalDeviceMemoryProperties *mp,
             report = want;
         }
 
-        // Floors and ceilings: never below current usage plus one working set
-        // (reporting less than usage trips the engine's overstep alarm and
-        // the user-facing "not enough VRAM" dialog), never above the heap.
         uint64_t floorB = rawUsage + (64ull << 20);
         if (report < floorB)  report = floorB;
         if (report > heapSize) report = heapSize;
 
         lastReported = report;
         b->heapBudget[i] = report;
-        break;                        // first device-local heap only
+        break;
     }
 }
 
-// ============================================================ emergency
-// Called on VK_ERROR_OUT_OF_DEVICE_MEMORY before any retry. Returns true if
-// anything was actually reclaimed (a retry is then worth making).
 static bool emergency()
 {
     allocFails.fetch_add(1);
@@ -1900,21 +1537,19 @@ static bool emergency()
         before = g_poolBytes;
         deflateLeft = cfg.deflateFrames;
         zone = CRITICAL; zoneDwell = 0;
-        // Learn from it: every failure raises the standing reserve carried
-        // into future sessions, capped so one bad day cannot eat the card.
+
         ++failsEver;
         if (reserveBiasMB < 256) reserveBiasMB += 64;
     }
     stateSave();
-    flushAll(&flushOnDep);            // held uploads complete, then retire
-    poolTrim(true);                   // pooled blocks back to the driver
+    flushAll(&flushOnDep);
+    poolTrim(true);
     trace("VRAMSYS: EMERGENCY - allocation failed; recycle pool flushed "
           "(%.1f MB reclaimed), budget deflated %d MB for %d frames, zone "
           "CRITICAL", before / 1048576.0, cfg.deflateMB, cfg.deflateFrames);
     return before > 0;
 }
 
-// ============================================================ per-frame tick
 static void refreshConfig()
 {
     cfg.enable   = live::onoff("vram.enable",   "TAA_VRAMSYS",         true);
@@ -1932,7 +1567,7 @@ static void refreshConfig()
     cfg.deflateFrames  = live::i("vram.deflate_frames",  nullptr, 600);
     cfg.recycleMaxMB   = live::i("vram.recycle_max_mb",  nullptr, 256);
     cfg.recycleHoldFrames = live::i("vram.recycle_hold_frames", nullptr, 180);
-    cfg.uploadBudgetMB[GREEN]  = live::i("vram.upload_g", nullptr, 0);   // 0 = off
+    cfg.uploadBudgetMB[GREEN]  = live::i("vram.upload_g", nullptr, 0);
     cfg.uploadBudgetMB[YELLOW] = live::i("vram.upload_y", nullptr, 0);
     cfg.uploadBudgetMB[ORANGE] = live::i("vram.upload_o", nullptr, 64);
     cfg.uploadBudgetMB[RED]    = live::i("vram.upload_r", nullptr, 24);
@@ -1951,10 +1586,6 @@ static void refreshConfig()
     cfg.ageFrames      = live::i("vram.age_frames",      nullptr, 1800);
 }
 
-// Frame-time sample and the adaptive upload notch (SS29/58). If the rolling
-// average degrades more than 30% past the best recent average while uploads
-// are flowing, the upload budget halves; after 600 clean frames it steps back.
-// Smoothing both ways so it cannot oscillate.
 static void frameTimeTick()
 {
     LARGE_INTEGER now, fq;
@@ -1970,14 +1601,10 @@ static void frameTimeTick()
             if (frameAvgMs <= 0.0) frameAvgMs = ms;
             frameAvgMs += (ms - frameAvgMs) * 0.05;
             if (frameAvgMs < frameBestMs) frameBestMs = frameAvgMs;
-            frameBestMs *= 1.0001;         // decays upward: "recent" best
-            // Measured on the first flight: loading screens present at ~1 ms
-            // and seeded an absurd baseline, so every load hitch read as a
-            // 50x regression and notched the budget. No real in-world frame
-            // is under 4 ms on any target hardware; the floor removes the
-            // poisoning without touching genuine regressions.
+            frameBestMs *= 1.0001;
+
             if (frameBestMs < 4.0) frameBestMs = 4.0;
-            if (cfg.adaptive && g_camValid) {   // no notching before flight
+            if (cfg.adaptive && g_camValid) {
                 bool uploadsFlowing = upBytesLast > (4ull << 20);
                 if (frameAvgMs > frameBestMs * 1.30 && uploadsFlowing) {
                     if (uploadNotch < 3) {
@@ -2006,8 +1633,6 @@ static void frameTimeTick()
     g_havePresentQpc = true;
 }
 
-// Percentiles over the frame-time ring, for the report (SS30: average FPS,
-// 1% low, 0.1% low, variance, maximum).
 static void frameTimeStats(double *avg, double *p99, double *p999,
                            double *worst, double *var)
 {
@@ -2028,26 +1653,17 @@ static void frameTimeStats(double *avg, double *p99, double *p999,
 
 static void zoneUpdate()
 {
-    // Projected usage (SS27): what is resident now, plus what the last frame's
-    // uploads suggest is arriving, plus what the governor is holding and will
-    // release - minus the recycle pool, which is reclaimable the instant it is
-    // needed. Cheap, monotone with real pressure, no readbacks.
+
     double basis = filteredBudget > 0 ? filteredBudget : (double)heapSize;
     if (basis <= 0) return;
-    // SS85: usage HISTORY predicts the peak. The per-frame delta's EMA,
-    // projected over the lookahead horizon, joins the projection - so a
-    // climb toward a dense region begins degradation BEFORE the peak.
+
     double delta = (double)rawUsage - (double)prevRawUsage;
     prevRawUsage = rawUsage;
     if (delta > -1e9 && delta < 1e9)
         usageTrendBytes += (delta - usageTrendBytes) * 0.05;
     double trendTerm = usageTrendBytes > 0
                      ? usageTrendBytes * (double)cfg.lookaheadFrames : 0.0;
-    // Measured on the first flight: the load ramp's delta EMA times the
-    // lookahead projected 6 GB of demand at 0.37 GB of usage and pushed the
-    // zone to YELLOW on the menu. The trend is a PRESSURE refinement, not a
-    // pressure source: capped at a quarter of the basis, and ignored
-    // entirely until real usage crosses half the budget.
+
     if (trendTerm > basis * 0.25) trendTerm = basis * 0.25;
     if ((double)rawUsage < basis * 0.5) trendTerm = 0.0;
     double projected = (double)rawUsage + (double)upBytesLast * 2.0 +
@@ -2059,10 +1675,10 @@ static void zoneUpdate()
     static const double exitT[5] = { 0.0, 0.75, 0.83, 0.90, 0.95 };
 
     int want = zone;
-    while (want < CRITICAL && f >= enter[want + 1]) ++want;    // up: immediate
-    while (want > GREEN && f < exitT[want]) --want;            // down: candidate
+    while (want < CRITICAL && f >= enter[want + 1]) ++want;
+    while (want > GREEN && f < exitT[want]) --want;
 
-    if (teleportLeft > 0 && want < YELLOW) want = YELLOW;      // predictive bias
+    if (teleportLeft > 0 && want < YELLOW) want = YELLOW;
 
     if (want > zone) { zone = want; zoneDwell = 0; ++zoneFlips;
         trace("VRAMSYS: zone %s (%.0f%% of %.2f GB shaped basis, usage %.2f GB "
@@ -2070,7 +1686,7 @@ static void zoneUpdate()
               basis / 1073741824.0, rawUsage / 1073741824.0,
               upBytesLast / 1048576.0);
     } else if (want < zone) {
-        if (++zoneDwell >= 60) {                                // 60-frame dwell
+        if (++zoneDwell >= 60) {
             zone = want; zoneDwell = 0; ++zoneFlips;
             trace("VRAMSYS: zone %s (%.0f%%)", zoneName(zone), f * 100.0);
         }
@@ -2092,12 +1708,11 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
         g_frameUploadSpent = 0;
         upBytesLast = upBytesFrame.exchange(0);
         if (upBytesLast > upBytesPeak) upBytesPeak = upBytesLast;
-        g_upSeen.clear();                       // per-frame dup detection
+        g_upSeen.clear();
     }
 
     frameTimeTick();
 
-    // Per-frame peaks for the stutter telemetry.
     {
         uint64_t pf = pipesFrame.exchange(0);
         if (pf > pipesFramePeak) { pipesFramePeak = pf; pipesFramePeakAt = fi; }
@@ -2109,9 +1724,6 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
         if (pb > pipeBindsPeak) pipeBindsPeak = pb;
     }
 
-    // Aircraft / livery change (SS76): the burst score decays; over the
-    // threshold, the teleport response fires - pool flushed, zone floored -
-    // because the working set is about to be replaced wholesale.
     {
         std::lock_guard<std::mutex> g(m);
         bigDestroyScore *= 0.98;
@@ -2129,7 +1741,6 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
     if (teleportLeft == cfg.teleportFrames && aircraftChangeCooldown == 1800)
         poolTrim(true);
 
-    // The benchmark window (SS99): vram.bench=1 opens it, 0 closes and dumps.
     {
         bool want = live::i("vram.bench", nullptr, 0) != 0;
         if (want && !benchOn) {
@@ -2189,11 +1800,8 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
         }
     }
 
-    if (fi % 3600 == 0) stateSave();            // SS77: survive the session
+    if (fi % 3600 == 0) stateSave();
 
-    // Predictor: speed for telemetry, teleports for policy. The camera delta
-    // arrives from the layer's own per-frame snapshot - nothing here reads the
-    // sim.
     if (camDeltaMeters >= 0.0f) {
         camSpeedEma += (camDeltaMeters - camSpeedEma) * 0.05;
         if (camDeltaMeters > cfg.teleportM) {
@@ -2207,10 +1815,6 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
     }
     if (teleportLeft == cfg.teleportFrames) poolTrim(true);
 
-    // Camera/scene integration: a sustained fast turn sweeps fresh scenery
-    // into the frustum - the same "demand is coming" signal as speed, from
-    // the view matrix the layer already receives. Floors the zone at YELLOW
-    // for two seconds per trigger, which pre-tightens the shaped budget.
     if (camRotDeg >= 0.0f && camRotDeg < 45.0f) {
         camRotEma += (camRotDeg - camRotEma) * 0.1;
         if (camRotEma > live::f("vram.rot_floor_deg", nullptr, 1.0f)) {
@@ -2219,9 +1823,6 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
         }
     }
 
-    // A fresh heap sample, on our own cadence, through the down-chain query -
-    // shaping happens in the report hook; this keeps zones honest even when
-    // the app is not asking.
     if (dev.memProps2 && dev.phys) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT bud;
         memset(&bud, 0, sizeof(bud));
@@ -2246,7 +1847,6 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
 
     { std::lock_guard<std::mutex> g(m); zoneUpdate(); }
 
-    // Governor: age out anything held too long, then release within budget.
     std::vector<HeldSubmit> release;
     {
         std::lock_guard<std::mutex> g(m);
@@ -2254,8 +1854,7 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
         for (size_t i = 0; i < g_heldSubmits.size();) {
             bool aged = fi - g_heldSubmits[i].frame >= (uint64_t)cfg.uploadMaxHold;
             bool fits = g_frameUploadSpent + g_heldSubmits[i].bytes <= budget;
-            // FIFO per queue: once one stays, everything younger for that
-            // queue stays behind it.
+
             bool blocked = false;
             for (size_t k = 0; k < i; ++k)
                 if (g_heldSubmits[k].q == g_heldSubmits[i].q) { blocked = true; break; }
@@ -2266,7 +1865,7 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
                 g_heldSubmits.erase(g_heldSubmits.begin() + (long)i);
             } else ++i;
         }
-        // Rebuild trigger indices.
+
         std::vector<HeldSubmit> tmp;
         tmp.swap(g_heldSubmits);
         g_heldSubmits.swap(tmp);
@@ -2340,8 +1939,7 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
               g_burstId, g_camVX, g_camVY, g_camVZ,
               (unsigned long long)g_physOf.size());
         {
-            // Pool composition - the fragmentation-adjacent view (SS8 of the
-            // NEXT list): how many blocks, and how uneven their sizes are.
+
             uint64_t largest = 0;
             for (size_t i = 0; i < g_pool.size(); ++i)
                 if (g_pool[i].size > largest) largest = g_pool[i].size;
@@ -2415,8 +2013,7 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
               (unsigned long long)agedDemotions,
               (unsigned long long)agedRestores, cfg.ageFrames);
         {
-            // The registry census: resources by class and residency state -
-            // the intelligence layer's whole view in two lines.
+
             uint64_t byClass[10] = {0}, clsBytes[10] = {0};
             uint64_t st[5] = {0};
             for (std::map<VkImage, ResRec>::iterator it = g_registry.begin();
@@ -2448,7 +2045,7 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
                   (unsigned long long)governorBypassed);
         }
         {
-            // Top churners - the shapes cycling through residency (SS51).
+
             int printed = 0;
             for (std::map<ChurnKey, ChurnRec>::iterator it = g_churn.begin();
                  it != g_churn.end() && printed < 5; ++it) {
@@ -2473,24 +2070,18 @@ static void onPresent(float camDeltaMeters, float camRotDeg = -1.0f)
               (unsigned long long)allocFails.load());
 }
 
-// Device teardown: everything held goes back before the device dies, the
-// session's learning is saved, and what remains allocated is reported - the
-// plan's SS67 leak check, stated rather than assumed.
 static void shutdown()
 {
     flushAll(&flushOnDep);
     poolTrim(true);
-    // Automated tuning: a session that thrashed between zones teaches the
-    // next one to keep a wider margin - the same persistent-bias channel the
-    // allocation failures use, learned once per session at shutdown.
+
     if (zoneFlips > 200 && reserveBiasMB < 256) {
         reserveBiasMB += 32;
         trace("VRAMSYS: %llu zone transitions this session - reserve bias "
               "raised to +%d MB for future sessions",
               (unsigned long long)zoneFlips, reserveBiasMB);
     }
-    // Age-window tuning: many restores shortly after decay means the window
-    // was too short - the next session waits longer before decaying.
+
     if (agedDemotions > 50 && agedRestores * 2 > agedDemotions &&
         ageBiasFrames < 3600) {
         ageBiasFrames += 600;
@@ -2511,4 +2102,4 @@ static void shutdown()
           (unsigned long long)g_allocs.size(), remBytes / 1048576.0);
 }
 
-} // namespace vram
+}
