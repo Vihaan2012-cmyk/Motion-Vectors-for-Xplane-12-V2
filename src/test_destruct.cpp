@@ -9,6 +9,7 @@
 #include "destruct/occupancy.h"
 #include "destruct/solver.h"
 #include "destruct/gpu_layout.h"
+#include "destruct/bounds.h"
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -644,6 +645,123 @@ int main()
               "and before the transform region, so a reject cannot corrupt one");
         check(destruct::kDataXform < destruct::kDataWords,
               "the transform region is inside the buffer");
+    }
+
+
+    // ------------------------------------------------ seed box and refinement
+    //
+    // X-Plane publishes acf_size_x and acf_size_z and NO height dataref, so the
+    // box cannot be read off the aircraft. It is bracketed generously and then
+    // measured from the occupancy the GPU reports. These check the bracket
+    // really does bracket, and that the measurement narrows correctly.
+    printf("\nthe seed box brackets, the refinement measures\n");
+    {
+        // A 737-ish airframe: 36 m span, 39 m long, gear 2.5 m below datum.
+        destruct::AircraftDims d;
+        d.sizeX = 36.0f; d.sizeZ = 39.0f; d.lowestY = -2.5f;
+        float bbMin[3], bbMax[3];
+        destruct::seedBounds(d, bbMin, bbMax);
+
+        check(bbMin[0] < -18.0f && bbMax[0] > 18.0f,
+              "the seed box contains the full span");
+        check(bbMin[2] < -19.5f && bbMax[2] > 19.5f,
+              "the seed box contains the full length");
+        check(bbMin[1] <= -2.5f,
+              "the seed box reaches at least to the gear contact point");
+        check(bbMax[1] > 8.0f,
+              "and high enough to contain a tail");
+
+        // A Pitts: tiny, and proportionally much taller. The height factor is
+        // chosen from this extreme rather than from an airliner average.
+        destruct::AircraftDims p;
+        p.sizeX = 6.1f; p.sizeZ = 5.3f; p.lowestY = -1.0f;
+        float pMin[3], pMax[3];
+        destruct::seedBounds(p, pMin, pMax);
+        check(pMax[1] > 1.8f,
+              "a short aerobatic airframe still gets headroom for its fin");
+
+        // Nothing useful reported at all must not produce a degenerate grid.
+        destruct::AircraftDims z;   // all zero
+        float zMin[3], zMax[3];
+        destruct::seedBounds(z, zMin, zMax);
+        bool nonDegenerate = true;
+        for (int a = 0; a < 3; ++a)
+            if (!(zMax[a] - zMin[a] > 1.0f)) nonDegenerate = false;
+        check(nonDegenerate,
+              "an aircraft that reports no dimensions still gets a usable box");
+
+        // ---- refinement
+        destruct::Grid g = destruct::gridForBounds(bbMin, bbMax);
+        std::vector<unsigned char> occ((size_t)g.nx * g.ny * g.nz, 0);
+
+        // Occupy a known interior block and check the measured box encloses it
+        // without wandering outside by more than the cell it must round to.
+        float realMin[3], realMax[3];
+        for (int a = 0; a < 3; ++a) {
+            realMin[a] = bbMin[a] + 0.3f * (bbMax[a] - bbMin[a]);
+            realMax[a] = bbMin[a] + 0.6f * (bbMax[a] - bbMin[a]);
+        }
+        // The truth to compare against is the OCCUPIED CELLS, not the region
+        // used to choose them: a cell is filled by its centre, so the outermost
+        // occupied centre can sit up to half a cell inside realMin/realMax.
+        // refineBounds returns cell FACES, and must enclose every centre.
+        float cMin[3] = {  1e30f,  1e30f,  1e30f };
+        float cMax[3] = { -1e30f, -1e30f, -1e30f };
+        int filled = 0;
+        for (int zc = 0; zc < g.nz; ++zc)
+        for (int yc = 0; yc < g.ny; ++yc)
+        for (int xc = 0; xc < g.nx; ++xc) {
+            float c[3];
+            const int flat = xc + yc * g.nx + zc * g.nx * g.ny;
+            destruct::gridCellCentre(g, flat, c);
+            if (c[0] >= realMin[0] && c[0] <= realMax[0] &&
+                c[1] >= realMin[1] && c[1] <= realMax[1] &&
+                c[2] >= realMin[2] && c[2] <= realMax[2]) {
+                occ[(size_t)flat] = 1;
+                for (int a = 0; a < 3; ++a) {
+                    if (c[a] < cMin[a]) cMin[a] = c[a];
+                    if (c[a] > cMax[a]) cMax[a] = c[a];
+                }
+                ++filled;
+            }
+        }
+        check(filled > 0, "the synthetic airframe occupies some cells");
+
+        float rMin[3], rMax[3];
+        check(destruct::refineBounds(g, occ.data(), rMin, rMax),
+              "refinement succeeds when something is occupied");
+
+        bool encloses = true, tight = true;
+        for (int a = 0; a < 3; ++a) {
+            if (rMin[a] > cMin[a] || rMax[a] < cMax[a]) encloses = false;
+            // Never wider than the truth plus the cell it had to round to on
+            // each side, or the refinement is not actually measuring.
+            if (rMin[a] < cMin[a] - 2.0f * g.cell ||
+                rMax[a] > cMax[a] + 2.0f * g.cell) tight = false;
+        }
+        check(encloses, "the refined box encloses every occupied cell centre");
+        check(tight, "and is tight to within the cell size it rounded to");
+
+        // The refined box must be strictly smaller than the seed, or the seed
+        // was not generous and something was clipped.
+        bool narrowed = true;
+        for (int a = 0; a < 3; ++a)
+            if (!(rMax[a] - rMin[a] < bbMax[a] - bbMin[a])) narrowed = false;
+        check(narrowed, "pass two narrows the seed rather than matching it");
+
+        // Nothing occupied is a REAL outcome - it means the transform put the
+        // aeroplane somewhere other than the grid - and must be reported as
+        // failure rather than yielding a box at the origin.
+        std::vector<unsigned char> empty((size_t)g.nx * g.ny * g.nz, 0);
+        float eMin[3], eMax[3];
+        check(!destruct::refineBounds(g, empty.data(), eMin, eMax),
+              "an empty occupancy is reported as failure, not as a box at zero");
+
+        // The gate the plan states in these exact terms.
+        const float frac = destruct::occupiedFraction(g, occ.data());
+        check(frac > 0.0f && frac < 1.0f, "occupied fraction is a real fraction");
+        const float fracEmpty = destruct::occupiedFraction(g, empty.data());
+        check(fracEmpty == 0.0f, "an empty grid reports zero occupancy");
     }
 
     printf("\n%s: %d failure(s)\n", g_fail ? "FAILED" : "OK", g_fail);
