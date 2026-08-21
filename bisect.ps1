@@ -7,7 +7,7 @@ $xp   = "d:\Steam Games\steamapps\common\X-Plane 12"
 $sit  = "$xp\Output\situations\Felis 742 GE XP12 Situation.sit"
 $log  = "$xp\Log.txt"
 $out  = "$xp\MotionVectors\bisect_results.txt"
-$layerPath = "$xp\MotionVectors\build\vklayer"
+$layerPath = "$xp\MotionVectors\build\MotionVectors\vklayer"
 
 # Two rounds per config: the crash is intermittent, one clean pass proves little.
 $configs = @(

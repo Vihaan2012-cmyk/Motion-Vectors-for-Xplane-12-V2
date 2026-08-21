@@ -63,8 +63,8 @@ if (-not $NoBuild) {
 # launcher is optional and its build is allowed to fail without blocking a
 # release, so it is checked separately below rather than gating this.
 $need = @(
-    "$root\build\vklayer\VkLayer_mv.dll",
-    "$root\build\vklayer\VkLayer_mv.json",
+    "$root\build\MotionVectors\vklayer\VkLayer_mv.dll",
+    "$root\build\MotionVectors\vklayer\VkLayer_mv.json",
     "$root\build\MotionVectors.xpl",
     "$root\build\MotionVectorsLauncher.exe"
 )
@@ -85,8 +85,8 @@ foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path $d | Out-Null 
 
 # Layer + launcher live together: the launcher points VK_LAYER_PATH at its own
 # directory, so the manifest and the DLL have to be beside it.
-Copy-Item "$root\build\vklayer\VkLayer_mv.dll"  "$stage\MotionVectors\"
-Copy-Item "$root\build\vklayer\VkLayer_mv.json" "$stage\MotionVectors\"
+Copy-Item "$root\build\MotionVectors\vklayer\VkLayer_mv.dll"  "$stage\MotionVectors\"
+Copy-Item "$root\build\MotionVectors\vklayer\VkLayer_mv.json" "$stage\MotionVectors\"
 Copy-Item "$root\build\MotionVectorsLauncher.exe" "$stage\MotionVectors\"
 if (Test-Path "$root\build\qt\MotionVectors.exe") {
     Copy-Item "$root\build\qt\MotionVectors.exe" "$stage\MotionVectors\MotionVectorsSettings.exe"

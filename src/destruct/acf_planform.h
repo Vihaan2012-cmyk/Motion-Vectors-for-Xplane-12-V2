@@ -100,6 +100,23 @@ struct Airframe {
     // Mirroring is left to the caller because a body on the centreline must
     // not be mirrored into a duplicate of itself.
     std::vector<float>   bodyXyz;      // xyz triples
+
+    // ---- THE SAME POINTS, WITH THEIR NEIGHBOURS.
+    //
+    // bodyXyz above is a flat cloud, which is all a bounding box needs.
+    // Voxelising the hull needs to know which points are adjacent: 20 stations
+    // over a 70 m fuselage are 3.5 m apart on a 1.73 m grid, so marking points
+    // alone leaves a string of dots with empty cells between them.
+    //
+    // stride is the ring size, so point (station, p) is at (station*nj + p).
+    struct BodyLoft {
+        int ni = 0;                  // stations along the body
+        int nj = 0;                  // points around each station
+        std::vector<float> xyz;      // ni * nj * 3, metres, .acf frame
+        std::vector<unsigned char> set;   // ni * nj, which ones the file gave
+    };
+    std::vector<BodyLoft> bodies;
+
     std::vector<GearLeg> gear;
     // The pilot's eye, metres, .acf frame. Carried because the sim publishes
     // the SAME point relative to the CG, so the pair identifies which frame
@@ -285,12 +302,42 @@ inline bool parseAcf(const char *path, Airframe &out)
 
     for (int b = 0; b < kMaxAcfBodies; ++b) {
         const RawBody &rb = bodies[(size_t)b];
+        if (rb.pts.empty()) continue;
+
+        // Dimensions from the DATA, not from i_count / j_count. Those appear
+        // after the points in the alphabetically-sorted file, and trusting
+        // them is what silently discarded every body point the first time.
+        uint32_t maxS = 0, maxP = 0;
         std::map<uint64_t, Pt3>::const_iterator it = rb.pts.begin();
         for (; it != rb.pts.end(); ++it) {
-            out.bodyXyz.push_back((it->second.x + rb.ox) * kFeetToMetres);
-            out.bodyXyz.push_back((it->second.y + rb.oy) * kFeetToMetres);
-            out.bodyXyz.push_back((it->second.z + rb.oz) * kFeetToMetres);
+            const uint32_t st = (uint32_t)(it->first >> 32);
+            const uint32_t pt = (uint32_t)(it->first & 0xFFFFFFFFu);
+            if (st > maxS) maxS = st;
+            if (pt > maxP) maxP = pt;
         }
+
+        Airframe::BodyLoft lo;
+        lo.ni = (int)maxS + 1;
+        lo.nj = (int)maxP + 1;
+        lo.xyz.assign((size_t)lo.ni * lo.nj * 3, 0.0f);
+        lo.set.assign((size_t)lo.ni * lo.nj, 0);
+
+        for (it = rb.pts.begin(); it != rb.pts.end(); ++it) {
+            const uint32_t st = (uint32_t)(it->first >> 32);
+            const uint32_t pt = (uint32_t)(it->first & 0xFFFFFFFFu);
+            const size_t k = (size_t)st * lo.nj + pt;
+            const float x = (it->second.x + rb.ox) * kFeetToMetres;
+            const float y = (it->second.y + rb.oy) * kFeetToMetres;
+            const float z = (it->second.z + rb.oz) * kFeetToMetres;
+            lo.xyz[k * 3 + 0] = x;
+            lo.xyz[k * 3 + 1] = y;
+            lo.xyz[k * 3 + 2] = z;
+            lo.set[k] = 1;
+            out.bodyXyz.push_back(x);
+            out.bodyXyz.push_back(y);
+            out.bodyXyz.push_back(z);
+        }
+        out.bodies.push_back(lo);
     }
 
     for (int i = 0; i < kMaxAcfGear; ++i) {

@@ -306,9 +306,16 @@ local function verify_integrity()
         return nil
     end
 
+    -- THREE layouts now. The product split moved development output to
+    -- build\\<product>\\vklayer, and dropping the old path without
+    -- adding the new one made the panel report MISSING for a layer that was
+    -- loaded and running - the same self-contradiction the comment above
+    -- records, reintroduced from the other direction.
     local dll  = { base .. "VkLayer_mv.dll",
+                   base .. "build\\MotionVectors\\vklayer\\VkLayer_mv.dll",
                    base .. "build\\vklayer\\VkLayer_mv.dll" }
     local json = { base .. "VkLayer_mv.json",
+                   base .. "build\\MotionVectors\\vklayer\\VkLayer_mv.json",
                    base .. "build\\vklayer\\VkLayer_mv.json" }
 
     local checks = {
@@ -888,9 +895,11 @@ local function title_bar()
     imgui.Separator()
 end
 
+local win_bg_pushed = 0
+
 local function build(w, x, y)
-    -- Nothing to balance. The style stack begins and ends this function at
-    -- the same depth, which is what ImGui requires of every frame.
+    -- Balance last frame's push before doing anything else.
+    if win_bg_pushed > 0 then popcol(win_bg_pushed); win_bg_pushed = 0 end
     if not started then first_frame() end
 
     -- ---- SETTLE THE ATTACH QUESTION ONCE THE ANSWER EXISTS.
@@ -913,17 +922,19 @@ local function build(w, x, y)
     -- on WindowBg arrives too late. A full-size child with ChildBg is what
     -- gives the whole plugin one background, and its alpha is what lets the
     -- scene through the way the reference dialog does.
-    -- ---- THE CHILD CARRIES THE TINT, INSIDE THIS FRAME.
+    -- ---- THE WINDOW CARRIES THE TINT. THE CHILD STAYS TRANSPARENT.
     --
-    -- This was transparent because WindowBg carried the colour, pushed at the
-    -- end of the previous frame to reach a Begin() FlyWithLua had already
-    -- called. That is what ImGui was objecting to: a frame cannot end one push
-    -- deep, and the next cannot pop what it did not push.
+    -- Moving the colour here to silence an ImGui style-stack assert cost the
+    -- panel its transparency AND its drag: FlyWithLua's own window kept its
+    -- default opaque background, the child painted over it, and the drag
+    -- strips stopped behaving. "The panel looks the same" was wrong.
     --
-    -- Exactly ONE of the two may be tinted - the note that used to sit here
-    -- recorded that tinting both stacked two dark layers into a black band -
-    -- so the colour moves here, where it belongs to the frame that draws it.
-    local nWin = pushcol("ChildBg", C_PANEL)
+    -- The assert is cosmetic. A panel you cannot see through or move is not.
+    -- So the cross-frame push is back, and the ImGui message with it, until
+    -- there is a fix that does not cost the look - most likely painting the
+    -- background with a draw-list rectangle, which touches no style stack at
+    -- all.
+    local nWin = pushcol("ChildBg", 0x00000000)
     imgui.BeginChild("panel", -1, -1, false)
     title_bar()
     -- Drag strips live in genuinely empty space, so they can never sit on top
@@ -1063,6 +1074,10 @@ local function build(w, x, y)
 
     imgui.EndChild()
     popcol(nWin)
+
+    -- Applies to the NEXT Begin(), which is the only way to reach a window
+    -- FlyWithLua has already opened. Popped at the top of the next frame.
+    win_bg_pushed = pushcol("WindowBg", C_PANEL)
 end
 
 function mv_open()

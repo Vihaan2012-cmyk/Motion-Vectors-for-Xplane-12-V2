@@ -347,6 +347,21 @@ inline void uploadHeader(const float aircraftInv[16], const float aircraftFwd[16
 // Cleared before a discovery frame and read after it. Both operate on the
 // CELLS THE CURRENT GRID USES, not the whole region: leftovers from a previous,
 // larger grid would otherwise read as occupied and seed fragments in mid-air.
+// ---- THE CPU'S ANSWER, WRITTEN INTO THE BUFFER THE SHADER READS.
+//
+// The occupancy region is filled from the aircraft's own geometry rather than
+// discovered by rasterising, so this is a straight copy into mapped, coherent
+// memory. No barrier: the shader only ever READS these bytes, and a frame that
+// catches the copy half-done displaces a slightly wrong set of cells for one
+// frame rather than corrupting anything.
+inline void writeOccupancy(const unsigned char *src, uint32_t cells)
+{
+    State &s = state();
+    if (!s.ready || !s.mapped || !src) return;
+    if (cells > destruct::kMaxCells) cells = destruct::kMaxCells;
+    memcpy((unsigned char *)s.mapped + destruct::kOffOccupancy, src, cells);
+}
+
 inline void clearOccupancy(uint32_t cells)
 {
     State &s = state();

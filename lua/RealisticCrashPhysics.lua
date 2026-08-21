@@ -1,12 +1,9 @@
--- Derived from the Motion Vectors panel, which is the same panel for a
--- different product: same live-config mechanism, same integrity check,
--- same generated settings table. Only the identity differs, and every
--- part of that identity is here because BOTH MODS MAY BE INSTALLED AT
--- ONCE - a panel reading the other one's datarefs would drive the wrong
--- layer while looking entirely correct.
+-- Derived from the Motion Vectors panel: same live-config mechanism, same
+-- integrity check, same generated settings table, different identity.
 --
--- If the two panels drift, the settings table is the part that matters:
--- it is generated from the layer source, so regenerate rather than edit.
+-- REGENERATE rather than edit. This file drifted from its source within
+-- an hour of first being written - a layer-path fix landed in the other
+-- panel and not this one - which is exactly what a copy does.
 
 --[[ ===========================================================================
   REALISTIC CRASH PHYSICS - in-sim panel
@@ -316,10 +313,17 @@ local function verify_integrity()
         return nil
     end
 
-    local dll  = { base .. "VkLayer_mv.dll",
-                   base .. "build\\vklayer\\VkLayer_mv.dll" }
-    local json = { base .. "VkLayer_mv.json",
-                   base .. "build\\vklayer\\VkLayer_mv.json" }
+    -- THREE layouts now. The product split moved development output to
+    -- build\\<product>\\vklayer, and dropping the old path without
+    -- adding the new one made the panel report MISSING for a layer that was
+    -- loaded and running - the same self-contradiction the comment above
+    -- records, reintroduced from the other direction.
+    local dll  = { base .. "VkLayer_rcp.dll",
+                   base .. "build\\MotionVectors\\vklayer\\VkLayer_rcp.dll",
+                   base .. "build\\vklayer\\VkLayer_rcp.dll" }
+    local json = { base .. "VkLayer_rcp.json",
+                   base .. "build\\MotionVectors\\vklayer\\VkLayer_rcp.json",
+                   base .. "build\\vklayer\\VkLayer_rcp.json" }
 
     local checks = {
         { "Vulkan layer",     first_existing(dll)  or dll[1]  },

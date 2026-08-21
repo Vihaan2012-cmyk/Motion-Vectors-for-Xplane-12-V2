@@ -27,7 +27,12 @@ param(
     [Parameter(Position = 0)] [string]$Action = "status",
     [Parameter(Position = 1)] [string]$Key,
     [Parameter(Position = 2)] [string]$Value,
-    [switch]$Taa,
+    # -NoTaa, not -Taa. TAA ON is what the mod IS: the shipped product is
+    # either TAA, or TAA and crash physics together. Launching with it off
+    # tested a configuration nobody runs, and cost a round of "TAA stopped
+    # working" when the launcher had simply switched it off.
+    [switch]$NoTaa,
+    [switch]$Taa,          # accepted and ignored, so old commands still run
     [int]$Viz = -1,
     [string]$Match
 )
@@ -55,17 +60,23 @@ switch ($Action) {
     }
 
     "launch" {
-        $env:VK_LAYER_PATH           = Join-Path $root "build\vklayer"
+        # build\<product>klayer since the product split. Pointing at the old
+        # buildklayer loaded a STALE layer while the plugin was current,
+        # and the layer refused the shared block over a version mismatch:
+        # "plugin v11/3408B, layer v10/2888B". No matrices, so no motion
+        # vectors, so TAA had nothing to resolve - which reads as "TAA
+        # stopped working" and is nothing of the kind.
+        $env:VK_LAYER_PATH           = Join-Path $root "build\MotionVectors\vklayer"
         $env:VK_LOADER_LAYERS_ENABLE = "VK_LAYER_mv"
         $env:TAA_LAYER_TRACE         = "1"
         $env:TAA_VELOCITY            = "1"     # exactly "1" - see header
         if (Test-Path $trace) { Clear-Content $trace }
-        if ($Taa -or $Viz -ge 0) { Set-LiveKey "taa.enable" "1" } else { Set-LiveKey "taa.enable" "0" }
+        if ($NoTaa) { Set-LiveKey "taa.enable" "0" } else { Set-LiveKey "taa.enable" "1" }
         if ($Viz -ge 0) { Set-LiveKey "taa.viz" "$Viz" } else { Set-LiveKey "taa.viz" "0" }
         Start-Process -FilePath (Join-Path $xp "X-Plane.exe") -WorkingDirectory $xp
         Start-Sleep 8
         if (Get-Process -Name "X-Plane" -ErrorAction SilentlyContinue) {
-            Write-Host "X-Plane up: layer + velocity armed$(if ($Taa -or $Viz -ge 0) { ', TAA on' })$(if ($Viz -ge 0) { ", viz=$Viz" })"
+            Write-Host "X-Plane up: layer + velocity armed$(if ($NoTaa) { ', TAA OFF' } else { ', TAA on' })$(if ($Viz -ge 0) { ", viz=$Viz" })"
         } else { Write-Host "X-Plane did not start" }
     }
 

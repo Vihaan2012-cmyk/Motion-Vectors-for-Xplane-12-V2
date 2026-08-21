@@ -1877,6 +1877,15 @@ static void publishCrashGrid(bool force)
             destruct::referencePointOffset(XPLMGetDataf(rCgY),
                                            XPLMGetDataf(rCgZ), off);
             destruct::applyOffset(verts, off);
+
+            // Published so the LAYER can voxelise the same geometry into the
+            // buffer it owns. The path it can read itself; the offset it
+            // cannot, because that comes from datarefs.
+            memcpy(g_share->crashRefOffset, off, sizeof(g_share->crashRefOffset));
+            strncpy(g_share->crashAcfPath, acfPath,
+                    sizeof(g_share->crashAcfPath) - 1);
+            g_share->crashAcfPath[sizeof(g_share->crashAcfPath) - 1] = 0;
+
             xlog("crash grid: Plane Maker reference point at (%.2f %.2f) ft "
                  "-> airframe shifted (%.2f %.2f %.2f) m into the render frame",
                  (double)XPLMGetDataf(rCgY), (double)XPLMGetDataf(rCgZ),

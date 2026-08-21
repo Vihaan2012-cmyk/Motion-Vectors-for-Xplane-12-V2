@@ -120,6 +120,7 @@ static void trace(const char *fmt, ...)
 #include "upscaler_policy.h"
 #include "xess_probe.h"
 #include "../destruct/bounds.h"
+#include "../destruct/voxelise.h"
 
 // ------------------------------------------------------- shared memory
 
@@ -7437,6 +7438,82 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // there before the draws ran, which is zero - and zero is
     // indistinguishable from "the transform is wrong and nothing landed in the
     // grid", which is the single most important failure this is looking for.
+    // ---- STAMP THE AIRFRAME INTO OCCUPANCY, ONCE PER AEROPLANE.
+    //
+    // The displacement gate asks whether a cell is airframe. Nothing filled
+    // that, so it refused everything - which is why a 5 m test offset produced
+    // a completely normal sim rather than a moved aeroplane.
+    //
+    // From the .acf rather than from the GPU discovery pass. Discovery
+    // classifies EVERY vertex the sim draws, so a parked aeroplane marks the
+    // terminal building beside it; the measured box came out asymmetric,
+    // -27.4 to +33.2, which a symmetric aeroplane cannot do. It is not fixable
+    // by tightening the classification, because a vertex carries no flag
+    // saying which model it came from.
+    //
+    // Keyed on the PATH: parsing 49105 properties costs about a tenth of a
+    // second, which is fine once per aircraft and not fine per frame.
+    // Say which gate is shut, once. Four conditions and a silent skip is the
+    // same shape of problem as the discard word: no output is not a diagnosis.
+    if (g_share && crashEnabled()) {
+        static bool saidGate = false;
+        if (!saidGate && destructgpu::state().ready) {
+            saidGate = true;
+            trace("DESTRUCT: voxelise gate - ready=%d path='%s' nx=%d cell=%.2f",
+                  destructgpu::state().ready ? 1 : 0,
+                  g_share->crashAcfPath[0] ? g_share->crashAcfPath : "(empty)",
+                  g_share->crashNx, (double)g_share->crashCell);
+        }
+    }
+
+    if (g_share && crashEnabled() && destructgpu::state().ready &&
+        g_share->crashAcfPath[0] && g_share->crashNx > 0) {
+        static std::string voxPath;
+        static float       voxCell = 0.0f;
+        // The GRID matters as much as the path: the same aeroplane on a
+        // different grid needs restamping, or the occupancy describes cells
+        // that have moved.
+        if (voxPath != g_share->crashAcfPath || voxCell != g_share->crashCell) {
+            voxPath = g_share->crashAcfPath;
+            voxCell = g_share->crashCell;
+
+            destruct::Airframe frame;
+            if (destruct::parseAcf(voxPath.c_str(), frame)) {
+                destruct::Grid g;
+                g.min[0] = g_share->crashGridMin[0];
+                g.min[1] = g_share->crashGridMin[1];
+                g.min[2] = g_share->crashGridMin[2];
+                g.cell   = g_share->crashCell;
+                g.nx = g_share->crashNx; g.ny = g_share->crashNy; g.nz = g_share->crashNz;
+
+                const uint32_t cells = destruct::gpuCellCount(g);
+                std::vector<unsigned char> occ(cells ? cells : 1, 0);
+                const uint32_t hull = destruct::voxeliseAirframe(
+                    frame, g_share->crashRefOffset, g, occ.data(), cells);
+                const uint32_t gear = destruct::voxeliseGear(
+                    frame, g_share->crashRefOffset, g, occ.data(), cells);
+
+                uint32_t total = 0;
+                for (uint32_t i = 0; i < cells; ++i) if (occ[i]) ++total;
+
+                destructgpu::writeOccupancy(occ.data(), cells);
+
+                const float frac = cells ? (float)total / (float)cells : 0.0f;
+                trace("DESTRUCT: airframe voxelised from %s - %u of %u cells "
+                      "(%.1f%%), hull %u gear %u. This is the aeroplane's own "
+                      "geometry, so it contains no scenery however close the "
+                      "sim is parked to it.",
+                      voxPath.c_str(), total, cells, (double)(frac * 100.0f),
+                      hull, gear);
+            } else {
+                trace("DESTRUCT: could not read the airframe from '%s' - "
+                      "occupancy stays empty, so displacement will move "
+                      "nothing rather than move the wrong thing.",
+                      voxPath.c_str());
+            }
+        }
+    }
+
     if (g_share && crashEnabled() && destructgpu::state().ready) {
         static int discoverPhase = 0;   // 0 idle, 1 armed, 2 read next frame
         static uint32_t discoverCells = 0;

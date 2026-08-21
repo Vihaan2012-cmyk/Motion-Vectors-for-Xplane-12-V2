@@ -1641,7 +1641,20 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         const uint32_t idInRange = bound++, idOk1 = bound++, idOkAll = bound++;
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idWant); body.push_back(idTest); body.push_back(3);
         body.push_back(head(OpFOrdNotEqual, 5)); body.push_back(idBool); body.push_back(idWantB); body.push_back(idWant); body.push_back(idConstZeroF);
-        body.push_back(head(OpLogicalNot, 4)); body.push_back(idBool); body.push_back(idInRange); body.push_back(idSkip);
+        // ---- !idBadAll, NOT !idSkip.
+        //
+        // idSkip is idBadAll OR idInactive, and idInactive is the DISCOVER
+        // flag. Using it here made displacement depend on discovery being
+        // armed - and gridDim.w is deliberately pinned to 0 so a test
+        // offset cannot switch the occupancy WRITE on. So every vertex
+        // was out of range, and a 5 m offset with 1065 occupied cells
+        // moved nothing at all.
+        //
+        // The flags were split in the buffer and this one test was left
+        // reading the old one. What displacement needs to know is only
+        // whether the vertex is INSIDE THE GRID; whether discovery is
+        // running is none of its business.
+        body.push_back(head(OpLogicalNot, 4)); body.push_back(idBool); body.push_back(idInRange); body.push_back(idBadAll);
         body.push_back(head(OpLogicalAnd, 5)); body.push_back(idBool); body.push_back(idOk1);   body.push_back(idInRange); body.push_back(idOccupied);
         body.push_back(head(OpLogicalAnd, 5)); body.push_back(idBool); body.push_back(idOkAll); body.push_back(idOk1);     body.push_back(idWantB);
         body.push_back(head(OpSelect, 6)); body.push_back(idV4); body.push_back(idPicked);

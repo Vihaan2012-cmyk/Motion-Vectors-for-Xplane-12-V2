@@ -81,7 +81,7 @@
 #include <math.h>
 
 #define TAA_MAGIC       0x4D414154u            // 'TAAM'
-#define TAA_VERSION     10     // 10: crashAircraftFwd for displacement
+#define TAA_VERSION     11     // 11: acf path + reference offset for voxelising
                                // 8: crash destruction state (grid, transform)
 
 // Which temporal backend to run. All of them consume the SAME inputs - velocity
@@ -631,6 +631,19 @@ struct TaaShare {
     // It multiplies a DISPLACEMENT and never a position, so only its 3x3
     // part is ever read - see the layout note in gpu_layout.h.
     float crashAircraftFwd[16];
+
+    // ---- WHERE THE AIRFRAME GEOMETRY LIVES, AND HOW TO PLACE IT.
+    //
+    // The LAYER voxelises, not the plugin, because the layer owns the
+    // buffer the result goes into - handing 32 KB of occupancy through
+    // shared memory would be a second copy of the same answer, and two
+    // copies of one thing is how this project loses evenings.
+    //
+    // acf_planform.h needs no XPLM, so the layer can read the file
+    // itself. What it cannot get is the reference point: that comes from
+    // datarefs, which only the plugin can reach.
+    char  crashAcfPath[512];
+    float crashRefOffset[3];
 
     // The grid, in airframe-local metres. gridClassify in destruct/grid.h and
     // the shader perform the IDENTICAL arithmetic on these; if the two ever
