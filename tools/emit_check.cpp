@@ -48,20 +48,60 @@ int main(int argc, char **argv)
     // tool's findings survive it in the meantime.
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) { printf("usage: emit_check <module.spv>\n"); return 2; }
-    fprintf(stderr, "[m1] before readSpv\n");
     std::vector<uint32_t> in = readSpv(argv[1]);
-    fprintf(stderr, "[m2] readSpv gave %zu words\n", in.size());
     if (in.size() < 5) { printf("could not read %s\n", argv[1]); return 2; }
+
+    // ---- REFUSE A MODULE THAT HAS ALREADY BEEN PATCHED.
+    //
+    // The dumps in %TEMP%\mvspv are POST-injection: they carry Location 28 and
+    // 29 decorations this layer put there. Injecting into one of those tests
+    // DOUBLE injection, and it passes - 59 of 60 emitted and validated - while
+    // saying nothing whatever about the real patch.
+    //
+    // That is exactly the failure this tool was built to prevent, and it was
+    // fed the wrong corpus for a whole evening. So the input is checked rather
+    // than assumed: a module already decorated at our varying locations is a
+    // corpus error, not a result.
+    {
+        // The signature is the PUSH CONSTANT BLOCK, not the varying location.
+        //
+        // Checking Location 14/15 - this tool's defaults, with no device to
+        // ask - missed a corpus patched at 28/29, and let a whole evening of
+        // validation run against DOUBLE injection. The locations depend on
+        // the device; the marker must not.
+        //
+        // X-Plane declares no push constant ranges in any of the 6855
+        // modules this layer has inspected, and the layer adds one to every
+        // vertex module it patches. So a vertex module carrying a
+        // PushConstant variable is one of ours, whatever locations that run
+        // happened to use.
+        uint32_t i2 = 5;
+        bool alreadyPatched = false;
+        while (i2 < in.size()) {
+            const uint16_t op = (uint16_t)(in[i2] & 0xFFFF);
+            const uint16_t ln = (uint16_t)(in[i2] >> 16);
+            if (!ln) break;
+            if (op == spvinj::OpVariable && ln >= 4 &&
+                in[i2 + 3] == spvinj::SC_PushConstant)
+                alreadyPatched = true;
+            i2 += ln;
+        }
+        if (alreadyPatched) {
+            printf("module            %s\n", argv[1]);
+            printf("\nALREADY PATCHED - this module declares a push constant block.\n"
+                   "X-Plane declares none in 6855 modules and this layer adds one to\n"
+                   "every vertex module it patches, so this dump was taken AFTER\n"
+                   "injection. Injecting again tests DOUBLE injection and proves\n"
+                   "nothing about the real patch. Dump originals and re-run.\n");
+            return 3;
+        }
+    }
 
     std::vector<uint32_t> off, on;
     uint32_t l1 = 0, l2 = 0;
-    fprintf(stderr, "[m3] before inject(off)\n");
     const spvinj::Result r1 = spvinj::inject(in.data(), in.size() * 4, off, &l1, -1);
-    fprintf(stderr, "[m4] inject(off) -> %d, %zu words\n", (int)r1, off.size());
     const uint64_t emittedBefore = spvinj::occupancyVsCount();
-    fprintf(stderr, "[m5] before inject(on)\n");
     const spvinj::Result r2 = spvinj::inject(in.data(), in.size() * 4, on,  &l2, 7);
-    fprintf(stderr, "[m6] inject(on) -> %d, %zu words\n", (int)r2, on.size());
     const uint64_t emittedAfter = spvinj::occupancyVsCount();
 
     printf("module            %s\n", argv[1]);
