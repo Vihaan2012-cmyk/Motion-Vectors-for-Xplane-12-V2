@@ -221,7 +221,18 @@ enum {
 // and buys the ability to answer a question in the ten seconds it takes to save
 // a file instead of the four minutes it takes to relaunch.
 static bool  taaEnabled()  { return live::onoff("taa.enable", "TAA_RESOLVE", false); }
-static int   taaMode()     { return live::i("taa.mode",  "TAA_MODE",  0); }
+// ---- DEFAULT 2, NOT 0. 0 IS PASSTHROUGH.
+//
+// mode 0 runs every binding, barrier and dispatch and then writes the input
+// back out unchanged - it exists to prove the plumbing, not to anti-alias.
+// As the compiled default it meant a fresh install did all of TAA's work and
+// none of its effect: 15168 pipelines carrying velocity, 0 rejected by the
+// driver, dispatches climbing, and an image identical to no mod at all.
+//
+// The tuned config sets 2 and lives only in %TEMP%	aa_live.ini, which ships
+// as taa_live.ini.reference and is never installed. So the value that made TAA
+// work existed on exactly one machine.
+static int   taaMode()     { return live::i("taa.mode",  "TAA_MODE",  2); }
 static float taaAlpha()    { return live::f("taa.alpha", "TAA_ALPHA", 0.05f); }
 static float taaGain()     { return live::f("taa.gain",  "TAA_GAIN",  4.0f); }
 // 8.0, not 1.25. A tight clamp rejects history wherever it differs from the

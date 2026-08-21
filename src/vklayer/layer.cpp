@@ -4144,7 +4144,9 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
     // qualifying pass, >=0 pins one ordinal.
     long onlyPass = g_mvSceneOrdinal;
     {
-        const int sel = live::i("taa.mv_pass", "TAA_MV_PASS", -2);
+        // -1 (auto) is what the tuned config ships; -2 was the compiled
+        // default and disagreed with it.
+        const int sel = live::i("taa.mv_pass", "TAA_MV_PASS", -1);
         if (sel != -2) onlyPass = sel;
     }
 
@@ -8377,7 +8379,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // trembling panel and crawling smear in motion. Sub-pixel AA returns
     // via taa.jitter_scale=1 only after a run proves the cancellation
     // (static scene, jitter on: the image must not move AT ALL).
-    g_jitterScale = live::f("taa.jitter_scale", "TAA_JITTER_SCALE", 0.0f);
+    // ---- DEFAULT 1.0, NOT 0.0. ZERO JITTER IS NO ANTI-ALIASING.
+    //
+    // The sub-pixel offset is what gives TAA more samples than the raster has
+    // pixels; at scale 0 every frame samples the same points and there is
+    // nothing for the resolve to average. Independently fatal alongside
+    // taa.mode=0, so a fresh install had two separate reasons to look untouched.
+    g_jitterScale = live::f("taa.jitter_scale", "TAA_JITTER_SCALE", 1.0f);
     {
         float nf = live::f("taa.nearfield_m", "TAA_NEARFIELD_M", g_nearFieldM);
         if (nf < 0.0f)  nf = 0.0f;
