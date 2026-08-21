@@ -1,0 +1,62 @@
+Motion Vectors for X-Plane 12 - version @VER@
+
+
+INSTALL
+
+1. Open your X-Plane 12 folder.
+2. Drag everything inside this zip into it.
+3. Choose Merge, and Replace, if Windows asks.
+
+You should then have:
+
+    X-Plane 12\MotionVectors\MotionVectorsLauncher.exe
+    X-Plane 12\MotionVectors\VkLayer_mv.dll
+    X-Plane 12\MotionVectors\VkLayer_mv.json
+    X-Plane 12\Resources\plugins\MotionVectors\64\win.xpl
+    X-Plane 12\Resources\plugins\FlyWithLua\Scripts\MotionVectors.lua
+
+
+RUN
+
+Start the sim with MotionVectorsLauncher.exe instead of X-Plane.exe.
+The mod does not load if you start X-Plane.exe directly.
+
+Steam: right click X-Plane 12, Properties, Launch Options, and put in
+
+    "C:\path\to\X-Plane 12\MotionVectors\MotionVectorsLauncher.exe" %command%
+
+
+TURN IT OFF
+
+In the sim: Plugins menu, FlyWithLua, Motion Vectors.
+
+Or set taa.enable=0 in the settings file while the sim is running.
+
+
+SETTINGS
+
+Edit this file while the sim is running, changes apply in a few frames:
+
+    %TEMP%\taa_live.ini
+
+MotionVectors\taa_live.ini.reference lists every key and its shipped value.
+
+
+UNINSTALL
+
+Delete the five files listed under INSTALL. Nothing else is changed, and
+nothing was written to the registry.
+
+
+REQUIREMENTS
+
+X-Plane 12 running on Vulkan, not OpenGL.
+FlyWithLua, for the settings panel only. The mod works without it.
+
+
+NOTES
+
+Costs roughly 20 percent of frame rate at 4K.
+
+taa.reactive is off by default. If you fly a propeller aircraft and see
+artefacts around the propeller disc, set taa.reactive=1.

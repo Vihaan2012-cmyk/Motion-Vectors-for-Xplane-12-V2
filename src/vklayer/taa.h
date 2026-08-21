@@ -204,9 +204,15 @@ enum {
 // a file instead of the four minutes it takes to relaunch.
 static bool  taaEnabled()  { return live::onoff("taa.enable", "TAA_RESOLVE", false); }
 static int   taaMode()     { return live::i("taa.mode",  "TAA_MODE",  0); }
-static float taaAlpha()    { return live::f("taa.alpha", "TAA_ALPHA", 0.1f); }
+static float taaAlpha()    { return live::f("taa.alpha", "TAA_ALPHA", 0.05f); }
 static float taaGain()     { return live::f("taa.gain",  "TAA_GAIN",  4.0f); }
-static float taaVarClip()  { return live::f("taa.varclip", "TAA_VARCLIP", 1.25f); }
+// 8.0, not 1.25. A tight clamp rejects history wherever it differs from the
+// current 3x3, and jitter guarantees it differs on a thin edge - so flap track
+// fairings, gear struts and pylon edges took the raw frame every frame, never
+// accumulated, and shimmered. Reported in flight and confirmed fixed at 8.0.
+// This is a DEFAULT, not just a live value: %TEMP%	aa_live.ini does not exist
+// on a new install, so whatever is compiled here IS the shipping configuration.
+static float taaVarClip()  { return live::f("taa.varclip", "TAA_VARCLIP", 8.0f); }
 // Deadband on the clamp correction, in units of the noise floor. 1.0 makes a
 // correction at or below the floor read as zero, which is what the shader's
 // floorS note asks for; 0.0 restores the old behaviour that pinned a at 1.0.

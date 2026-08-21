@@ -1,25 +1,23 @@
-build/
-*.dll
-*.xpl
-*.o
-*.obj
-dist/
-*.bmp
-tools/*.exe
-patched_*.spv
-
-captures/*.rdc
-
-# Study material stays local, never published.
-VRAM_STUDY.md
-FIXES.md
-tools/inject_test.exe
 
 # Private notes and helpers - never published.
-learnings.md
+# Study material stays local, never published.
+*.bmp
+*.bundle
+*.dll
+*.o
+*.obj
+*.xpl
+FIXES.md
 VRAM_INTELLIGENCE_MAP.md
+VRAM_STUDY.md
+build/
 captures/
+captures/*.rdc
+dist/
+learnings.md
+patched_*.spv
 resume-flight.ps1
 stop-xp.ps1
+tools/*.exe
+tools/inject_test.exe
 xp-shot.ps1
-*.bundle
