@@ -102,6 +102,43 @@ for ($i = 0; $i -lt $words.Count; $i += 8) {
 Set-Content -Path "$src\vklayer\taa_spv.h" -Value $sb.ToString() -Encoding utf8 -NoNewline
 Write-Host "  taa_spv.h: $($words.Count) words"
 
+# ---- OUR REPLACEMENT FOR X-PLANE'S FSR UPSCALE.
+#
+# Compiled the same way and for the same reason as the resolve above: this
+# header was written by hand once, and a hand-written generated header is one
+# that silently stops tracking its source.
+#
+# The interface is not free to change. It must match X-Plane's EASU module
+# exactly - set 0 bindings 0-3, both images ARRAYED, Rgba16f output,
+# LocalSize 64 1 1 - because X-Plane binds its own resources against it. Verify
+# with spirv-dis after any edit; a mismatch binds real resources to the wrong
+# slots, which shows up as a rendering artefact rather than an error.
+Write-Host "Compiling X-Plane FSR replacement..."
+$fsrTmp = Join-Path $env:TEMP "xpfsr_replace.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src\shaders\xpfsr_replace.comp" -o $fsrTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "xpfsr_replace.comp failed to compile" }
+$fbytes = [System.IO.File]::ReadAllBytes($fsrTmp)
+if ($fbytes.Length % 4) { throw "FSR replacement SPIR-V is not a whole number of words" }
+$fwords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $fbytes.Length; $i += 4) {
+    $fwords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($fbytes, $i)))
+}
+$fsb = New-Object System.Text.StringBuilder
+[void]$fsb.AppendLine("// Generated from src/shaders/xpfsr_replace.comp by build.ps1 - do not edit.")
+[void]$fsb.AppendLine("#pragma once")
+[void]$fsb.AppendLine("#include <stdint.h>")
+[void]$fsb.AppendLine("")
+[void]$fsb.AppendLine("static const uint32_t kXpFsrReplaceSpv[] = {")
+for ($i = 0; $i -lt $fwords.Count; $i += 8) {
+    $n = [Math]::Min(8, $fwords.Count - $i)
+    [void]$fsb.AppendLine("    " + (($fwords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$fsb.AppendLine("};")
+[void]$fsb.AppendLine("")
+[void]$fsb.AppendLine("static const size_t kXpFsrReplaceSpvWords = $($fwords.Count);")
+Set-Content -Path "$src\vklayer\xpfsr_spv.h" -Value $fsb.ToString() -Encoding utf8 -NoNewline
+Write-Host "  xpfsr_spv.h: $($fwords.Count) words"
+
 Write-Host "Building Vulkan layer..."
 & g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
   -I"$vksdk\Include" -m64 -O2 -std=c++17 `
