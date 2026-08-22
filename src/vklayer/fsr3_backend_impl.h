@@ -144,8 +144,17 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     vkCtx.vkPhysicalDevice = phys;
     vkCtx.vkDeviceProcAddr = gdpa;
 
+    // ---- EVERY STEP TRACES BEFORE IT RUNS.
+    //
+    // The first attempt died with NO FSR3 output whatever, which says only that
+    // it failed somewhere before the first trace - and there was no trace until
+    // after the scratch query, so that is most of the function. Naming the step
+    // before doing it turns "it crashed" into "it crashed HERE", which is the
+    // difference between one run and five.
     const size_t maxContexts = 2;
+    trace("FSR3: step 1 - ffxGetScratchMemorySizeVK(phys=%p)", (void*)phys);
     s.scratchSize = ffxGetScratchMemorySizeVK(phys, maxContexts);
+    trace("FSR3: step 1 OK - scratch %u bytes", (unsigned)s.scratchSize);
     if (!s.scratchSize) {
         trace("FSR3: scratch size query returned 0 - backend unavailable");
         s.failed = true; return false;
@@ -153,8 +162,11 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     s.scratch = malloc(s.scratchSize);
     if (!s.scratch) { s.failed = true; return false; }
 
+    trace("FSR3: step 2 - ffxGetInterfaceVK(device=%p gdpa=%p)",
+          (void*)device, (void*)gdpa);
     FfxErrorCode rc = ffxGetInterfaceVK(&s.iface, ffxGetDeviceVK(&vkCtx),
                                         s.scratch, s.scratchSize, maxContexts);
+    trace("FSR3: step 2 returned %d", (int)rc);
     if (rc != FFX_OK) {
         trace("FSR3: ffxGetInterfaceVK failed (%d)", (int)rc);
         s.failed = true; return false;
@@ -177,7 +189,10 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     cd.maxUpscaleSize.height = outH;
     cd.backendInterface      = s.iface;
 
+    trace("FSR3: step 3 - ffxFsr3UpscalerContextCreate %ux%u -> %ux%u",
+          renderW, renderH, outW, outH);
     rc = ffxFsr3UpscalerContextCreate(&s.ctx, &cd);
+    trace("FSR3: step 3 returned %d", (int)rc);
     if (rc != FFX_OK) {
         trace("FSR3: ffxFsr3UpscalerContextCreate failed (%d)", (int)rc);
         s.failed = true; return false;
@@ -185,6 +200,7 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
 
     FfxFsr3UpscalerSharedResourceDescriptions sh;
     memset(&sh, 0, sizeof(sh));
+    trace("FSR3: step 4 - shared resource descriptions");
     if (ffxFsr3UpscalerGetSharedResourceDescriptions(&s.ctx, &sh) != FFX_OK) {
         trace("FSR3: shared resource descriptions unavailable");
         s.failed = true; return false;
@@ -215,6 +231,7 @@ inline bool dispatch(VkCommandBuffer cb,
                      VkImage mvImg,    VkFormat mvFmt,
                      VkImage outImg,   VkFormat outFmt,
                      float jitterX, float jitterY,
+                     float mvScaleX, float mvScaleY,
                      float deltaMs, bool reset,
                      float camNear, float camFar, float fovY)
 {
@@ -253,15 +270,28 @@ inline bool dispatch(VkCommandBuffer cb,
 
     d.jitterOffset.x = jitterX;
     d.jitterOffset.y = jitterY;
-    // ---- MOTION VECTOR SCALE: OURS ARE ALREADY IN NDC.
+    // ---- MOTION VECTOR SCALE. THE UNITS, STATED ONCE.
     //
-    // FSR3 multiplies the sampled vector by this to reach pixels. This layer's
-    // injected shaders emit clip-space displacement, so the conversion is the
-    // render size - and the sign follows the same Y convention the resolve
-    // uses. A disagreement here does not fail; it produces smearing that looks
-    // like a temporal bug, which is the expensive kind to chase.
-    d.motionVectorScale.x = (float)s.renderW;
-    d.motionVectorScale.y = (float)s.renderH;
+    // This layer's velocity is in UV, not clip space - taa.comp fetches history
+    // at literally
+    //
+    //     hUv = uv + vec2(vel.x, pc.velYSign * vel.y)
+    //
+    // so the vector already points from the current pixel to where that surface
+    // was, which is the direction FSR3 wants. Converting UV to pixels is
+    // therefore just the render size.
+    //
+    // The Y SIGN is the part that would otherwise be wrong. X-Plane draws with
+    // a negative-height viewport, so velYSign is -1 and the resolve flips Y on
+    // every fetch. FSR3 has no such hook, so the flip has to live in the scale.
+    //
+    // Both numbers are computed by the CALLER from taaVelScale() and
+    // taaVelYSign() - the same accessors the resolve uses - so the two cannot
+    // drift apart. Passing them in rather than recomputing here is the whole
+    // point: a units disagreement does not fail, it smears, and smearing looks
+    // like a temporal bug rather than a units bug.
+    d.motionVectorScale.x = mvScaleX;
+    d.motionVectorScale.y = mvScaleY;
 
     d.renderSize.width   = s.renderW;
     d.renderSize.height  = s.renderH;

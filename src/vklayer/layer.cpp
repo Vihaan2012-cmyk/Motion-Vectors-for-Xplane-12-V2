@@ -422,6 +422,28 @@ static bool g_availReported = false;
 // resolve did. So: record what is asked, and what is answered.
 static PFN_vkGetPhysicalDeviceMemoryProperties2 g_nextMemProps2 = nullptr;
 static PFN_vkEnumerateDeviceExtensionProperties g_nextEnumDeviceExt = nullptr;
+// Needed by ffx_vk_shim.cpp, which answers the Vulkan entry points FidelityFX
+// calls by name so they go DOWN the chain instead of re-entering the loader.
+static PFN_vkGetPhysicalDeviceProperties2 g_getPhysProps2 = nullptr;
+static PFN_vkGetPhysicalDeviceFeatures2   g_getPhysFeat2  = nullptr;
+static PFN_vkGetPhysicalDeviceFeatures    g_getPhysFeat   = nullptr;
+
+extern "C" PFN_vkEnumerateDeviceExtensionProperties mvNextEnumDeviceExtensionProperties()
+{ return g_nextEnumDeviceExt; }
+extern "C" PFN_vkGetPhysicalDeviceProperties2 mvNextGetPhysicalDeviceProperties2()
+{ return g_getPhysProps2; }
+extern "C" PFN_vkGetPhysicalDeviceFeatures2 mvNextGetPhysicalDeviceFeatures2()
+{ return g_getPhysFeat2; }
+extern "C" PFN_vkGetPhysicalDeviceProperties mvNextGetPhysicalDeviceProperties()
+{ return g_getPhysProps; }
+extern "C" PFN_vkGetPhysicalDeviceMemoryProperties mvNextGetPhysicalDeviceMemoryProperties()
+{ return g_getPhysMemProps; }
+extern "C" PFN_vkGetPhysicalDeviceFeatures mvNextGetPhysicalDeviceFeatures()
+{ return g_getPhysFeat; }
+
+// Device functions, resolved through the NEXT layer for the device in question.
+// Defined after g_devices below; declared here so the shim can bind to it.
+extern "C" PFN_vkVoidFunction mvNextDeviceProcAddr(VkDevice device, const char *name);
 static uint64_t g_memQueryCount = 0;
 static float    g_vramBudgetScale = 1.0f;   // >1 inflates the reported budget
 static PFN_vkAllocateMemory g_nextAllocateMemory = nullptr;
@@ -1569,10 +1591,27 @@ static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "spirv_inject.h"
 #include "xpfsr_spv.h"
 #include "fsr_probe.h"
+#include "fsr3_backend_impl.h"
 
 // Defined with the probe below; called from the present path, which comes
 // first in this file.
 static void fsrProbeResolve();
+
+// ---- DEVICE FUNCTIONS, DOWN THE CHAIN.
+//
+// ffx_vk_shim.cpp answers vkGetDeviceProcAddr and vkCreateBuffer for the
+// FidelityFX objects; both come here. Resolving through the DeviceData we
+// already hold means the call continues below this layer instead of restarting
+// at the loader - which is the recursion that killed the sim inside
+// ffxGetScratchMemorySizeVK.
+extern "C" PFN_vkVoidFunction mvNextDeviceProcAddr(VkDevice device, const char *name)
+{
+    std::lock_guard<std::mutex> g(g_lock);
+    std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+    if (it == g_devices.end()) it = g_devices.begin();
+    if (it == g_devices.end() || !it->second.gdpa) return nullptr;
+    return it->second.gdpa(device, name);
+}
 #include "taa.h"
 #include "destruct_gpu.h"
 
@@ -4424,6 +4463,20 @@ static uint64_t g_xpFsrNoTarget = 0;
 // Default OFF. A layer that silently replaces a shipped feature the moment it
 // is installed is not something a user can reason about, and X-Plane's FSR
 // working exactly as Laminar wrote it has to be the state you get by default.
+// Which upscaler runs in the slot we took over. "shader" is the built-in
+// Catmull-Rom replacement; "fsr3" is AMD's temporal upscaler.
+//
+// Read live rather than latched, unlike fsr.replace: the substitution has to be
+// decided before shader modules are created, but WHICH upscaler dispatches is a
+// per-frame decision and can be switched in flight to compare them on the same
+// scene, weather and thermal state.
+static bool fsr3Wanted()
+{
+    const char *e = getenv("TAA_FSR3");
+    if (e && atoi(e)) return true;
+    return live::i("fsr.backend_fsr3", nullptr, 0) != 0;
+}
+
 static bool fsrReplaceEnabled()
 {
     // ---- LATCHED ONCE, AND ONLY AFTER THE FILE HAS BEEN READ.
@@ -6964,6 +7017,35 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // once per frame and is already past the submit that carried them.
     fsrProbeResolve();
 
+    // ---- BUILD THE FSR3 CONTEXT HERE, NOT IN THE DISPATCH.
+    //
+    // Present is the one point per frame where no command buffer is being
+    // recorded, so pipeline and memory creation is safe. Attempted from inside
+    // vkCmdDispatch it killed the sim before any FSR3 trace appeared.
+    //
+    // Everything it needs settles at different times - the sub-native render
+    // size, the output image the probe identifies - so this simply retries each
+    // frame until they are all present, and does nothing once built.
+    if (fsrReplaceEnabled() && fsr3Wanted() && !fsr3::state().ready &&
+        !fsr3::state().failed) {
+        VkDevice dev = VK_NULL_HANDLE; VkPhysicalDevice ph = VK_NULL_HANDLE;
+        PFN_vkGetDeviceProcAddr gd = nullptr;
+        uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<void*, DeviceData>::iterator di = g_devices.begin();
+            if (di != g_devices.end()) {
+                dev = di->second.device; ph = di->second.phys; gd = di->second.gdpa;
+            }
+            rw = g_sceneColor.w; rh = g_sceneColor.h;
+            std::map<VkImage, ColorTarget>::iterator oc =
+                g_colorImages.find(fsrprobe::state().output);
+            if (oc != g_colorImages.end()) { ow = oc->second.w; oh = oc->second.h; }
+        }
+        if (dev && ph && gd && rw && rh && ow && oh && rw < ow)
+            fsr3::ensure(dev, ph, gd, g_getPhysMemProps, rw, rh, ow, oh);
+    }
+
     // Last frame's timings, read without blocking - waiting on them would
     // change what is being measured.
     {
@@ -9327,6 +9409,16 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
                                  nextGIPA(*out, "vkGetPhysicalDeviceProperties");
         g_nextEnumDeviceExt = (PFN_vkEnumerateDeviceExtensionProperties)
                                  nextGIPA(*out, "vkEnumerateDeviceExtensionProperties");
+        // Bound here for the same reason as the others: from the APPLICATION's
+        // instance, once. A physical-device function resolved from some other
+        // instance and called with this one's device is answered by __fastfail,
+        // not by an error - which this file already records having cost a day.
+        g_getPhysProps2 = (PFN_vkGetPhysicalDeviceProperties2)
+                              nextGIPA(*out, "vkGetPhysicalDeviceProperties2");
+        g_getPhysFeat2  = (PFN_vkGetPhysicalDeviceFeatures2)
+                              nextGIPA(*out, "vkGetPhysicalDeviceFeatures2");
+        g_getPhysFeat   = (PFN_vkGetPhysicalDeviceFeatures)
+                              nextGIPA(*out, "vkGetPhysicalDeviceFeatures");
         g_getPhysQueueFamProps = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)
                                  nextGIPA(*out, "vkGetPhysicalDeviceQueueFamilyProperties");
         g_nextMemProps2    = (PFN_vkGetPhysicalDeviceMemoryProperties2)
@@ -12360,7 +12452,79 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
             return;                      // never forwarded
         }
     }
-    if (dd && dd->cmdDispatch) dd->cmdDispatch(cb, gx, gy, gz);
+    // ---- FSR 3 RUNS HERE, IN PLACE OF THE DISPATCH.
+    //
+    // Not instead of X-Plane's upscale - that slot is already ours, because the
+    // shader in it was substituted at module creation. This chooses which
+    // upscaler fills it: our Catmull-Rom shader (forward the dispatch) or FSR3
+    // (record its ten passes into this same command buffer and skip it).
+    //
+    // Recording into X-Plane's own buffer means ordering against the scene
+    // render and everything downstream is the sim's, and needs no
+    // synchronisation of ours.
+    bool fsr3Ran = false;
+    if (dd && fsrReplaceEnabled() && fsr3Wanted()) {
+        VkImage  colour = VK_NULL_HANDLE, depth = VK_NULL_HANDLE;
+        VkImage  mv = VK_NULL_HANDLE,     out = VK_NULL_HANDLE;
+        VkFormat colourFmt = VK_FORMAT_UNDEFINED, mvFmt = VK_FORMAT_UNDEFINED;
+        VkFormat outFmt = VK_FORMAT_UNDEFINED;
+        uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
+        bool ours = false;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<void*, bool>::iterator fb = g_cbFsrBound.find((void*)cb);
+            ours   = (fb != g_cbFsrBound.end() && fb->second);
+            colour = g_sceneColor.image;  colourFmt = g_sceneColor.format;
+            rw     = g_sceneColor.w;      rh = g_sceneColor.h;
+            depth  = g_sceneDepth;
+            mv     = g_mv.image;          mvFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+            out    = fsrprobe::state().output;
+            std::map<VkImage, ColorTarget>::iterator oc = g_colorImages.find(out);
+            if (oc != g_colorImages.end()) {
+                ow = oc->second.w; oh = oc->second.h; outFmt = oc->second.format;
+            }
+        }
+        // ---- ensure() IS NOT CALLED HERE, AND THAT IS THE POINT.
+        //
+        // Creating the context builds pipelines, allocates memory and creates
+        // descriptor pools. Doing that from inside vkCmdDispatch means doing it
+        // while a command buffer is being recorded, from within a Vulkan call -
+        // which took the sim down with no trace at all, before a single FSR3
+        // line printed. It is the same hazard this file already documents for
+        // the XeSS probe.
+        //
+        // The context is built from the present path instead, where nothing is
+        // being recorded. Here we only dispatch, and only once it is ready.
+        if (ours && out != VK_NULL_HANDLE && colour != VK_NULL_HANDLE &&
+            depth != VK_NULL_HANDLE && mv != VK_NULL_HANDLE && rw && rh && ow && oh &&
+            fsr3::state().ready) {
+            // ---- THE UNITS, FROM THE RESOLVE'S OWN ACCESSORS.
+            //
+            // Velocity is stored in UV. taa.comp fetches history at
+            // uv + (vel.x, velYSign * vel.y), so UV to pixels is the render
+            // size and the Y sign is the resolve's - X-Plane draws with a
+            // negative-height viewport, so it is -1. Taking both from
+            // taaVelScale()/taaVelYSign() rather than restating them is what
+            // stops FSR3 and the resolve drifting apart.
+            const float vs = taaVelScale();
+            const float ys = taaVelYSign();
+            fsr3Ran = fsr3::dispatch(
+                cb, colour, colourFmt, depth, VK_FORMAT_D32_SFLOAT, mv, mvFmt,
+                out, outFmt,
+                // Jitter in PIXELS, which is what FSR3 wants. g_velSnap holds
+                // the plugin's request and g_jitterScale is the amplitude the
+                // layer actually applied - the resolve converts the same pair
+                // to NDC with 2*j*scale/width, so taking it before that
+                // conversion is the pixel value.
+                g_velSnap.jitterX * g_jitterScale,
+                g_velSnap.jitterY * g_jitterScale,
+                vs * (float)rw, vs * ys * (float)rh,
+                16.6f, false,
+                0.1f, 100000.0f, 1.0472f);
+        }
+    }
+
+    if (!fsr3Ran && dd && dd->cmdDispatch) dd->cmdDispatch(cb, gx, gy, gz);
 
     // After the dispatch, in the same command buffer: our substituted shader
     // has just written the output, sentinel and all.
