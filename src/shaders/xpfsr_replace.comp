@@ -1,0 +1,139 @@
+#version 450
+//
+// A DROP-IN REPLACEMENT FOR X-PLANE'S FSR UPSCALE.
+//
+// ---- WHY REPLACE THE SHADER RATHER THAN THE DISPATCH.
+//
+// Dropping the dispatch and writing the result ourselves needs to know WHICH
+// image the upscale writes, and that turned out to be unanswerable from
+// outside: thirteen storage images share the output's 3840x2160 extent, and
+// X-Plane's descriptor contents are invisible to this layer - vkUpdateDescriptorSets
+// records one set per frame, and every push-descriptor entry point
+// (KHR, 1.4 core, and the "2" form) is called exactly zero times.
+//
+// Replacing the MODULE sidesteps all of it. X-Plane binds its own resources,
+// through whatever path it likes, and this code runs against them. There is
+// nothing to identify and nothing to guess.
+//
+// ---- THE INTERFACE IS COPIED FROM THE MODULE THIS STANDS IN FOR.
+//
+// Read out of the real SPIR-V with spirv-dis, not assumed:
+//
+//     set 0 binding 0   u_input_sampler     sampler
+//     set 0 binding 1   u_input_texture     texture2D ARRAY
+//     set 0 binding 2   i_output_texture    image2D ARRAY, rgba16f
+//     set 0 binding 3   u_fsr_data          Const0..Const3, Sample
+//     LocalSize 64 1 1
+//
+// Both images are ARRAYED. A plain image2D here would compile, bind, and read
+// the wrong memory - which is exactly the class of fault that looks like a
+// rendering artefact rather than a mistake.
+//
+// Copyright (C) 2026 MotionVectors contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler   u_input_sampler;
+layout(set = 0, binding = 1) uniform texture2DArray u_input_texture;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2DArray i_output_texture;
+
+// AMD's FSR1 constant block, as FsrEasuCon fills it. Only Const0 and Const1
+// are needed for the mapping; the sharpening terms are not used here.
+layout(set = 0, binding = 3) uniform u_fsr_data {
+    uvec4 Const0;
+    uvec4 Const1;
+    uvec4 Const2;
+    uvec4 Const3;
+    uvec4 Sample;
+};
+
+// Catmull-Rom, because the whole point is to beat what a plain stretch gives.
+// Nine taps arranged as a separable 4x4 with the corner weights folded in - the
+// standard trick that gets bicubic quality out of bilinear fetches.
+vec4 sampleCatmullRom(vec2 uv, vec2 texSize, float layer)
+{
+    vec2 samplePos = uv * texSize;
+    vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    vec2 f = samplePos - texPos1;
+
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / max(w12, vec2(1e-5));
+
+    vec2 texPos0  = (texPos1 - 1.0)      / texSize;
+    vec2 texPos3  = (texPos1 + 2.0)      / texSize;
+    vec2 texPos12 = (texPos1 + offset12) / texSize;
+
+    vec4 result = vec4(0.0);
+    result += texture(sampler2DArray(u_input_texture, u_input_sampler),
+                      vec3(texPos0.x,  texPos0.y,  layer)) * w0.x  * w0.y;
+    result += texture(sampler2DArray(u_input_texture, u_input_sampler),
+                      vec3(texPos12.x, texPos0.y,  layer)) * w12.x * w0.y;
+    result += texture(sampler2DArray(u_input_texture, u_input_sampler),
+                      vec3(texPos3.x,  texPos0.y,  layer)) * w3.x  * w0.y;
+
+    result += texture(sampler2DArray(u_input_texture, u_input_sampler),
+                      vec3(texPos0.x,  texPos12.y, layer)) * w0.x  * w12.y;
+    result += texture(sampler2DArray(u_input_texture, u_input_sampler),
+                      vec3(texPos12.x, texPos12.y, layer)) * w12.x * w12.y;
+    result += texture(sampler2DArray(u_input_texture, u_input_sampler),
+                      vec3(texPos3.x,  texPos12.y, layer)) * w3.x  * w12.y;
+
+    result += texture(sampler2DArray(u_input_texture, u_input_sampler),
+                      vec3(texPos0.x,  texPos3.y,  layer)) * w0.x  * w3.y;
+    result += texture(sampler2DArray(u_input_texture, u_input_sampler),
+                      vec3(texPos12.x, texPos3.y,  layer)) * w12.x * w3.y;
+    result += texture(sampler2DArray(u_input_texture, u_input_sampler),
+                      vec3(texPos3.x,  texPos3.y,  layer)) * w3.x  * w3.y;
+
+    return result;
+}
+
+void main()
+{
+    // ---- 64 THREADS, ONE 16x16 TILE.
+    //
+    // 240x135 groups at 16x16 pixels is 3840x2160, which is the measured output
+    // extent. Each thread therefore owns four pixels. The mapping is a plain
+    // 16-wide, 4-tall block stepped four times rather than AMD's swizzle: the
+    // swizzle exists for cache locality, not correctness, and a wrong swizzle
+    // would scramble the image in a way that looks like a sampling bug.
+    const uint t = gl_LocalInvocationID.x;
+    const ivec2 tileBase = ivec2(gl_WorkGroupID.xy) * 16;
+    const ivec2 local    = ivec2(int(t & 15u), int(t >> 4u));
+    const int   layer    = int(gl_WorkGroupID.z);
+
+    // Const0 holds the scale and the half-texel offset, as FsrEasuCon packs it:
+    //   xy = inputViewport / outputSize
+    //   zw = 0.5 * that - 0.5
+    const vec2 ratio  = vec2(uintBitsToFloat(Const0.x), uintBitsToFloat(Const0.y));
+    const vec2 offset = vec2(uintBitsToFloat(Const0.z), uintBitsToFloat(Const0.w));
+    // Const1.xy is 1/inputSize.
+    const vec2 rcpIn  = vec2(uintBitsToFloat(Const1.x), uintBitsToFloat(Const1.y));
+    const vec2 inSize = 1.0 / max(rcpIn, vec2(1e-9));
+
+    const ivec3 bounds = imageSize(i_output_texture);
+
+    for (int i = 0; i < 4; ++i) {
+        const ivec2 dst = tileBase + local + ivec2(0, i * 4);
+        // The last tile of a row or column hangs off the edge whenever the
+        // output is not a multiple of sixteen. Writing there is undefined, not
+        // merely wasteful.
+        if (dst.x >= bounds.x || dst.y >= bounds.y) continue;
+
+        const vec2 srcPx = vec2(dst) * ratio + offset;
+        const vec2 uv    = (srcPx + 0.5) * rcpIn;
+
+        vec4 c = sampleCatmullRom(uv, inSize, float(layer));
+        // Catmull-Rom's negative lobes can ring into negative values on a high
+        // contrast edge, and this target is float - so a negative would survive
+        // all the way to the tonemap instead of being clamped by the format.
+        c.rgb = max(c.rgb, vec3(0.0));
+        imageStore(i_output_texture, ivec3(dst, layer), c);
+    }
+}

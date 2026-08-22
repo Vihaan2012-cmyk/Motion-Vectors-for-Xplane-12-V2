@@ -346,6 +346,8 @@ struct DeviceData {
     PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets;
     PFN_vkCmdPushConstants      cmdPushConstants;
     PFN_vkCmdDispatch           cmdDispatch;
+    PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet;  // X-Plane binds FSR's resources this way
+    PFN_vkCmdPushDescriptorSet2 cmdPushDescriptorSet2;   // the Vulkan 1.4 form, which is the one it actually uses
     PFN_vkCmdPipelineBarrier    cmdPipelineBarrier;
     PFN_vkCmdCopyImageToBuffer  cmdCopyImageToBuffer;
     PFN_vkCmdFillBuffer         cmdFillBuffer;
@@ -1565,6 +1567,7 @@ static VkImageLayout g_sceneDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "mv_target.h"
 #include "spirv_inject.h"
+#include "xpfsr_spv.h"
 #include "taa.h"
 #include "destruct_gpu.h"
 
@@ -4009,6 +4012,11 @@ static bool swapInfoFor(VkImage img, SwapInfo &out)
     return false;
 }
 static std::map<VkDescriptorSet, std::vector<VkImageView> > g_setViews;
+// The same, for STORAGE images. g_setViews holds only sampled images because
+// it answers "what does the composite read"; a compute shader's OUTPUT is a
+// storage image and is filtered out of it. Separate rather than merged: the
+// composite search depends on g_setViews meaning exactly what it means today.
+static std::map<VkDescriptorSet, std::vector<VkImageView> > g_setStorageViews;
 static std::map<VkCommandBuffer, bool> g_cbInSwapPass;
 
 // Every image that has ever been a render-pass colour attachment.
@@ -4380,6 +4388,34 @@ static std::set<VkShaderModule> g_xpFsrModules;    // modules that ARE X-Plane's
 static std::set<VkPipeline>     g_xpFsrPipelines;  // compute pipelines built from them
 static std::map<void*, bool>    g_cbFsrBound;      // is an FSR pipeline bound on this cb
 static uint64_t g_xpFsrDropped   = 0;
+
+// Images seen in descriptor sets bound while one of X-Plane's FSR pipelines was
+// active on this command buffer. The upscale's OUTPUT is in here; so is its
+// input, and both are found the same way, so they are told apart by size at
+// dispatch time - an upscaler's destination is the larger of the two, and that
+// is true whatever X-Plane calls them.
+static std::map<void*, std::vector<VkImage> > g_cbFsrImages;
+// STORAGE images pushed on this command buffer, newest last. The upscale's
+// destination is a storage image, and X-Plane pushes it immediately before the
+// dispatch, so the most recent one of the right extent is the answer - no
+// ranking, no size heuristic, no guessing between seven identical candidates.
+static std::map<void*, std::vector<VkImage> > g_cbPushedStorage;
+static uint64_t g_xpFsrBlits   = 0;
+static uint64_t g_xpFsrNoTarget = 0;
+
+// ---- fsr.replace: DO WE TAKE OVER X-PLANE'S UPSCALE?
+//
+// Read live so it can be flipped mid-flight against the sim's own FSR toggle,
+// which is the only honest way to compare the two paths - a restart changes
+// scenery, weather and thermal state along with the setting.
+//
+// Default OFF. A layer that silently replaces a shipped feature the moment it
+// is installed is not something a user can reason about, and X-Plane's FSR
+// working exactly as Laminar wrote it has to be the state you get by default.
+static bool fsrReplaceEnabled()
+{
+    return live::i("fsr.replace", "TAA_REPLACE_XPFSR", 0) != 0;
+}
 
 // Does this SPIR-V belong to X-Plane's FSR?
 //
@@ -6645,6 +6681,18 @@ static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSets(
         if (it != g_devices.end()) next = it->second.updateDescriptorSets;
         for (uint32_t i = 0; i < nw && w; ++i) {
             if (!w[i].pImageInfo) continue;
+            // STORAGE images go in their own map. X-Plane's FSR writes
+            // i_output_texture, a storage image, and this filter is why it was
+            // invisible: four rebuilds were spent looking for it in descriptor
+            // sets that had been recorded with it stripped out.
+            if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+                std::vector<VkImageView> &sv = g_setStorageViews[w[i].dstSet];
+                for (uint32_t k = 0; k < w[i].descriptorCount; ++k)
+                    if (w[i].pImageInfo[k].imageView != VK_NULL_HANDLE)
+                        sv.push_back(w[i].pImageInfo[k].imageView);
+                if (sv.size() > 64) sv.erase(sv.begin(), sv.begin() + (sv.size() - 64));
+                continue;
+            }
             if (w[i].descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
                 w[i].descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) continue;
             std::vector<VkImageView> &v = g_setViews[w[i].dstSet];
@@ -6715,6 +6763,57 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
         if (ci != g_cbToDevice.end()) {
             std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
             if (di != g_devices.end()) next = di->second.cmdBindDescriptorSets;
+        }
+        // ---- REMEMBER WHAT AN FSR DISPATCH IS ABOUT TO READ AND WRITE.
+        //
+        // vkCmdDispatch names nothing - no pipeline, no resources - so by the
+        // time we decide to drop X-Plane's upscale there is no way left to ask
+        // what it would have written. The descriptor sets bound beforehand are
+        // the only place that answer exists, and only while the FSR pipeline is
+        // the one bound on this command buffer.
+        //
+        // Recorded unconditionally of fsr.replace: the switch can be flipped
+        // mid-flight, and a dispatch that arrives in the same frame as the flip
+        // would otherwise find nothing recorded and be dropped with no target.
+        {
+            // NOT gated on the FSR pipeline already being bound. X-Plane
+            // binds descriptor sets BEFORE the pipeline, so gating on
+            // g_cbFsrBound recorded nothing and the dispatch found a null
+            // destination. Recording is cheap and the dispatch identifies its
+            // own output precisely, so a few extra candidates cost nothing.
+            if (sets) {
+                std::vector<VkImage> &imgs = g_cbFsrImages[(void*)cb];
+                if (imgs.size() > 64) imgs.clear();   // bounded, per buffer
+                for (uint32_t s2 = 0; s2 < n; ++s2) {
+                    // Storage first: the upscale's DESTINATION is here, and
+                    // it is the only one of these images we can legally write.
+                    std::map<VkDescriptorSet, std::vector<VkImageView> >::iterator
+                        stv = g_setStorageViews.find(sets[s2]);
+                    if (stv != g_setStorageViews.end())
+                        for (size_t v = 0; v < stv->second.size(); ++v) {
+                            std::map<VkImageView, VkImage>::iterator im2 =
+                                g_viewToImage.find(stv->second[v]);
+                            if (im2 == g_viewToImage.end()) continue;
+                            bool have2 = false;
+                            for (size_t q = 0; q < imgs.size(); ++q)
+                                if (imgs[q] == im2->second) { have2 = true; break; }
+                            if (!have2) imgs.push_back(im2->second);
+                        }
+
+                    std::map<VkDescriptorSet, std::vector<VkImageView> >::iterator
+                        sv = g_setViews.find(sets[s2]);
+                    if (sv == g_setViews.end()) continue;
+                    for (size_t v = 0; v < sv->second.size(); ++v) {
+                        std::map<VkImageView, VkImage>::iterator im =
+                            g_viewToImage.find(sv->second[v]);
+                        if (im == g_viewToImage.end()) continue;
+                        bool have = false;
+                        for (size_t q = 0; q < imgs.size(); ++q)
+                            if (imgs[q] == im->second) { have = true; break; }
+                        if (!have) imgs.push_back(im->second);
+                    }
+                }
+            }
         }
         std::map<VkCommandBuffer, bool>::iterator sp = g_cbInSwapPass.find(cb);
         if (sp != g_cbInSwapPass.end() && sp->second && sets) {
@@ -9636,6 +9735,45 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
     // than of any binding, and the gap here is fifteenfold rather than marginal.
     bool isXpFsr = ci && spirvIsXpFsr(ci->pCode, ci->codeSize / 4) &&
                    ci->codeSize >= 10000;
+
+    // ---- HAND THE DRIVER OUR UPSCALER INSTEAD OF X-PLANE'S.
+    //
+    // Substituted at MODULE CREATION, not at the dispatch. X-Plane then builds
+    // its pipeline, allocates its descriptors and binds its resources exactly
+    // as it always does - it cannot observe that the code inside is not its
+    // own - and our shader runs against those bindings.
+    //
+    // This is why the approach changed. Dropping the dispatch required naming
+    // the image the upscale writes, and that is unanswerable from outside:
+    // thirteen storage images share the 3840x2160 output extent, and every way
+    // a descriptor could be observed came up empty - vkUpdateDescriptorSets
+    // records one set per frame, and vkCmdPushDescriptorSetKHR, the 1.4 core
+    // name and the "2" form are each called zero times. Replacing the module
+    // makes the question unnecessary instead of answering it.
+    //
+    // The interface was compared against the real module with spirv-dis before
+    // this was wired: set 0 bindings 0-3, both images ARRAYED, Rgba16f output,
+    // LocalSize 64 1 1 - identical on every point.
+    //
+    // EASU only. RCAS is a sharpening pass with its own uniform layout, and
+    // substituting an upscaler for it would be replacing a shader that does a
+    // different job. The two are told apart by size: 14609 words against 3820.
+    VkShaderModuleCreateInfo mvCi2;
+    const VkShaderModuleCreateInfo *ciUse = ci;
+    if (isXpFsr && ci && fsrReplaceEnabled() && (ci->codeSize / 4) > 8000) {
+        mvCi2 = *ci;
+        mvCi2.pCode    = kXpFsrReplaceSpv;
+        mvCi2.codeSize = kXpFsrReplaceSpvWords * 4;
+        ciUse = &mvCi2;
+        static bool mvSaidSub = false;
+        if (!mvSaidSub) {
+            mvSaidSub = true;
+            trace("XP FSR: SUBSTITUTING our upscaler for X-Plane's EASU module "
+                  "(%u words -> %u). X-Plane binds its own resources; only the "
+                  "code that runs is ours.",
+                  (unsigned)(ci->codeSize / 4), (unsigned)kXpFsrReplaceSpvWords);
+        }
+    }
     if (ci && ci->codeSize < 10000 && spirvIsXpFsr(ci->pCode, ci->codeSize / 4))
         trace("XP FSR: shader module (%zu bytes) mentions u_fsr_data but is too "
               "small to be EASU or RCAS - left alone, it is used elsewhere in "
@@ -9807,12 +9945,44 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
     // ever ask for them, and this is several megabytes.
     if (g_spirvLive) {
         VkResult rr = g_nextCreateShaderModule
-            ? g_nextCreateShaderModule(device, ci, alloc, out)
+            ? g_nextCreateShaderModule(device, ciUse, alloc, out)
             : VK_ERROR_INITIALIZATION_FAILED;
         if (rr == VK_SUCCESS && out) {
             std::lock_guard<std::mutex> g(g_lock);
             g_moduleCode[*out].assign(ci->pCode, ci->pCode + ci->codeSize / 4);
             if (isXpFsr) g_xpFsrModules.insert(*out);
+            // ---- DUMP X-PLANE'S FSR SPIR-V.
+            //
+            // A replacement shader has to declare the SAME descriptor layout as
+            // the module it stands in for - same sets, same bindings, same
+            // types - or X-Plane's own bindings land in the wrong places. That
+            // layout is not documented anywhere; it is in this SPIR-V, so it
+            // gets written out and read rather than guessed at.
+            //
+            // This is also the answer to the output-image problem: replacing
+            // the shader means X-Plane binds its own resources exactly as it
+            // always does, so there is no longer any need to work out WHICH of
+            // thirteen same-sized storage images the upscale writes.
+            if (isXpFsr) {
+                static int nDump = 0;
+                if (nDump < 4) {
+                    char path[512];
+                    // Forward slash on purpose: Windows accepts it in fopen,
+                    // and a backslash here has been eaten by the shell twice
+                    // already, producing "\x used with no following hex digits".
+                    snprintf(path, sizeof(path), "%s/xpfsr_%d_%u.spv",
+                             getenv("TEMP") ? getenv("TEMP") : ".",
+                             nDump, (unsigned)(ci->codeSize / 4));
+                    FILE *f = fopen(path, "wb");
+                    if (f) {
+                        fwrite(ci->pCode, 1, ci->codeSize, f);
+                        fclose(f);
+                        trace("XP FSR: dumped module to %s (%u words)",
+                              path, (unsigned)(ci->codeSize / 4));
+                    }
+                    ++nDump;
+                }
+            }
         }
         if (isXpFsr)
             trace("XP FSR: shader module %p is one of X-Plane's FSR variants "
@@ -9829,7 +9999,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
     g_patchedCode.clear();
     {
         VkResult rr = g_nextCreateShaderModule
-            ? g_nextCreateShaderModule(device, ci, alloc, out)
+            ? g_nextCreateShaderModule(device, ciUse, alloc, out)
             : VK_ERROR_INITIALIZATION_FAILED;
         if (rr == VK_SUCCESS && out && isXpFsr) {
             std::lock_guard<std::mutex> g(g_lock);
@@ -11453,6 +11623,106 @@ static void velImageBarrier(DeviceData &dd, VkCommandBuffer cb, VkImage img,
 // X-Plane's FSR is a compute dispatch, so this is the interception point: the
 // dispatch is simply never forwarded. Nothing else in the frame changes, and
 // the sim has no way to observe that its upscale did not happen.
+// ---- WHERE X-PLANE ACTUALLY NAMES ITS FSR RESOURCES.
+//
+// This layer tracked descriptor sets only through vkUpdateDescriptorSets, and
+// X-Plane does not bind the upscale's resources that way - so the set was
+// invisible and the dispatch had nothing to write into. Seven storage images
+// share the output's extent, which is why extent alone could not settle it.
+//
+// A push descriptor states the type of every binding. The FSR output is
+// declared STORAGE_IMAGE, so recording the storage-image writes on this command
+// buffer names the destination outright.
+//
+// Forwarded unconditionally: this is observation, and the sim's own upscale
+// must keep working exactly as before whenever fsr.replace is off.
+// The Vulkan 1.4 form. Same job, arguments wrapped in a struct.
+//
+// The classic entry point counted ZERO calls while 98 descriptor-set binds went
+// past per frame, which is what sent the search here rather than to another
+// guess about naming.
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdPushDescriptorSet2(
+    VkCommandBuffer cb, const VkPushDescriptorSetInfo *info)
+{
+    PFN_vkCmdPushDescriptorSet2 next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(cb));
+        if (it == g_devices.end()) it = g_devices.begin();
+        if (it != g_devices.end()) next = it->second.cmdPushDescriptorSet2;
+
+        if (info && info->pDescriptorWrites) {
+            static uint64_t nPush2 = 0;
+            if (nPush2++ < 4)
+                trace("PUSH DESC 2: call %llu stages=0x%x writes=%u",
+                      (unsigned long long)nPush2, (unsigned)info->stageFlags,
+                      info->descriptorWriteCount);
+            std::vector<VkImage> &v = g_cbPushedStorage[(void*)cb];
+            for (uint32_t i = 0; i < info->descriptorWriteCount; ++i) {
+                const VkWriteDescriptorSet &w = info->pDescriptorWrites[i];
+                if (w.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) continue;
+                if (!w.pImageInfo) continue;
+                for (uint32_t d = 0; d < w.descriptorCount; ++d) {
+                    std::map<VkImageView, VkImage>::iterator im =
+                        g_viewToImage.find(w.pImageInfo[d].imageView);
+                    if (im == g_viewToImage.end()) continue;
+                    if (v.size() > 32) v.erase(v.begin(), v.begin() + 16);
+                    v.push_back(im->second);
+                }
+            }
+        }
+    }
+    if (next) next(cb, info);
+}
+
+static VKAPI_ATTR void VKAPI_CALL TAA_CmdPushDescriptorSetKHR(
+    VkCommandBuffer cb, VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
+    uint32_t set, uint32_t writeCount, const VkWriteDescriptorSet *writes)
+{
+    PFN_vkCmdPushDescriptorSetKHR next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(cb));
+        if (it == g_devices.end()) it = g_devices.begin();
+        if (it != g_devices.end()) next = it->second.cmdPushDescriptorSet;
+
+        // ---- IS THIS HOOK CALLED AT ALL, AND WITH WHAT?
+        //
+        // Four rebuilds were spent inferring why the FSR output stayed unnamed:
+        // KHR name, core 1.4 name, descriptor sets, image-map fallback. Every
+        // one of those was a guess about a call nobody had confirmed happens.
+        // Count it and say what it carries.
+        {
+            static uint64_t nPush = 0;
+            if (nPush++ < 6)
+                trace("PUSH DESC: call %llu bindPoint=%d writes=%u",
+                      (unsigned long long)nPush, (int)bindPoint, writeCount);
+            if (writes && nPush <= 6)
+                for (uint32_t i = 0; i < writeCount && i < 8; ++i)
+                    trace("PUSH DESC:   write %u type=%d count=%u",
+                          i, (int)writes[i].descriptorType, writes[i].descriptorCount);
+        }
+        if (writes && bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+            std::vector<VkImage> &v = g_cbPushedStorage[(void*)cb];
+            for (uint32_t i = 0; i < writeCount; ++i) {
+                if (writes[i].descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                    continue;
+                if (!writes[i].pImageInfo) continue;
+                for (uint32_t d = 0; d < writes[i].descriptorCount; ++d) {
+                    std::map<VkImageView, VkImage>::iterator im =
+                        g_viewToImage.find(writes[i].pImageInfo[d].imageView);
+                    if (im == g_viewToImage.end()) continue;
+                    // Newest last, and bounded: a command buffer that pushes
+                    // all frame would otherwise grow without limit.
+                    if (v.size() > 32) v.erase(v.begin(), v.begin() + 16);
+                    v.push_back(im->second);
+                }
+            }
+        }
+    }
+    if (next) next(cb, bindPoint, layout, set, writeCount, writes);
+}
+
 static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
     VkCommandBuffer cb, uint32_t gx, uint32_t gy, uint32_t gz)
 {
@@ -11462,6 +11732,308 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
         std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(cb));
         if (it == g_devices.end()) it = g_devices.begin();
         if (it != g_devices.end()) dd = &it->second;
+    }
+    // ---- THE TAKEOVER SWITCH.
+    //
+    // OFF (default): X-Plane's FSR is forwarded untouched and behaves exactly
+    // as Laminar intended. This layer must never change what the sim does with
+    // a feature the user did not point at us.
+    //
+    // ON: X-Plane's own FSR toggle becomes the control for OUR upscaler. The
+    // sim renders the 3-D scene BELOW display resolution through its own
+    // supported path - which is the part a layer cannot do safely on its own -
+    // and then dispatches its spatial upscale. We drop that dispatch and write
+    // our own result into the image it would have produced.
+    //
+    // In through X-Plane's path, out through X-Plane's supported output. No
+    // viewport games, no second swap chain, and the reduced render is a
+    // documented sim setting rather than something we forced.
+    //
+    // g_cbFsrBound was recorded at vkCmdBindPipeline: the pipeline was built
+    // from a module carrying u_fsr_data, which is X-Plane's FSR uniform block
+    // and survives a recompile because it lives in OpName.
+    if (dd && fsrReplaceEnabled()) {
+        bool fsrBound = false;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<void*, bool>::iterator fb = g_cbFsrBound.find((void*)cb);
+            fsrBound = (fb != g_cbFsrBound.end() && fb->second);
+        }
+        // ---- THE DISPATCH IS NO LONGER DROPPED.
+        //
+        // It runs, and what runs is our module. Dropping it was the earlier
+        // route and it could not be completed: it needed the output image named
+        // from outside, which X-Plane does not expose.
+        //
+        // Kept, disabled, because this counter and its trace are how anyone
+        // checks the interception point is still being reached.
+        if (false && fsrBound) {
+            ++g_xpFsrDropped;
+
+            // ---- PUT OUR RESULT WHERE X-PLANE'S UPSCALE WOULD HAVE PUT ITS OWN.
+            //
+            // The destination is the LARGEST image the FSR descriptor sets
+            // named: an upscaler writes bigger than it reads, so size separates
+            // output from input without needing to know X-Plane's binding
+            // numbers - which are not documented and would not survive a
+            // recompile if they were.
+            //
+            // The source is the scene target, which at this point in the frame
+            // holds the resolved low-resolution image: X-Plane rendered it
+            // small because ITS OWN FSR setting is on, and our resolve has
+            // already run over it. So this blit is the upscale, and the rest of
+            // the frame - tonemap, cockpit, UI - happens downstream exactly as
+            // the sim intended, because we are handing back the same image it
+            // was going to read.
+            VkImage dst = VK_NULL_HANDLE;
+            uint32_t dw = 0, dh = 0;
+            VkImage src = VK_NULL_HANDLE;
+            uint32_t sw = 0, sh = 0;
+            {
+                std::lock_guard<std::mutex> g(g_lock);
+                std::map<void*, std::vector<VkImage> >::iterator fi =
+                    g_cbFsrImages.find((void*)cb);
+                // ---- THE DISPATCH STATES ITS OWN OUTPUT SIZE.
+                //
+                // A compute upscale covers its destination exactly once, so the
+                // grid times the workgroup size IS the output extent - measured
+                // at 240x135 groups for a 1920x1080 output, which fixes the
+                // workgroup at 8x8. Matching on that plus the STORAGE bit
+                // identifies X-Plane's i_output_texture outright, where
+                // "largest image in the set" was only ever a ranking of
+                // guesses.
+                const uint32_t wantW = gx * 8, wantH = gy * 8;
+                if (fi != g_cbFsrImages.end()) {
+                    for (size_t i = 0; i < fi->second.size(); ++i) {
+                        std::map<VkImage, ColorTarget>::iterator ct =
+                            g_colorImages.find(fi->second[i]);
+                        if (ct == g_colorImages.end()) continue;
+                        if (!(ct->second.usage & VK_IMAGE_USAGE_STORAGE_BIT)) continue;
+                        if (ct->second.w != wantW || ct->second.h != wantH) continue;
+                        dst = ct->second.image;
+                        dw  = ct->second.w;
+                        dh  = ct->second.h;
+                        break;
+                    }
+                }
+
+                // ---- NO DESCRIPTOR SET? FIND IT IN THE IMAGE MAP INSTEAD.
+                //
+                // g_setViews is fed only by vkUpdateDescriptorSets. X-Plane
+                // binds the FSR resources by push descriptor or update
+                // template, and this layer hooks neither, so the descriptor
+                // route reports zero candidates and always will.
+                //
+                // It was only ever a way of naming one image, and the dispatch
+                // names it already: an upscale covers its destination exactly
+                // once, so the grid times the workgroup gives the extent. Every
+                // created image is recorded with its usage, so the output is
+                // findable without knowing which set held it.
+                //
+                // AMBIGUITY IS NOT RESOLVED BY PICKING ONE. Writing into the
+                // wrong same-sized target produces a frame that looks plausible
+                // and is wrong, which costs far more to attribute later than a
+                // refusal costs now.
+                // The push descriptor named it. Search newest-first: the
+                // upscale's output is pushed immediately before its dispatch.
+                if (dst == VK_NULL_HANDLE) {
+                    std::map<void*, std::vector<VkImage> >::iterator ps =
+                        g_cbPushedStorage.find((void*)cb);
+                    if (ps != g_cbPushedStorage.end()) {
+                        for (size_t i = ps->second.size(); i-- > 0; ) {
+                            std::map<VkImage, ColorTarget>::iterator ct =
+                                g_colorImages.find(ps->second[i]);
+                            if (ct == g_colorImages.end()) continue;
+                            if (ct->second.w != wantW || ct->second.h != wantH) continue;
+                            dst = ct->second.image;
+                            dw = ct->second.w; dh = ct->second.h;
+                            static bool said = false;
+                            if (!said) {
+                                said = true;
+                                trace("XP FSR: output named by its PUSH DESCRIPTOR "
+                                      "- storage image %p at %ux%u. No guessing "
+                                      "between same-sized candidates.",
+                                      (void*)dst, dw, dh);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // ---- THE WORKGROUP SIZE IS NOT ASSUMED.
+                //
+                // Reading the 240x135 grid as 8x8 threads gave 1920x1080, and
+                // five rebuilds went looking for that image. FSR's EASU pass
+                // uses 16x16, which makes the same grid 3840x2160 - this
+                // display, and the extent 11 of this frame's passes run at.
+                // The target was never 1920x1080.
+                //
+                // So every plausible group size is tried, and the one yielding
+                // EXACTLY ONE storage image of that extent wins. Ambiguity is
+                // still refused: writing into the wrong same-sized target gives
+                // a frame that looks plausible and is not.
+                if (dst == VK_NULL_HANDLE) {
+                    static const uint32_t kGroups[] = { 16, 8, 32, 64 };
+                    for (size_t gi = 0; gi < sizeof(kGroups)/sizeof(kGroups[0]); ++gi) {
+                        const uint32_t tw = gx * kGroups[gi], th = gy * kGroups[gi];
+                        VkImage only = VK_NULL_HANDLE;
+                        uint32_t matches = 0;
+                        for (std::map<VkImage, ColorTarget>::iterator it2 = g_colorImages.begin();
+                             it2 != g_colorImages.end(); ++it2) {
+                            if (!(it2->second.usage & VK_IMAGE_USAGE_STORAGE_BIT)) continue;
+                            if (it2->second.w != tw || it2->second.h != th) continue;
+                            ++matches;
+                            only = it2->second.image;
+                        }
+                        static uint32_t saidN = 0;
+                        if (saidN < 8) {
+                            ++saidN;
+                            trace("XP FSR: group %ux%u -> output would be %ux%u; "
+                                  "%u storage image(s) match",
+                                  kGroups[gi], kGroups[gi], tw, th, matches);
+                        }
+                        if (matches == 1) {
+                            dst = only; dw = tw; dh = th;
+                            static bool said = false;
+                            if (!said) {
+                                said = true;
+                                trace("XP FSR: output is %p at %ux%u - the only "
+                                      "storage image matching a %ux%u dispatch "
+                                      "at %ux%u threads per group.",
+                                      (void*)dst, dw, dh, gx, gy,
+                                      kGroups[gi], kGroups[gi]);
+                            }
+                            break;
+                        }
+                    }
+                }
+                src = g_sceneColor.image;
+                sw  = g_sceneColor.w;
+                sh  = g_sceneColor.h;
+            }
+
+            if (dst != VK_NULL_HANDLE && src != VK_NULL_HANDLE &&
+                dst != src && sw && sh && dw && dh && dd->cmdBlitImage) {
+                // Scene target out of colour-attachment layout, FSR output out
+                // of GENERAL - a storage image is always in GENERAL, which is
+                // what makes it legal for the shader that was going to write it.
+                velImageBarrier(*dd, cb, src,
+                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                VK_ACCESS_TRANSFER_READ_BIT,
+                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT);
+                velImageBarrier(*dd, cb, dst,
+                                VK_IMAGE_LAYOUT_GENERAL,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_ACCESS_TRANSFER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+                VkImageBlit blit;
+                memset(&blit, 0, sizeof(blit));
+                blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blit.srcSubresource.layerCount = 1;
+                blit.dstSubresource = blit.srcSubresource;
+                blit.srcOffsets[1].x = (int32_t)sw;
+                blit.srcOffsets[1].y = (int32_t)sh;
+                blit.srcOffsets[1].z = 1;
+                blit.dstOffsets[1].x = (int32_t)dw;
+                blit.dstOffsets[1].y = (int32_t)dh;
+                blit.dstOffsets[1].z = 1;
+                // LINEAR because this IS the upscale. A nearest blit here would
+                // be a resolution downgrade dressed up as a feature.
+                dd->cmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                 dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 1, &blit, VK_FILTER_LINEAR);
+
+                velImageBarrier(*dd, cb, dst,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_IMAGE_LAYOUT_GENERAL,
+                                VK_ACCESS_TRANSFER_WRITE_BIT,
+                                VK_ACCESS_SHADER_READ_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                velImageBarrier(*dd, cb, src,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                VK_ACCESS_TRANSFER_READ_BIT,
+                                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                VK_ACCESS_SHADER_READ_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+                ++g_xpFsrBlits;
+                if (g_xpFsrBlits <= 3 || (g_xpFsrBlits % 600) == 0)
+                    trace("XP FSR: upscaled %ux%u -> %ux%u into X-Plane's own "
+                          "output image %p (%llu blits). We are the upscaler "
+                          "now.", sw, sh, dw, dh, (void*)dst,
+                          (unsigned long long)g_xpFsrBlits);
+            } else {
+                // Named, because a dropped dispatch with nothing written in its
+                // place is exactly the corrupted frame this feature is meant to
+                // stop producing.
+                ++g_xpFsrNoTarget;
+                if (g_xpFsrNoTarget <= 3 || (g_xpFsrNoTarget % 600) == 0)
+                {
+                    std::lock_guard<std::mutex> g(g_lock);
+                    std::map<void*, std::vector<VkImage> >::iterator fi2 =
+                        g_cbFsrImages.find((void*)cb);
+                    const size_t n2 = (fi2 == g_cbFsrImages.end()) ? 0 : fi2->second.size();
+                    // Split the remaining possibilities with one number
+                    // each, instead of another attempt:
+                    //   storageSets == 0  -> no STORAGE write was ever recorded,
+                    //                        so the update path is still wrong.
+                    //   storageSets  > 0  -> writes ARE recorded, but the sets
+                    //                        bound on this buffer are not among
+                    //                        them, so bind-sets is the problem.
+                    //   binds == 0        -> vkCmdBindDescriptorSets never ran
+                    //                        on this command buffer at all.
+                    trace("XP FSR: DIAG storageSets=%u sampledSets=%u binds=%u "
+                          "viewToImage=%u colourImages=%u",
+                          (unsigned)g_setStorageViews.size(),
+                          (unsigned)g_setViews.size(),
+                          (unsigned)g_cbFsrImages.size(),
+                          (unsigned)g_viewToImage.size(),
+                          (unsigned)g_colorImages.size());
+                    trace("XP FSR: dispatch dropped but NO target written. "
+                          "Wanted a STORAGE image of %ux%u (from a %ux%u grid); "
+                          "%u candidate(s) were bound on this buffer. "
+                          "src=%p scene %ux%u",
+                          gx * 8, gy * 8, gx, gy, (unsigned)n2,
+                          (void*)src, sw, sh);
+                    if (fi2 != g_cbFsrImages.end())
+                        for (size_t i = 0; i < fi2->second.size() && i < 12; ++i) {
+                            std::map<VkImage, ColorTarget>::iterator ct =
+                                g_colorImages.find(fi2->second[i]);
+                            if (ct == g_colorImages.end())
+                                trace("XP FSR:   candidate %p - not in the colour map",
+                                      (void*)fi2->second[i]);
+                            else
+                                trace("XP FSR:   candidate %p %ux%u usage=0x%x storage=%s",
+                                      (void*)ct->second.image, ct->second.w, ct->second.h,
+                                      (unsigned)ct->second.usage,
+                                      (ct->second.usage & VK_IMAGE_USAGE_STORAGE_BIT)
+                                          ? "yes" : "no");
+                        }
+                }
+            }
+            // Loud for the first few, then rare: a dispatch dropped every
+            // frame is thousands of lines an hour, and a count nobody can see
+            // is how the occupancy write went missing for a week.
+            if (g_xpFsrDropped <= 4 || (g_xpFsrDropped % 600) == 0)
+                trace("XP FSR: dropped X-Plane's upscale dispatch %ux%ux%u "
+                      "(%llu so far). fsr.replace=1, so this layer owns the "
+                      "upscale now. Until a backend writes into its output "
+                      "image the frame WILL look wrong - that is the "
+                      "interception working, not failing.",
+                      gx, gy, gz, (unsigned long long)g_xpFsrDropped);
+            return;                      // never forwarded
+        }
     }
     if (dd && dd->cmdDispatch) dd->cmdDispatch(cb, gx, gy, gz);
 }
@@ -13236,6 +13808,15 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         g_nextCmdDrawIndexedIndirectCount = (PFN_vkCmdDrawIndexedIndirectCount)nextGDPA(*out, "vkCmdDrawIndexedIndirectCount");          GD(endCommandBuffer, EndCommandBuffer);
     GD(cmdBindPipeline, CmdBindPipeline);             GD(cmdBindDescriptorSets, CmdBindDescriptorSets);
     GD(cmdPushConstants, CmdPushConstants);            GD(cmdDispatch, CmdDispatch);
+    dd.cmdPushDescriptorSet = (PFN_vkCmdPushDescriptorSetKHR)nextGDPA(*out, "vkCmdPushDescriptorSetKHR");
+    if (!dd.cmdPushDescriptorSet)
+        dd.cmdPushDescriptorSet = (PFN_vkCmdPushDescriptorSetKHR)
+            nextGDPA(*out, "vkCmdPushDescriptorSet");   // core in 1.4
+    dd.cmdPushDescriptorSet2 = (PFN_vkCmdPushDescriptorSet2)
+        nextGDPA(*out, "vkCmdPushDescriptorSet2");
+    if (!dd.cmdPushDescriptorSet2)
+        dd.cmdPushDescriptorSet2 = (PFN_vkCmdPushDescriptorSet2)
+            nextGDPA(*out, "vkCmdPushDescriptorSet2KHR");
     GD(cmdPipelineBarrier, CmdPipelineBarrier);          GD(cmdCopyImageToBuffer, CmdCopyImageToBuffer);
     GD(cmdFillBuffer, CmdFillBuffer);
     GD(cmdCopyImage, CmdCopyImage);                   GD(deviceWaitIdle, DeviceWaitIdle);
@@ -13683,6 +14264,13 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkCreateShaderModule",   TAA_CreateShaderModule)
     RETURN_IF("vkCreateComputePipelines", TAA_CreateComputePipelines)
     RETURN_IF("vkCmdDispatch",          TAA_CmdDispatch)
+    RETURN_IF("vkCmdPushDescriptorSetKHR", TAA_CmdPushDescriptorSetKHR)
+    // Vulkan 1.4 promoted push descriptors to core and dropped the suffix.
+    // X-Plane reports a 1.4 device, so it resolves the CORE name and the KHR
+    // hook above never fired - which is why the FSR output stayed unnamed.
+    RETURN_IF("vkCmdPushDescriptorSet",    TAA_CmdPushDescriptorSetKHR)
+    RETURN_IF("vkCmdPushDescriptorSet2",    TAA_CmdPushDescriptorSet2)
+    RETURN_IF("vkCmdPushDescriptorSet2KHR", TAA_CmdPushDescriptorSet2)
     RETURN_IF("vkCreatePipelineLayout", TAA_CreatePipelineLayout)
     RETURN_IF("vkCmdBindPipeline",     TAA_CmdBindPipeline)
     RETURN_IF("vkCmdDraw",             TAA_CmdDraw)

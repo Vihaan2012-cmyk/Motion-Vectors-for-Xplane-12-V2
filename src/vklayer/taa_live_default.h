@@ -103,4 +103,12 @@ static const char *kLiveDefaultIni =
 "crash.offset_y=0\n"
 "crash.offset_z=0\n"
 "\n"
+"# ---- X-Plane FSR takeover (in development)\n"
+"# 0 = X-Plane's FSR works exactly as Laminar intended.\n"
+"# 1 = X-Plane's FSR toggle drives OUR upscaler: the sim renders below display\n"
+"#     resolution through its own supported path, and this layer takes over the\n"
+"#     upscale step. Nothing writes the output yet, so the frame will look wrong\n"
+"#     with this on - that is the interception working.\n"
+"fsr.replace=0\n"
+"\n"
 ;
