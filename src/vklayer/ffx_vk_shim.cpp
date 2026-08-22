@@ -54,6 +54,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <vulkan/vulkan.h>
+#include <stdlib.h>
+#include <string.h>
 
 // Defined in layer.cpp, bound once from the application's instance. The
 // binding is deliberately done ONCE there: this project has already been taken
@@ -77,7 +79,42 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL mvFfxEnumerateDeviceExtensionPropertie
     VkPhysicalDevice physicalDevice, const char *pLayerName,
     uint32_t *pPropertyCount, VkExtensionProperties *pProperties)
 {
+    // ---- THE COUNT MUST NOT CHANGE BETWEEN THE TWO CALLS.
+    //
+    // ffxGetScratchMemorySizeVK sizes its buffer with
+    // sizeof(VkExtensionProperties) * numExtensions, taken from THIS function.
+    // CreateBackendContextVK then carves that buffer up and memsets each piece.
+    // If the count differs between the sizing call and the filling call - or if
+    // the first one answered 0 because the next-layer pointer was not bound yet
+    // - the buffer is short and the memset runs off the end. That is heap
+    // corruption, and it presents exactly as this did: entered, never returned.
+    //
+    // So the answer is LATCHED on first success and every later call is served
+    // from it, which makes the two calls agree by construction rather than by
+    // luck.
+    static uint32_t  s_count = 0;
+    static bool      s_have  = false;
+    static VkExtensionProperties *s_props = nullptr;
+
     PFN_vkEnumerateDeviceExtensionProperties next = mvNextEnumDeviceExtensionProperties();
+    if (next && !s_have) {
+        uint32_t n = 0;
+        if (next(physicalDevice, nullptr, &n, nullptr) == VK_SUCCESS && n) {
+            s_props = (VkExtensionProperties *)calloc(n, sizeof(VkExtensionProperties));
+            if (s_props && next(physicalDevice, nullptr, &n, s_props) == VK_SUCCESS) {
+                s_count = n;
+                s_have  = true;
+            }
+        }
+    }
+    if (s_have) {
+        if (!pPropertyCount) return VK_INCOMPLETE;
+        if (!pProperties) { *pPropertyCount = s_count; return VK_SUCCESS; }
+        const uint32_t give = (*pPropertyCount < s_count) ? *pPropertyCount : s_count;
+        memcpy(pProperties, s_props, give * sizeof(VkExtensionProperties));
+        *pPropertyCount = give;
+        return (give < s_count) ? VK_INCOMPLETE : VK_SUCCESS;
+    }
     if (!next) {
         // Reporting zero extensions is safe here: the only caller that reaches
         // this is FFX sizing an array, and a zero-length array is merely a

@@ -1507,6 +1507,22 @@ extern "C" PFN_vkVoidFunction mvNextDeviceProcAddr(VkDevice device, const char *
     // plain globals here.
     if (g_ffxDevice != VK_NULL_HANDLE && device == g_ffxDevice && g_ffxGdpa)
         return g_ffxGdpa(device, name);
+    // ---- AND NO LOCK ON THE MISS EITHER.
+    //
+    // The only caller is FidelityFX, and it only ever asks about the device we
+    // built its context for. Taking g_lock here to answer a question that
+    // cannot arise is a deadlock waiting for a caller that already holds it -
+    // which is what turned a crash into a hang once the memory was fixed.
+    //
+    // A null answer is recoverable; a hang inside context creation is not.
+    if (g_ffxGdpa && g_ffxDevice != VK_NULL_HANDLE) {
+        static uint32_t saidOther = 0;
+        if (saidOther++ < 3)
+            trace("FFX SHIM: asked for %s on device %p, but the context was "
+                  "built for %p. Answering null rather than locking.",
+                  name ? name : "(null)", (void*)device, (void*)g_ffxDevice);
+        return nullptr;
+    }
     std::lock_guard<std::mutex> g(g_lock);
     std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
     if (it == g_devices.end()) {

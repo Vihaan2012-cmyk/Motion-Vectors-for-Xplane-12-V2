@@ -52,6 +52,13 @@ struct State {
     bool                        failed  = false;
     FfxInterface                iface;
     FfxFsr3UpscalerContext      ctx;
+    // ---- THIS MUST OUTLIVE ensure(). IT IS HELD BY POINTER.
+    //
+    // ffxGetDeviceVK does not copy the VkDeviceContext - it casts the pointer,
+    // and CreateBackendContextVK reads it straight back out of
+    // backendInterface->device. A local would be a dangling stack pointer for
+    // every later call, the dispatch included.
+    VkDeviceContext             vkCtx;
     void                       *scratch = nullptr;
     size_t                      scratchSize = 0;
     uint32_t                    renderW = 0, renderH = 0;
