@@ -160,6 +160,30 @@ $haveFfx = Test-Path (Join-Path $ffxSdk "sdk\src\backends\vk\ffx_vk.cpp")
 if ($haveFfx -and -not (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
     Write-Host "Building FidelityFX (once)..."
     New-Item -ItemType Directory -Force $ffxObj | Out-Null
+    # ---- FFX'S DIRECT VULKAN CALLS, REDIRECTED BY NAME.
+    #
+    # ffx_vk.cpp calls eight Vulkan entry points BY NAME rather than through the
+    # vkGetDeviceProcAddr it is handed. Bound to the loader's exports, a call
+    # from inside a layer re-enters the dispatch chain at the top and comes back
+    # into our own hook - which killed FSR3 in its first call with no output.
+    #
+    # Defining the real vk* names inside this DLL fixed that and introduced a
+    # worse problem: those names ARE the layer interface, so anything else here
+    # that calls one binds to ours instead of the loader, and the export table
+    # becomes somewhere a mistake can hide. It crashed the sim during load.
+    #
+    # Redefining the names for THIS COMPILE ONLY avoids both. FFX's calls become
+    # calls to mvFfx* forwarders, which go down the chain; no Vulkan symbol is
+    # defined in the DLL at all, so there is nothing to collide with or export.
+    $ffxRename = @(
+        "-DvkEnumerateDeviceExtensionProperties=mvFfxEnumerateDeviceExtensionProperties",
+        "-DvkGetPhysicalDeviceProperties2=mvFfxGetPhysicalDeviceProperties2",
+        "-DvkGetPhysicalDeviceFeatures2=mvFfxGetPhysicalDeviceFeatures2",
+        "-DvkGetPhysicalDeviceProperties=mvFfxGetPhysicalDeviceProperties",
+        "-DvkGetPhysicalDeviceMemoryProperties=mvFfxGetPhysicalDeviceMemoryProperties",
+        "-DvkGetPhysicalDeviceFeatures=mvFfxGetPhysicalDeviceFeatures",
+        "-DvkGetDeviceProcAddr=mvFfxGetDeviceProcAddr",
+        "-DvkCreateBuffer=mvFfxCreateBuffer")
     $ffxInc = @(
         "-I$ffxSdk\sdk\include", "-I$ffxSdk\sdk\src\backends\vk",
         "-I$ffxSdk\sdk\src\backends\shared",
@@ -184,6 +208,7 @@ if ($haveFfx -and -not (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
         & g++ -c -O2 -std=c++17 -include new -include cmath -include cstring `
             -include cwchar -include cstdio $ffxInc `
             -DFFX_VK=1 -DFFX_FSR3UPSCALER -DWIN32 "-Dswprintf_s=_snwprintf" `
+            @ffxRename `
             $f -o $o
         if ($LASTEXITCODE -ne 0) { throw "FidelityFX: $(Split-Path $f -Leaf) failed to compile" }
     }
@@ -239,7 +264,7 @@ Write-Host "Building Vulkan layer..."
 & g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
   -I"$vksdk\Include" -m64 -O2 -std=c++17 `
   @sdkDefines @sdkIncludes $ffxDefine `
-  "-I$ffxSdk\sdk\include" @ffxObjs $ffxHide `
+  "-I$ffxSdk\sdk\include" @ffxObjs `
   -static -static-libgcc -static-libstdc++
 if ($LASTEXITCODE -ne 0) { throw "layer build failed" }
 Copy-Item "$src\vklayer\VkLayer_mv.json" "$out\vklayer" -Force

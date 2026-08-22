@@ -189,9 +189,32 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     cd.maxUpscaleSize.height = outH;
     cd.backendInterface      = s.iface;
 
+    // ---- MARKERS STRAIGHT TO DISK, FLUSHED, AROUND THE CALL.
+    //
+    // The contradiction this settles: step 3 is entered once, its return is
+    // never traced, ensure() is never called again - which should be impossible
+    // unless it returned - and the render thread that calls it keeps presenting
+    // at 37 fps. All three cannot hold, and trace() is the one component
+    // involved in all three, so it is the one to take out of the question.
+    //
+    // A separate file, opened and closed per write, with fflush: if "after"
+    // appears the call returns and the fault is in the reporting; if it does
+    // not, the call really does not come back and the render thread is somehow
+    // not the caller.
+    {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "before ContextCreate %ux%u -> %ux%u%c",
+                         renderW, renderH, outW, outH, 10);
+                 fflush(m); fclose(m); }
+    }
     trace("FSR3: step 3 - ffxFsr3UpscalerContextCreate %ux%u -> %ux%u",
           renderW, renderH, outW, outH);
     rc = ffxFsr3UpscalerContextCreate(&s.ctx, &cd);
+    {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "after ContextCreate rc=%d%c", (int)rc, 10);
+                 fflush(m); fclose(m); }
+    }
     trace("FSR3: step 3 returned %d", (int)rc);
     if (rc != FFX_OK) {
         trace("FSR3: ffxFsr3UpscalerContextCreate failed (%d)", (int)rc);

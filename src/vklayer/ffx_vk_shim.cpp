@@ -1,5 +1,19 @@
 // The Vulkan entry points FidelityFX calls DIRECTLY, answered by this layer.
 //
+// ---- THESE ARE NOT NAMED vk*. THAT IS THE WHOLE POINT.
+//
+// An earlier version defined the real Vulkan names inside this DLL. That works
+// for the link, and it is a trap: those names ARE the Vulkan layer interface,
+// anything else in the layer that calls one binds to it instead of the loader,
+// and the export table becomes a place a mistake can hide. It took X-Plane down
+// during load.
+//
+// So the FidelityFX objects are compiled with those names REDEFINED to the
+// mv-prefixed ones below (see build.ps1). FFX's calls resolve here; no Vulkan
+// symbol is defined in this DLL at all, so there is nothing to collide with,
+// nothing to export by accident, and no way for our own code to reach these by
+// writing an ordinary Vulkan call.
+//
 // ---- WHY THIS FILE EXISTS. IT IS NOT A CONVENIENCE.
 //
 // ffx_vk.cpp does not resolve everything through the vkGetDeviceProcAddr it is
@@ -59,7 +73,7 @@ PFN_vkGetPhysicalDeviceFeatures          mvNextGetPhysicalDeviceFeatures();
 PFN_vkVoidFunction mvNextDeviceProcAddr(VkDevice device, const char *name);
 }
 
-extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL mvFfxEnumerateDeviceExtensionProperties(
     VkPhysicalDevice physicalDevice, const char *pLayerName,
     uint32_t *pPropertyCount, VkExtensionProperties *pProperties)
 {
@@ -74,42 +88,42 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
     return next(physicalDevice, pLayerName, pPropertyCount, pProperties);
 }
 
-extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(
+extern "C" VKAPI_ATTR void VKAPI_CALL mvFfxGetPhysicalDeviceProperties2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties)
 {
     PFN_vkGetPhysicalDeviceProperties2 next = mvNextGetPhysicalDeviceProperties2();
     if (next) next(physicalDevice, pProperties);
 }
 
-extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(
+extern "C" VKAPI_ATTR void VKAPI_CALL mvFfxGetPhysicalDeviceFeatures2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures)
 {
     PFN_vkGetPhysicalDeviceFeatures2 next = mvNextGetPhysicalDeviceFeatures2();
     if (next) next(physicalDevice, pFeatures);
 }
 
-extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties(
+extern "C" VKAPI_ATTR void VKAPI_CALL mvFfxGetPhysicalDeviceProperties(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties *pProperties)
 {
     PFN_vkGetPhysicalDeviceProperties next = mvNextGetPhysicalDeviceProperties();
     if (next) next(physicalDevice, pProperties);
 }
 
-extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties(
+extern "C" VKAPI_ATTR void VKAPI_CALL mvFfxGetPhysicalDeviceMemoryProperties(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties *pProperties)
 {
     PFN_vkGetPhysicalDeviceMemoryProperties next = mvNextGetPhysicalDeviceMemoryProperties();
     if (next) next(physicalDevice, pProperties);
 }
 
-extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(
+extern "C" VKAPI_ATTR void VKAPI_CALL mvFfxGetPhysicalDeviceFeatures(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures *pFeatures)
 {
     PFN_vkGetPhysicalDeviceFeatures next = mvNextGetPhysicalDeviceFeatures();
     if (next) next(physicalDevice, pFeatures);
 }
 
-extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL mvFfxGetDeviceProcAddr(
     VkDevice device, const char *pName)
 {
     return mvNextDeviceProcAddr(device, pName);
@@ -117,7 +131,7 @@ extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(
 
 // FFX creates one staging buffer directly rather than through the table it was
 // given. Resolved down the chain like everything else here.
-extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkCreateBuffer(
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL mvFfxCreateBuffer(
     VkDevice device, const VkBufferCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer)
 {
