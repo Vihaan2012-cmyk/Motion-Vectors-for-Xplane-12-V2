@@ -114,6 +114,87 @@ inline bool createShared(VkDevice device, VkPhysicalDevice phys,
     return true;
 }
 
+// ---- NAME EACH PIPELINE BEFORE IT IS BUILT.
+//
+// Context creation does not return, and it builds ten compute pipelines from
+// the blobs tools/ffx_permute.cpp generated. The interface is a table of
+// function pointers we own, so substituting fpCreatePipeline turns "it dies in
+// there somewhere" into "it dies on pass N".
+//
+// Written to the marker file rather than through trace(): whatever goes wrong
+// takes the thread with it, and anything buffered dies with it.
+static FfxCreatePipelineFunc g_realCreatePipeline = nullptr;
+static FfxCreateBackendContextFunc  g_realCreateBackendContext = nullptr;
+static FfxGetDeviceCapabilitiesFunc g_realGetDeviceCapabilities = nullptr;
+
+// These two run before any pipeline is built, and fpGetDeviceCapabilities is
+// the first code to reach our renamed Vulkan forwarders - the newest thing in
+// the path, and so the first suspect.
+static FfxErrorCode tracedCreateBackendContext(FfxInterface *bi, FfxEffect effect,
+                                               FfxEffectBindlessConfig *cfg,
+                                               FfxUInt32 *effectContextId)
+{
+    {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "  fpCreateBackendContext enter%c", 10);
+                 fflush(m); fclose(m); }
+    }
+    const FfxErrorCode rc = g_realCreateBackendContext
+        ? g_realCreateBackendContext(bi, effect, cfg, effectContextId)
+        : FFX_ERROR_BACKEND_API_ERROR;
+    {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "  fpCreateBackendContext returned %d%c", (int)rc, 10);
+                 fflush(m); fclose(m); }
+    }
+    return rc;
+}
+
+static FfxErrorCode tracedGetDeviceCapabilities(FfxInterface *bi,
+                                                FfxDeviceCapabilities *caps)
+{
+    {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "  fpGetDeviceCapabilities enter%c", 10);
+                 fflush(m); fclose(m); }
+    }
+    const FfxErrorCode rc = g_realGetDeviceCapabilities
+        ? g_realGetDeviceCapabilities(bi, caps)
+        : FFX_ERROR_BACKEND_API_ERROR;
+    {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "  fpGetDeviceCapabilities returned %d%c", (int)rc, 10);
+                 fflush(m); fclose(m); }
+    }
+    return rc;
+}
+
+
+static FfxErrorCode tracedCreatePipeline(
+    FfxInterface *backendInterface, FfxEffect effect, FfxPass pass,
+    uint32_t permutationOptions, const FfxPipelineDescription *pipelineDescription,
+    FfxUInt32 effectContextId, FfxPipelineState *outPipeline)
+{
+    {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "  pipeline: effect=%d pass=%d perm=0x%x%c",
+                         (int)effect, (int)pass, permutationOptions, 10);
+                 fflush(m); fclose(m); }
+    }
+    if (!g_realCreatePipeline) return FFX_ERROR_BACKEND_API_ERROR;
+    const FfxErrorCode rc = g_realCreatePipeline(backendInterface, effect, pass,
+                                                permutationOptions,
+                                                pipelineDescription,
+                                                effectContextId, outPipeline);
+    {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "  pipeline: pass=%d returned %d%c",
+                         (int)pass, (int)rc, 10);
+                 fflush(m); fclose(m); }
+    }
+    return rc;
+}
+
 // ---- BUILD THE CONTEXT.
 //
 // Called once the render and display sizes are both known - which is only true
@@ -138,11 +219,11 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     // mean re-entering the loader from inside one of its own calls, which is
     // one of the two suspects never separated in the XeSS probe crash. Given
     // our next-layer address table it resolves everything below us instead.
-    VkDeviceContext vkCtx;
-    memset(&vkCtx, 0, sizeof(vkCtx));
-    vkCtx.vkDevice         = device;
-    vkCtx.vkPhysicalDevice = phys;
-    vkCtx.vkDeviceProcAddr = gdpa;
+    // Stored in State, not on the stack: the interface keeps the POINTER.
+    memset(&s.vkCtx, 0, sizeof(s.vkCtx));
+    s.vkCtx.vkDevice         = device;
+    s.vkCtx.vkPhysicalDevice = phys;
+    s.vkCtx.vkDeviceProcAddr = gdpa;
 
     // ---- EVERY STEP TRACES BEFORE IT RUNS.
     //
@@ -159,14 +240,40 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
         trace("FSR3: scratch size query returned 0 - backend unavailable");
         s.failed = true; return false;
     }
-    s.scratch = malloc(s.scratchSize);
+    // ---- ZEROED. malloc ALONE IS THE BUG.
+    //
+    // CreateBackendContextVK reads its own state straight out of this buffer
+    // before initialising anything:
+    //
+    //     BackendContext_VK* backendContext =
+    //         (BackendContext_VK*)backendInterface->scratchBuffer;
+    //     if (!backendContext->refCount) { ...set everything up... }
+    //
+    // With malloc'd memory refCount is whatever was on the heap. Non-zero, and
+    // the entire initialisation block is SKIPPED - the function then runs on
+    // uninitialised pointers. maxEffectContexts is garbage too, so the array
+    // sizes derived from it are garbage, and the memsets that follow write
+    // wherever those sizes reach.
+    //
+    // That is why it was entered and never returned, and why it presented first
+    // as a hang and then as a crash once a lock stopped serialising it.
+    s.scratch = calloc(1, s.scratchSize);
     if (!s.scratch) { s.failed = true; return false; }
 
     trace("FSR3: step 2 - ffxGetInterfaceVK(device=%p gdpa=%p)",
           (void*)device, (void*)gdpa);
-    FfxErrorCode rc = ffxGetInterfaceVK(&s.iface, ffxGetDeviceVK(&vkCtx),
+    FfxErrorCode rc = ffxGetInterfaceVK(&s.iface, ffxGetDeviceVK(&s.vkCtx),
                                         s.scratch, s.scratchSize, maxContexts);
     trace("FSR3: step 2 returned %d", (int)rc);
+    // Substituted before the context is created, which is what builds the
+    // pipelines. The original is kept and called through, so behaviour is
+    // unchanged apart from the two lines each pass now writes.
+    g_realCreatePipeline = s.iface.fpCreatePipeline;
+    s.iface.fpCreatePipeline = tracedCreatePipeline;
+    g_realCreateBackendContext  = s.iface.fpCreateBackendContext;
+    g_realGetDeviceCapabilities = s.iface.fpGetDeviceCapabilities;
+    s.iface.fpCreateBackendContext  = tracedCreateBackendContext;
+    s.iface.fpGetDeviceCapabilities = tracedGetDeviceCapabilities;
     if (rc != FFX_OK) {
         trace("FSR3: ffxGetInterfaceVK failed (%d)", (int)rc);
         s.failed = true; return false;
