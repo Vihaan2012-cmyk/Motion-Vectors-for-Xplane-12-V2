@@ -134,6 +134,27 @@ void main()
         // contrast edge, and this target is float - so a negative would survive
         // all the way to the tonemap instead of being clamped by the format.
         c.rgb = max(c.rgb, vec3(0.0));
+
+        // ---- WHY A MAGENTA FILL ONCE LIVED HERE.
+        //
+        // Four things were each established and could not all be true: the
+        // sentinel was in this module, substitution was logged as active, the
+        // probe's copies executed and returned real image content, and none of
+        // twenty-six candidates contained the sentinel. Widening the search
+        // three times did not break the tie, because a single stamped pixel
+        // depends on the pixel surviving, on the right image being a candidate,
+        // and on the readback being aligned.
+        //
+        // Painting every pixel depended on none of those. The screen stayed
+        // normal, which said plainly that this code was not running - and the
+        // reason was already in the log and had been ignored:
+        //
+        //   RENDER RESOLUTION: scene passes are 3840x2160 against a 3840x2160
+        //   display (1.000x). Native - X-Plane's own FSR is off.
+        //
+        // At 1.000x there is nothing to upscale, so EASU is never dispatched;
+        // only RCAS runs. With X-Plane set to a real upscaling ratio the fill
+        // turned the whole scene magenta, which is what proved the takeover.
         imageStore(i_output_texture, ivec3(dst, layer), c);
     }
 

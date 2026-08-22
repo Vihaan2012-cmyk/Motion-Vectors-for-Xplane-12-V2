@@ -10098,6 +10098,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateComputePipelines(
             if (g_xpFsrOurModule != VK_NULL_HANDLE &&
                 ci[i].stage.module == g_xpFsrOurModule)
                 g_xpFsrOurPipelines.insert(out[i]);
+            // ---- IS THE PIPELINE BUILT FROM THE MODULE WE SUBSTITUTED?
+            //
+            // The screen stayed normal with the shader painting every pixel
+            // magenta, so our code is not executing even though substitution
+            // logs. The tagging above never matched either. Say the two handles
+            // out loud rather than infer why.
+            trace("XP FSR: compute pipeline from module %p; our substituted "
+                  "module is %p -> %s",
+                  (void*)ci[i].stage.module, (void*)g_xpFsrOurModule,
+                  (g_xpFsrOurModule != VK_NULL_HANDLE &&
+                   ci[i].stage.module == g_xpFsrOurModule)
+                      ? "MATCH - this pipeline runs our code"
+                      : "DIFFERENT MODULE - our code is not in this pipeline");
             trace("XP FSR: compute pipeline %p is X-Plane's upscaler - its "
                   "dispatches will be dropped and replaced by FSR2's result",
                   (void*)out[i]);
