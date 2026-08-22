@@ -1,5 +1,7 @@
 #pragma once
 
+#include "taa_live_default.h"
+
 // LIVE CONTROLS: change anything without restarting the sim.
 //
 // This exists because of how the work actually went. Every question - is the
@@ -69,119 +71,55 @@ inline const char *path()
 // text that changes them.
 inline void writeTemplate()
 {
+    // ---- AN EXISTING FILE WITH NO ACTIVE KEYS IS THE OLD DEAD TEMPLATE.
+    //
+    // Every release up to 1.0.2 wrote a template whose keys were all commented
+    // out, and left it in %TEMP% forever. A plain "never overwrite" check would
+    // preserve exactly that file for everyone who has already run this mod, so
+    // they would keep the compiled defaults - and the ghosting - no matter how
+    // many times they reinstalled.
+    //
+    // A real edit always leaves at least one active key behind. Zero active
+    // keys means nothing was ever chosen, so there is no user intent to
+    // protect and the file is reseeded. Anything with a single live setting in
+    // it is left strictly alone.
     FILE *f = fopen(path(), "r");
-    if (f) { fclose(f); return; }        // never overwrite the user's edits
+    if (f) {
+        int active = 0;
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            const char *p = line;
+            // Numeric codes, not escapes: a heredoc ate the escapes in
+            // this block once and produced unterminated character
+            // literals. 9 tab, 10 newline, 13 carriage return.
+            while (*p == ' ' || *p == 9) ++p;
+            if (*p == '#' || *p == ';' || *p == 10 || *p == 13 || !*p)
+                continue;
+            if (strchr(p, '=')) { ++active; break; }
+        }
+        fclose(f);
+        if (active) return;              // the user has chosen something: keep it
+        trace("LIVE: %s has no active keys - it is the pre-1.0.3 template, "
+              "reseeding with the known-good settings", path());
+    }
     f = fopen(path(), "w");
     if (!f) return;
-    fprintf(f,
-"# Motion Vectors - LIVE CONTROLS\n"
-"#\n"
-"# Edit and save while X-Plane is running. The layer re-reads this file every\n"
-"# few frames and applies changes immediately. No restart, ever.\n"
-"#\n"
-"# Precedence: this file > environment variable > built-in default.\n"
-"# A key that is absent or commented out falls through to the environment.\n"
-"# Delete a line to hand control back; you do not have to restore its default.\n"
-"#\n"
-"# ---------------------------------------------------------------- resolve\n"
-"# taa.enable      0/1   master switch. 0 leaves the frame completely untouched.\n"
-"# taa.mode        0     passthrough - every binding, barrier and dispatch runs\n"
-"#                       but the output is the input. IF THE FRAME CHANGES AT\n"
-"#                       ALL IN THIS MODE THE FAULT IS PLUMBING, FULL STOP.\n"
-"#                 1     reproject only. Ghosting along motion is EXPECTED and\n"
-"#                       means reprojection works.\n"
-"#                 2     full - neighbourhood statistics on top. Ghosting should\n"
-"#                       collapse.\n"
-"# taa.alpha       0.1   weight of the current frame. Lower accumulates more.\n"
-"# taa.gain        4.0   how hard a rejected history sample pushes alpha to 1.\n"
-"# taa.varclip     1.25  variance box width, in standard deviations.\n"
-"#\n"
-"# ---------------------------------------------------------------- isolate\n"
-"# Each of these removes ONE input, so a fault can be attributed instead of\n"
-"# guessed. They are the generalisation of taa.mode=0 to every stage.\n"
-"#\n"
-"# taa.freeze_history  0/1  stop updating history. The picture should freeze in\n"
-"#                          place and smear along motion. If it does not, the\n"
-"#                          history is not what is being displayed.\n"
-"# taa.no_motion       0/1  treat every vector as zero. Reprojection becomes a\n"
-"#                          same-pixel fetch, so any remaining ghosting is NOT\n"
-"#                          the vectors.\n"
-"# taa.no_accum        0/1  output the current frame but keep every binding,\n"
-"#                          barrier and dispatch live.\n"
-"# taa.force_reset     0/1  drop history every frame. Equivalent to no_accum but\n"
-"#                          through the reset path, so the two together separate\n"
-"#                          'reset is broken' from 'accumulation is broken'.\n"
-"#\n"
-"# ---------------------------------------------------------------- look at it\n"
-"# taa.viz         0     off, normal image\n"
-"#                 1     motion vectors as colour. Red is +x, green is +y, and\n"
-"#                       grey is zero. Sky and clouds should be FLAT GREY - they\n"
-"#                       have no vectors - and the ground should be a smooth\n"
-"#                       gradient with no blocks or discontinuities.\n"
-"#                 2     magnitude heatmap. Black 0 px, blue 1, green 4, yellow\n"
-"#                       16, red 64+. Should scale as 1/depth.\n"
-"#                 3     invalid pixels. RED  = no vector was written here while\n"
-"#                       the camera moved (sky, cloud, or a shader we failed to\n"
-"#                       patch). BLUE = history reprojected off screen. GREEN =\n"
-"#                       accepted. This is the map that says whether the cloud\n"
-"#                       and sky rejection is doing what it claims.\n"
-"#                 4     history buffer directly, before it is copied back.\n"
-"#                 5     blend weight. Black is full accumulation, white is the\n"
-"#                       current frame only. Disocclusion edges should glow.\n"
-"#                 6     how far the clamp moved history, in sigma.\n"
-"# taa.viz_scale   1.0   multiplies the magnitude and weight views.\n"
-"#\n"
-"# ---------------------------------------------------------------- reports\n"
-"# report          1     dump the full state to the log ONCE, then clear itself\n"
-"#                       back to 0 in this file. Image census, pass census,\n"
-"#                       injection outcomes, every refusal and its reason,\n"
-"#                       timings, and the live values in force.\n"
-"# report.every    0     dump it automatically every N frames. 0 disables.\n"
-"#\n"
-"# ---------------------------------------------------------------- vram system\n"
-"# vram.enable     1     master switch for the whole VRAM system.\n"
-"# vram.shape      1     budget shaping: low-pass + monotone-under-free +\n"
-"#                       zone reserve on the budget X-Plane reads.\n"
-"# vram.recycle    1     deferred-free pool: freed device-local blocks are\n"
-"#                       held and identical re-allocations answered instantly.\n"
-"# vram.priority   1     per-category memory priorities via\n"
-"#                       VK_EXT_memory_priority / pageable_device_local.\n"
-"# vram.governor   1     upload pacing on the transfer-only queue, ORANGE+.\n"
-"# vram.reserve_g/y/o/r/c    MB withheld from the reported budget per zone\n"
-"#                           (defaults 128/256/384/512/768).\n"
-"# vram.upload_o/r/c         MB of uploads released per frame in that zone\n"
-"#                           (defaults 64/24/8; _g/_y default 0 = unlimited).\n"
-"# vram.upload_max_hold 2    presents a held upload may wait before release.\n"
-"# vram.recycle_max_mb 256   pool cap;  vram.recycle_hold_frames 180  age cap.\n"
-"# vram.deflate_mb 512       emergency budget cut after an allocation failure,\n"
-"# vram.deflate_frames 600   and for how long.\n"
-"# vram.teleport_m 2000      camera jump that counts as a teleport.\n"
-"# vram.budget_alpha 0.02    low-pass constant per budget query.\n"
-"# vram.adaptive 1           frame-time feedback notches the upload budget\n"
-"#                           down when frame time degrades while uploading.\n"
-"# vram.speed_reserve 0.01   reserve growth per m/frame of camera speed.\n"
-"# vram.tex_drop_above       override the zone policy's preload texture cap.\n"
-"# vram.tex_streamed_to      override the zone policy's streamed texture cap.\n"
-"# vram.upload_cache 1       elide re-uploads of identical texture content;\n"
-"#                           also prices eviction-means-disk-reload in bytes.\n"
-"# vram.warmup_frames 900    progressive VRAM fill after device creation,\n"
-"# vram.warmup_mb 512        starting this much extra reserve, decaying to 0.\n"
-"# vram.hold_max_mb 512      governor backpressure: past this, pass through.\n"
-"# vram.lookahead 300        frames of usage-trend projection (predict peaks).\n"
-"# vram.age_frames 1800      unused-resource window before priority decay;\n"
-"#                           doubled for frequently-used resources.\n"
-"# vram.bench=1 / =0         open / close a measurement window; closing dumps\n"
-"#                           avg, 1%% low, 0.1%% low, VRAM peak, uploads,\n"
-"#                           allocs, JIT pipelines, zone residency.\n"
-"# vram.trace_every 600      heartbeat cadence in frames; 0 silences it.\n"
-"# vram.report=1             one-shot full state dump, clears itself.\n"
-"#\n"
-"# ---------------------------------------------------------------- examples\n"
-"# taa.enable=1\n"
-"# taa.mode=2\n"
-"# taa.alpha=0.1\n"
-"# taa.viz=3\n"
-"# report=1\n");
+    // ---- SEEDED WITH THE TUNED CONFIG, KEYS ACTIVE.
+    //
+    // This used to write a documented template with every key COMMENTED OUT,
+    // which meant a fresh install ran on compiled defaults for all of them.
+    // Two of those defaults - taa.mode=0 (passthrough) and taa.jitter_scale=0
+    // (no jitter) - made TAA do nothing at all, and the rest were never
+    // audited, which is how ghosting shipped afterwards.
+    //
+    // Auditing forty-eight defaults against a config file is the wrong shape
+    // of fix. The file already takes precedence over environment and built-in
+    // default, so writing the KNOWN-GOOD file itself makes a fresh install
+    // identical to the machine it was tuned on by construction.
+    //
+    // The user's own edits are still never overwritten: the early return above
+    // fires whenever the file already exists.
+    fputs(kLiveDefaultIni, f);
     fclose(f);
 }
 
