@@ -4293,7 +4293,33 @@ static uint64_t g_xpFsrNoTarget = 0;
 // working exactly as Laminar wrote it has to be the state you get by default.
 static bool fsrReplaceEnabled()
 {
-    return live::i("fsr.replace", "TAA_REPLACE_XPFSR", 0) != 0;
+    // ---- LATCHED ONCE, AND ONLY AFTER THE FILE HAS BEEN READ.
+    //
+    // Read per call, this gave DIFFERENT answers for the same shader module.
+    // Modules are created during startup, before the live config has been
+    // polled, so an early call saw the built-in default while a later one saw
+    // the file - and the trace showed exactly that: the 58436-byte module was
+    // created without the "carries our code" marker while SUBSTITUTING printed
+    // once. Substitution and tagging disagreed about the same module, so the
+    // pipeline was never recognised and the probe never fired.
+    //
+    // loadNow() forces the read rather than waiting for the next poll, so the
+    // first caller gets the file's answer instead of a default that would then
+    // be latched for the life of the process.
+    //
+    // Latching also makes the switch honest about itself: module substitution
+    // happens once at startup, so this cannot take effect mid-flight however
+    // often the file is edited. A value that only applies at launch should be
+    // read at launch.
+    static int cached = -1;
+    if (cached < 0) {
+        live::loadNow();
+        cached = (live::i("fsr.replace", "TAA_REPLACE_XPFSR", 0) != 0) ? 1 : 0;
+        trace("XP FSR: fsr.replace latched %s for this process - module "
+              "substitution is decided at startup and cannot change later.",
+              cached ? "ON" : "off");
+    }
+    return cached != 0;
 }
 
 // Does this SPIR-V belong to X-Plane's FSR?
@@ -11080,6 +11106,35 @@ static void fsrProbeRecord(DeviceData &dd, VkCommandBuffer cb,
         if (ps.candidates.size() >= fsrprobe::kMaxCandidates) break;
         ps.candidates.push_back(it->second.image);
     }
+    // ---- SWAPCHAIN IMAGES ARE CANDIDATES TOO.
+    //
+    // They can never appear in g_colorImages: they come from
+    // vkGetSwapchainImagesKHR, not vkCreateImage, so the creation hook that
+    // fills that map never sees them. If X-Plane's upscale writes straight into
+    // the image it is about to present - which it may, when the swapchain was
+    // created with STORAGE usage - then the destination was never in the
+    // candidate list at all, and the probe would report "not found" forever
+    // while everything else about it worked.
+    //
+    // That is exactly the state this reached: the sentinel is provably in the
+    // shader, the shader provably runs (the upscaled image is correct), the
+    // copies provably execute, and no candidate carried the stamp.
+    for (std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator si =
+             g_swapImages.begin(); si != g_swapImages.end(); ++si) {
+        SwapInfo inf;
+        memset(&inf, 0, sizeof(inf));
+        std::map<VkSwapchainKHR, SwapInfo>::iterator ii = g_swapInfo.find(si->first);
+        if (ii != g_swapInfo.end()) inf = ii->second;
+        if (inf.w != wantW || inf.h != wantH) continue;
+        for (size_t k = 0; k < si->second.size(); ++k) {
+            if (ps.candidates.size() >= fsrprobe::kMaxCandidates) break;
+            bool have = false;
+            for (size_t q = 0; q < ps.candidates.size(); ++q)
+                if (ps.candidates[q] == si->second[k]) { have = true; break; }
+            if (!have) ps.candidates.push_back(si->second[k]);
+        }
+    }
+
     if (ps.candidates.empty()) return;      // nothing to ask about yet
 
     if (ps.buf == VK_NULL_HANDLE) {
@@ -11607,10 +11662,25 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
             // grid and runs after ours, so probing on any FSR dispatch reads a
             // pixel that has already been overwritten - which is exactly what
             // "sentinel not found in 13 candidates" was reporting.
-            std::map<void*, bool>::iterator fo = g_cbFsrOurs.find((void*)cb);
-            const bool ours = (fo != g_cbFsrOurs.end() && fo->second);
-            if (fsrBound2 && ours && (gx * 16) > 64)
+            // ---- THE FIRST FSR DISPATCH OF A FRAME IS EASU, WHICH IS OURS.
+            //
+            // Two FSR pipelines dispatch per frame at this same grid: EASU,
+            // which we substituted, and RCAS, which sharpens the result
+            // afterwards. Probing after RCAS reads a pixel X-Plane has already
+            // overwritten, which is what "sentinel not found in 13 candidates"
+            // was reporting.
+            //
+            // Matching the pipeline handle would be more direct and did not
+            // work - the tag never reached g_cbFsrOurs - so this uses ordering
+            // instead, which is a property of the algorithm rather than of our
+            // bookkeeping: a spatial upscale must produce the image before a
+            // sharpener can sharpen it.
+            static uint64_t lastProbeFrame = ~0ull;
+            const bool firstThisFrame = (lastProbeFrame != g_frameCount);
+            if (fsrBound2 && firstThisFrame && (gx * 16) > 64) {
+                lastProbeFrame = g_frameCount;
                 fsrProbeRecord(*dd, cb, gx * 16, gy * 16);
+            }
         }
     }
 }
