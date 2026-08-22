@@ -136,4 +136,26 @@ void main()
         c.rgb = max(c.rgb, vec3(0.0));
         imageStore(i_output_texture, ivec3(dst, layer), c);
     }
+
+    // ---- THE SENTINEL: HOW THE CPU LEARNS WHICH IMAGE THIS IS.
+    //
+    // Thirteen storage images share this output's extent, and X-Plane exposes
+    // no way to tell them apart - its descriptor contents are invisible to a
+    // layer (one recorded set per frame; every push-descriptor entry point
+    // called zero times). Anything downstream that needs the real handle, FSR3
+    // above all, is stuck on that.
+    //
+    // But THIS shader is already writing the right image. So it stamps a value
+    // the CPU can look for: copy one pixel out of each candidate, and the one
+    // carrying the stamp is the output. One frame, one answer.
+    //
+    // Written LAST so the upscale loop above cannot overwrite it, and only by
+    // the first thread of the first group. Three independent improbable
+    // components, so real content cannot forge it by accident.
+    //
+    // The cost is one pixel in the extreme top-left corner. It is also a free
+    // liveness check: if the stamp is absent, this shader is not running.
+    if (gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u && t == 0u)
+        imageStore(i_output_texture, ivec3(0, 0, layer),
+                   vec4(0.111111, 0.222222, 0.333333, 1.0));
 }

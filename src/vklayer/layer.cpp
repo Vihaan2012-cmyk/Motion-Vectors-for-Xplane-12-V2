@@ -1568,6 +1568,11 @@ static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "mv_target.h"
 #include "spirv_inject.h"
 #include "xpfsr_spv.h"
+#include "fsr_probe.h"
+
+// Defined with the probe below; called from the present path, which comes
+// first in this file.
+static void fsrProbeResolve();
 #include "taa.h"
 #include "destruct_gpu.h"
 
@@ -4387,7 +4392,14 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
 static std::set<VkShaderModule> g_xpFsrModules;    // modules that ARE X-Plane's FSR
 static std::set<VkPipeline>     g_xpFsrPipelines;  // compute pipelines built from them
 static std::map<void*, bool>    g_cbFsrBound;      // is an FSR pipeline bound on this cb
+static std::map<void*, bool>    g_cbFsrOurs;       // is it specifically OUR substituted pipeline
 static uint64_t g_xpFsrDropped   = 0;
+// The module we actually substituted, and the pipelines built from it. There
+// are TWO FSR modules - EASU, which we replace, and RCAS, which we leave alone
+// - and only the first writes the sentinel. Probing after the wrong one reads
+// a pixel X-Plane has since overwritten.
+static VkShaderModule       g_xpFsrOurModule = VK_NULL_HANDLE;
+static std::set<VkPipeline> g_xpFsrOurPipelines;
 
 // Images seen in descriptor sets bound while one of X-Plane's FSR pipelines was
 // active on this command buffer. The upscale's OUTPUT is in here; so is its
@@ -6920,6 +6932,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // somewhere else would drift from this and the two would disagree in logs
     // for reasons nobody could reconstruct later.
     uint64_t frames = ++g_frameCount;
+
+    // The probe's answer becomes readable a few frames after its copies were
+    // recorded. Checked here because this is the one place that runs exactly
+    // once per frame and is already past the submit that carried them.
+    fsrProbeResolve();
 
     // Last frame's timings, read without blocking - waiting on them would
     // change what is being measured.
@@ -9951,6 +9968,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
             std::lock_guard<std::mutex> g(g_lock);
             g_moduleCode[*out].assign(ci->pCode, ci->pCode + ci->codeSize / 4);
             if (isXpFsr) g_xpFsrModules.insert(*out);
+            // Remember WHICH module got our code, so the probe can wait
+            // for the dispatch that actually writes the sentinel.
+            if (isXpFsr && ciUse != ci) g_xpFsrOurModule = *out;
             // ---- DUMP X-PLANE'S FSR SPIR-V.
             //
             // A replacement shader has to declare the SAME descriptor layout as
@@ -10004,8 +10024,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
         if (rr == VK_SUCCESS && out && isXpFsr) {
             std::lock_guard<std::mutex> g(g_lock);
             g_xpFsrModules.insert(*out);
+            // ---- TAG IT HERE TOO.
+            //
+            // There are two module-creation paths and only the other one
+            // recorded which module got our code, so g_xpFsrOurPipelines stayed
+            // empty and the probe never fired. Substitution is decided above,
+            // before the branch; the tagging has to follow it on BOTH sides.
+            if (ciUse != ci) g_xpFsrOurModule = *out;
             trace("XP FSR: shader module %p is one of X-Plane's FSR variants "
-                  "(u_fsr_data present, %zu bytes)", (void*)*out, ci->codeSize);
+                  "(u_fsr_data present, %zu bytes)%s", (void*)*out, ci->codeSize,
+                  ciUse != ci ? " - THIS ONE CARRIES OUR CODE" : "");
         }
         return rr;
     }
@@ -10041,6 +10069,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateComputePipelines(
         for (uint32_t i = 0; i < count; ++i) {
             if (!g_xpFsrModules.count(ci[i].stage.module)) continue;
             g_xpFsrPipelines.insert(out[i]);
+            if (g_xpFsrOurModule != VK_NULL_HANDLE &&
+                ci[i].stage.module == g_xpFsrOurModule)
+                g_xpFsrOurPipelines.insert(out[i]);
             trace("XP FSR: compute pipeline %p is X-Plane's upscaler - its "
                   "dispatches will be dropped and replaced by FSR2's result",
                   (void*)out[i]);
@@ -11641,6 +11672,147 @@ static void velImageBarrier(DeviceData &dd, VkCommandBuffer cb, VkImage img,
 // The classic entry point counted ZERO calls while 98 descriptor-set binds went
 // past per frame, which is what sent the search here rather than to another
 // guess about naming.
+// ---- RECORD ONE PIXEL FROM EVERY CANDIDATE.
+//
+// Called immediately after X-Plane's FSR dispatch has been forwarded, in the
+// SAME command buffer, so the copies are ordered after the writes that produced
+// them. Done once: the answer does not change for the life of the process.
+static void fsrProbeRecord(DeviceData &dd, VkCommandBuffer cb,
+                           uint32_t wantW, uint32_t wantH)
+{
+    fsrprobe::State &ps = fsrprobe::state();
+    if (ps.resolved || ps.failed || ps.copiesRecorded) return;
+    if (!dd.createBuffer || !dd.cmdCopyImageToBuffer || !dd.cmdPipelineBarrier ||
+        !g_getPhysMemProps) { ps.failed = true; return; }
+
+    // Candidates: every storage image of the output's exact extent.
+    ps.candidates.clear();
+    for (std::map<VkImage, ColorTarget>::iterator it = g_colorImages.begin();
+         it != g_colorImages.end(); ++it) {
+        if (!(it->second.usage & VK_IMAGE_USAGE_STORAGE_BIT)) continue;
+        if (it->second.w != wantW || it->second.h != wantH) continue;
+        if (ps.candidates.size() >= fsrprobe::kMaxCandidates) break;
+        ps.candidates.push_back(it->second.image);
+    }
+    if (ps.candidates.empty()) return;      // nothing to ask about yet
+
+    if (ps.buf == VK_NULL_HANDLE) {
+        const VkDeviceSize bytes =
+            (VkDeviceSize)fsrprobe::kMaxCandidates * fsrprobe::kPixelBytes;
+        VkBufferCreateInfo bci;
+        memset(&bci, 0, sizeof(bci));
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size  = bytes;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (dd.createBuffer(dd.device, &bci, nullptr, &ps.buf) != VK_SUCCESS) {
+            ps.failed = true; trace("FSR PROBE: buffer creation failed"); return;
+        }
+        VkMemoryRequirements mr;
+        dd.getBufferMemReq(dd.device, ps.buf, &mr);
+        VkPhysicalDeviceMemoryProperties mp;
+        memset(&mp, 0, sizeof(mp));
+        g_getPhysMemProps(dd.phys, &mp);
+        uint32_t ti = UINT32_MAX;
+        for (uint32_t k = 0; k < mp.memoryTypeCount; ++k)
+            if ((mr.memoryTypeBits & (1u << k)) &&
+                (mp.memoryTypes[k].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                (mp.memoryTypes[k].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                ti = k; break;
+            }
+        VkMemoryAllocateInfo mai;
+        memset(&mai, 0, sizeof(mai));
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize  = mr.size;
+        mai.memoryTypeIndex = ti;
+        if (ti == UINT32_MAX ||
+            dd.allocateMemory(dd.device, &mai, nullptr, &ps.mem) != VK_SUCCESS ||
+            dd.bindBufferMemory(dd.device, ps.buf, ps.mem, 0) != VK_SUCCESS ||
+            dd.mapMemory(dd.device, ps.mem, 0, bytes, 0, &ps.ptr) != VK_SUCCESS) {
+            ps.failed = true; trace("FSR PROBE: memory failed"); return;
+        }
+        memset(ps.ptr, 0, (size_t)bytes);
+        ps.device = dd.device;
+    }
+
+    for (size_t i = 0; i < ps.candidates.size(); ++i) {
+        VkImageMemoryBarrier b;
+        memset(&b, 0, sizeof(b));
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange.levelCount = 1;
+        b.subresourceRange.layerCount = 1;
+        b.image = ps.candidates[i];
+        // GENERAL is where a storage image lives; ALL_COMMANDS because a
+        // candidate that is NOT the output may have been touched by anything.
+        b.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                              0, nullptr, 0, nullptr, 1, &b);
+
+        VkBufferImageCopy bic;
+        memset(&bic, 0, sizeof(bic));
+        bic.bufferOffset = (VkDeviceSize)i * fsrprobe::kPixelBytes;
+        bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bic.imageSubresource.layerCount = 1;
+        bic.imageExtent.width = 1; bic.imageExtent.height = 1; bic.imageExtent.depth = 1;
+        dd.cmdCopyImageToBuffer(cb, ps.candidates[i],
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                ps.buf, 1, &bic);
+
+        b.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                              0, nullptr, 0, nullptr, 1, &b);
+    }
+
+    ps.copiesRecorded = true;
+    ps.copiedOnFrame  = g_frameCount;
+    trace("FSR PROBE: copied pixel (0,0) from %u candidate(s) of %ux%u. The one "
+          "carrying the sentinel our shader stamps is X-Plane's real upscale "
+          "output.", (unsigned)ps.candidates.size(), wantW, wantH);
+}
+
+// Read the answer, a few frames after the copies were recorded. No fence: see
+// the note in fsr_probe.h.
+static void fsrProbeResolve()
+{
+    fsrprobe::State &ps = fsrprobe::state();
+    if (ps.resolved || ps.failed || !ps.copiesRecorded || !ps.ptr) return;
+    if (g_frameCount < ps.copiedOnFrame + 3) return;
+
+    const uint8_t *base = (const uint8_t *)ps.ptr;
+    for (size_t i = 0; i < ps.candidates.size(); ++i) {
+        if (!fsrprobe::looksLikeSentinel(base + i * fsrprobe::kPixelBytes)) continue;
+        ps.output   = ps.candidates[i];
+        ps.resolved = true;
+        trace("FSR PROBE: X-Plane's upscale output is %p - candidate %u of %u "
+              "carried the sentinel. This handle is what a CPU-driven upscaler "
+              "must be given to write.",
+              (void*)ps.output, (unsigned)i, (unsigned)ps.candidates.size());
+        return;
+    }
+    // Not found: say so once and allow one retry, rather than silently
+    // reporting nothing forever.
+    static int retries = 0;
+    if (retries++ < 2) {
+        trace("FSR PROBE: sentinel not found in %u candidate(s) - retrying. "
+              "If this persists the substituted shader is not running, or the "
+              "output is not among the images this layer sees created.",
+              (unsigned)ps.candidates.size());
+        ps.copiesRecorded = false;
+    } else {
+        ps.failed = true;
+    }
+}
+
 static VKAPI_ATTR void VKAPI_CALL TAA_CmdPushDescriptorSet2(
     VkCommandBuffer cb, const VkPushDescriptorSetInfo *info)
 {
@@ -12036,6 +12208,25 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
         }
     }
     if (dd && dd->cmdDispatch) dd->cmdDispatch(cb, gx, gy, gz);
+
+    // After the dispatch, in the same command buffer: our substituted shader
+    // has just written the output, sentinel and all.
+    if (dd && fsrReplaceEnabled()) {
+        bool fsrBound2 = false;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<void*, bool>::iterator fb = g_cbFsrBound.find((void*)cb);
+            fsrBound2 = (fb != g_cbFsrBound.end() && fb->second);
+            // OURS specifically. X-Plane's RCAS pass also dispatches at this
+            // grid and runs after ours, so probing on any FSR dispatch reads a
+            // pixel that has already been overwritten - which is exactly what
+            // "sentinel not found in 13 candidates" was reporting.
+            std::map<void*, bool>::iterator fo = g_cbFsrOurs.find((void*)cb);
+            const bool ours = (fo != g_cbFsrOurs.end() && fo->second);
+            if (fsrBound2 && ours && (gx * 16) > 64)
+                fsrProbeRecord(*dd, cb, gx * 16, gy * 16);
+        }
+    }
 }
 
 // Re-push immediately before the draw. Cheap - a push constant write is a few
@@ -12311,6 +12502,9 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     if (bind == VK_PIPELINE_BIND_POINT_COMPUTE) {
         std::lock_guard<std::mutex> g(g_lock);
         g_cbFsrBound[(void*)cb] = (g_xpFsrPipelines.count(pipeline) != 0);
+        // Separately: is it OUR pipeline, the one whose shader stamps the
+        // sentinel? Only that dispatch is worth probing after.
+        g_cbFsrOurs[(void*)cb] = (g_xpFsrOurPipelines.count(pipeline) != 0);
     }
 
     if (!g_spirvInject || bind != VK_PIPELINE_BIND_POINT_GRAPHICS) return;
