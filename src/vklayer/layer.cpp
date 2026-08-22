@@ -427,6 +427,12 @@ static PFN_vkEnumerateDeviceExtensionProperties g_nextEnumDeviceExt = nullptr;
 static PFN_vkGetPhysicalDeviceProperties2 g_getPhysProps2 = nullptr;
 static PFN_vkGetPhysicalDeviceFeatures2   g_getPhysFeat2  = nullptr;
 static PFN_vkGetPhysicalDeviceFeatures    g_getPhysFeat   = nullptr;
+// Written once at device creation, read without a lock by the FidelityFX
+// forwarders. FFX asks for function addresses constantly while building its
+// context, and taking g_lock there deadlocked against a caller that already
+// held it.
+static VkDevice                g_ffxDevice = VK_NULL_HANDLE;
+static PFN_vkGetDeviceProcAddr g_ffxGdpa   = nullptr;
 
 extern "C" PFN_vkEnumerateDeviceExtensionProperties mvNextEnumDeviceExtensionProperties()
 { return g_nextEnumDeviceExt; }
@@ -1618,6 +1624,19 @@ extern "C" PFN_vkVoidFunction mvNextDeviceProcAddr(VkDevice device, const char *
     //
     // Returning null instead makes the caller fail its own way, which is
     // recoverable and reportable.
+    // ---- NO LOCK ON THIS PATH.
+    //
+    // FidelityFX calls this many times while building its context, and this
+    // used to take g_lock. g_lock is a plain std::mutex, so if anything above
+    // in that call path already holds it the second acquire never returns -
+    // and that is exactly what was measured: a marker written to disk before
+    // ffxFsr3UpscalerContextCreate and never after it.
+    //
+    // The answer needs no lock. The device and its next-layer address table are
+    // written once at device creation and never change, so they are read from
+    // plain globals here.
+    if (g_ffxDevice != VK_NULL_HANDLE && device == g_ffxDevice && g_ffxGdpa)
+        return g_ffxGdpa(device, name);
     std::lock_guard<std::mutex> g(g_lock);
     std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
     if (it == g_devices.end()) {
@@ -14311,6 +14330,10 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     dd.device        = *out;
     dd.phys          = phys;
     dd.gdpa          = nextGDPA;
+    // The lock-free pair the FidelityFX forwarders read. Set here, once, and
+    // never changed - which is what makes reading them without g_lock safe.
+    g_ffxDevice = *out;
+    g_ffxGdpa   = nextGDPA;
     dd.destroyDevice = (PFN_vkDestroyDevice)nextGDPA(*out, "vkDestroyDevice");
     dd.createImage   = (PFN_vkCreateImage)nextGDPA(*out, "vkCreateImage");
     dd.destroyImage  = (PFN_vkDestroyImage)nextGDPA(*out, "vkDestroyImage");
