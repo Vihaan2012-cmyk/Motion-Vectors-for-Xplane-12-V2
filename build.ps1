@@ -194,6 +194,28 @@ $ffxDefine = ""
 if ($haveFfx -and (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
     $ffxObjs = (Get-ChildItem $ffxObj -Filter *.o | ForEach-Object { $_.FullName })
     $ffxDefine = "-DMV_HAVE_FSR3=1"
+    # ---- HIDE THE SHIM SYMBOLS FROM THE DLL EXPORT TABLE.
+    #
+    # ffx_vk_shim.cpp defines the Vulkan entry points FidelityFX calls by name,
+    # and MinGW exports every symbol from a DLL by default. Several of those
+    # names ARE the Vulkan layer interface - the loader calls
+    # vkEnumerateDeviceExtensionProperties and vkGetDeviceProcAddr ON A LAYER -
+    # so exporting them handed the loader our FFX forwarders as though they were
+    # this layer's own entry points. It took X-Plane down inside vulkan-1.dll
+    # with 0xc0000409, the loader __fastfail this project has met before.
+    #
+    # They must still exist for the internal link, so they are excluded from the
+    # EXPORT TABLE rather than removed. MV_GetInstanceProcAddr and
+    # MV_GetDeviceProcAddr, which the manifest names, are untouched.
+    $ffxHide = @(
+        "-Wl,--exclude-symbols=vkGetDeviceProcAddr",
+        "-Wl,--exclude-symbols=vkEnumerateDeviceExtensionProperties",
+        "-Wl,--exclude-symbols=vkGetPhysicalDeviceProperties",
+        "-Wl,--exclude-symbols=vkGetPhysicalDeviceProperties2",
+        "-Wl,--exclude-symbols=vkGetPhysicalDeviceFeatures",
+        "-Wl,--exclude-symbols=vkGetPhysicalDeviceFeatures2",
+        "-Wl,--exclude-symbols=vkGetPhysicalDeviceMemoryProperties",
+        "-Wl,--exclude-symbols=vkCreateBuffer")
     # ---- THE LOADER IMPORT LIBRARY, FOR A FEW INSTANCE CALLS ONLY.
     #
     # ffx_vk.cpp calls vkGetPhysicalDeviceProperties2 and friends directly while
@@ -217,7 +239,7 @@ Write-Host "Building Vulkan layer..."
 & g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
   -I"$vksdk\Include" -m64 -O2 -std=c++17 `
   @sdkDefines @sdkIncludes $ffxDefine `
-  "-I$ffxSdk\sdk\include" @ffxObjs `
+  "-I$ffxSdk\sdk\include" @ffxObjs $ffxHide `
   -static -static-libgcc -static-libstdc++
 if ($LASTEXITCODE -ne 0) { throw "layer build failed" }
 Copy-Item "$src\vklayer\VkLayer_mv.json" "$out\vklayer" -Force

@@ -1476,10 +1476,30 @@ static void fsrProbeResolve();
 // ffxGetScratchMemorySizeVK.
 extern "C" PFN_vkVoidFunction mvNextDeviceProcAddr(VkDevice device, const char *name)
 {
+    // ---- NO FALLBACK TO ANOTHER DEVICE. EVER.
+    //
+    // This used to fall back to g_devices.begin() when the handle was not
+    // recognised, which hands the caller ANOTHER device's function pointers.
+    // That is precisely the shape this file already records as fatal: a
+    // function resolved against one device or instance, then called with a
+    // handle belonging to a different one, is not answered with an error - the
+    // loader __fastfails, and the Windows event log blames vulkan-1.dll with
+    // 0xc0000409. Which is exactly how FSR3's context creation died.
+    //
+    // Returning null instead makes the caller fail its own way, which is
+    // recoverable and reportable.
     std::lock_guard<std::mutex> g(g_lock);
     std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
-    if (it == g_devices.end()) it = g_devices.begin();
-    if (it == g_devices.end() || !it->second.gdpa) return nullptr;
+    if (it == g_devices.end()) {
+        static uint32_t said = 0;
+        if (said++ < 4)
+            trace("FFX SHIM: vkGetDeviceProcAddr(%s) for device %p, which this "
+                  "layer does not track. Returning null rather than another "
+                  "device's function - that substitution is what the loader "
+                  "answers by __fastfail.", name ? name : "(null)", (void*)device);
+        return nullptr;
+    }
+    if (!it->second.gdpa) return nullptr;
     return it->second.gdpa(device, name);
 }
 #include "taa.h"
