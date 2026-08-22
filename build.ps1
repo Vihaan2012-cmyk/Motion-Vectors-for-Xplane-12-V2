@@ -139,9 +139,85 @@ for ($i = 0; $i -lt $fwords.Count; $i += 8) {
 Set-Content -Path "$src\vklayer\xpfsr_spv.h" -Value $fsb.ToString() -Encoding utf8 -NoNewline
 Write-Host "  xpfsr_spv.h: $($fwords.Count) words"
 
+# ---- THE FIDELITYFX OBJECTS.
+#
+# Compiled once and reused. ffx_fsr3upscaler_shaderblobs.cpp alone is 1.5 MB of
+# generated SPIR-V and is slow; rebuilding it on every layer edit would make the
+# normal loop slower for nothing. Delete build\ffx_obj to force a rebuild after
+# regenerating shaders.
+#
+# THREE FORCED INCLUDES. MSVC pulls <new>, <cmath> and <cstring> in
+# transitively and the SDK relies on that, so placement new, log2/floor and
+# memset/memcmp are otherwise undeclared under GCC. swprintf_s is mapped to
+# _snwprintf for the same reason.
+#
+# -DFFX_FSR3UPSCALER selects the upscaler alone: ffx_shader_blobs.cpp is guarded
+# per component, so without it every effect in the SDK would be pulled in and
+# none of their shader headers exist here.
+$ffxSdk = Join-Path $root "third_party\FidelityFX-SDK"
+$ffxObj = Join-Path $root "build\ffx_obj"
+$haveFfx = Test-Path (Join-Path $ffxSdk "sdk\src\backends\vk\ffx_vk.cpp")
+if ($haveFfx -and -not (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
+    Write-Host "Building FidelityFX (once)..."
+    New-Item -ItemType Directory -Force $ffxObj | Out-Null
+    $ffxInc = @(
+        "-I$ffxSdk\sdk\include", "-I$ffxSdk\sdk\src\backends\vk",
+        "-I$ffxSdk\sdk\src\backends\shared",
+        "-I$ffxSdk\sdk\src\backends\shared\blob_accessors",
+        "-I$ffxSdk\sdk\src\components", "-I$ffxSdk\sdk\src",
+        "-I$ffxSdk\sdk\src\shared", "-I$root\build\ffx_shaders",
+        "-I$vksdk\Include")
+    $ffxSrc = @(
+        "$ffxSdk\sdk\src\backends\vk\ffx_vk.cpp",
+        "$ffxSdk\sdk\src\components\fsr3upscaler\ffx_fsr3upscaler.cpp",
+        "$ffxSdk\sdk\src\backends\shared\ffx_shader_blobs.cpp",
+        "$ffxSdk\sdk\src\backends\shared\blob_accessors\ffx_fsr3upscaler_shaderblobs.cpp",
+        "$ffxSdk\sdk\src\shared\ffx_assert.cpp",
+        "$ffxSdk\sdk\src\shared\ffx_breadcrumbs_list.cpp",
+        "$ffxSdk\sdk\src\shared\ffx_message.cpp",
+        "$ffxSdk\sdk\src\shared\ffx_object_management.cpp",
+        "$src\vklayer\ffx_fg_stub.cpp",
+        "$src\vklayer\ffx_vk_shim.cpp")
+    foreach ($f in $ffxSrc) {
+        if (-not (Test-Path $f)) { continue }
+        $o = Join-Path $ffxObj ((Split-Path $f -Leaf) -replace '\.cpp$', '.o')
+        & g++ -c -O2 -std=c++17 -include new -include cmath -include cstring `
+            -include cwchar -include cstdio $ffxInc `
+            -DFFX_VK=1 -DFFX_FSR3UPSCALER -DWIN32 "-Dswprintf_s=_snwprintf" `
+            $f -o $o
+        if ($LASTEXITCODE -ne 0) { throw "FidelityFX: $(Split-Path $f -Leaf) failed to compile" }
+    }
+    Write-Host "  $((Get-ChildItem $ffxObj -Filter *.o).Count) FidelityFX objects"
+}
+$ffxObjs = @()
+$ffxDefine = ""
+if ($haveFfx -and (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
+    $ffxObjs = (Get-ChildItem $ffxObj -Filter *.o | ForEach-Object { $_.FullName })
+    $ffxDefine = "-DMV_HAVE_FSR3=1"
+    # ---- THE LOADER IMPORT LIBRARY, FOR A FEW INSTANCE CALLS ONLY.
+    #
+    # ffx_vk.cpp calls vkGetPhysicalDeviceProperties2 and friends directly while
+    # building its interface. Every PER-FRAME call it makes goes through the
+    # vkGetDeviceProcAddr we hand it, which is the NEXT LAYER's - so the frame
+    # path never re-enters the loader. These few are capability queries made
+    # once at context creation, well away from any nested loader call, which is
+    # the situation the XeSS probe crash warned about.
+    $ffxVkLib = Join-Path $vksdk ("Lib" + [char]92 + "vulkan-1.lib")
+}
+
+# ---- NO vulkan-1 IMPORT LIBRARY ON THIS LINK.
+#
+# ffx_vk_shim.cpp defines the three Vulkan entry points FidelityFX calls by
+# name. Linking the loader's exports alongside them would let link order decide
+# which wins, and the loader's version means a call made from inside this layer
+# re-enters the dispatch chain AT THE TOP - straight back into our own hook.
+# That recursion killed the sim inside ffxGetScratchMemorySizeVK, FSR3's very
+# first call, with no output at all.
 Write-Host "Building Vulkan layer..."
 & g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
   -I"$vksdk\Include" -m64 -O2 -std=c++17 `
+  @sdkDefines @sdkIncludes $ffxDefine `
+  "-I$ffxSdk\sdk\include" @ffxObjs `
   -static -static-libgcc -static-libstdc++
 if ($LASTEXITCODE -ne 0) { throw "layer build failed" }
 Copy-Item "$src\vklayer\VkLayer_mv.json" "$out\vklayer" -Force
