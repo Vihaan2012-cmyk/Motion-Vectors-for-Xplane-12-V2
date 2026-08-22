@@ -11094,6 +11094,14 @@ static void fsrProbeRecord(DeviceData &dd, VkCommandBuffer cb,
 {
     fsrprobe::State &ps = fsrprobe::state();
     if (ps.resolved || ps.failed || ps.copiesRecorded) return;
+    // ---- NOT DURING THE LOAD.
+    //
+    // The first FSR dispatch happens while the sim is still loading, and the
+    // command buffer carrying it is not necessarily submitted. The copies were
+    // recorded into one that was discarded: every candidate read back as
+    // 0 0 0 0, alpha included, which is the memset and not image content - a
+    // real frame has alpha 1. Recording is not execution.
+    if (g_frameCount < 240) return;
     if (!dd.createBuffer || !dd.cmdCopyImageToBuffer || !dd.cmdPipelineBarrier ||
         !g_getPhysMemProps) { ps.failed = true; return; }
 
@@ -11102,7 +11110,16 @@ static void fsrProbeRecord(DeviceData &dd, VkCommandBuffer cb,
     for (std::map<VkImage, ColorTarget>::iterator it = g_colorImages.begin();
          it != g_colorImages.end(); ++it) {
         if (!(it->second.usage & VK_IMAGE_USAGE_STORAGE_BIT)) continue;
-        if (it->second.w != wantW || it->second.h != wantH) continue;
+        // ---- EVERY PLAUSIBLE OUTPUT EXTENT, NOT ONE DERIVED ONE.
+        //
+        // wantW/wantH assume a 16x16 tile per 64-thread group. If the tile is
+        // really 8x8 the output is half that in each axis - and the rendered
+        // image cannot tell the two apart, because a 16x16 mapping over a
+        // 1920x1080 target still fills it completely: the groups that would
+        // run past the edge are discarded by the shader's own bounds check.
+        // So a correct-looking frame is consistent with BOTH, and the probe
+        // must not exclude one on the strength of it.
+        if (it->second.w < 1920 || it->second.h < 1080) continue;
         if (ps.candidates.size() >= fsrprobe::kMaxCandidates) break;
         ps.candidates.push_back(it->second.image);
     }
@@ -11121,11 +11138,16 @@ static void fsrProbeRecord(DeviceData &dd, VkCommandBuffer cb,
     // copies provably execute, and no candidate carried the stamp.
     for (std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator si =
              g_swapImages.begin(); si != g_swapImages.end(); ++si) {
-        SwapInfo inf;
-        memset(&inf, 0, sizeof(inf));
-        std::map<VkSwapchainKHR, SwapInfo>::iterator ii = g_swapInfo.find(si->first);
-        if (ii != g_swapInfo.end()) inf = ii->second;
-        if (inf.w != wantW || inf.h != wantH) continue;
+        // ---- UNCONDITIONALLY. NO EXTENT FILTER.
+        //
+        // The extent recorded for a swapchain is 0x0 - g_swapInfo has no entry
+        // for it - so filtering on a match excluded every presented image, and
+        // those are precisely the ones that can never appear in g_colorImages:
+        // they come from vkGetSwapchainImagesKHR, not vkCreateImage.
+        //
+        // There are three of them. Copying a pixel from three extra images
+        // costs nothing next to excluding the one category the answer might be
+        // hiding in.
         for (size_t k = 0; k < si->second.size(); ++k) {
             if (ps.candidates.size() >= fsrprobe::kMaxCandidates) break;
             bool have = false;
@@ -11216,7 +11238,7 @@ static void fsrProbeRecord(DeviceData &dd, VkCommandBuffer cb,
 
     ps.copiesRecorded = true;
     ps.copiedOnFrame  = g_frameCount;
-    trace("FSR PROBE: copied pixel (0,0) from %u candidate(s) of %ux%u. The one "
+    trace("FSR PROBE: copied pixel (0,0) from %u candidate(s), any storage image at least 1920x1080 (the %ux%u guess is no longer trusted). The one "
           "carrying the sentinel our shader stamps is X-Plane's real upscale "
           "output.", (unsigned)ps.candidates.size(), wantW, wantH);
 }
@@ -11240,17 +11262,80 @@ static void fsrProbeResolve()
               (void*)ps.output, (unsigned)i, (unsigned)ps.candidates.size());
         return;
     }
+    // ---- SAY WHAT IS ACTUALLY THERE.
+    //
+    // "Does this pixel match" cannot tell you where the value went, and three
+    // attempts were spent theorising about that instead of looking. The
+    // sentinel is provably written by a shader that provably runs, so it is
+    // SOMEWHERE - print every candidate's contents and let the numbers say
+    // which, or say plainly that none of them was ever written at all.
+    {
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            const uint8_t *b0 = (const uint8_t *)ps.ptr;
+            trace("FSR PROBE: no match. Contents of pixel (0,0) in each "
+                  "candidate - the sentinel is (%.4f %.4f %.4f):",
+                  fsrprobe::kSentinel[0], fsrprobe::kSentinel[1],
+                  fsrprobe::kSentinel[2]);
+            for (size_t i = 0; i < ps.candidates.size(); ++i) {
+                uint16_t h[4];
+                memcpy(h, b0 + i * fsrprobe::kPixelBytes, sizeof(h));
+                std::map<VkImage, ColorTarget>::iterator ct =
+                    g_colorImages.find(ps.candidates[i]);
+                trace("FSR PROBE:   [%2u] %p  %.4f %.4f %.4f %.4f   %ux%u usage=0x%x",
+                      (unsigned)i, (void*)ps.candidates[i],
+                      fsrprobe::halfToFloat(h[0]), fsrprobe::halfToFloat(h[1]),
+                      fsrprobe::halfToFloat(h[2]), fsrprobe::halfToFloat(h[3]),
+                      ct != g_colorImages.end() ? ct->second.w : 0,
+                      ct != g_colorImages.end() ? ct->second.h : 0,
+                      ct != g_colorImages.end() ? (unsigned)ct->second.usage : 0u);
+            }
+            // Everything the layer knows that is big enough to be an upscale
+            // target, whether or not it was a candidate - so an output that was
+            // excluded by the filters shows up here rather than being invisible.
+            trace("FSR PROBE: every tracked image at least 1920 wide:");
+            unsigned n = 0;
+            for (std::map<VkImage, ColorTarget>::iterator it = g_colorImages.begin();
+                 it != g_colorImages.end() && n < 40; ++it) {
+                if (it->second.w < 1920) continue;
+                ++n;
+                trace("FSR PROBE:   %p %ux%u fmt=%d usage=0x%x storage=%s",
+                      (void*)it->second.image, it->second.w, it->second.h,
+                      (int)it->second.format, (unsigned)it->second.usage,
+                      (it->second.usage & VK_IMAGE_USAGE_STORAGE_BIT) ? "yes" : "no");
+            }
+            trace("FSR PROBE: swapchain images tracked: %u chain(s)",
+                  (unsigned)g_swapImages.size());
+            for (std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator si =
+                     g_swapImages.begin(); si != g_swapImages.end(); ++si) {
+                std::map<VkSwapchainKHR, SwapInfo>::iterator ii =
+                    g_swapInfo.find(si->first);
+                trace("FSR PROBE:   chain %p: %u image(s) %ux%u",
+                      (void*)si->first, (unsigned)si->second.size(),
+                      ii != g_swapInfo.end() ? ii->second.w : 0,
+                      ii != g_swapInfo.end() ? ii->second.h : 0);
+            }
+        }
+    }
+
     // Not found: say so once and allow one retry, rather than silently
     // reporting nothing forever.
     static int retries = 0;
-    if (retries++ < 2) {
-        trace("FSR PROBE: sentinel not found in %u candidate(s) - retrying. "
-              "If this persists the substituted shader is not running, or the "
-              "output is not among the images this layer sees created.",
-              (unsigned)ps.candidates.size());
+    if (retries++ < 20) {
+        // Retried properly rather than twice. The failure mode this is built
+        // for - copies recorded into a command buffer that is never submitted -
+        // is transient, so giving up after two attempts turns a timing problem
+        // into a permanent "not found".
+        if (retries <= 3 || (retries % 10) == 0)
+            trace("FSR PROBE: sentinel not found in %u candidate(s), attempt %d "
+                  "- retrying on a later frame.",
+                  (unsigned)ps.candidates.size(), retries);
         ps.copiesRecorded = false;
+        ps.copiedOnFrame  = g_frameCount;
     } else {
         ps.failed = true;
+        trace("FSR PROBE: giving up after %d attempts.", retries);
     }
 }
 
