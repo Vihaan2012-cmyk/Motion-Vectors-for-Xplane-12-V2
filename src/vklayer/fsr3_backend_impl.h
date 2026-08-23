@@ -37,6 +37,25 @@ inline VkFormat vkFormatOf(FfxSurfaceFormat f)
     case FFX_SURFACE_FORMAT_R11G11B10_FLOAT:     return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     case FFX_SURFACE_FORMAT_R16G16_FLOAT:        return VK_FORMAT_R16G16_SFLOAT;
     case FFX_SURFACE_FORMAT_R16G16_UINT:         return VK_FORMAT_R16G16_UINT;
+    // ---- ADDED FOR OPTICAL FLOW AND FRAME INTERPOLATION.
+    //
+    // This list was written for the FSR3 upscaler alone, which never asks for
+    // these. Frame generation does: the optical-flow VECTOR is R16G16_SINT, and
+    // an unlisted format fell through to UNDEFINED here - which vkCreateImage
+    // rejected ("format must not be VK_FORMAT_UNDEFINED") and, without
+    // validation, produced a broken image the interpolation then read. The full
+    // set is copied from the SDK's own ffxGetVkFormatFromSurfaceFormat so the
+    // two cannot disagree again.
+    case FFX_SURFACE_FORMAT_R16G16_SINT:         return VK_FORMAT_R16G16_SINT;
+    case FFX_SURFACE_FORMAT_R32G32B32A32_UINT:   return VK_FORMAT_R32G32B32A32_UINT;
+    case FFX_SURFACE_FORMAT_R32G32B32_FLOAT:     return VK_FORMAT_R32G32B32_SFLOAT;
+    case FFX_SURFACE_FORMAT_R8G8B8A8_SNORM:      return VK_FORMAT_R8G8B8A8_SNORM;
+    case FFX_SURFACE_FORMAT_R8G8B8A8_SRGB:       return VK_FORMAT_R8G8B8A8_SRGB;
+    case FFX_SURFACE_FORMAT_B8G8R8A8_UNORM:      return VK_FORMAT_B8G8R8A8_UNORM;
+    case FFX_SURFACE_FORMAT_B8G8R8A8_SRGB:       return VK_FORMAT_B8G8R8A8_SRGB;
+    case FFX_SURFACE_FORMAT_R10G10B10A2_UNORM:   return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case FFX_SURFACE_FORMAT_R9G9B9E5_SHAREDEXP:  return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+    case FFX_SURFACE_FORMAT_R8G8_UINT:           return VK_FORMAT_R8G8_UINT;
     case FFX_SURFACE_FORMAT_R16_FLOAT:           return VK_FORMAT_R16_SFLOAT;
     case FFX_SURFACE_FORMAT_R16_UINT:            return VK_FORMAT_R16_UINT;
     case FFX_SURFACE_FORMAT_R16_UNORM:           return VK_FORMAT_R16_UNORM;

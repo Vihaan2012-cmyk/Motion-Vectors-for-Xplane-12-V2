@@ -296,6 +296,33 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     // frame - see the note at the top of this file.
     fsr3::State &u = fsr3::state();
 
+    // ---- NO DILATED RESOURCES, NO INTERPOLATION. THIS FRAME PRESENTS REAL.
+    //
+    // Frame interpolation reads dilatedDepth, dilatedMotionVectors and
+    // reconstructedPrevDepth. Those are the UPSCALER's, and the upscaler is a
+    // separate context that comes up on its own schedule - later than this
+    // callback can first fire, because the swapchain (and so this callback) is
+    // live from the loading screen while the upscaler waits for a real scene.
+    //
+    // Handing the interpolation a VK_NULL_HANDLE for any of them is a compute
+    // shader dereferencing address 0: "Encountered Unknown at virtual address
+    // 0x0, Type: Compute", one frame after the first dispatch. Measured exactly
+    // that. Returning FFX_OK here tells the swapchain there is no interpolated
+    // frame this time, so it presents the real one - the correct behaviour
+    // until the upscaler is producing, and the natural place a future
+    // self-contained depth/MV path would plug in.
+    if (!u.ready || u.failed ||
+        u.shared[0] == VK_NULL_HANDLE ||
+        u.shared[1] == VK_NULL_HANDLE ||
+        u.shared[2] == VK_NULL_HANDLE) {
+        static uint64_t skipped = 0;
+        if ((skipped++ % 300) == 0)
+            trace("FG: upscaler resources not ready (ready=%d) - presenting the "
+                  "real frame, no interpolation yet (%llu skipped).",
+                  u.ready ? 1 : 0, (unsigned long long)skipped);
+        return FFX_OK;
+    }
+
     FfxFrameInterpolationDispatchDescription fd;
     memset(&fd, 0, sizeof(fd));
     fd.commandList        = p->commandList;
@@ -303,8 +330,22 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     fd.output             = p->outputs[0];
     fd.displaySize.width  = s.dispW;
     fd.displaySize.height = s.dispH;
-    fd.renderSize.width   = s.renderW;
-    fd.renderSize.height  = s.renderH;
+    // ---- RENDER SIZE MUST MATCH THE DILATED RESOURCES, NOT THE CONTEXT.
+    //
+    // The context was created with the DISPLAY extent as its max render size (a
+    // safe upper bound that needs neither FSR3 nor the real render size). But
+    // the dilated depth and motion vectors handed to this dispatch are the
+    // UPSCALER's, produced at its RENDER resolution - 2953x1661 here, not the
+    // 3840x2160 display. Passing the display size as renderSize told the
+    // interpolation to read a 3840-wide field out of a 2953-wide resource, and
+    // the out-of-bounds sample is a compute shader reading unmapped memory:
+    // "DEVICE_LOST, Type: Compute" one frame after the first dispatch.
+    //
+    // The dilated depth's own description carries the right extent, so it is the
+    // authority - the resources and the size cannot disagree if the size comes
+    // from the resource.
+    fd.renderSize.width   = u.sharedDesc[1].width  ? u.sharedDesc[1].width  : s.renderW;
+    fd.renderSize.height  = u.sharedDesc[1].height ? u.sharedDesc[1].height : s.renderH;
     fd.interpolationRect  = p->interpolationRect;
 
     fd.opticalFlowVector  = od.opticalFlowVector;

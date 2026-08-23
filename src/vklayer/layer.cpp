@@ -1699,6 +1699,8 @@ static FgSwap            g_fgSwap;
 static std::atomic<bool> g_fgActive(false);
 // Which proxy image FSR3 writes this frame; advanced once per present.
 static uint32_t          g_fgOutIndex = 0;
+// Frame-generation config applied to the proxy? One-shot per proxy.
+static bool              g_fgConfigApplied = false;
 
 // Swapchain images, by swapchain. Declared HERE rather than beside the present
 // path that fills it, because the synchronization2 barrier hook above reads it
@@ -7506,20 +7508,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         // creating pipelines while a command buffer is recording killed the sim
         // once - and frame generation inherits that constraint and its
         // ordering both. Immediately after it, where the sizes are real.
+        // ---- CONTEXTS ARE ALREADY BUILT (at swapchain replacement, single
+        // ---- threaded). HERE WE ONLY APPLY THE CONFIG, ONCE.
+        //
+        // The config registers our interpolation callback with the swapchain.
+        // It is separate from context creation and cheap; doing it from the
+        // present path means the proxy is definitely live by now. Guarded by a
+        // one-shot so it runs exactly once per proxy.
         if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
-            !fg::state().ready && !fg::state().failed &&
-            dev && ph && gd && g_fgSwap.dispW && g_fgSwap.dispH &&
-            fsr3::state().ready) {
-            trace("FG STEP A: FSR3 ready, about to build OF+FI contexts "
-                  "(render %ux%u disp %ux%u fmt=%d)",
-                  fsr3::state().renderW, fsr3::state().renderH,
-                  g_fgSwap.dispW, g_fgSwap.dispH, (int)g_sceneColor.format);
-            const bool fgReady = fg::ensure(dev, ph, gd, g_getPhysMemProps,
-                           fsr3::state().renderW, fsr3::state().renderH,
-                           g_fgSwap.dispW, g_fgSwap.dispH,
-                           g_sceneColor.format);
-            trace("FG STEP B: fg::ensure returned %d", fgReady ? 1 : 0);
-            if (fgReady) {
+            fg::state().ready && !g_fgConfigApplied) {
+            g_fgConfigApplied = true;
+            {
                 FfxFrameGenerationConfig cfg;
                 memset(&cfg, 0, sizeof(cfg));
                 cfg.swapChain               = g_fgSwap.proxy;
@@ -14934,6 +14933,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
               (void*)g_fgSwap.device, (void*)device);
         g_fgSwap = FgSwap();
         g_fgActive.store(false, std::memory_order_relaxed);
+        g_fgConfigApplied = false;
     }
 
     if (live::onoff("taa.fg", "TAA_FG", false) && !g_fgSwap.have && fgSizeOk &&
@@ -14956,7 +14956,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
     // Only ever for the device FidelityFX is bound to. A swapchain created on a
     // second device would build a proxy whose contexts, queues and resources all
     // belong to the first - which is the mismatch that crashed this.
-    if (live::onoff("taa.fg", "TAA_FG", false) && !g_fgSwap.have &&
+    // FG needs the mod itself on: it interpolates between TAA-resolved frames,
+    // and without taa.enable there is nothing to interpolate. It does NOT need
+    // FSR - that coupling is being removed.
+    if (live::onoff("taa.fg", "TAA_FG", false) &&
+        live::onoff("taa.enable", "TAA_RESOLVE", false) &&
+        !g_fgSwap.have &&
         device == g_ffxDevice && g_ffxDevice != VK_NULL_HANDLE) {
         FgQueues fq = fgPickQueues(device, g_ffxPhys, ci->surface);
         trace("FG: queue selection %s - game fam %u, present fam %u, "
@@ -15008,9 +15013,41 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
             fi.compositionMode           = VK_COMPOSITION_MODE_NOT_FORCED_FFX;
             fi.pAllocator                = alloc;
 
-            FfxSwapchain proxy = ffxGetSwapchainVK(VK_NULL_HANDLE);
-            FfxErrorCode fe = ffxReplaceSwapchainForFrameinterpolationVK(
-                ffxGetCommandQueueVK(fq.game), proxy, &mod, &fi);
+            // ---- BUILD THE CONTEXTS BEFORE THE SWAPCHAIN, NOT AFTER.
+            //
+            // ffxReplaceSwapchainForFrameinterpolationVK starts a PRESENTER
+            // THREAD. Creating the optical-flow and frame-interpolation contexts
+            // after that means building ~18 compute pipelines, samplers and
+            // descriptor set layouts on the main thread while the presenter
+            // thread touches the same device - and it crashed, non
+            // deterministically, inside vkCreateDescriptorSetLayout for the
+            // interpolation pass's sampler set. Every structural check passed;
+            // the tell was that more tracing (which locks) moved the crash
+            // LATER, which is the exact race signature fsr3_backend.h records.
+            //
+            // Built here, before the replacement, the contexts are created while
+            // this is still the only thread. maxRenderSize is the display extent
+            // - a safe upper bound, since the game never renders larger than it
+            // presents - so this needs neither FSR3 nor the real render size,
+            // which is also the decoupling from the upscaler.
+            const bool fgCtxOk = fg::ensure(device, g_ffxPhys, g_ffxGdpa,
+                                            g_getPhysMemProps,
+                                            mod.imageExtent.width, mod.imageExtent.height,
+                                            mod.imageExtent.width, mod.imageExtent.height,
+                                            g_sceneColor.format != VK_FORMAT_UNDEFINED
+                                                ? g_sceneColor.format
+                                                : VK_FORMAT_R16G16B16A16_SFLOAT);
+            trace("FG: contexts built before swapchain replacement: %s",
+                  fgCtxOk ? "OK" : "FAILED");
+            if (!fgCtxOk) {
+                trace("FG: no contexts, so no interpolation - leaving X-Plane a "
+                      "normal swapchain rather than a proxy that cannot work.");
+                // fall through to the normal create below by not activating
+            }
+
+            FfxSwapchain proxy = fgCtxOk ? ffxGetSwapchainVK(VK_NULL_HANDLE) : nullptr;
+            FfxErrorCode fe = fgCtxOk ? ffxReplaceSwapchainForFrameinterpolationVK(
+                ffxGetCommandQueueVK(fq.game), proxy, &mod, &fi) : FFX_ERROR_INVALID_ARGUMENT;
             if (fe == FFX_OK && proxy) {
                 FfxSwapchainReplacementFunctions fns;
                 memset(&fns, 0, sizeof(fns));
