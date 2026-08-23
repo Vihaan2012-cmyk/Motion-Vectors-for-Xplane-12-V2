@@ -90,6 +90,13 @@ struct State {
     // Its own mutex, never g_lock: g_lock is held across large parts of this
     // layer and taking it here is how the earlier deadlock happened.
     std::mutex                  lock;
+    // ---- FSR3'S OWN DEBUG VIEW.
+    //
+    // FSR3 ships a pass that draws its internal view of its inputs into the
+    // output. With the temporal half already ruled out by reset=1, this says
+    // WHICH current-frame input is wrong instead of guessing at one at a time.
+    bool                        debugView = false;
+
     // The three resources FSR3 emits for downstream effects. Required by the
     // dispatch even when nothing downstream consumes them.
     VkImage                     shared[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };

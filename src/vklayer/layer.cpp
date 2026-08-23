@@ -11915,6 +11915,9 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
     // render and everything downstream is the sim's, and needs no
     // synchronisation of ours.
     bool fsr3Ran = false;
+    // Set once X-Plane's own upscale dispatch has been forwarded, so the tail
+    // of this function does not run it a second time.
+    bool xpDispatched = false;
     if (dd && fsrReplaceEnabled() && fsr3Wanted()) {
         VkImage  colour = VK_NULL_HANDLE, depth = VK_NULL_HANDLE;
         VkImage  mv = VK_NULL_HANDLE,     out = VK_NULL_HANDLE;
@@ -11926,8 +11929,36 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
             std::lock_guard<std::mutex> g(g_lock);
             std::map<void*, bool>::iterator fb = g_cbFsrBound.find((void*)cb);
             ours   = (fb != g_cbFsrBound.end() && fb->second);
-            colour = g_sceneColor.image;  colourFmt = g_sceneColor.format;
+            // ---- THE LIT COLOUR, NOT THE G-BUFFER.
+            //
+            // The scene pass has FIVE colour attachments - it is the G-buffer -
+            // and g_sceneColor is not necessarily the lit result. Handing an
+            // upscaler normals or material data produces exactly what was on
+            // screen: geometry in the right places, palette and banding wrong.
+            //
+            // g_taa.sceneImage is the image the TAA resolve reads and writes,
+            // and that resolve is known to look correct, so it is the lit
+            // colour by demonstration rather than by assumption.
+            colour = (g_taa.ready && g_taa.sceneImage != VK_NULL_HANDLE)
+                         ? g_taa.sceneImage : g_sceneColor.image;
+            colourFmt = (g_taa.ready && g_taa.sceneImage != VK_NULL_HANDLE)
+                         ? g_taa.format : g_sceneColor.format;
             rw     = g_sceneColor.w;      rh = g_sceneColor.h;
+            {
+                // Periodic, not once. The first print happened before TAA was
+                // ready and so showed the fallback - which is exactly the kind
+                // of one-shot diagnostic that reports a state the frame is no
+                // longer in.
+                static uint64_t saidIn = 0;
+                if ((saidIn++ % 600) == 0 && colour != VK_NULL_HANDLE) {
+                    trace("FSR3 INPUT COLOUR: %p fmt=%d (g_sceneColor was %p "
+                          "fmt=%d) - the TAA resolve's image is used when "
+                          "available, because that one demonstrably holds the "
+                          "lit frame.",
+                          (void*)colour, (int)colourFmt,
+                          (void*)g_sceneColor.image, (int)g_sceneColor.format);
+                }
+            }
             depth  = g_sceneDepth;
             mv     = g_mv.image;          mvFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
             out    = fsrprobe::state().output;
@@ -11962,6 +11993,29 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
                       (void*)mv, rw, rh, ow, oh,
                       fsr3::state().ready ? 1 : 0, fsr3::state().failed ? 1 : 0);
         }
+        // ---- WHAT THE OUTPUT IMAGE ACTUALLY IS.
+        //
+        // FSR3 is TOLD its output extent; our own shader reads imageSize() and
+        // so could never disagree with reality. If these numbers are not the
+        // real ones, FSR3 writes past the end - which is a seam and repeated
+        // content, exactly what is on screen.
+        {
+            static bool saidOut = false;
+            if (!saidOut && out != VK_NULL_HANDLE) {
+                saidOut = true;
+                std::map<VkImage, ColorTarget>::iterator oc = g_colorImages.find(out);
+                if (oc != g_colorImages.end())
+                    trace("FSR3 OUTPUT IMAGE: %p is %ux%u fmt=%d layers=%u "
+                          "samples=%u usage=0x%x - FSR3 is being told %ux%u",
+                          (void*)out, oc->second.w, oc->second.h,
+                          (int)oc->second.format, (unsigned)oc->second.arrayLayers,
+                          (unsigned)oc->second.samples, (unsigned)oc->second.usage,
+                          ow, oh);
+                else
+                    trace("FSR3 OUTPUT IMAGE: %p is NOT in the colour map at all",
+                          (void*)out);
+            }
+        }
         if (ours && out != VK_NULL_HANDLE && colour != VK_NULL_HANDLE &&
             depth != VK_NULL_HANDLE && mv != VK_NULL_HANDLE && rw && rh && ow && oh &&
             fsr3::state().ready) {
@@ -11973,8 +12027,18 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
             // negative-height viewport, so it is -1. Taking both from
             // taaVelScale()/taaVelYSign() rather than restating them is what
             // stops FSR3 and the resolve drifting apart.
-            const float vs = taaVelScale();
-            const float ys = taaVelYSign();
+            // ---- THE MOTION VECTOR CONVENTION, LIVE.
+            //
+            // Ours are UV, and the resolve applies velYSign per fetch; FSR3 has
+            // no such hook, so the whole convention has to live in
+            // motionVectorScale. A wrong sign does not fail - it reprojects to
+            // the wrong place, which is the banding on screen.
+            //
+            // Tunable live so all four sign combinations can be tried against
+            // the SAME scene rather than across four rebuilds, each of which
+            // changes weather and thermal state too.
+            const float vs = taaVelScale() * live::f("fsr.mv_x", nullptr, 1.0f);
+            const float ys = taaVelYSign() * live::f("fsr.mv_y", nullptr, 1.0f);
             // The real depth format and the layouts these images are actually
             // in - not assumed ones. g_sceneDepthLayout is recorded from the
             // sim's own rendering info, which is the only place that truth
@@ -11984,6 +12048,29 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
             // X-Plane's depth is D32_SFLOAT_S8_UINT and FFX cannot make a legal
             // view over a combined depth-stencil image - it forces D32_SFLOAT.
             // This writes a plain R32_SFLOAT copy, which FSR3 reads instead.
+            // ---- X-PLANE'S DISPATCH RUNS BEFORE WE TOUCH ANY BIND STATE.
+            //
+            // This dispatch inherits whatever pipeline and descriptor set are
+            // currently bound on the command buffer. depthcopy::record() binds
+            // OUR compute pipeline and OUR descriptor set into this very
+            // buffer, so running it first meant X-Plane's upscale executed our
+            // depth-copy shader over X-Plane's grid: the sim's upscaler never
+            // ran, its output image was never written, and RCAS read leftover
+            // memory.
+            //
+            // That is why the corruption was pixel-identical across every FSR3
+            // change - fp16, the luma-history format, isolation, reset, the
+            // debug view. None of them were ever on screen, because the damage
+            // happened before FSR3 was even reached.
+            //
+            // Order is the whole fix: forward X-Plane's dispatch while its own
+            // state is still bound, THEN clobber bind state freely. FFX binds
+            // its own pipelines per pass, so FSR3 is unaffected by ordering.
+            if (dd && dd->cmdDispatch) {
+                dd->cmdDispatch(cb, gx, gy, gz);
+                xpDispatched = true;
+            }
+
             depthcopy::record(dd->cmdBindPipeline, dd->cmdBindDescriptorSets,
                               dd->cmdDispatch, dd->cmdPipelineBarrier,
                               cb, g_sceneDepthLayout);
@@ -11991,6 +12078,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
                 depth = depthcopy::state().image;
             }
 
+            fsr3::state().debugView = live::f("fsr.debug", nullptr, 0.0f) > 0.5f;
             fsr3Ran = fsr3::dispatch(
                 dd->cmdPipelineBarrier, cb,
                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, g_sceneDepthLayout,
@@ -12006,12 +12094,20 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
                 g_velSnap.jitterX * g_jitterScale,
                 g_velSnap.jitterY * g_jitterScale,
                 vs * (float)rw, vs * ys * (float)rh,
-                16.6f, false,
+                // ---- SPLIT FSR3 IN HALF, LIVE.
+                //
+                // reset=true discards history every frame: the temporal half of
+                // FSR3 goes away and the current-frame spatial path remains. If
+                // the corruption survives that, it lives in colour-in/output-out;
+                // if it vanishes, it lives in history, motion vectors, depth or
+                // the shared resources. Four targeted fixes failed in a row, so
+                // this splits the remaining system instead of guessing again.
+                16.6f, live::f("fsr.reset", nullptr, 0.0f) > 0.5f,
                 0.1f, 100000.0f, 1.0472f);
         }
     }
 
-    if (!fsr3Ran && dd && dd->cmdDispatch) dd->cmdDispatch(cb, gx, gy, gz);
+    if (!fsr3Ran && !xpDispatched && dd && dd->cmdDispatch) dd->cmdDispatch(cb, gx, gy, gz);
 
     // After the dispatch, in the same command buffer: our substituted shader
     // has just written the output, sentinel and all.

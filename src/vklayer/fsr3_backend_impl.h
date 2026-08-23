@@ -484,14 +484,30 @@ inline bool dispatch(PFN_vkCmdPipelineBarrier cmdBarrier,
     FfxFsr3UpscalerDispatchDescription d;
     memset(&d, 0, sizeof(d));
     d.commandList = ffxGetCommandListVK(cb);
+    d.flags = s.debugView ? FFX_FSR3UPSCALER_DISPATCH_DRAW_DEBUG_VIEW : 0;
 
     d.color = ffxGetResourceVK(colorImg,
         describeTex2D(s.renderW, s.renderH, ffxGetSurfaceFormatVK(colorFmt),
                       FFX_RESOURCE_USAGE_READ_ONLY),
         nullptr, FFX_RESOURCE_STATE_COMPUTE_READ);
+    // ---- NOT A DEPTH TARGET ANY MORE. DO NOT SAY IT IS.
+    //
+    // depthcopy has already turned X-Plane's D32_SFLOAT_S8_UINT into a plain
+    // R32_SFLOAT colour image. Declaring DEPTHTARGET here would undo that,
+    // because ffx_vk.cpp keys the VIEW format off this one flag:
+    //
+    //     imageViewCreateInfo.format = ...DEPTHTARGET ? VK_FORMAT_D32_SFLOAT
+    //                                                 : <from surface format>
+    //
+    // and a D32_SFLOAT view over an R32_SFLOAT image is not a legal pairing -
+    // different compatibility classes, and the copy is not MUTABLE_FORMAT. The
+    // copy fixed the CRASH; this flag was still handing FSR3 a mismatched view
+    // to read depth through. Colour and motion vectors put the geometry in the
+    // right place regardless, so the damage showed up only where depth drives
+    // the result: disocclusion and locks, as per-tile black and banding.
     d.depth = ffxGetResourceVK(depthImg,
         describeTex2D(s.renderW, s.renderH, ffxGetSurfaceFormatVK(depthFmt),
-                      FFX_RESOURCE_USAGE_DEPTHTARGET),
+                      FFX_RESOURCE_USAGE_READ_ONLY),
         nullptr, FFX_RESOURCE_STATE_COMPUTE_READ);
     d.motionVectors = ffxGetResourceVK(mvImg,
         describeTex2D(s.renderW, s.renderH, ffxGetSurfaceFormatVK(mvFmt),
