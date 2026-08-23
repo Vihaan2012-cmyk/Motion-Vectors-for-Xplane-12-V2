@@ -93,7 +93,17 @@ static void trace(const char *fmt, ...)
     static std::string path;
     if (path.empty()) {
         const char *t = getenv("TEMP");
-        path = std::string(t ? t : ".") + "\\taa_layer.txt";
+        // ---- PER-PID, BECAUSE X-PLANE IS NOT ONE PROCESS.
+        //
+        // When the sim crashes it spawns "X-Plane.exe --report_crash", a second
+        // process that also loads this layer and appends here. For a whole
+        // session that made two processes' output one interleaved file, and
+        // reading it produced ghosts: "two devices", "two FG activations", a
+        // "reload" - all of it just the reporter's lines mixed into the sim's.
+        char pid[40];
+        snprintf(pid, sizeof(pid), "\\taa_layer_%lu.txt",
+                 (unsigned long)GetCurrentProcessId());
+        path = std::string(t ? t : ".") + pid;
     }
 
     std::lock_guard<std::mutex> g(g_traceLock);
@@ -476,6 +486,19 @@ extern "C" PFN_vkVoidFunction mvFfxDeviceProc(const char *name)
 // as the other physical-device getters, and for the same reason recorded
 // there: one resolved from a probe instance and called with the application's
 // physical device is answered by __fastfail, not by an error.
+// The frame-generation shim's way into this file's trace(). Defined here
+// because trace() is a file-scope static and the shim is a separate object.
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+extern "C" void mvFgTrace(const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    trace("%s", buf);
+}
+
 extern "C" PFN_vkVoidFunction mvFfxInstanceProc(const char *name)
 {
     if (g_appInstance == VK_NULL_HANDLE || !g_appGipa) return nullptr;
@@ -1660,12 +1683,22 @@ static FgQueues fgPickQueues(VkDevice device, VkPhysicalDevice phys,
 // makes this safe to ship switched off.
 struct FgSwap {
     FfxSwapchainReplacementFunctions fn;
+    // The display extent FFX was built for. Taken from the swapchain create
+    // info, NOT from the FSR probe: under frame generation FFX owns
+    // presentation, so the probe never identifies an output image and its
+    // size reads 0 - which silently blocked the frame-generation config from
+    // ever being applied.
+    uint32_t                         dispW   = 0, dispH = 0;
+    VkFormat                         dispFmt = VK_FORMAT_UNDEFINED;
+    VkDevice                         device  = VK_NULL_HANDLE;  // the device this proxy belongs to
     FfxSwapchain                     proxy   = nullptr;
     VkSwapchainKHR                   handle  = VK_NULL_HANDLE;  // what XP holds
     bool                             have    = false;
 };
 static FgSwap            g_fgSwap;
 static std::atomic<bool> g_fgActive(false);
+// Which proxy image FSR3 writes this frame; advanced once per present.
+static uint32_t          g_fgOutIndex = 0;
 
 // Swapchain images, by swapchain. Declared HERE rather than beside the present
 // path that fills it, because the synchronization2 barrier hook above reads it
@@ -7348,8 +7381,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_GetSwapchainImagesKHR(
     // see FgSwap. Asking the driver about it would be asking about an address
     // it has never seen.
     if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
-        sc == g_fgSwap.handle && g_fgSwap.fn.getSwapchainImagesKHR)
-        return g_fgSwap.fn.getSwapchainImagesKHR(device, sc, count, images);
+        sc == g_fgSwap.handle && g_fgSwap.fn.getSwapchainImagesKHR) {
+        const VkResult pr = g_fgSwap.fn.getSwapchainImagesKHR(device, sc, count, images);
+        // TRACK THEM. This used to return straight out, skipping the
+        // bookkeeping below - so g_swapImages held nothing for the proxy, and
+        // anything that looks up its images (the FSR3 output selection, the
+        // backbuffer layout rewrite) silently found an empty set and did
+        // nothing. A feature that quietly does nothing is worse than one that
+        // fails.
+        if (pr == VK_SUCCESS && images && count && *count) {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::vector<VkImage> &v = g_swapImages[sc];
+            v.assign(images, images + *count);
+            static bool said = false;
+            if (!said) {
+                said = true;
+                trace("FG: %u proxy images tracked - these are FFX's replacement "
+                      "backbuffers, which is what the sim actually renders into.",
+                      *count);
+            }
+        }
+        return pr;
+    }
 
     PFN_vkGetSwapchainImagesKHR next = nullptr;
     {
@@ -7387,6 +7440,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // somewhere else would drift from this and the two would disagree in logs
     // for reasons nobody could reconstruct later.
     uint64_t frames = ++g_frameCount;
+    // One proxy image per frame, matching the sim's own rotation through them.
+    if (g_fgActive.load(std::memory_order_relaxed)) ++g_fgOutIndex;
 
     // The probe's answer becomes readable a few frames after its copies were
     // recorded. Checked here because this is the one place that runs exactly
@@ -7418,6 +7473,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             std::map<VkImage, ColorTarget>::iterator oc =
                 g_colorImages.find(fsrprobe::state().output);
             if (oc != g_colorImages.end()) { ow = oc->second.w; oh = oc->second.h; }
+            // Same blind spot as the dispatch gate: under frame generation the
+            // probe never identifies an output (the sim renders into FFX's
+            // replacement buffers, which the sentinel scan cannot see), so ow/oh
+            // stayed 0 here and fsr3::ensure was never called - ready=0 for the
+            // whole run while the gate below it had already been fixed. The
+            // swapchain extent recorded at activation is the display size.
+            else if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have) {
+                ow = g_fgSwap.dispW; oh = g_fgSwap.dispH;
+            }
         }
         // The depth copy is built here too - same reason: creating pipelines
         // while a command buffer is being recorded is what killed the sim
@@ -7444,10 +7508,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         // ordering both. Immediately after it, where the sizes are real.
         if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
             !fg::state().ready && !fg::state().failed &&
-            dev && ph && gd && ow && oh && fsr3::state().ready) {
-            if (fg::ensure(dev, ph, gd, g_getPhysMemProps,
+            dev && ph && gd && g_fgSwap.dispW && g_fgSwap.dispH &&
+            fsr3::state().ready) {
+            trace("FG STEP A: FSR3 ready, about to build OF+FI contexts "
+                  "(render %ux%u disp %ux%u fmt=%d)",
+                  fsr3::state().renderW, fsr3::state().renderH,
+                  g_fgSwap.dispW, g_fgSwap.dispH, (int)g_sceneColor.format);
+            const bool fgReady = fg::ensure(dev, ph, gd, g_getPhysMemProps,
                            fsr3::state().renderW, fsr3::state().renderH,
-                           ow, oh, g_sceneColor.format)) {
+                           g_fgSwap.dispW, g_fgSwap.dispH,
+                           g_sceneColor.format);
+            trace("FG STEP B: fg::ensure returned %d", fgReady ? 1 : 0);
+            if (fgReady) {
                 FfxFrameGenerationConfig cfg;
                 memset(&cfg, 0, sizeof(cfg));
                 cfg.swapChain               = g_fgSwap.proxy;
@@ -12499,6 +12571,20 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
             }
             depth  = g_sceneDepth;
             mv     = g_mv.image;          mvFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+            // ---- FSR3 WRITES X-PLANE'S UPSCALE IMAGE. NEVER THE SWAPCHAIN.
+            //
+            // A previous version pointed FSR3's output at the frame-generation
+            // proxy's backbuffer when the probe had no answer. Measured: the
+            // sim survived while that gate stayed closed, and died at +32 s -
+            // the first FSR3 dispatch - once it opened. A compute write into a
+            // presentable image mid-frame, before it is acquired and in a layout
+            // nobody tracked, is a lost device, not an upscale.
+            //
+            // X-Plane's own FSR does not write the swapchain either: it writes
+            // an internal 3840x2160 storage image and blits that to the
+            // backbuffer afterwards. That internal image is what the sentinel
+            // probe identifies, and it is the only correct output here - under
+            // frame generation exactly as without it.
             out    = fsrprobe::state().output;
             std::map<VkImage, ColorTarget>::iterator oc = g_colorImages.find(out);
             if (oc != g_colorImages.end()) {
@@ -14320,6 +14406,26 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         g_ffxDevice = *out;
         g_ffxGdpa   = nextGDPA;
         g_ffxPhys   = phys;
+        // ---- WHO IS 'WE'? RELOAD vs CONCURRENT DOUBLE-LOAD.
+        //
+        // This global going null a second time can mean two things and they
+        // need opposite fixes: the loader unloaded and reloaded THIS module
+        // (same base address, globals reset), or TWO copies of the module are
+        // resident at once (different base addresses, independent globals) -
+        // which happens when the layer sits in more than one dispatch chain.
+        // The base address settles it.
+        {
+            static int s_bindOrdinal = 0;
+            HMODULE self = nullptr;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)&TAA_CreateDevice, &self);
+            trace("DEVICE BIND #%d: module base=%p, this pointer's module=%p, "
+                  "pid=%lu. Same base across binds = reload; different = two "
+                  "copies resident.",
+                  ++s_bindOrdinal, (void*)&__ImageBase, (void*)self,
+                  (unsigned long)GetCurrentProcessId());
+        }
         trace("DEVICE: FidelityFX bound to device %p (the first created). Any "
               "later device is tracked normally but will not rebind this.",
               (void*)*out);
@@ -14767,7 +14873,71 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
     //
     // If the picture looks washed out with frame generation on, this is why:
     // the hardware is no longer applying the transfer function on write.
-    if (live::onoff("taa.fg", "TAA_FG", false) && !g_fgSwap.have &&
+    // ---- NOT EVERY SWAPCHAIN IS THE ONE ON SCREEN.
+    //
+    // X-Plane creates a tiny placeholder swapchain during startup before the
+    // real window exists. Taking it was the whole failure: the trace at death
+    // read
+    //
+    //   -- COLOUR IMAGE CENSUS (2 tracked)
+    //      ... R8G8B8A8_UNORM  2x2  layers=1 samples=1
+    //   -- TAA RESOLVE  ready=0 0x0  dispatches=0  scene targets=0
+    //
+    // Frame generation had bound itself to a 2x2 swapchain. Nothing renders
+    // there, so FSR3 never became ready, the config block never ran and the
+    // callback never fired - and worse, g_fgSwap.have was now true, so the
+    // guard below refused the REAL swapchain when it arrived. X-Plane got a
+    // driver swapchain while our 2x2 proxy stayed live in the present path,
+    // and it died shortly after.
+    //
+    // Every format patch, device-binding guard and lifetime fix before this was
+    // downstream of that. The images were 2x2 the entire time.
+    //
+    // 640x480 is chosen to be obviously below any real display and obviously
+    // above a placeholder; the sim's own window is 3840x2160 here.
+    const bool fgSizeOk = mod.imageExtent.width  >= 640 &&
+                          mod.imageExtent.height >= 480;
+    if (live::onoff("taa.fg", "TAA_FG", false) && !fgSizeOk) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            trace("FG: declining a %ux%u swapchain - too small to be the "
+                  "display. Frame generation waits for the real one.",
+                  mod.imageExtent.width, mod.imageExtent.height);
+        }
+    }
+    // ---- A STALE PROXY FROM A DEAD DEVICE MUST GO BEFORE A NEW ONE.
+    //
+    // X-Plane creates its render device TWICE per run - measured: two identical
+    // XP DEVICE REQUEST blocks, two different VkDevice handles, the first
+    // destroyed before the second. It happens around "Rebuilding offscreens for
+    // window resize", when the sim settles on the real render resolution.
+    //
+    // The frame-generation proxy built on the first device is then wired into
+    // the present path with functions and queues that belong to a device that
+    // no longer exists. The old recreation guard only caught the case where
+    // X-Plane handed its old swapchain back as ci->oldSwapchain - but across a
+    // DEVICE change there is no old swapchain to hand back, so it was bypassed
+    // and a second proxy went live alongside a dangling first. That is the
+    // crash at load.
+    //
+    // If the live proxy belongs to a device other than the one now creating a
+    // swapchain, it is dead by definition - its device is gone. Drop it (no
+    // Vulkan teardown: the device that owned it is destroyed, so its objects
+    // are already freed and calling into them is the fault we are avoiding) and
+    // let the block below build a fresh one on the live device.
+    if (g_fgSwap.have && g_fgSwap.device != VK_NULL_HANDLE &&
+        g_fgSwap.device != device) {
+        trace("FG: the live proxy belonged to device %p, but this swapchain is "
+              "on device %p - the old device is gone, so its proxy is dropped "
+              "without teardown and a new one is built here.",
+              (void*)g_fgSwap.device, (void*)device);
+        g_fgSwap = FgSwap();
+        g_fgActive.store(false, std::memory_order_relaxed);
+    }
+
+    if (live::onoff("taa.fg", "TAA_FG", false) && !g_fgSwap.have && fgSizeOk &&
+
         device == g_ffxDevice && g_ffxDevice != VK_NULL_HANDLE) {
         VkFormat unorm = VK_FORMAT_UNDEFINED;
         switch (mod.imageFormat) {
@@ -14851,10 +15021,59 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
                     g_fgSwap.proxy  = proxy;
                     g_fgSwap.handle = ffxGetVKSwapchain(proxy);
                     g_fgSwap.have   = true;
+                    g_fgSwap.device = device;
+                    g_fgSwap.dispW  = mod.imageExtent.width;
+                    g_fgSwap.dispH  = mod.imageExtent.height;
+                    g_fgSwap.dispFmt = mod.imageFormat;   // post-substitution, i.e. UNORM
                     *out = g_fgSwap.handle;
                     g_fgActive.store(true, std::memory_order_relaxed);
+
+                    // ---- PIN THIS DLL. THE PROXY CANNOT OUTLIVE ITS CODE.
+                    //
+                    // What we just handed X-Plane as its VkSwapchainKHR is a
+                    // C++ object allocated inside THIS module. The Vulkan
+                    // loader unloads layers when the last instance goes, and
+                    // this layer is measurably loaded twice per process - two
+                    // "FidelityFX bound to device" lines, two FG activations,
+                    // both at 3840x2160, from one X-Plane.
+                    //
+                    // If the module unloads while the sim still holds that
+                    // handle, its next present, acquire or destroy calls into
+                    // freed code. There is no diagnostic for that: no
+                    // validation error, no Vulkan return code, just a process
+                    // that stops.
+                    //
+                    // Pinning is the same remedy this file already applies to
+                    // Streamline's probe instances - deliberately keeping
+                    // something alive because a handle derived from it outlives
+                    // its owner. The cost is one module that never unloads.
+                    {
+                        static bool pinned = false;
+                        if (!pinned) {
+                            HMODULE self = nullptr;
+                            if (GetModuleHandleExA(
+                                    GET_MODULE_HANDLE_EX_FLAG_PIN |
+                                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                    (LPCSTR)&Layer_CreateSwapchainKHR, &self)) {
+                                pinned = true;
+                                trace("FG: this module is pinned - the proxy "
+                                      "swapchain is our object and must not be "
+                                      "unloaded while X-Plane holds it.");
+                            } else {
+                                trace("FG: could not pin this module (%lu) - if "
+                                      "the loader unloads it, the proxy handle "
+                                      "X-Plane holds becomes freed code.",
+                                      (unsigned long)GetLastError());
+                            }
+                        }
+                    }
                     trace("FG: ACTIVE - the frame-interpolation swapchain now "
-                          "owns presentation (proxy %p).", (void*)g_fgSwap.handle);
+                          "owns presentation (proxy %p) at %ux%u fmt=%d, "
+                          "%u images, present mode %d.",
+                          (void*)g_fgSwap.handle,
+                          mod.imageExtent.width, mod.imageExtent.height,
+                          (int)mod.imageFormat, mod.minImageCount,
+                          (int)mod.presentMode);
 
                     return VK_SUCCESS;
                 }

@@ -174,6 +174,7 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     s.scratch = calloc(1, s.scratchSize);   // calloc, not malloc - see ffx_vk.cpp
     if (!s.scratch) { s.failed = true; return false; }
 
+    trace("FG ENSURE: ffxGetInterfaceVK (own scratch %zu bytes)", (size_t)s.scratchSize);
     if (ffxGetInterfaceVK(&s.iface, ffxGetDeviceVK(&s.vkCtx),
                           s.scratch, s.scratchSize, maxContexts) != FFX_OK) {
         trace("FG: ffxGetInterfaceVK failed");
@@ -192,6 +193,7 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     ofd.flags            = 0;
     ofd.resolution.width  = dispW;
     ofd.resolution.height = dispH;
+    trace("FG ENSURE: creating optical flow context %ux%u", dispW, dispH);
     if (ffxOpticalflowContextCreate(&s.ofCtx, &ofd) != FFX_OK) {
         trace("FG: ffxOpticalflowContextCreate failed");
         s.failed = true; return false;
@@ -231,6 +233,7 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     fid.displaySize.height   = dispH;
     fid.backBufferFormat = ffxGetSurfaceFormatVK(backbufferFmt);
     fid.previousInterpolationSourceFormat = fid.backBufferFormat;
+    trace("FG ENSURE: creating frame interpolation context");
     if (ffxFrameInterpolationContextCreate(&s.fiCtx, &fid) != FFX_OK) {
         trace("FG: ffxFrameInterpolationContextCreate failed");
         s.failed = true; return false;

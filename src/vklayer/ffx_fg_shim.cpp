@@ -39,6 +39,7 @@
 extern "C" {
 PFN_vkVoidFunction mvFfxDeviceProc(const char *name);
 PFN_vkVoidFunction mvFfxInstanceProc(const char *name);
+void mvFgTrace(const char *fmt, ...);
 }
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL mvFfx_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex)
@@ -212,7 +213,18 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL mvFfx_vkCreateImageView(VkDevice devic
     static PFN_vkCreateImageView fn = nullptr;
     if (!fn) fn = (PFN_vkCreateImageView)mvFfxDeviceProc("vkCreateImageView");
     if (!fn) return (VkResult)0;
-    return fn(device, pCreateInfo, pAllocator, pView);
+    const VkResult r = fn(device, pCreateInfo, pAllocator, pView);
+    // ---- WHICH CALL SITE, NOT WHICH VUID.
+    //
+    // Validation says an sRGB view of a storage-capable image was rejected, and
+    // names the IMAGE - but FFX creates views from five different places and
+    // the message cannot say which. Three were patched on the strength of a
+    // guess and none of them was the one. This reports the failing call itself.
+    if (r != VK_SUCCESS && pCreateInfo)
+        mvFgTrace("FG VIEW FAIL: rc=%d format=%d image=%p usage-pNext=%s",
+                  (int)r, (int)pCreateInfo->format, (void*)pCreateInfo->image,
+                  pCreateInfo->pNext ? "yes" : "no");
+    return r;
 }
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL mvFfx_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkPipelineLayout* pPipelineLayout)
