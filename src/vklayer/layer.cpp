@@ -4594,6 +4594,23 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
                     info->pDepthAttachment->imageView != VK_NULL_HANDLE;
     bool isScene  = fullViewport && hasDepth && g_mv.ready;
 
+    // DIAGNOSTIC (temporary): why no pass qualifies as the scene at some
+    // resolutions. Dumps every near-full-res pass with the three facts isScene
+    // is made of, so a resolution where the resolve never runs can be read
+    // rather than guessed. Only passes at least half the velocity-target width,
+    // throttled, so it names the scene candidates without flooding.
+    {
+        static uint64_t n = 0;
+        const uint32_t prw = info->renderArea.extent.width;
+        const uint32_t prh = info->renderArea.extent.height;
+        if (taaEnabled() && g_mv.w && prw >= g_mv.w / 2 && (n++ % 90) == 0)
+            trace("SCENE PROBE: pass %ux%u colours=%u | velTarget %ux%u ready=%d "
+                  "-> fullViewport=%d hasDepth=%d isScene=%d",
+                  prw, prh, (unsigned)info->colorAttachmentCount,
+                  g_mv.w, g_mv.h, g_mv.ready ? 1 : 0,
+                  fullViewport ? 1 : 0, hasDepth ? 1 : 0, isScene ? 1 : 0);
+    }
+
     // ---- ONLY THE FIRST QUALIFYING PASS.
     //
     // isScene is size-plus-depth, and THIRTEEN passes a frame satisfy it. They
@@ -5918,6 +5935,19 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     const bool litPass = passInfo.colorCount == 1 && !passInfo.depthLoad &&
                          passInfo.color0 != VK_NULL_HANDLE &&
                          passInfo.w == g_mv.w && passInfo.h == g_mv.h;
+    // DIAGNOSTIC (temporary): why the LIT pass is or is not matched. Fires for
+    // any single-colour pass at (near) the velocity-target size, so a reload
+    // that turns the resolve off can be read - the usual culprit is depthLoad
+    // flipping on, which excludes the pass the resolve needs.
+    if (taaEnabled() && passInfo.colorCount == 1 &&
+        passInfo.w >= g_mv.w / 2 && g_mv.w) {
+        static uint64_t n = 0;
+        if ((n++ % 90) == 0)
+            trace("LIT PROBE: pass %ux%u colours=1 depthLoad=%d color0=%p | "
+                  "velTarget %ux%u -> litPass=%d",
+                  passInfo.w, passInfo.h, passInfo.depthLoad ? 1 : 0,
+                  (void*)passInfo.color0, g_mv.w, g_mv.h, litPass ? 1 : 0);
+    }
     if (taaEnabled()) {
         if (litPass) gateReach(1);
         else if (passInfo.colorCount == 1 && !passInfo.depthLoad &&
@@ -6200,8 +6230,31 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     if (passInfo.color0 != latchTarget) break;
                     latchSeen = g_frameCount;
                 } else {
-                    if (g_hdrPassesLastFrame == 0 ||
-                        (hdrIdx % g_hdrPassesLastFrame) != 0)
+                    // ---- A FALLING HDR-PASS COUNT MUST NOT DROP THE FRAME.
+                    //
+                    // The gate was hdrIdx % g_hdrPassesLastFrame == 0: resolve at
+                    // a multiple of the PREVIOUS frame's count. That is exact, and
+                    // the count is not stable - changing aircraft or location adds
+                    // and removes cockpit-display passes, so the HDR count swings
+                    // frame to frame. On any frame whose count fell below the last
+                    // one, hdrIdx never reaches the multiple and NOTHING resolves:
+                    // measured as ~20% duty and read as "TAA stops after I change
+                    // aircraft", every health flag still green.
+                    //
+                    // Track a floor that follows the count DOWN immediately and
+                    // eases back UP one pass per frame. It is <= this frame's
+                    // count every frame, so the first pass to reach it resolves -
+                    // AA lands on every frame instead of one in five. On a frame
+                    // with more passes than the floor a couple of trailing
+                    // composites miss AA for a frame or two while the floor rises,
+                    // which is invisible next to losing AA outright.
+                    static uint32_t hdrFloor = 0;
+                    if (g_hdrPassesLastFrame == 0) break;
+                    if (hdrFloor == 0 || g_hdrPassesLastFrame < hdrFloor)
+                        hdrFloor = g_hdrPassesLastFrame;
+                    else if (g_hdrPassesLastFrame > hdrFloor)
+                        ++hdrFloor;
+                    if (hdrIdx < hdrFloor)
                         break;
                     if (latchTarget != passInfo.color0)
                         trace("TAA LATCH: holding target %p (hdr %u of %u). The "
@@ -12820,7 +12873,14 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
         // Note this direction is not symmetric, and the panel says so: turning
         // FSR OFF takes effect on the next frame, turning it ON still needs the
         // launch that latched fsr.replace.
+        // Isolation: taa.fsr_run=0 skips the FSR3 upscale-replacement dispatch
+        // entirely while the FSR3 context and the proxy swapchain stay live.
+        // X-Plane's own upscale still runs (forwarded at the tail of this hook),
+        // so this asks whether intercepting X-Plane's dispatch and running FSR3
+        // on its command buffer is what crashes under the proxy - the last
+        // untested variable behind the FSR3+proxy fault.
         if (ours && fsr3Wanted() &&
+            live::onoff("taa.fsr_run", "TAA_FSR_RUN", true) &&
             out != VK_NULL_HANDLE && colour != VK_NULL_HANDLE &&
             depth != VK_NULL_HANDLE && mv != VK_NULL_HANDLE && rw && rh && ow && oh &&
             fsr3::state().ready) {
