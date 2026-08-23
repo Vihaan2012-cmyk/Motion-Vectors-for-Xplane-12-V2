@@ -316,7 +316,7 @@ if ($haveFfx) {
         if ((Test-Path $o) -and ((Get-Item $o).LastWriteTime -gt (Get-Item $f).LastWriteTime)) { continue }
         & g++ -c -O2 -std=c++17 -include new -include cmath -include cstring `
             -include cwchar -include cstdio $ffxInc `
-            -w -DFFX_VK=1 -DFFX_FSR3UPSCALER -DFFX_FRAMEINTERPOLATION -DFFX_OPTICALFLOW -DWIN32 "-Dswprintf_s=_snwprintf" `
+            -w -DFFX_VK=1 -DFFX_FSR3UPSCALER -DFFX_FRAMEINTERPOLATION -DFFX_OPTICALFLOW -DFFX_FI -DFFX_OF -DWIN32 "-Dswprintf_s=_snwprintf" `
             @ffxRename `
             $f -o $o
         if ($LASTEXITCODE -ne 0) { throw "FidelityFX: $(Split-Path $f -Leaf) failed to compile" }

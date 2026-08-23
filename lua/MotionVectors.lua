@@ -1048,22 +1048,48 @@ local function build(w, x, y)
     -- the substitution was latched at startup, and otherwise needs a relaunch -
     -- which the file cannot distinguish, so the caption below does not pretend
     -- to. The button is a toggle either way.
+    -- ---- TWO INDEPENDENT AXES, NOT ONE RADIO GROUP.
+    --
+    -- FSR (and the greyed DLSS/XeSS/DLAA) are UPSCALERS - mutually exclusive,
+    -- one owns the image. FG and MFG are FRAME GENERATION - they run ON TOP of
+    -- whatever antialiasing is active and are not mutually exclusive with it.
+    -- Treating the whole row as one radio group forced a false either/or, which
+    -- is exactly the "needing fsr and fg" the panel should not impose.
+    --
+    -- So FG is its own toggle. It needs TAA running (taa.enable) because frame
+    -- generation interpolates between resolved frames, and its switch is
+    -- taa.fg. It does NOT require FSR.
+    local taa_on = (ini_get("taa.enable", "1") == "1")
     local fsr_on = (ini_get("fsr.replace", "0") == "1")
                and (ini_get("fsr.backend_fsr3", "0") == "1")
+    local fg_on  = (ini_get("taa.fg", "0") == "1")
     for i, b in ipairs(BACKENDS) do
-        local implemented = (b == "TAA" or b == "FSR")
-        local selected    = implemented and ((b == "FSR") == fsr_on)
+        local isUpscaler = (b == "TAA" or b == "FSR")
+        local isFrameGen = (b == "FG")
+        local implemented = isUpscaler or isFrameGen
+        local selected
+        if isFrameGen then
+            -- FG is lit only when it is ON and it CAN run (TAA on). Not gated on
+            -- the FSR selection at all.
+            selected = fg_on and taa_on
+        else
+            selected = isUpscaler and ((b == "FSR") == fsr_on)
+        end
         if i > 1 then same() end
-        local edge = selected and C_GREEN or (implemented and C_AMBER or C_DIM)
+        -- FG greys out when TAA is off, since it cannot run without it.
+        local usable = implemented and (not isFrameGen or taa_on)
+        local edge = selected and C_GREEN or (usable and C_AMBER or C_DIM)
         local bg   = selected and C_GREEN_BG or C_GREY_BG
-        if styled_button(b, 76, 22, edge, bg, implemented) then
-            -- Clicking the SELECTED FSR button turns it off, so FSR is a
-            -- toggle rather than a one-way choice. Without this the only way
-            -- back was the TAA button, which reads as picking a different
-            -- backend rather than as switching FSR off.
-            local want = (b == "FSR") and not fsr_on
-            ini_set("fsr.replace",      want and "1" or "0")
-            ini_set("fsr.backend_fsr3", want and "1" or "0")
+        if styled_button(b, 76, 22, edge, bg, usable) then
+            if isFrameGen then
+                -- Independent toggle. Leaves the FSR selection untouched, so
+                -- TAA+FG, FSR+FG, or FG alone are all reachable.
+                ini_set("taa.fg", fg_on and "0" or "1")
+            else
+                local want = (b == "FSR") and not fsr_on
+                ini_set("fsr.replace",      want and "1" or "0")
+                ini_set("fsr.backend_fsr3", want and "1" or "0")
+            end
         end
     end
     if fsr_on then
@@ -1078,7 +1104,14 @@ local function build(w, x, y)
         text(C_DIM, "FSR is off. If it was on when X-Plane started, switching it")
         text(C_DIM, "back on applies at once; otherwise it needs a restart.")
     end
-    text(C_DIM, "DLSS, XeSS, DLAA, FG and MFG are not implemented yet.")
+    if fg_on and taa_on then
+        text(C_GREEN, "Frame generation ON - interpolated frames between real ones.")
+        text(C_DIM, "Runs on top of TAA. Turning it off applies on the next frame;")
+        text(C_DIM, "turning it on needs a restart (it replaces the swapchain).")
+    elseif fg_on and not taa_on then
+        text(C_AMBER, "Frame generation needs TAA on. Enable the mod first.")
+    end
+    text(C_DIM, "DLSS, XeSS, DLAA and MFG are not implemented yet.")
 
     if show_advanced then
         imgui.TextUnformatted("")
