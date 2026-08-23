@@ -207,6 +207,7 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
                    uint32_t outW, uint32_t outH)
 {
     State &s = state();
+    std::lock_guard<std::mutex> guard(s.lock);
     if (s.failed) return false;
     if (s.ready && s.renderW == renderW && s.renderH == renderH &&
         s.outW == outW && s.outH == outH) return true;
@@ -335,6 +336,25 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
         trace("FSR3: shared resource descriptions unavailable");
         s.failed = true; return false;
     }
+    // ---- THE ISOLATION OUTPUT.
+    //
+    // Same extent and format as X-Plane's, so FSR3 cannot tell the difference.
+    // Enabled with TAA_FSR3_OWN_OUTPUT=1; off, the real image is used.
+    if (getenv("TAA_FSR3_OWN_OUTPUT")) {
+        FfxCreateResourceDescription od;
+        memset(&od, 0, sizeof(od));
+        od.resourceDescription = describeTex2D(outW, outH,
+            FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT, FFX_RESOURCE_USAGE_UAV);
+        if (createShared(device, phys, od, 0, gdpa, getMemProps)) {
+            s.ownOut = s.shared[0];
+            s.shared[0] = VK_NULL_HANDLE;   // slot reused below for the real one
+            trace("FSR3: ISOLATION MODE - writing our own %ux%u image, not "
+                  "X-Plane's. Nothing will reach the screen; this only asks "
+                  "whether writing the sim's image is what kills it.",
+                  outW, outH);
+        }
+    }
+
     if (!createShared(device, phys, sh.reconstructedPrevNearestDepth, 0, gdpa, getMemProps) ||
         !createShared(device, phys, sh.dilatedDepth,                  1, gdpa, getMemProps) ||
         !createShared(device, phys, sh.dilatedMotionVectors,          2, gdpa, getMemProps)) {
@@ -350,12 +370,41 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     return true;
 }
 
+// A colour or depth layout transition, recorded into X-Plane's command buffer.
+//
+// FFX barriers FROM the state it is told a resource is in. Telling it
+// COMPUTE_READ while the image is still a colour attachment is not a hint that
+// gets corrected - it is a wrong barrier, and the first dispatch pays for it.
+inline void barrier(PFN_vkCmdPipelineBarrier cmdBarrier, VkCommandBuffer cb,
+                    VkImage img, VkImageAspectFlags aspect,
+                    VkImageLayout from, VkImageLayout to,
+                    VkAccessFlags srcAccess, VkAccessFlags dstAccess)
+{
+    if (!cmdBarrier || img == VK_NULL_HANDLE) return;
+    VkImageMemoryBarrier b;
+    memset(&b, 0, sizeof(b));
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcAccessMask = srcAccess;
+    b.dstAccessMask = dstAccess;
+    b.subresourceRange.aspectMask = aspect;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = 1;
+    cmdBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
 // ---- ONE FRAME.
 //
 // Recorded into X-Plane's own command buffer, at the point its upscale would
 // have run, so ordering against the scene render and everything downstream is
 // the sim's own and needs no synchronisation of ours.
-inline bool dispatch(VkCommandBuffer cb,
+inline bool dispatch(PFN_vkCmdPipelineBarrier cmdBarrier,
+                     VkCommandBuffer cb,
+                     VkImageLayout colorLayout, VkImageLayout depthLayout,
                      VkImage colorImg, VkFormat colorFmt,
                      VkImage depthImg, VkFormat depthFmt,
                      VkImage mvImg,    VkFormat mvFmt,
@@ -366,9 +415,71 @@ inline bool dispatch(VkCommandBuffer cb,
                      float camNear, float camFar, float fovY)
 {
     State &s = state();
+    // Same lock as ensure(). A dispatch that begins while the context is still
+    // being built - or two dispatches from different recording threads - is the
+    // race this fixes.
+    std::lock_guard<std::mutex> guard(s.lock);
     if (!s.ready || s.failed) return false;
     if (colorImg == VK_NULL_HANDLE || depthImg == VK_NULL_HANDLE ||
         mvImg == VK_NULL_HANDLE || outImg == VK_NULL_HANDLE) return false;
+
+    // ---- MAKE THE DECLARED STATES TRUE BEFORE DECLARING THEM.
+    //
+    // The three shared resources have never been touched, so they are still
+    // UNDEFINED on the first frame; FFX expects GENERAL. Transitioning from
+    // UNDEFINED discards contents, which is correct exactly once - after that
+    // they hold data FSR3 wrote and must be left alone.
+    if (!s.sharedReady) {
+        s.sharedReady = true;
+        for (int i = 0; i < 3; ++i)
+            barrier(cmdBarrier, cb, s.shared[i], VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                    0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+
+    // ---- ORDER X-PLANE'S WRITES BEFORE FSR3'S READS.
+    //
+    // FSR3 reads the scene colour, the depth and our motion vectors, all of
+    // which X-Plane (and this layer) wrote earlier in the SAME frame. Recording
+    // FFX's passes into X-Plane's command buffer does not order them: without a
+    // barrier the reads may run before the writes land, which validation does
+    // not catch and the GPU does.
+    //
+    // A GLOBAL MEMORY BARRIER, not per-image transitions. The earlier version
+    // transitioned images from layouts they were not in - undefined behaviour,
+    // and destructive - because the true layout at this point is not something
+    // this layer reliably knows. A memory barrier needs no layout at all: it
+    // orders access, which is the part that was actually missing.
+    if (cmdBarrier) {
+        VkMemoryBarrier mb;
+        memset(&mb, 0, sizeof(mb));
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_SHADER_WRITE_BIT |
+                           VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        cmdBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                   1, &mb, 0, nullptr, 0, nullptr);
+    }
+
+    // ---- THE INPUTS ARE NOT TRANSITIONED. THEY ARE ALREADY RIGHT.
+    //
+    // This runs at X-Plane's own upscale dispatch, and X-Plane has just bound
+    // the scene colour as a sampled texture for that upscale - so it is already
+    // in SHADER_READ_ONLY_OPTIMAL, which is exactly what
+    // FFX_RESOURCE_STATE_COMPUTE_READ means to the VK backend.
+    //
+    // The previous version transitioned it FROM COLOR_ATTACHMENT_OPTIMAL. An
+    // oldLayout that is not the image's actual layout is undefined behaviour -
+    // the driver is entitled to discard the contents - and that is destructive
+    // rather than merely wrong. It dispatched once and the sim died shortly
+    // after.
+    //
+    // Declaring the state and leaving the image alone is both correct and less
+    // work. If a layout ever genuinely disagrees, the answer is to learn what
+    // it is, not to assert one.
 
     FfxFsr3UpscalerDispatchDescription d;
     memset(&d, 0, sizeof(d));
@@ -386,6 +497,7 @@ inline bool dispatch(VkCommandBuffer cb,
         describeTex2D(s.renderW, s.renderH, ffxGetSurfaceFormatVK(mvFmt),
                       FFX_RESOURCE_USAGE_READ_ONLY),
         nullptr, FFX_RESOURCE_STATE_COMPUTE_READ);
+    if (s.ownOut != VK_NULL_HANDLE) outImg = s.ownOut;
     d.output = ffxGetResourceVK(outImg,
         describeTex2D(s.outW, s.outH, ffxGetSurfaceFormatVK(outFmt),
                       FFX_RESOURCE_USAGE_UAV),
@@ -438,7 +550,27 @@ inline bool dispatch(VkCommandBuffer cb,
     d.cameraFovAngleVertical = fovY;
     d.viewSpaceToMetersFactor = 1.0f;   // X-Plane's world units ARE metres
 
+    // ---- EVERY ONE OF THE FIRST FEW, BEFORE AND AFTER.
+    //
+    // The count stops at exactly 1 on every run, which is deterministic rather
+    // than a race. Two possibilities remain and they need separating: the
+    // SECOND CPU call dies, or the GPU dies executing the first. A marker
+    // before and after each call says which - "before 2" with no "after 2"
+    // means the CPU call; "after 1" with no "before 2" means the frame never
+    // came back.
+    if (s.dispatches < 400) {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "before dispatch %llu%c",
+                         (unsigned long long)(s.dispatches + 1), 10);
+                 fflush(m); fclose(m); }
+    }
     const FfxErrorCode rc = ffxFsr3UpscalerContextDispatch(&s.ctx, &d);
+    if (s.dispatches < 400) {
+        FILE *m = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a");
+        if (m) { fprintf(m, "after dispatch %llu rc=%d%c",
+                         (unsigned long long)(s.dispatches + 1), (int)rc, 10);
+                 fflush(m); fclose(m); }
+    }
     if (rc != FFX_OK) {
         // Loud once, then silent: a dispatch failing every frame would bury
         // everything else in the trace.
@@ -452,8 +584,23 @@ inline bool dispatch(VkCommandBuffer cb,
         return false;
     }
 
+    // And order FSR3's writes before whatever X-Plane does next with the
+    // output image - the same argument in the other direction.
+    if (cmdBarrier) {
+        VkMemoryBarrier mb;
+        memset(&mb, 0, sizeof(mb));
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                           VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                           VK_ACCESS_TRANSFER_READ_BIT;
+        cmdBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                   1, &mb, 0, nullptr, 0, nullptr);
+    }
+
     ++s.dispatches;
-    if (s.dispatches == 1 || (s.dispatches % 600) == 0)
+    if (s.dispatches == 1 || (s.dispatches % 30) == 0)
         trace("FSR3: %llu dispatches, %ux%u -> %ux%u",
               (unsigned long long)s.dispatches, s.renderW, s.renderH, s.outW, s.outH);
     return true;

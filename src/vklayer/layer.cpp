@@ -1467,6 +1467,7 @@ static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "spirv_inject.h"
 #include "xpfsr_spv.h"
 #include "fsr_probe.h"
+#include "depth_copy.h"
 #include "fsr3_backend_impl.h"
 
 // Defined with the probe below; called from the present path, which comes
@@ -1830,6 +1831,9 @@ static uint64_t g_depthProbeAt  = 0;       // frame to run the next probe on
 static bool          g_depthFreshThisFrame = false;
 static VkImageLayout g_depthLayoutThisFrame = VK_IMAGE_LAYOUT_UNDEFINED;
 static VkImage  g_sceneDepth  = VK_NULL_HANDLE;
+// Recorded with the image, because FSR3 must be told the real format - a
+// guessed D32_SFLOAT binds the right memory and describes it wrongly.
+static VkFormat g_sceneDepthFormat = VK_FORMAT_UNDEFINED;
 static uint32_t g_sceneDepthW = 0, g_sceneDepthH = 0;
 static bool     g_depthReported = false;
 
@@ -1919,6 +1923,7 @@ static void selectSceneDepth()
     }
 
     g_sceneDepth  = c->image;
+    g_sceneDepthFormat = c->format;
     g_sceneDepthW = c->w;
     g_sceneDepthH = c->h;
     trace("DEPTH: selected FROM THE FRAME - %ux%u fmt=%s samples=%u usage=0x%x",
@@ -6951,6 +6956,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 g_colorImages.find(fsrprobe::state().output);
             if (oc != g_colorImages.end()) { ow = oc->second.w; oh = oc->second.h; }
         }
+        // The depth copy is built here too - same reason: creating pipelines
+        // while a command buffer is being recorded is what killed the sim
+        // earlier.
+        if (dev && ph && gd && rw && rh && g_sceneDepth != VK_NULL_HANDLE)
+            depthcopy::ensure(dev, ph, gd, g_getPhysMemProps,
+                              g_sceneDepth, g_sceneDepthFormat, rw, rh);
         if (dev && ph && gd && rw && rh && ow && oh && rw < ow)
             fsr3::ensure(dev, ph, gd, g_getPhysMemProps, rw, rh, ow, oh);
     }
@@ -11936,6 +11947,21 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
         //
         // The context is built from the present path instead, where nothing is
         // being recorded. Here we only dispatch, and only once it is ready.
+        // ---- WHY THE GATE CLOSED, IF IT DID.
+        //
+        // FSR3 dispatched exactly once and then stopped, with the built-in
+        // shader silently taking over - which looks like success and is not.
+        // Six conditions guard this and a silent no-op looks the same whichever
+        // one fails, so each is named.
+        {
+            static uint64_t said = 0;
+            if ((said++ % 600) == 0)
+                trace("FSR3 GATE: ours=%d out=%p colour=%p depth=%p mv=%p "
+                      "render=%ux%u out=%ux%u ready=%d failed=%d",
+                      ours ? 1 : 0, (void*)out, (void*)colour, (void*)depth,
+                      (void*)mv, rw, rh, ow, oh,
+                      fsr3::state().ready ? 1 : 0, fsr3::state().failed ? 1 : 0);
+        }
         if (ours && out != VK_NULL_HANDLE && colour != VK_NULL_HANDLE &&
             depth != VK_NULL_HANDLE && mv != VK_NULL_HANDLE && rw && rh && ow && oh &&
             fsr3::state().ready) {
@@ -11949,8 +11975,28 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
             // stops FSR3 and the resolve drifting apart.
             const float vs = taaVelScale();
             const float ys = taaVelYSign();
+            // The real depth format and the layouts these images are actually
+            // in - not assumed ones. g_sceneDepthLayout is recorded from the
+            // sim's own rendering info, which is the only place that truth
+            // exists.
+            // ---- CONVERT THE DEPTH FIRST.
+            //
+            // X-Plane's depth is D32_SFLOAT_S8_UINT and FFX cannot make a legal
+            // view over a combined depth-stencil image - it forces D32_SFLOAT.
+            // This writes a plain R32_SFLOAT copy, which FSR3 reads instead.
+            depthcopy::record(dd->cmdBindPipeline, dd->cmdBindDescriptorSets,
+                              dd->cmdDispatch, dd->cmdPipelineBarrier,
+                              cb, g_sceneDepthLayout);
+            if (depthcopy::state().ready) {
+                depth = depthcopy::state().image;
+            }
+
             fsr3Ran = fsr3::dispatch(
-                cb, colour, colourFmt, depth, VK_FORMAT_D32_SFLOAT, mv, mvFmt,
+                dd->cmdPipelineBarrier, cb,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, g_sceneDepthLayout,
+                colour, colourFmt, depth,
+                depthcopy::state().ready ? VK_FORMAT_R32_SFLOAT : g_sceneDepthFormat,
+                mv, mvFmt,
                 out, outFmt,
                 // Jitter in PIXELS, which is what FSR3 wants. g_velSnap holds
                 // the plugin's request and g_jitterScale is the amplitude the

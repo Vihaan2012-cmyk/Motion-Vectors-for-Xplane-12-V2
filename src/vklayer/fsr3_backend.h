@@ -41,6 +41,7 @@
 #include <vulkan/vulkan.h>
 #include <stdint.h>
 #include <string.h>
+#include <mutex>
 
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
@@ -64,6 +65,31 @@ struct State {
     uint32_t                    renderW = 0, renderH = 0;
     uint32_t                    outW = 0,   outH = 0;
     uint64_t                    dispatches = 0;
+    // The shared resources start UNDEFINED and are transitioned once.
+    bool                        sharedReady = false;
+
+    // ---- A SCRATCH OUTPUT, FOR ISOLATION.
+    //
+    // FSR3 dispatches six times, every call FFX_OK, validation clean, and then
+    // the GPU dies - deterministically, and independently of FFX's queue depth.
+    // Two possibilities remain: writing X-PLANE'S output image is what kills
+    // it, or FSR3's own internal work does.
+    //
+    // Pointing the output at an image of ours separates them. Nothing reaches
+    // the screen in this mode; that is the point.
+    VkImage                     ownOut = VK_NULL_HANDLE;
+    VkDeviceMemory              ownOutMem = VK_NULL_HANDLE;
+
+    // ---- FSR3 IS NOT THREAD SAFE, AND THIS LAYER IS MULTI-THREADED.
+    //
+    // ensure() runs from the present path; dispatch() runs on whichever thread
+    // records X-Plane's upscale. An FFX context used from two threads at once
+    // is undefined, and the symptom fits exactly: it crashes normally, and
+    // SURVIVES under the validation layer, which serialises enough to hide it.
+    //
+    // Its own mutex, never g_lock: g_lock is held across large parts of this
+    // layer and taking it here is how the earlier deadlock happened.
+    std::mutex                  lock;
     // The three resources FSR3 emits for downstream effects. Required by the
     // dispatch even when nothing downstream consumes them.
     VkImage                     shared[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };

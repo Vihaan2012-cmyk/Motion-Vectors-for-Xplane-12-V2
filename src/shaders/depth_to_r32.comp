@@ -1,0 +1,55 @@
+#version 450
+// texelFetch on a plain texture2D (no sampler attached) needs this. Without it
+// glslang refuses: "required extension not requested".
+#extension GL_EXT_samplerless_texture_functions : require
+//
+// Copy X-Plane's depth into a plain R32_SFLOAT image that FSR 3 can read.
+//
+// ---- WHY THIS EXISTS.
+//
+// X-Plane's scene depth is D32_SFLOAT_S8_UINT - depth AND stencil in one image.
+// FidelityFX's Vulkan backend does not anticipate that: for anything tagged as
+// a depth target it forces the view format,
+//
+//     imageViewCreateInfo.format = ...DEPTHTARGET ? VK_FORMAT_D32_SFLOAT : ...
+//
+// and a D32_SFLOAT view over a D32_SFLOAT_S8_UINT image is not a legal pairing.
+// Everything on the CPU still succeeds - every FFX call returns FFX_OK and the
+// validation layer stays quiet about the dispatch - and then the GPU dies a few
+// frames in, once that view is actually sampled.
+//
+// Vulkan will not copy or blit between those two formats either: depth/stencil
+// copies require identical formats, and blits cannot cross depth to colour. So
+// the conversion has to be a shader.
+//
+// ---- WHAT IT DOES.
+//
+// One texel in, one texel out, no filtering and no conversion beyond dropping
+// the stencil. The depth VALUE is untouched: X-Plane uses reversed-Z and FSR 3
+// is told so through FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED, so reinterpreting
+// it here would mean two corrections for one convention.
+//
+// Copyright (C) 2026 MotionVectors contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Sampled with the DEPTH aspect only - the stencil half is not readable through
+// this view and is not wanted.
+layout(set = 0, binding = 0) uniform texture2D u_depth;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D o_depth;
+
+void main()
+{
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 sz = imageSize(o_depth);
+    // The render size is rarely a multiple of eight, so the last group in each
+    // row and column hangs off the edge. Writing there is undefined, not merely
+    // wasteful.
+    if (px.x >= sz.x || px.y >= sz.y) return;
+
+    // texelFetch, not texture(): no sampler, no filtering, and no dependence on
+    // sampler state we would then have to keep correct.
+    const float d = texelFetch(u_depth, px, 0).x;
+    imageStore(o_depth, px, vec4(d, 0.0, 0.0, 0.0));
+}
