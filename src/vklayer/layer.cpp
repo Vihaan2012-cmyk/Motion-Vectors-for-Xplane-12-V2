@@ -1699,8 +1699,16 @@ static FgSwap            g_fgSwap;
 static std::atomic<bool> g_fgActive(false);
 // Which proxy image FSR3 writes this frame; advanced once per present.
 static uint32_t          g_fgOutIndex = 0;
-// Frame-generation config applied to the proxy? One-shot per proxy.
+// Frame-generation config applied to the proxy? One-shot per proxy - the
+// callback is registered exactly once.
 static bool              g_fgConfigApplied = false;
+// Is frame generation currently ENABLED in the swapchain config? Distinct from
+// the callback being registered: the callback stays registered, but generation
+// is only enabled while interpolation can actually produce a frame (the dilated
+// resources exist). Enabling it while it cannot present a black generated frame
+// every other flip - the callback returns "nothing" and FFX shows its empty
+// output buffer. Tracked so the config is re-applied only when this flips.
+static bool              g_fgGenEnabled = false;
 
 // Swapchain images, by swapchain. Declared HERE rather than beside the present
 // path that fills it, because the synchronization2 barrier hook above reads it
@@ -7618,50 +7626,56 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                               g_sceneDepth, g_sceneDepthFormat, rw, rh);
         if (dev && ph && gd && rw && rh && ow && oh && rw < ow)
             fsr3::ensure(dev, ph, gd, g_getPhysMemProps, rw, rh, ow, oh);
+    }
 
-        // ---- FRAME GENERATION IS BUILT HERE, NOT AT SWAPCHAIN CREATION.
-        //
-        // It was, and it never once succeeded. Interpolation consumes the
-        // UPSCALER's dilated depth and motion vectors, so it needs the
-        // upscaler's render size - and at vkCreateSwapchainKHR the upscaler does
-        // not exist yet. fsr3::state().renderW was still 0, ensure() rejected
-        // the zero extent, and the log read "contexts unavailable" while the
-        // swapchain went right on owning presentation: full cost, no benefit,
-        // and nothing in the symptom pointing at ordering.
-        //
-        // The upscaler is built here for the reason its own file records -
-        // creating pipelines while a command buffer is recording killed the sim
-        // once - and frame generation inherits that constraint and its
-        // ordering both. Immediately after it, where the sizes are real.
-        // ---- CONTEXTS ARE ALREADY BUILT (at swapchain replacement, single
-        // ---- threaded). HERE WE ONLY APPLY THE CONFIG, ONCE.
-        //
-        // The config registers our interpolation callback with the swapchain.
-        // It is separate from context creation and cheap; doing it from the
-        // present path means the proxy is definitely live by now. Guarded by a
-        // one-shot so it runs exactly once per proxy.
-        if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
-            fg::state().ready && !g_fgConfigApplied) {
+    // ---- APPLY THE FRAME-GENERATION CONFIG - INDEPENDENT OF THE UPSCALER.
+    //
+    // This used to sit inside the FSR3-build block above, gated by
+    // fsrReplaceEnabled() && fsr3Wanted(). With FSR off that block never ran, so
+    // the config was never applied, our interpolation callback was never
+    // registered, and the proxy swapchain presented real frames only: the full
+    // cost of frame generation with none of the frames. Frame generation
+    // interpolates between TAA-resolved frames and must not be gated on the
+    // upscaler - see the note on ensure() being built with the display extent.
+    // Applied here at the present level whenever generation is active and the
+    // contexts are built.
+    //
+    // The config registers our interpolation callback with the swapchain. It is
+    // separate from context creation and cheap. Guarded by a one-shot so it runs
+    // exactly once per proxy.
+    if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
+        fg::state().ready) {
+        // Generation may be ENABLED only when the interpolation actually has its
+        // inputs - the same three dilated resources the dispatch checks. With
+        // them absent (the upscaler not up, or off entirely) enabling generation
+        // presents a black frame every other flip: the callback produces nothing
+        // and the swapchain shows its uninitialised output buffer. So the enable
+        // bit tracks capability, and the config is re-applied only when it flips.
+        fsr3::State &u = fsr3::state();
+        const bool canInterp = u.ready && !u.failed &&
+                               u.shared[0] != VK_NULL_HANDLE &&
+                               u.shared[1] != VK_NULL_HANDLE &&
+                               u.shared[2] != VK_NULL_HANDLE;
+        if (!g_fgConfigApplied || canInterp != g_fgGenEnabled) {
             g_fgConfigApplied = true;
-            {
-                FfxFrameGenerationConfig cfg;
-                memset(&cfg, 0, sizeof(cfg));
-                cfg.swapChain               = g_fgSwap.proxy;
-                cfg.frameGenerationEnabled  = true;
-                cfg.frameGenerationCallback = fg::dispatchCallback;
-                cfg.frameGenerationCallbackContext = nullptr;
-                // Synchronous: FFX's own guidance is to avoid its async path
-                // when the engine already uses async compute, and X-Plane does.
-                cfg.allowAsyncWorkloads     = false;
-                cfg.onlyPresentInterpolated = false;
-                cfg.frameID                 = 0;
-                const FfxErrorCode ce =
-                    ffxSetFrameGenerationConfigToSwapchainVK(&cfg);
-                trace("FG: frame generation config %s (%d) - interpolation is %s.",
-                      ce == FFX_OK ? "accepted" : "REJECTED", (int)ce,
-                      ce == FFX_OK ? "live"
-                                   : "not running, so the swapchain is overhead");
-            }
+            g_fgGenEnabled    = canInterp;
+            FfxFrameGenerationConfig cfg;
+            memset(&cfg, 0, sizeof(cfg));
+            cfg.swapChain               = g_fgSwap.proxy;
+            cfg.frameGenerationEnabled  = canInterp;
+            cfg.frameGenerationCallback = fg::dispatchCallback;
+            cfg.frameGenerationCallbackContext = nullptr;
+            // Synchronous: FFX's own guidance is to avoid its async path when the
+            // engine already uses async compute, and X-Plane does.
+            cfg.allowAsyncWorkloads     = false;
+            cfg.onlyPresentInterpolated = false;
+            cfg.frameID                 = 0;
+            const FfxErrorCode ce = ffxSetFrameGenerationConfigToSwapchainVK(&cfg);
+            trace("FG: frame generation config %s (%d) - generation is now %s "
+                  "(interpolation inputs %s).",
+                  ce == FFX_OK ? "accepted" : "REJECTED", (int)ce,
+                  canInterp ? "ENABLED" : "disabled - clean passthrough, no black frame",
+                  canInterp ? "present" : "absent");
         }
     }
 
