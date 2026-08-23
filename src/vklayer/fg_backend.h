@@ -273,6 +273,18 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     State &s = state();
     if (!p || !s.ready || s.failed) return FFX_OK;
 
+    {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            trace("FG CB ENTRY: present=%p cmdList=%p ofVec=%p ofScd=%p "
+                  "reset=%d - optical flow runs on presentColor every frame, "
+                  "before the interpolation skip.",
+                  p->presentColor.resource, (void*)p->commandList,
+                  (void*)s.ofVector, (void*)s.ofScd, (int)p->reset);
+        }
+    }
+
     FfxOpticalflowDispatchDescription od;
     memset(&od, 0, sizeof(od));
     od.commandList       = p->commandList;
@@ -377,6 +389,22 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     fd.minMaxLuminance[0] = p->minMaxLuminance[0];
     fd.minMaxLuminance[1] = p->minMaxLuminance[1];
 
+    {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            trace("FG DISPATCH: present=%p output=%p ofVec=%p ofScd=%p "
+                  "recPrev=%p dilDepth=%p dilMV=%p hudless=%p distort=%p "
+                  "render=%ux%u disp=%ux%u",
+                  fd.currentBackBuffer.resource, fd.output.resource,
+                  fd.opticalFlowVector.resource, fd.opticalFlowSceneChangeDetection.resource,
+                  fd.reconstructedPrevDepth.resource, fd.dilatedDepth.resource,
+                  fd.dilatedMotionVectors.resource, fd.currentBackBuffer_HUDLess.resource,
+                  fd.distortionField.resource,
+                  fd.renderSize.width, fd.renderSize.height,
+                  fd.displaySize.width, fd.displaySize.height);
+        }
+    }
     rc = ffxFrameInterpolationDispatch(&s.fiCtx, &fd);
     if (rc != FFX_OK) {
         static bool said = false;

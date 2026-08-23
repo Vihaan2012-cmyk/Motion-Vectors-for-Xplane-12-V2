@@ -1914,6 +1914,14 @@ static std::vector<DepthCandidate> g_depthCandidates;
 // be tied together to answer "which image does the scene actually render into".
 static std::map<VkImageView, VkImage> g_viewToImage;
 
+// The frame-generation backbuffers the layer tagged MUTABLE_FORMAT, mapped to
+// the usage they were really created with. Layer_CreateImageView consults this
+// to make X-Plane's sRGB view of one of these UNORM images legal: the format is
+// left sRGB (so X-Plane's gamma is unchanged), but STORAGE is masked out of the
+// view's usage, because no sRGB format can be a storage image. See the note at
+// the MUTABLE_FORMAT patch in Layer_CreateImage.
+static std::map<VkImage, VkImageUsageFlags> g_fgMutableImg;
+
 // commandBuffer -> device. Command recording functions carry no device handle,
 // but the dispatch table is per-device, so the two have to be tied together to
 // record anything from inside a Cmd* hook.
@@ -3093,8 +3101,63 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
     // flags already permit. Removing an interception is worth more than making
     // one work.
 
-    VkResult r = next(device, (drop || addedDst) ? &ci2 : ci, alloc, out);
+    // ---- MAKE THE FRAME-GEN BACKBUFFERS VIEWABLE AS sRGB (the FG crash).
+    //
+    // GPU-assisted validation named this exactly: FFX's replacement backbuffers
+    // are created UNORM (the layer substitutes the UNORM twin of X-Plane's sRGB
+    // swapchain so they can carry STORAGE - no _SRGB format can be a storage
+    // image). But X-Plane never saw that substitution: it still believes the
+    // swapchain is sRGB, so it creates an sRGB VIEW of a UNORM image -
+    //
+    //   vkCreateImageView(): format B8G8R8A8_SRGB is different from VkImage
+    //   [AMD FSR Replacement BackBuffer 0] format (B8G8R8A8_UNORM)
+    //
+    // - which is illegal unless the image was created MUTABLE_FORMAT. Without
+    // the flag the view creation FAILS, X-Plane binds the null view, and the
+    // compute pass that samples it reads address 0x0: "Unknown at virtual
+    // address 0x0, Type: Compute". That is the frame-generation crash.
+    //
+    // MUTABLE_FORMAT costs effectively nothing and only WIDENS what views are
+    // legal, so the sRGB and UNORM twins can both view the one image. It is
+    // added only to the backbuffer signature - a BGRA/RGBA UNORM that carries
+    // STORAGE and COLOR_ATTACHMENT at once, which is the swapchain-backing shape
+    // and not a normal render target (those are one or the other, never both) -
+    // and only while frame generation is on. The sibling gamma trap in
+    // ffx_vk.cpp (ffxGetImageResourceDescriptionVK reads the flag as "really
+    // sRGB") does not reach these: FFX sets their description explicitly in
+    // createImage, it is never derived from this VkImageCreateInfo.
+    bool addedMutable = false;
+    {
+        const bool bgraUnorm = (ci->format == VK_FORMAT_B8G8R8A8_UNORM ||
+                                ci->format == VK_FORMAT_R8G8B8A8_UNORM);
+        const bool backbufferShape =
+            bgraUnorm &&
+            (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+            (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+            !(ci->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+        if (backbufferShape && live::onoff("taa.fg", "TAA_FG", false)) {
+            if (!(drop || addedDst)) ci2 = *ci;
+            ci2.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            addedMutable = true;
+        }
+    }
+
+    VkResult r = next(device, (drop || addedDst || addedMutable) ? &ci2 : ci, alloc, out);
     if (r != VK_SUCCESS) return r;
+
+    if (addedMutable) {
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            g_fgMutableImg[*out] = ci->usage;
+        }
+        static uint64_t n = 0;
+        if (++n <= 6)
+            trace("IMAGE: added MUTABLE_FORMAT to a %ux%u backbuffer-shape image "
+                  "(fmt=%d, usage 0x%x) so X-Plane's sRGB view of this UNORM "
+                  "frame-gen backbuffer is legal instead of null.",
+                  ci->extent.width, ci->extent.height, (int)ci->format,
+                  (unsigned)ci->usage);
+    }
 
     if (addedDst) {
         static uint64_t n = 0;
@@ -3440,6 +3503,48 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImageView(
                   ci->subresourceRange.levelCount, ci2.subresourceRange.levelCount);
     }
 
+    // ---- X-PLANE'S sRGB VIEW OF A FRAME-GEN BACKBUFFER MUST NOT ASK FOR STORAGE.
+    //
+    // These backbuffers were tagged MUTABLE_FORMAT (see Layer_CreateImage), so an
+    // sRGB view of the UNORM image is now format-legal. But a view with no usage
+    // override inherits ALL of the image's usage, and the image carries STORAGE -
+    // and no _SRGB format supports VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT, so the
+    // sRGB-plus-storage view is still rejected and still comes back null. The
+    // fix is to hand this one view a usage that is the image's minus STORAGE:
+    // X-Plane samples and renders through it (SAMPLED, COLOR_ATTACHMENT), never
+    // stores through it, so nothing it needs is dropped. Left as-is for every
+    // other view - only an sRGB view of a tagged backbuffer is touched.
+    VkImageViewUsageCreateInfo viewUsage;
+    if (ci && (ci->format == VK_FORMAT_B8G8R8A8_SRGB ||
+               ci->format == VK_FORMAT_R8G8B8A8_SRGB)) {
+        VkImageUsageFlags imgUsage = 0;
+        bool tagged = false;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<VkImage, VkImageUsageFlags>::iterator it =
+                g_fgMutableImg.find(ci->image);
+            if (it != g_fgMutableImg.end()) { imgUsage = it->second; tagged = true; }
+        }
+        if (tagged && (imgUsage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+            if (use != &ci2) { ci2 = *ci; use = &ci2; }
+            memset(&viewUsage, 0, sizeof(viewUsage));
+            viewUsage.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+            viewUsage.pNext = ci2.pNext;
+            viewUsage.usage = imgUsage & ~VK_IMAGE_USAGE_STORAGE_BIT;
+            ci2.pNext = &viewUsage;
+            static uint64_t n = 0;
+            if (++n <= 6)
+                trace("FG: narrowed an sRGB backbuffer view's usage 0x%x -> 0x%x "
+                      "(dropped STORAGE) so X-Plane's sRGB view of a UNORM "
+                      "frame-gen backbuffer is created instead of returning null.",
+                      (unsigned)imgUsage, (unsigned)viewUsage.usage);
+        }
+        // Untagged sRGB views (X-Plane's ordinary sRGB textures, measured as
+        // R8G8B8A8_SRGB) are left exactly as-is: their image really is sRGB, so
+        // the view matches and nothing needs narrowing. Only an sRGB view of a
+        // tagged UNORM frame-gen backbuffer is touched.
+    }
+
     VkResult r = next(device, use, alloc, out);
     if (r == VK_SUCCESS && ci) {
         std::lock_guard<std::mutex> g(g_lock);
@@ -3683,6 +3788,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
              vi != g_viewToImage.end(); ) {
             if (vi->second == img) vi = g_viewToImage.erase(vi); else ++vi;
         }
+        g_fgMutableImg.erase(img);
         for (size_t i = 0; i < g_depthCandidates.size(); ++i)
             if (g_depthCandidates[i].image == img) {
                 g_depthCandidates.erase(g_depthCandidates.begin() + i);
@@ -7395,12 +7501,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_GetSwapchainImagesKHR(
             std::lock_guard<std::mutex> g(g_lock);
             std::vector<VkImage> &v = g_swapImages[sc];
             v.assign(images, images + *count);
+            // ---- TAG THESE AS FRAME-GEN BACKBUFFERS FOR THE VIEW FIX.
+            //
+            // FFX creates them through its own resolved vkCreateImage (the next
+            // layer's, not ours), so Layer_CreateImage never sees them and could
+            // not tag them there. Here is where the layer first meets the actual
+            // handles. They are the UNORM twin of X-Plane's sRGB swapchain and
+            // carry the usage FrameInterpolationSwapchainVK.cpp gives every
+            // replacement backbuffer; recording that lets Layer_CreateImageView
+            // strip STORAGE from the sRGB view X-Plane makes of them, which no
+            // _SRGB format may carry. Paired with the MUTABLE_FORMAT those images
+            // are now created with, X-Plane's sRGB view is finally legal instead
+            // of a null handle. The format substitution above is what makes them
+            // UNORM, so anything not substituted is not one of these.
+            const VkImageUsageFlags fgUsage =
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            for (uint32_t k = 0; k < *count; ++k)
+                g_fgMutableImg[images[k]] = fgUsage;
             static bool said = false;
             if (!said) {
                 said = true;
-                trace("FG: %u proxy images tracked - these are FFX's replacement "
-                      "backbuffers, which is what the sim actually renders into.",
-                      *count);
+                trace("FG: %u proxy images tracked and tagged for the sRGB-view "
+                      "fix - these are FFX's replacement backbuffers, which is "
+                      "what the sim actually renders into.", *count);
             }
         }
         return pr;
