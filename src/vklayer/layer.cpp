@@ -14744,6 +14744,45 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
                   "stays bound to the proxy it was configured for.");
         }
     }
+    // ---- FFX'S FI SWAPCHAIN CANNOT USE AN sRGB SWAPCHAIN. MEASURED.
+    //
+    // FrameInterpolationSwapchainVK.cpp creates its replacement backbuffers in
+    // the SWAPCHAIN's format with VK_IMAGE_USAGE_STORAGE_BIT. No _SRGB format
+    // supports storage images, so with X-Plane's sRGB swapchain the driver
+    // refuses every one of them:
+    //
+    //   vkCreateImage(): ... returned VK_ERROR_FORMAT_NOT_SUPPORTED
+    //   format (VK_FORMAT_B8G8R8A8_SRGB) usage (...|STORAGE|COLOR_ATTACHMENT)
+    //
+    // Substituting the UNORM twin lets the images exist, and the SDK patch
+    // adding MUTABLE_FORMAT lets FFX view them as sRGB for presentation. What
+    // is still unresolved is FFX's sRGB VIEW keeping the storage usage it
+    // inherits from the image: its own addMutableViewForSRV narrows exactly
+    // that, but only when the RESOURCE DESCRIPTION says sRGB, which this
+    // substitution makes false.
+    //
+    // So this is the better of two broken states, not a fix: one validation
+    // error instead of two. Left in because it is the half that is definitely
+    // right - a storage image cannot be sRGB under any arrangement.
+    //
+    // If the picture looks washed out with frame generation on, this is why:
+    // the hardware is no longer applying the transfer function on write.
+    if (live::onoff("taa.fg", "TAA_FG", false) && !g_fgSwap.have &&
+        device == g_ffxDevice && g_ffxDevice != VK_NULL_HANDLE) {
+        VkFormat unorm = VK_FORMAT_UNDEFINED;
+        switch (mod.imageFormat) {
+        case VK_FORMAT_B8G8R8A8_SRGB: unorm = VK_FORMAT_B8G8R8A8_UNORM; break;
+        case VK_FORMAT_R8G8B8A8_SRGB: unorm = VK_FORMAT_R8G8B8A8_UNORM; break;
+        default: break;
+        }
+        if (unorm != VK_FORMAT_UNDEFINED) {
+            trace("FG: swapchain format %d is sRGB and cannot back a storage "
+                  "image - substituting %d so FFX's replacement backbuffers can "
+                  "be created at all.", (int)mod.imageFormat, (int)unorm);
+            mod.imageFormat = unorm;
+        }
+    }
+
     // Only ever for the device FidelityFX is bound to. A swapchain created on a
     // second device would build a proxy whose contexts, queues and resources all
     // belong to the first - which is the mismatch that crashed this.
