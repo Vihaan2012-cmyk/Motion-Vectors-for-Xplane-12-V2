@@ -71,8 +71,99 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     State &s = state();
     if (s.failed) return false;
     if (s.ready && s.srcImage == depthImage && s.w == w && s.h == h) return true;
-    if (s.ready) return true;          // the depth image moved; a later concern
     if (!device || !gdpa || depthImage == VK_NULL_HANDLE || !w || !h) return false;
+
+    // ---- THE DEPTH IMAGE MOVED, AND THIS IS NOT "A LATER CONCERN".
+    //
+    // What stood here was `if (s.ready) return true;` - notice the depth image
+    // is a different handle, then keep using the old one anyway. That is a
+    // use-after-free with a compute shader on the far end of it, and the GPU
+    // says so in exactly those terms:
+    //
+    //   E/GFX/VK: Address Translation Error at virtual address 0x421fa8000
+    //   E/GFX/VK: Access type: Read, Engine: Graphics
+    //   E/GFX/VK: Active shader count: 1
+    //   E/GFX/VK:   Hash: 0dbf6e7283122087-..., Type: Compute
+    //   E/GFX/VK: VK_ERROR_DEVICE_LOST
+    //
+    // logged one second after "Rebuilding offscreens for window resize".
+    //
+    // The chain: X-Plane destroys its depth target on a resize, a settings
+    // change or at flight start and makes a new one. s.srcView is a view built
+    // over the OLD image and s.srcImage names it. record() then binds srcView
+    // as a descriptor, barriers srcImage, and dispatches depth_to_r32.comp,
+    // which READS through that view - into memory the driver has already
+    // reclaimed. Read access, compute shader, freed page. That is the whole
+    // fault, and it is not intermittent; it is every rebuild that is followed
+    // by a dispatch.
+    //
+    // Rebuilding is the only correct answer, because a view cannot be retargeted
+    // - it is immutable once created and bound to one image for its lifetime.
+    // Everything derived from the old image goes, and the code below then
+    // recreates all of it against the new one.
+    //
+    // vkDeviceWaitIdle first: these objects may still be referenced by a
+    // submitted command buffer, and freeing them under the GPU trades this
+    // crash for a less legible one. A resize frame is already stalled rebuilding
+    // every target in the sim, so the cost is not visible.
+    if (s.ready) {
+        PFN_vkDeviceWaitIdle waitIdle =
+            (PFN_vkDeviceWaitIdle)gdpa(device, "vkDeviceWaitIdle");
+        PFN_vkDestroyImageView destroyView =
+            (PFN_vkDestroyImageView)gdpa(device, "vkDestroyImageView");
+        PFN_vkDestroyImage destroyImage =
+            (PFN_vkDestroyImage)gdpa(device, "vkDestroyImage");
+        PFN_vkFreeMemory freeMem =
+            (PFN_vkFreeMemory)gdpa(device, "vkFreeMemory");
+        PFN_vkDestroyDescriptorPool destroyPool =
+            (PFN_vkDestroyDescriptorPool)gdpa(device, "vkDestroyDescriptorPool");
+
+        if (waitIdle) waitIdle(device);
+
+        // The two views first - srcView is the dangling one, dstView belongs to
+        // our own image which is about to go too.
+        if (destroyView && s.srcView) destroyView(device, s.srcView, nullptr);
+        if (destroyView && s.dstView) destroyView(device, s.dstView, nullptr);
+        s.srcView = VK_NULL_HANDLE;
+        s.dstView = VK_NULL_HANDLE;
+
+        // Our R32_SFLOAT copy is sized for the old extent. Even when the extent
+        // is unchanged it must go, because its dstView did.
+        if (destroyImage && s.image) destroyImage(device, s.image, nullptr);
+        if (freeMem && s.mem)        freeMem(device, s.mem, nullptr);
+        s.image = VK_NULL_HANDLE;
+        s.mem   = VK_NULL_HANDLE;
+
+        // The descriptor set holds both views. Freeing the pool frees the set
+        // with it; the set is not freed separately because the pool was not
+        // created with FREE_DESCRIPTOR_SET.
+        if (destroyPool && s.pool) destroyPool(device, s.pool, nullptr);
+        s.pool = VK_NULL_HANDLE;
+        s.set  = VK_NULL_HANDLE;
+
+        // setLayout, pipeLayout and pipeline reference no image, so they are not
+        // part of the fault - but the code below creates all three
+        // UNCONDITIONALLY, straight over these handles. Leaving them would leak
+        // one of each per rebuild, silently, for as long as the sim runs.
+        // Destroying them here is what makes the recreation below correct
+        // rather than merely successful.
+        PFN_vkDestroyDescriptorSetLayout destroySetLayout =
+            (PFN_vkDestroyDescriptorSetLayout)gdpa(device, "vkDestroyDescriptorSetLayout");
+        PFN_vkDestroyPipelineLayout destroyPipeLayout =
+            (PFN_vkDestroyPipelineLayout)gdpa(device, "vkDestroyPipelineLayout");
+        PFN_vkDestroyPipeline destroyPipeline =
+            (PFN_vkDestroyPipeline)gdpa(device, "vkDestroyPipeline");
+        if (destroyPipeline && s.pipeline)      destroyPipeline(device, s.pipeline, nullptr);
+        if (destroyPipeLayout && s.pipeLayout)  destroyPipeLayout(device, s.pipeLayout, nullptr);
+        if (destroySetLayout && s.setLayout)    destroySetLayout(device, s.setLayout, nullptr);
+        s.pipeline   = VK_NULL_HANDLE;
+        s.pipeLayout = VK_NULL_HANDLE;
+        s.setLayout  = VK_NULL_HANDLE;
+
+        s.srcImage = VK_NULL_HANDLE;
+        s.w = 0; s.h = 0;
+        s.ready = false;
+    }
 
     PFN_vkCreateImage      createImage = (PFN_vkCreateImage)gdpa(device, "vkCreateImage");
     PFN_vkCreateImageView  createView  = (PFN_vkCreateImageView)gdpa(device, "vkCreateImageView");
@@ -310,6 +401,44 @@ inline void record(PFN_vkCmdBindPipeline bindPipe,
     barrierFn(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
 
+    // ---- X-PLANE'S DEPTH MUST BE IN THE LAYOUT OUR DESCRIPTOR CLAIMS.
+    //
+    // The descriptor for u_depth is written with SHADER_READ_ONLY_OPTIMAL, but
+    // X-Plane leaves its depth in DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL.
+    // Reading through a descriptor whose layout does not match the image is
+    // undefined - the validation layer says so outright:
+    //
+    //   VUID-vkCmdDispatch-imageLayout-00344: VkImage [gbuf-depth] with layout
+    //   SHADER_READ_ONLY_OPTIMAL (descriptor "u_depth") doesn't match the
+    //   previous known layout DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL
+    //
+    // So the copy was feeding FSR3 undefined depth, and FSR3 drives reprojection
+    // and its lock/luminance logic from depth. That is not a subtle error: it is
+    // every frame, on every pixel.
+    //
+    // depthLayout is the layout the sim actually recorded, which is why it is
+    // passed in. It used to be discarded with (void)depthLayout - the parameter
+    // was there and the correction was not.
+    //
+    // DEPTH aspect only: the source view was built with VK_IMAGE_ASPECT_DEPTH_BIT
+    // and a barrier has to name the same subresource the view reads.
+    VkImageMemoryBarrier db;
+    memset(&db, 0, sizeof(db));
+    db.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    db.image = s.srcImage;
+    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    db.subresourceRange.levelCount = 1;
+    db.subresourceRange.layerCount = 1;
+    db.oldLayout = depthLayout;
+    db.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    db.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    db.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrierFn(cb, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &db);
+
     bindPipe(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeline);
     bindSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeLayout, 0, 1, &s.set, 0, nullptr);
     dispatch(cb, (s.w + 7) / 8, (s.h + 7) / 8, 1);
@@ -322,7 +451,23 @@ inline void record(PFN_vkCmdBindPipeline bindPipe,
     b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     barrierFn(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-    (void)depthLayout;
+
+    // ---- PUT THE SIM'S DEPTH BACK EXACTLY AS IT WAS.
+    //
+    // X-Plane still believes its depth is in depthLayout and will barrier from
+    // that on its next use. Leaving it in SHADER_READ_ONLY_OPTIMAL would make
+    // the sim's own oldLayout a lie, and a mismatched oldLayout permits the
+    // driver to DISCARD the contents - a borrowed resource is returned in the
+    // state it was lent in.
+    db.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    db.newLayout = depthLayout;
+    db.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    barrierFn(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+              VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+              0, 0, nullptr, 0, nullptr, 1, &db);
 }
 
 } // namespace depthcopy

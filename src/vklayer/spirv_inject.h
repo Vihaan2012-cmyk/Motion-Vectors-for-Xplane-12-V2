@@ -1452,7 +1452,41 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     }
 
     if (!isFragment) return INJ_NOT_VERTEX;   // "not our stage" - not a failure
-    if (!idV4 || !idFloat) return INJ_MALFORMED;
+    // ---- A MISSING TYPE IS NOT A MALFORMED SHADER.
+    //
+    // This refused any fragment shader that declared no 32-bit float and no
+    // vec4, calling it MALFORMED. It is neither malformed nor unusual: a
+    // shader that only ever writes a uint mask, or works entirely in vec3,
+    // legitimately never declares those types. SPIR-V has no prelude, so a
+    // type exists only if something used it.
+    //
+    // The cost of refusing was not "one shader unpatched". The velocity target
+    // is written ONLY by shaders we patch, so every fragment such a shader
+    // produces leaves the CLEAR SENTINEL behind - the layer's own message for
+    // this is "would leave holes in the velocity buffer". The resolve then
+    // reads those texels as `unwritten`, refuses to reproject them, and they
+    // neither accumulate nor antialias while every neighbour does. A region
+    // bounded by one material's draw calls therefore renders visibly different
+    // from the geometry around it, and the boundary is a SEAM.
+    //
+    // That is why this is aircraft-dependent rather than universal: which
+    // shaders exist at all is a property of the aircraft's materials, so a
+    // cockpit built from custom shaders can hit a case the stock aircraft
+    // never produce.
+    //
+    // Synthesising the types is the same thing this function already does for
+    // idV2, idPtrOutV4, idPtrInV4 and four constants a few lines below - the
+    // ids are allocated from `bound` and the declarations appended to
+    // `globals`. float and vec4 were simply missing from that list. They are
+    // allocated here rather than there because everything below depends on
+    // them, and `bound` is read early for exactly that reason.
+    uint32_t newFloat = 0, newV4 = 0;
+    {
+        uint32_t b = w[3];
+        if (!idFloat) { newFloat = b++; idFloat = newFloat; }
+        if (!idV4)    { newV4    = b++; idV4    = newV4;    }
+        w[3] = b;   // `bound` is read from w[3] below, so it covers these ids
+    }
     if (locationTaken) return INJ_LOCATION_TAKEN;
 
     // ---- MOVE A DEAD OUTPUT ASIDE RATHER THAN REFUSING THE WHOLE SHADER.
@@ -1583,6 +1617,10 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     annos.push_back(head(OpDecorate, 4)); annos.push_back(idInPrev); annos.push_back(Deco_Location); annos.push_back(prevClipLocation());
     annos.push_back(head(OpDecorate, 4)); annos.push_back(idOutMV);  annos.push_back(Deco_Location); annos.push_back(attachmentIndex);
 
+    // float first: the vector type below references it by id, and SPIR-V
+    // requires a type to be declared before it is used.
+    if (newFloat)    { globals.push_back(head(OpTypeFloat, 3));  globals.push_back(newFloat); globals.push_back(32); }
+    if (newV4)       { globals.push_back(head(OpTypeVector, 4)); globals.push_back(newV4); globals.push_back(idFloat); globals.push_back(4); }
     if (newV2)       { globals.push_back(head(OpTypeVector, 4)); globals.push_back(newV2); globals.push_back(idFloat); globals.push_back(2); }
     if (newPtrOutV4) { globals.push_back(head(OpTypePointer, 4)); globals.push_back(newPtrOutV4); globals.push_back(SC_Output); globals.push_back(idV4); }
     if (newPtrInV4)  { globals.push_back(head(OpTypePointer, 4)); globals.push_back(newPtrInV4);  globals.push_back(SC_Input);  globals.push_back(idV4); }

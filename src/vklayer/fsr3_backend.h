@@ -97,6 +97,18 @@ struct State {
     // WHICH current-frame input is wrong instead of guessing at one at a time.
     bool                        debugView = false;
 
+    // ---- RCAS SHARPNESS, 0 = OFF.
+    //
+    // Temporal accumulation resamples history every frame and upscaling
+    // resamples space; both cost high-frequency detail. FSR3 ships RCAS to put
+    // it back, and we were dispatching with enableSharpening=false - carrying
+    // the softness while the correction sat unused in the same pipeline. Live,
+    // so it can be dialled against a real scene instead of guessed at across
+    // rebuilds.
+    float                       sharpness = 0.0f;
+
+
+
     // The three resources FSR3 emits for downstream effects. Required by the
     // dispatch even when nothing downstream consumes them.
     VkImage                     shared[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };

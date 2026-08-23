@@ -157,8 +157,20 @@ Write-Host "  xpfsr_spv.h: $($fwords.Count) words"
 $ffxSdk = Join-Path $root "third_party\FidelityFX-SDK"
 $ffxObj = Join-Path $root "build\ffx_obj"
 $haveFfx = Test-Path (Join-Path $ffxSdk "sdk\src\backends\vk\ffx_vk.cpp")
-if ($haveFfx -and -not (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
-    Write-Host "Building FidelityFX (once)..."
+# ---- REBUILD WHEN THE SOURCE LIST GROWS, NOT ONLY WHEN ffx_vk.o IS ABSENT.
+#
+# This used to gate on ffx_vk.o alone, so the block ran exactly once ever.
+# Adding a source then did nothing at all: the new .cpp was never compiled,
+# the link failed on a symbol from a file that had never been built, and the
+# build still printed "Done" for everything up to the link. That cost two
+# rebuild cycles to spot, because a stale object directory looks identical to
+# a correct one.
+#
+# The block now always runs, and the per-file check in the loop below
+# skips anything whose object is already newer than its source - so adding
+# a source compiles it, and an unchanged tree costs nothing.
+if ($haveFfx) {
+    Write-Host "Building FidelityFX..."
     New-Item -ItemType Directory -Force $ffxObj | Out-Null
     # ---- FFX'S DIRECT VULKAN CALLS, REDIRECTED BY NAME.
     #
@@ -183,7 +195,70 @@ if ($haveFfx -and -not (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
         "-DvkGetPhysicalDeviceMemoryProperties=mvFfxGetPhysicalDeviceMemoryProperties",
         "-DvkGetPhysicalDeviceFeatures=mvFfxGetPhysicalDeviceFeatures",
         "-DvkGetDeviceProcAddr=mvFfxGetDeviceProcAddr",
-        "-DvkCreateBuffer=mvFfxCreateBuffer")
+        "-DvkCreateBuffer=mvFfxCreateBuffer",
+        # ---- THE FRAME-INTERPOLATION SWAPCHAIN'S DIRECT CALLS.
+        #
+        # Redirected to ffx_fg_shim.cpp, which forwards DOWN the dispatch
+        # chain. Several of these are entry points this layer HOOKS, so
+        # resolving them from the loader would recurse into us - see the
+        # note at the top of that file.
+        "-DvkAcquireNextImageKHR=mvFfx_vkAcquireNextImageKHR",
+        "-DvkAllocateCommandBuffers=mvFfx_vkAllocateCommandBuffers",
+        "-DvkAllocateDescriptorSets=mvFfx_vkAllocateDescriptorSets",
+        "-DvkAllocateMemory=mvFfx_vkAllocateMemory",
+        "-DvkBeginCommandBuffer=mvFfx_vkBeginCommandBuffer",
+        "-DvkBindImageMemory=mvFfx_vkBindImageMemory",
+        "-DvkCmdBeginRenderPass=mvFfx_vkCmdBeginRenderPass",
+        "-DvkCmdBindDescriptorSets=mvFfx_vkCmdBindDescriptorSets",
+        "-DvkCmdBindPipeline=mvFfx_vkCmdBindPipeline",
+        "-DvkCmdCopyImage=mvFfx_vkCmdCopyImage",
+        "-DvkCmdDraw=mvFfx_vkCmdDraw",
+        "-DvkCmdEndRenderPass=mvFfx_vkCmdEndRenderPass",
+        "-DvkCmdPipelineBarrier=mvFfx_vkCmdPipelineBarrier",
+        "-DvkCmdPushConstants=mvFfx_vkCmdPushConstants",
+        "-DvkCmdSetScissor=mvFfx_vkCmdSetScissor",
+        "-DvkCmdSetViewport=mvFfx_vkCmdSetViewport",
+        "-DvkCreateCommandPool=mvFfx_vkCreateCommandPool",
+        "-DvkCreateDescriptorPool=mvFfx_vkCreateDescriptorPool",
+        "-DvkCreateDescriptorSetLayout=mvFfx_vkCreateDescriptorSetLayout",
+        "-DvkCreateFramebuffer=mvFfx_vkCreateFramebuffer",
+        "-DvkCreateGraphicsPipelines=mvFfx_vkCreateGraphicsPipelines",
+        "-DvkCreateImage=mvFfx_vkCreateImage",
+        "-DvkCreateImageView=mvFfx_vkCreateImageView",
+        "-DvkCreatePipelineLayout=mvFfx_vkCreatePipelineLayout",
+        "-DvkCreateRenderPass=mvFfx_vkCreateRenderPass",
+        "-DvkCreateSemaphore=mvFfx_vkCreateSemaphore",
+        "-DvkCreateShaderModule=mvFfx_vkCreateShaderModule",
+        "-DvkCreateSwapchainKHR=mvFfx_vkCreateSwapchainKHR",
+        "-DvkDestroyCommandPool=mvFfx_vkDestroyCommandPool",
+        "-DvkDestroyDescriptorPool=mvFfx_vkDestroyDescriptorPool",
+        "-DvkDestroyDescriptorSetLayout=mvFfx_vkDestroyDescriptorSetLayout",
+        "-DvkDestroyFramebuffer=mvFfx_vkDestroyFramebuffer",
+        "-DvkDestroyImage=mvFfx_vkDestroyImage",
+        "-DvkDestroyImageView=mvFfx_vkDestroyImageView",
+        "-DvkDestroyPipeline=mvFfx_vkDestroyPipeline",
+        "-DvkDestroyPipelineLayout=mvFfx_vkDestroyPipelineLayout",
+        "-DvkDestroyRenderPass=mvFfx_vkDestroyRenderPass",
+        "-DvkDestroySemaphore=mvFfx_vkDestroySemaphore",
+        "-DvkDestroyShaderModule=mvFfx_vkDestroyShaderModule",
+        "-DvkDestroySwapchainKHR=mvFfx_vkDestroySwapchainKHR",
+        "-DvkDeviceWaitIdle=mvFfx_vkDeviceWaitIdle",
+        "-DvkEndCommandBuffer=mvFfx_vkEndCommandBuffer",
+        "-DvkFreeCommandBuffers=mvFfx_vkFreeCommandBuffers",
+        "-DvkFreeDescriptorSets=mvFfx_vkFreeDescriptorSets",
+        "-DvkFreeMemory=mvFfx_vkFreeMemory",
+        "-DvkGetImageMemoryRequirements=mvFfx_vkGetImageMemoryRequirements",
+        "-DvkGetPhysicalDeviceQueueFamilyProperties=mvFfx_vkGetPhysicalDeviceQueueFamilyProperties",
+        "-DvkGetPhysicalDeviceSurfaceSupportKHR=mvFfx_vkGetPhysicalDeviceSurfaceSupportKHR",
+        "-DvkGetSemaphoreCounterValue=mvFfx_vkGetSemaphoreCounterValue",
+        "-DvkGetSwapchainImagesKHR=mvFfx_vkGetSwapchainImagesKHR",
+        "-DvkQueuePresentKHR=mvFfx_vkQueuePresentKHR",
+        "-DvkQueueSubmit=mvFfx_vkQueueSubmit",
+        "-DvkQueueWaitIdle=mvFfx_vkQueueWaitIdle",
+        "-DvkResetCommandBuffer=mvFfx_vkResetCommandBuffer",
+        "-DvkResetCommandPool=mvFfx_vkResetCommandPool",
+        "-DvkUpdateDescriptorSets=mvFfx_vkUpdateDescriptorSets",
+        "-DvkWaitSemaphores=mvFfx_vkWaitSemaphores")
     $ffxInc = @(
         "-I$ffxSdk\sdk\include", "-I$ffxSdk\sdk\src\backends\vk",
         "-I$ffxSdk\sdk\src\backends\shared",
@@ -200,14 +275,48 @@ if ($haveFfx -and -not (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
         "$ffxSdk\sdk\src\shared\ffx_breadcrumbs_list.cpp",
         "$ffxSdk\sdk\src\shared\ffx_message.cpp",
         "$ffxSdk\sdk\src\shared\ffx_object_management.cpp",
-        "$src\vklayer\ffx_fg_stub.cpp",
-        "$src\vklayer\ffx_vk_shim.cpp")
+        # ---- FRAME GENERATION. The stub these replace is gone.
+        #
+        # ffx_fg_stub.cpp existed because FrameInterpolationSwapchainVK.cpp did
+        # not compile under GCC - it relied on MSVC accepting two things ISO C++
+        # forbids: a static_cast from void* to a function pointer, and binding a
+        # temporary to a non-const lvalue reference. Both are fixed in the
+        # vendored source now, so the real implementation builds and the stub
+        # would be a duplicate symbol.
+        #
+        # Those SDK edits are NOT in git - third_party is ignored - so they
+        # travel with the tree and must be re-applied to a fresh checkout.
+        "$ffxSdk\sdk\src\backends\vk\FrameInterpolationSwapchain\FrameInterpolationSwapchainVK.cpp",
+        "$ffxSdk\sdk\src\backends\vk\FrameInterpolationSwapchain\FrameInterpolationSwapchainVK_Helpers.cpp",
+        "$ffxSdk\sdk\src\backends\vk\FrameInterpolationSwapchain\FrameInterpolationSwapchainVK_UiComposition.cpp",
+        "$ffxSdk\sdk\src\backends\vk\FrameInterpolationSwapchain\FrameInterpolationSwapchainVK_DebugPacing.cpp",
+        "$ffxSdk\sdk\src\components\frameinterpolation\ffx_frameinterpolation.cpp",
+        "$ffxSdk\sdk\src\components\opticalflow\ffx_opticalflow.cpp",
+        "$ffxSdk\sdk\src\backends\shared\blob_accessors\ffx_frameinterpolation_shaderblobs.cpp",
+        "$ffxSdk\sdk\src\backends\shared\blob_accessors\ffx_opticalflow_shaderblobs.cpp",
+        "$src\vklayer\ffx_vk_shim.cpp",
+        "$src\vklayer\ffx_fg_shim.cpp")
     foreach ($f in $ffxSrc) {
         if (-not (Test-Path $f)) { continue }
         $o = Join-Path $ffxObj ((Split-Path $f -Leaf) -replace '\.cpp$', '.o')
+        # ---- WARNINGS ARE SILENCED FOR VENDORED FFX SOURCES (-w ABOVE).
+        #
+        # Not cosmetic: PowerShell 5.1 turns anything a native tool writes to
+        # stderr into a NativeCommandError and aborts the script, so a plain
+        # warning stops the build midway - leaving a half-populated object
+        # directory that then fails at link with "undefined reference" to a
+        # file that was never compiled. Two separate warnings in AMD's source
+        # did exactly that here ('#pragma once' in a main file, and a string
+        # constant to wchar_t*). We do not own this code and are not going to
+        # fix its warnings, so they are turned off rather than enumerated.
+        # Our OWN sources are compiled elsewhere and keep their warnings.
+        # Up to date? Skip it. ffx_fsr3upscaler_shaderblobs.cpp alone is 3.4 MB
+        # of object and dominates this stage, so rebuilding it every time would
+        # make the correct gate above cost more than the bug it fixes.
+        if ((Test-Path $o) -and ((Get-Item $o).LastWriteTime -gt (Get-Item $f).LastWriteTime)) { continue }
         & g++ -c -O2 -std=c++17 -include new -include cmath -include cstring `
             -include cwchar -include cstdio $ffxInc `
-            -DFFX_VK=1 -DFFX_FSR3UPSCALER -DWIN32 "-Dswprintf_s=_snwprintf" `
+            -w -DFFX_VK=1 -DFFX_FSR3UPSCALER -DFFX_FRAMEINTERPOLATION -DFFX_OPTICALFLOW -DWIN32 "-Dswprintf_s=_snwprintf" `
             @ffxRename `
             $f -o $o
         if ($LASTEXITCODE -ne 0) { throw "FidelityFX: $(Split-Path $f -Leaf) failed to compile" }
@@ -426,6 +535,25 @@ $xp  = Split-Path $root -Parent
 $dst = Join-Path $xp "Resources\plugins\MotionVectors\64"
 New-Item -ItemType Directory -Force $dst | Out-Null
 Copy-Item "$out\MotionVectors.xpl" (Join-Path $dst "win.xpl") -Force
+
+# ---- THE PANEL IS PART OF THE BUILD. IT WAS NOT, AND THAT COST A DEBUG CYCLE.
+#
+# build.ps1 installed the .xpl and nothing else, so every edit to the FlyWithLua
+# panel sat in the repo while the sim kept loading whatever copy happened to be
+# in Scripts\. That failed silently in the worst way: the panel LOOKED current,
+# the build said "Done", and a freshly added button did nothing at all - which
+# reads as a broken feature rather than as a stale file.
+#
+# Same failure mode as the .xpl lock this script already guards: the build
+# succeeds, the sim runs something else. Copying it here means "built" and
+# "installed" cannot drift apart again.
+$luaDst = Join-Path $xp "Resources\plugins\FlyWithLua\Scripts"
+if (Test-Path $luaDst) {
+    Copy-Item "$root\lua\MotionVectors.lua" (Join-Path $luaDst "MotionVectors.lua") -Force
+    Write-Host "  panel -> FlyWithLua\Scripts\MotionVectors.lua"
+} else {
+    Write-Host "  FlyWithLua Scripts folder not found - panel NOT installed" -ForegroundColor Yellow
+}
 
 
 # ---- THE INSTALLER, BUILT FROM THE SAME TREE AS THE BINARIES.

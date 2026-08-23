@@ -201,6 +201,12 @@ struct TaaPush {
     float   movedDead;
     float   alphaMoving;
     float   alphaMovingPx;
+    // Unsharp strength applied to the CURRENT sample only - never to the
+    // stored result, which would compound. See sharpenCurrent in taa.comp.
+    float   sharpen;
+    // Weight forced on transparent-covered pixels. 1.0 = the original
+    // all-or-nothing mask; lower lets them still accumulate. See taa.comp.
+    float   reactiveAlpha;
 };
 
 enum {
@@ -211,6 +217,7 @@ enum {
     kTaaFlagNoUnjitter    = 1 << 4,
     kTaaFlagCatmull       = 1 << 5,
     kTaaFlagNoVecByVel    = 1 << 6,
+    kTaaFlagCrUnjitter    = 1 << 7,
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -301,6 +308,21 @@ static bool taaReactive() { return live::onoff("taa.reactive", "TAA_REACTIVE", f
 // The unjitter alignment - isolation knob for the aligned sampling, so its
 // contribution can be removed live without touching the jitter itself.
 static bool taaUnjitter() { return live::onoff("taa.unjitter", nullptr, true); }
+// ---- THE TWO KNOBS THAT ANSWER "TAA ON IS SOFTER THAN TAA OFF".
+//
+// taa.cr_unjitter resamples the current frame's unjitter fetch with
+// Catmull-Rom instead of bilinear. This is not a preference: the bilinear
+// fetch at uv + S is a low-pass filter that runs on EVERY frame, parked
+// included, and history accumulates its output - so it is baked into the
+// converged image. Default ON for the same reason taa.hist_catmull is.
+//
+// taa.sharpen puts back what the resample cannot recover. Default 0.35: enough
+// to read as sharper than TAA-off on text and panel edges, well below where
+// the limiter in sharpenCurrent starts clipping on ordinary content. 0 turns
+// the pass off entirely rather than sharpening by zero.
+static bool  taaCrUnjitter() { return live::onoff("taa.cr_unjitter", nullptr, true); }
+static float taaSharpen()    { return live::f("taa.sharpen", "TAA_SHARPEN", 0.35f); }
+static float taaReactiveAlpha() { return live::f("taa.reactive_alpha", nullptr, 1.0f); }
 static bool taaFreezeHistory() { return live::onoff("taa.freeze_history", nullptr, false); }
 static bool taaNoMotion()      { return live::onoff("taa.no_motion",      nullptr, false); }
 static bool taaNoAccum()       { return live::onoff("taa.no_accum",       nullptr, false); }
@@ -1157,12 +1179,15 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.movedDead = taaMovedDead();
     pcv.alphaMoving = taaAlphaMoving();
     pcv.alphaMovingPx = taaAlphaMovingPx();
+    pcv.sharpen  = taaSharpen();
+    pcv.reactiveAlpha = taaReactiveAlpha();
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
                  | (taaReactive()      ? kTaaFlagReactive      : 0)
                  | (taaUnjitter()      ? 0 : kTaaFlagNoUnjitter)
                  | (taaCatmull()       ? kTaaFlagCatmull       : 0)
+                 | (taaCrUnjitter()    ? kTaaFlagCrUnjitter    : 0)
                  | (live::onoff("taa.novec_by_vel", nullptr, false)
                         ? kTaaFlagNoVecByVel : 0);
     pcv.velScale = taaVelScale();

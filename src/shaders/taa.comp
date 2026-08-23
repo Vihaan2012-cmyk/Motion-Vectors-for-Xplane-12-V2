@@ -158,6 +158,25 @@ layout(push_constant) uniform Params {
     float movedDead;    // deadband on the clamp correction, in units of floorS
     float alphaMoving;  // blend weight while the camera is moving
     float alphaMovingPx;// px/frame at which alphaMoving is fully applied
+    // ---- HOW MUCH OF THE UNJITTER'S SOFTNESS TO PUT BACK.
+    //
+    // 0 disables the pass entirely - not "sharpen by zero", the branch is
+    // taken and the taps are never fetched. See sharpenCurrent.
+    float sharpen;
+    // ---- HOW HARD THE REACTIVE MASK PUSHES. 1.0 IS ALL-OR-NOTHING.
+    //
+    // The mask exists to stop transparent geometry reprojecting what is behind
+    // it, and pinning the weight to 1.0 does that - but 1.0 also means those
+    // pixels NEVER accumulate, so they never antialias either. On glass that is
+    // the right trade. On water it is not: water is alpha-blended too, so the
+    // mask catches it, and X-Plane's sun glitter on the waves is exactly the
+    // high-frequency content temporal accumulation existed to average. Hard-on,
+    // the glitter shows raw every frame and reads as dense stipple.
+    //
+    // A weight between the base alpha and 1.0 keeps the anti-smear property -
+    // history is trusted much less than normal - while still letting the
+    // surface converge. 1.0 reproduces the binary behaviour exactly.
+    float reactiveAlpha;
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -169,6 +188,9 @@ const int FLAG_CATMULL        = 32;  // sharp history resampling; see the
                                      // note at sampleHistory
 const int FLAG_NOVEC_BY_VEL   = 64;  // legacy: pick unwritten pixels by
                                      // vel==0 instead of by coverage  // sample the raster raw - isolation only
+const int FLAG_CR_UNJITTER    = 128; // fetch the CURRENT frame's unjittered
+                                     // sample with Catmull-Rom instead of
+                                     // bilinear; see sampleSceneCR
 
 const int VIZ_OFF       = 0;
 const int VIZ_MOTION    = 1;   // direction as colour
@@ -333,6 +355,114 @@ vec3 sampleHistory(vec2 uv, float layer, vec2 tsz)
     r += texture(uHistorySampler, vec3(p3.x,  p3.y,  layer)).rgb * (w3.x  * w3.y);
 
     return max(r, vec3(0.0));
+}
+
+// ---- THE OTHER BILINEAR FETCH, WHICH WENT UNCOUNTED.
+//
+// The note above indicts bilinear for softening HISTORY, and fixes it. It
+// leaves the identical fetch on the CURRENT frame alone, on the argument
+// recorded at the callsite: "Bilinear, so it costs half a texel of softness at
+// most." That accounting is wrong in two ways.
+//
+// First, the offset is not incidental. The unjitter fetch is at uv + S with S
+// a sub-texel jitter that is DELIBERATELY non-zero and DELIBERATELY different
+// every frame - so unlike the history fetch, which is an identity while parked,
+// this one is a low-pass filter on EVERY frame including a parked one. That is
+// why TAA reads as softer than TAA-off even with the camera stopped, which no
+// amount of history tuning could ever explain.
+//
+// Second, "at most half a texel" is the per-frame figure and the loss does not
+// stay per-frame. currA is what history accumulates; at alpha 0.05 the steady
+// state is a running mean of twenty already-softened samples, so the filter is
+// baked into the converged image rather than averaged out of it.
+//
+// The fix is the fix that already worked once: a bicubic with negative lobes
+// resamples by a sub-texel offset while preserving the frequencies bilinear
+// removes. Same nine taps, same weights, against uScene instead of the history.
+//
+// GLSL will not let the sampler be a parameter without duplicating the call
+// site conditions, so this is sampleHistory's body with one binding changed.
+// The duplication is deliberate: the two have different failure modes and
+// merging them would put a branch in the inner loop of both.
+vec3 sampleSceneCR(vec2 uv, float layer, vec2 tsz)
+{
+    vec2 samplePos = uv * tsz;
+    vec2 texPos1   = floor(samplePos - 0.5) + 0.5;
+    vec2 f         = samplePos - texPos1;
+
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    vec2 w12      = w1 + w2;
+    vec2 offset12 = w2 / max(w12, vec2(1e-6));
+
+    vec2 p0  = (texPos1 - 1.0)      / tsz;
+    vec2 p3  = (texPos1 + 2.0)      / tsz;
+    vec2 p12 = (texPos1 + offset12) / tsz;
+
+    vec3 r = vec3(0.0);
+    r += texture(uScene, vec3(p0.x,  p0.y,  layer)).rgb * (w0.x  * w0.y);
+    r += texture(uScene, vec3(p12.x, p0.y,  layer)).rgb * (w12.x * w0.y);
+    r += texture(uScene, vec3(p3.x,  p0.y,  layer)).rgb * (w3.x  * w0.y);
+
+    r += texture(uScene, vec3(p0.x,  p12.y, layer)).rgb * (w0.x  * w12.y);
+    r += texture(uScene, vec3(p12.x, p12.y, layer)).rgb * (w12.x * w12.y);
+    r += texture(uScene, vec3(p3.x,  p12.y, layer)).rgb * (w3.x  * w12.y);
+
+    r += texture(uScene, vec3(p0.x,  p3.y,  layer)).rgb * (w0.x  * w3.y);
+    r += texture(uScene, vec3(p12.x, p3.y,  layer)).rgb * (w12.x * w3.y);
+    r += texture(uScene, vec3(p3.x,  p3.y,  layer)).rgb * (w3.x  * w3.y);
+
+    return max(r, vec3(0.0));
+}
+
+// ---- SHARPENING BELONGS ON THE CURRENT SAMPLE, NOT ON THE OUTPUT.
+//
+// This dispatch writes ONE image, uHistory, and the layer copies that into the
+// scene target with vkCmdCopyImage - there is no shader stage between history
+// and the screen to sharpen in. So the choice is to sharpen what goes INTO
+// history or nothing at all, and the two are not equivalent:
+//
+//   sharpening the STORED result compounds. Frame N sharpens a value that was
+//   already sharpened on frame N-1, N-2, ... and at alpha 0.05 that is twenty
+//   applications of the kernel. It ends in ringing and haloing that no strength
+//   setting avoids, because the strength multiplies twenty times over.
+//
+//   sharpening the CURRENT SAMPLE does not. out = mix(hist, sharp(curr), a) has
+//   the steady state sharp(curr) filtered temporally - the kernel is applied
+//   exactly once to each sample, and history is a mean of singly-sharpened
+//   values. This is the same place UE's accumulation filter puts its sharpen,
+//   and for the same reason.
+//
+// The kernel is a five-tap cross unsharp, and the result is CLAMPED to the span
+// of the taps that formed it. That clamp is what separates this from a naive
+// unsharp mask: the negative lobe cannot overshoot past the darkest neighbour
+// or undershoot past the brightest, so a high-contrast edge gains contrast
+// without gaining a halo, and a firefly cannot be manufactured out of a
+// gradient. It is RCAS' limiter, arrived at the same way and for the same
+// reason - and it is why the strength can be opened up without the image
+// falling apart.
+//
+// The taps are taken at uv, i.e. at the ALREADY-UNJITTERED position, so this
+// measures the local contrast of the geometry rather than of the jitter.
+vec3 sharpenCurrent(vec3 c, vec2 uv, float layer, vec2 invSz)
+{
+    vec3 l = texture(uScene, vec3(uv - vec2(invSz.x, 0.0), layer)).rgb;
+    vec3 r = texture(uScene, vec3(uv + vec2(invSz.x, 0.0), layer)).rgb;
+    vec3 u = texture(uScene, vec3(uv - vec2(0.0, invSz.y), layer)).rgb;
+    vec3 d = texture(uScene, vec3(uv + vec2(0.0, invSz.y), layer)).rgb;
+
+    vec3 blur = (l + r + u + d) * 0.25;
+    vec3 s    = c + (c - blur) * pc.sharpen;
+
+    // The limiter. min/max over the cross INCLUDING the centre, so a pixel that
+    // is already the local extreme is free to keep its value and everything
+    // else is bounded by real neighbouring colour.
+    vec3 lo = min(min(min(l, r), min(u, d)), c);
+    vec3 hi = max(max(max(l, r), max(u, d)), c);
+    return clamp(s, lo, hi);
 }
 
 void main()
@@ -596,13 +726,22 @@ void main()
         return;
     }
 
-    // The aligned read of the current frame. Bilinear, so it costs half a
-    // texel of softness at most - the alternative is the displacement itself
-    // reaching the screen. Everything below that consumes "the current frame"
-    // as a colour consumes this; the raster-space statistics loop keeps its
-    // texelFetches because a box built from the actual raster is still the
-    // right box, S being well under one texel.
-    vec3 currA = texture(uScene, vec3(uv + S, float(layer))).rgb;
+    // The aligned read of the current frame. Everything below that consumes
+    // "the current frame" as a colour consumes this; the raster-space
+    // statistics loop keeps its texelFetches because a box built from the
+    // actual raster is still the right box, S being well under one texel.
+    //
+    // The filter is no longer bilinear by default - see sampleSceneCR for why
+    // "half a texel of softness at most" was the wrong way to account for it.
+    vec3 currA = (pc.flags & FLAG_CR_UNJITTER) != 0
+               ? sampleSceneCR(uv + S, float(layer), vec2(size))
+               : texture(uScene, vec3(uv + S, float(layer))).rgb;
+
+    // Put back what the resample could not preserve. Applied here, to the
+    // current sample, so it is applied exactly once per sample rather than
+    // once per frame of history.
+    if (pc.sharpen > 0.001)
+        currA = sharpenCurrent(currA, uv + S, float(layer), pc.invSize);
 
     if (pc.reset != 0 || !valid || noVector) {
         imageStore(uHistory, ivec3(px, layer), vec4(currA, 1.0));
@@ -912,7 +1051,8 @@ void main()
     // `unwritten` already identifies exactly those pixels, by the sentinel
     // rather than by inference. Where nothing wrote a vector, nothing wrote a
     // coverage either, and the mask has no evidence to act on.
-    if ((pc.flags & FLAG_REACTIVE) != 0 && !unwritten && covMax < 0.5) a = 1.0;
+    if ((pc.flags & FLAG_REACTIVE) != 0 && !unwritten && covMax < 0.5)
+        a = max(a, pc.reactiveAlpha);
 
     // How far the clamp had to move history, in standard deviations. Edges under
     // motion should light up and flat interiors should stay black; a frame that

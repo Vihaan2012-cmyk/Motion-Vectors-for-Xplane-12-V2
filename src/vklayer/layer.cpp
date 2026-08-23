@@ -394,6 +394,9 @@ static PFN_vkGetPhysicalDeviceMemoryProperties g_getPhysMemProps = nullptr;
 static PFN_vkGetPhysicalDeviceQueueFamilyProperties g_getPhysQueueFamProps = nullptr;
 // Needed for minUniformBufferOffsetAlignment, which sets the UBO ring stride.
 static PFN_vkGetPhysicalDeviceProperties       g_getPhysProps    = nullptr;
+// Bound once from the application's instance - see mvFfxInstanceProc.
+static VkInstance                              g_appInstance     = VK_NULL_HANDLE;
+static PFN_vkGetInstanceProcAddr               g_appGipa         = nullptr;
 static bool g_availReported = false;
 
 // ---------------------------------------------------------------- VRAM survey
@@ -428,6 +431,7 @@ static PFN_vkGetPhysicalDeviceFeatures    g_getPhysFeat   = nullptr;
 // context, and taking g_lock there deadlocked against a caller that already
 // held it.
 static VkDevice                g_ffxDevice = VK_NULL_HANDLE;
+static VkPhysicalDevice        g_ffxPhys   = VK_NULL_HANDLE;
 static PFN_vkGetDeviceProcAddr g_ffxGdpa   = nullptr;
 
 extern "C" PFN_vkEnumerateDeviceExtensionProperties mvNextEnumDeviceExtensionProperties()
@@ -442,6 +446,41 @@ extern "C" PFN_vkGetPhysicalDeviceMemoryProperties mvNextGetPhysicalDeviceMemory
 { return g_getPhysMemProps; }
 extern "C" PFN_vkGetPhysicalDeviceFeatures mvNextGetPhysicalDeviceFeatures()
 { return g_getPhysFeat; }
+
+// ---- ONE RESOLVER FOR THE FRAME-INTERPOLATION SWAPCHAIN'S 56 DIRECT CALLS.
+//
+// FrameInterpolationSwapchainVK.cpp is a standalone swapchain implementation,
+// not a user of the FFX backend interface, so it calls Vulkan by NAME rather
+// than through the proc-addr it was handed - 56 entry points, including
+// vkCreateSwapchainKHR, vkQueuePresentKHR and vkDestroyImage, all of which THIS
+// LAYER HOOKS. Linking the loader's import library to satisfy them would send
+// every one of those back in at the TOP of the dispatch chain and straight into
+// our own hooks: unbounded recursion, which is the exact failure ffx_vk_shim.cpp
+// was written to document and avoid.
+//
+// So they are renamed at compile time and answered here, continuing DOWN the
+// chain like every other forward in this layer.
+//
+// A single pair of globals is enough. FFX builds its context for exactly one
+// device (g_ffxDevice), so a device function resolved from it is correct for
+// every queue and command buffer derived from it - which is what lets one
+// resolver serve calls whose first argument is a VkDevice, a VkQueue or a
+// VkCommandBuffer without a dispatch-key lookup.
+extern "C" PFN_vkVoidFunction mvFfxDeviceProc(const char *name)
+{
+    if (g_ffxDevice == VK_NULL_HANDLE || !g_ffxGdpa) return nullptr;
+    return g_ffxGdpa(g_ffxDevice, name);
+}
+
+// The instance half. Bound from the APPLICATION's instance in the same block
+// as the other physical-device getters, and for the same reason recorded
+// there: one resolved from a probe instance and called with the application's
+// physical device is answered by __fastfail, not by an error.
+extern "C" PFN_vkVoidFunction mvFfxInstanceProc(const char *name)
+{
+    if (g_appInstance == VK_NULL_HANDLE || !g_appGipa) return nullptr;
+    return g_appGipa(g_appInstance, name);
+}
 
 // Device functions, resolved through the NEXT layer for the device in question.
 // Defined after g_devices below; declared here so the shim can bind to it.
@@ -1171,6 +1210,24 @@ static PFN_vkBindImageMemory2  g_nextBindImageMemory2  = nullptr;
 static PFN_vkBindBufferMemory  g_nextBindBufferMemory  = nullptr;
 static PFN_vkBindBufferMemory2 g_nextBindBufferMemory2 = nullptr;
 static PFN_vkGetDeviceQueue    g_nextGetDeviceQueue    = nullptr;
+
+// ---- WHO OWNS WHICH QUEUE. FRAME GENERATION CANNOT GUESS THIS.
+//
+// FFX's present queue "cannot be used by the engine. Otherwise, some deadlock
+// can occur" - its words. So handing it a queue X-Plane also submits on is not
+// a performance question, it is a hang. The only way to be sure is to record
+// what the sim actually takes and pick from what is left.
+//
+// g_fgRaised is what the device-creation block above added, per family: X-Plane
+// asked for `orig` queues and we created `total`, so indices [orig, total) exist
+// because of us and the sim does not know about them. g_xpTook is belt and
+// braces - the indices the sim really retrieved - because a queue it never asks
+// for is free whatever the counts say, and one it does ask for is not.
+struct FgRaise { uint32_t orig; uint32_t total; };
+static std::map<uint32_t, FgRaise> g_fgRaised;
+static std::set<uint64_t>          g_xpTook;      // family << 32 | index
+static inline uint64_t queueKey(uint32_t fam, uint32_t idx)
+{ return ((uint64_t)fam << 32) | idx; }
 static PFN_vkWaitForFences     g_nextWaitForFences     = nullptr;
 static PFN_vkGetFenceStatus    g_nextGetFenceStatus    = nullptr;
 static PFN_vkResetFences       g_nextResetFences       = nullptr;
@@ -1293,7 +1350,12 @@ static VKAPI_ATTR void VKAPI_CALL Vram_GetDeviceQueue(
 {
     if (!g_nextGetDeviceQueue) return;
     g_nextGetDeviceQueue(device, family, index, out);
-    if (out && *out) vram::noteQueue(family, *out);
+    if (out && *out) {
+        vram::noteQueue(family, *out);
+        // The sim owns this one. See g_xpTook.
+        std::lock_guard<std::mutex> g(g_lock);
+        g_xpTook.insert(queueKey(family, index));
+    }
 }
 
 // Every wait path releases held submissions first - the deadlock-proofing.
@@ -1468,6 +1530,112 @@ static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "xpfsr_spv.h"
 #include "fsr_probe.h"
 #include "depth_copy.h"
+// ---- PICKING THE FOUR QUEUES FRAME INTERPOLATION NEEDS.
+//
+// FFX states the constraints and they are not all performance advice:
+//
+//   game queue     graphics + compute. MAY be shared with the engine.
+//   present queue  needs present support, and CANNOT be used by the engine -
+//                  "otherwise, some deadlock can occur". This one is a hang,
+//                  not a slowdown.
+//   image acquire  no capability needed; sharing the engine's queue delays the
+//                  acquire semaphore and costs frames.
+//   async compute  optional, compute capability.
+//
+// So the game queue is X-Plane's - sharing is explicitly allowed and it avoids
+// a queue-family ownership transfer on the colour buffer every frame. The other
+// three come from the indices the device-creation block added, which the sim
+// does not know exist and therefore cannot submit on.
+//
+// Returns false rather than improvising if the spare queues are not there. A
+// present queue shared with the engine is a deadlock, and a deadlock at present
+// is a hung sim with no message - exactly the failure this file keeps having to
+// diagnose after the fact.
+struct FgQueues {
+    VkQueue  game = VK_NULL_HANDLE, present = VK_NULL_HANDLE;
+    VkQueue  acquire = VK_NULL_HANDLE, asyncCompute = VK_NULL_HANDLE;
+    uint32_t gameFam = 0, presentFam = 0, acquireFam = 0, asyncFam = 0;
+    bool     ok = false;
+};
+
+static FgQueues fgPickQueues(VkDevice device, VkPhysicalDevice phys,
+                             VkSurfaceKHR surface)
+{
+    FgQueues q;
+    if (!device || !phys || g_fgRaised.empty()) {
+        trace("FG QUEUES: nothing was raised at device creation - frame "
+              "generation has no queue of its own to present on.");
+        return q;
+    }
+    PFN_vkGetDeviceQueue getQ =
+        (PFN_vkGetDeviceQueue)mvFfxDeviceProc("vkGetDeviceQueue");
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR surfSup =
+        (PFN_vkGetPhysicalDeviceSurfaceSupportKHR)
+            mvFfxInstanceProc("vkGetPhysicalDeviceSurfaceSupportKHR");
+    if (!getQ) return q;
+
+    uint32_t famCount = 0;
+    if (g_getPhysQueueFamProps) g_getPhysQueueFamProps(phys, &famCount, nullptr);
+    std::vector<VkQueueFamilyProperties> fams(famCount ? famCount : 1);
+    if (famCount && g_getPhysQueueFamProps)
+        g_getPhysQueueFamProps(phys, &famCount, fams.data());
+
+    // The engine's graphics+compute queue, shared deliberately.
+    for (std::map<uint32_t, FgRaise>::iterator it = g_fgRaised.begin();
+         it != g_fgRaised.end() && !q.game; ++it) {
+        if (it->first >= famCount) continue;
+        const VkQueueFlags f = fams[it->first].queueFlags;
+        if ((f & VK_QUEUE_GRAPHICS_BIT) && (f & VK_QUEUE_COMPUTE_BIT)) {
+            getQ(device, it->first, 0, &q.game);
+            q.gameFam = it->first;
+        }
+    }
+
+    // Spare indices, in the order FFX cares about them most.
+    struct Slot { VkQueue *out; uint32_t *fam; bool needPresent; bool needCompute; };
+    Slot slots[3] = {
+        { &q.present,      &q.presentFam, true,  false },
+        { &q.acquire,      &q.acquireFam, false, false },
+        { &q.asyncCompute, &q.asyncFam,   false, true  },
+    };
+    for (int si = 0; si < 3; ++si) {
+        for (std::map<uint32_t, FgRaise>::iterator it = g_fgRaised.begin();
+             it != g_fgRaised.end() && !*slots[si].out; ++it) {
+            const uint32_t fam = it->first;
+            if (fam >= famCount) continue;
+            if (slots[si].needCompute &&
+                !(fams[fam].queueFlags & VK_QUEUE_COMPUTE_BIT)) continue;
+            if (slots[si].needPresent && surfSup && surface) {
+                VkBool32 sup = VK_FALSE;
+                if (surfSup(phys, fam, surface, &sup) != VK_SUCCESS || !sup)
+                    continue;
+            }
+            // Only indices WE added, and only ones the sim never retrieved.
+            for (uint32_t idx = it->second.orig; idx < it->second.total; ++idx) {
+                if (g_xpTook.count(queueKey(fam, idx))) continue;
+                VkQueue cand = VK_NULL_HANDLE;
+                getQ(device, fam, idx, &cand);
+                if (!cand) continue;
+                bool dup = false;
+                for (int k = 0; k < si; ++k) if (*slots[k].out == cand) dup = true;
+                if (dup) continue;
+                *slots[si].out = cand;
+                *slots[si].fam = fam;
+                trace("FG QUEUES: slot %d -> family %u index %u", si, fam, idx);
+                break;
+            }
+        }
+    }
+
+    q.ok = (q.game && q.present && q.acquire);
+    if (!q.ok)
+        trace("FG QUEUES: incomplete (game=%d present=%d acquire=%d) - frame "
+              "generation stays off rather than sharing the engine's present "
+              "queue, which FFX documents as a deadlock.",
+              q.game ? 1 : 0, q.present ? 1 : 0, q.acquire ? 1 : 0);
+    return q;
+}
+
 #include "fsr3_backend_impl.h"
 
 // Defined with the probe below; called from the present path, which comes
@@ -3171,6 +3339,39 @@ static std::vector<DeferredImgKill> g_deferredImgKills;
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
     VkDevice device, VkImage img, const VkAllocationCallbacks *alloc)
 {
+    // ---- A NULL HANDLE IS NOT A DESTRUCTION. GUARD BEFORE ANY BOOKKEEPING.
+    //
+    // vkDestroyImage(device, VK_NULL_HANDLE, ...) is explicitly legal and does
+    // nothing. Every match below is written as `img == g_something`, so the
+    // moment one of those trackers is itself VK_NULL_HANDLE a null destroy
+    // satisfies it and wipes state that was never destroyed:
+    //
+    //     if (img == g_sceneColor.image) { g_sceneColor = ColorTarget();
+    //                                      g_sceneColorStable = 0; ... }
+    //     if (img == g_sceneDepth)       { g_sceneDepth = VK_NULL_HANDLE; ... }
+    //
+    // Once scene colour is null, EVERY null destroy re-runs that reset, so
+    // g_sceneColorStable can never climb to the 120 the velocity target waits
+    // for. The mod then reports spirvLive=1, depth=0, sceneImg=null,
+    // stable=1/120 forever - TAA never initialises and nothing says why.
+    //
+    // X-Plane alone rarely destroys a null image, which is why this never bit
+    // before. FFX does it constantly: its backend tears down fixed-size
+    // resource arrays without checking each slot, so enabling FSR3 turns a
+    // latent bug into a guaranteed one. That is the whole reason FSR3 "broke
+    // rendering" - it was never FSR3's output, it was our own bookkeeping
+    // being erased by its cleanup calls.
+    if (img == VK_NULL_HANDLE) {
+        PFN_vkDestroyImage nullNext = nullptr;
+        {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+            if (it != g_devices.end()) nullNext = it->second.destroyImage;
+        }
+        if (nullNext) nullNext(device, img, alloc);
+        return;
+    }
+
     // MEASURED IN THE CAPTURE: the blanket scene-sized quiesce was firing on
     // every streamed-texture destruction, so the resolve NEVER RAN - frame
     // 3595 contains no uVelocity dispatch at all - and the frames where it
@@ -3223,6 +3424,29 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
         // The scene depth buffer is recreated on resize. Holding a destroyed
         // handle and later building a view from it would be a use-after-free
         // on the GPU, which does not fail cleanly.
+        if (img == depthcopy::state().srcImage) {
+            // ---- HANDLE REUSE IS WHY THIS CANNOT BE LEFT TO ensure() ALONE.
+            //
+            // ensure() now rebuilds when it is handed a depth image that is not
+            // the one srcView was built for, which fixes the ordinary case. It
+            // compares HANDLES, though, and Vulkan is explicitly allowed to
+            // hand back an address it has just freed. A depth target destroyed
+            // and immediately recreated can land on the same VkImage value, and
+            // then `s.srcImage == depthImage` is true while srcView still
+            // refers to the freed allocation - the same use-after-free, reached
+            // by a path the comparison cannot see.
+            //
+            // Clearing srcImage HERE, at the one moment the destruction is a
+            // fact rather than an inference, makes that comparison fail no
+            // matter what address comes back. No Vulkan object is destroyed in
+            // this function: there is no device wait available inside a destroy
+            // callback, and tearing down objects the GPU may still reference is
+            // the crash this is meant to prevent. It only invalidates, and
+            // ensure() does the rebuild properly on the next frame.
+            depthcopy::state().srcImage = VK_NULL_HANDLE;
+            trace("DEPTH COPY: source depth image %p destroyed - invalidated so "
+                  "the view is rebuilt rather than read after free.", (void*)img);
+        }
         if (img == g_sceneDepth) {
             g_sceneDepth = VK_NULL_HANDLE;
             g_depthReported = false;
@@ -3232,6 +3456,45 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
             trace("DEPTH: scene depth destroyed - velocity pass will rebuild");
         }
         if (img == g_frameDepthImage) g_frameDepthImage = VK_NULL_HANDLE;
+
+        // ---- THE UPSCALE OUTPUT HAS A LIFETIME TOO, AND THE PROBE LATCHED IT.
+        //
+        // fsrprobe answers "which image is X-Plane's upscale output" by
+        // stamping a sentinel from our substituted shader and reading pixel
+        // (0,0) back off twenty candidates. It is expensive, so it latches:
+        // `resolved` goes true once and the handle is kept forever.
+        //
+        // Forever is wrong. X-Plane destroys and recreates every offscreen on a
+        // resolution change, on a render-setting change and at flight start -
+        // the same rebuild the depth and colour guards above already exist for.
+        // The probe had no such guard, so after any of those the latched handle
+        // named a destroyed image. g_colorImages no longer holds it, so the
+        // gate's `g_colorImages.find(out)` missed, ow and oh stayed 0, and
+        // ensure() refuses a zero extent - FSR3 stopped dispatching and never
+        // resumed.
+        //
+        // MEASURED, this run: TAA recovered on its own and climbed past 2400
+        // dispatches while FSR3 sat frozen at 660, with the gate reporting
+        // `render=2953x1661 out=0x0` against a stale handle. That is the whole
+        // failure, and it is silent - the mod reports ready=1 failed=0
+        // throughout, because nothing ever failed. It simply stopped being
+        // asked.
+        //
+        // Clearing the latch re-arms the probe, which then re-identifies the
+        // new output the same way it found the first one. The candidate list
+        // goes too: it is a list of handles from before the rebuild, and every
+        // one of them may now be freed.
+        if (img == fsrprobe::state().output) {
+            fsrprobe::State &ps = fsrprobe::state();
+            ps.output         = VK_NULL_HANDLE;
+            ps.resolved       = false;
+            ps.copiesRecorded = false;
+            ps.copiedOnFrame  = 0;
+            ps.candidates.clear();
+            trace("FSR PROBE: the resolved upscale output %p was destroyed - "
+                  "re-arming the probe so FSR3 does not spend the rest of the "
+                  "run pointed at a freed image.", (void*)img);
+        }
 
 
         // COLOUR image lifetime. The resolve holds an image view built from the
@@ -3246,6 +3509,11 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
         // lifetime, and that is the part it is easy to forget.
         g_colorImages.erase(img);
         if (img == g_sceneColor.image) {
+            {   static uint64_t nd = 0;
+                if ((nd++ % 120) == 0)
+                    trace("STABLE RESET [destroy]: scene colour image %p was "
+                          "destroyed (reset #%llu)", (void*)img,
+                          (unsigned long long)nd); }
             g_sceneColor = ColorTarget();
             g_sceneColorLast = VK_NULL_HANDLE;
             g_sceneColorStable = 0;
@@ -4433,6 +4701,28 @@ static bool fsrReplaceEnabled()
               cached ? "ON" : "off");
     }
     return cached != 0;
+}
+
+// ---- WHEN FSR3 IS UP, IT OWNS THE TEMPORAL PASS. OURS STANDS DOWN.
+//
+// FSR3 is a TEMPORAL upscaler: it accumulates history against motion vectors,
+// which is the same job our resolve does. Running both put the frame through
+// two accumulators in series - visibly softer than TAA alone, and softer than
+// no TAA at all by a wide margin.
+//
+// It is also wrong on FSR3's own terms. FSR3 expects the RAW JITTERED frame;
+// reconstruction is what it does with the jitter. Handing it an image whose
+// jitter has already been resolved away leaves it nothing to reconstruct from,
+// so it blurs instead of resolving detail. Two temporal passes do not add up to
+// a sharper picture, they add up to two lots of resampling.
+//
+// Only the RESOLVE stands down. Jitter still applies and the velocity target is
+// still written - FSR3 consumes both, and switching them off here would starve
+// the very inputs it needs.
+static bool fsr3OwnsTemporal()
+{
+    return fsrReplaceEnabled() && fsr3Wanted() &&
+           fsr3::state().ready && !fsr3::state().failed;
 }
 
 // Does this SPIR-V belong to X-Plane's FSR?
@@ -5929,6 +6219,19 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     std::lock_guard<std::mutex> g(g_lock);
                     g_taaBoundImgs[passInfo.color0] = g_frameCount;
                 }
+                // ---- THE RESOLVE ALWAYS RUNS, EVEN UNDER FSR3.
+                //
+                // Standing it down was tried and is WRONG. In theory FSR3 owns
+                // the temporal pass and ours is redundant work; in practice
+                // FSR3 without this resolve renders the blown-out white frame -
+                // measured, twice. The resolve leaves the scene colour and the
+                // velocity target in the layouts the FSR3 dispatch then
+                // declares, so removing it puts those images back into the
+                // mismatched state the layout fixes were for.
+                //
+                // The double-accumulation softness is real, but it is paid for
+                // with RCAS (fsr.sharpness), not by deleting a pass FSR3 turns
+                // out to depend on.
                 g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
 
@@ -7837,7 +8140,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // keyed on it resets forever and the resolve is never created at all.
     {
         static size_t lastCount = 0;
+        {   // Direct measurement: does this block run, and what does it see?
+            static uint64_t nb = 0;
+            if ((nb++ % 600) == 0)
+                trace("STABLE TICK: block ran %llu times, hdrTargets=%zu "
+                      "lastCount=%zu stable=%u",
+                      (unsigned long long)nb, g_hdrTargets.size(),
+                      lastCount, g_sceneColorStable); }
         if (g_hdrTargets.size() != lastCount) {
+            {   static uint64_t ns = 0;
+                if ((ns++ % 120) == 0)
+                    trace("STABLE RESET [set-size]: HDR target count %zu -> %zu "
+                          "(reset #%llu)", lastCount, g_hdrTargets.size(),
+                          (unsigned long long)ns); }
             lastCount = g_hdrTargets.size();
             g_sceneColorStable = 0;
         } else if (g_sceneColorStable < 100000) {
@@ -9027,6 +9342,8 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
     // probe, so binding once is both correct and the fix.
     if (!g_instanceGettersBound) {
         g_instanceGettersBound = true;
+        g_appInstance = *out;
+        g_appGipa     = nextGIPA;
         g_getPhysMemProps  = (PFN_vkGetPhysicalDeviceMemoryProperties)
                                  nextGIPA(*out, "vkGetPhysicalDeviceMemoryProperties");
         g_getPhysProps     = (PFN_vkGetPhysicalDeviceProperties)
@@ -12016,7 +12333,25 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
                           (void*)out);
             }
         }
-        if (ours && out != VK_NULL_HANDLE && colour != VK_NULL_HANDLE &&
+        // ---- fsr3Wanted() IS CHECKED HERE, WHICH IS WHAT MAKES FSR LIVE.
+        //
+        // It was only consulted where the context is BUILT, so once ensure()
+        // had run there was no way to stand FSR3 down again without restarting
+        // the sim - fsr.replace is latched at startup by necessity (module
+        // substitution happens before a frame is drawn) and it was the only
+        // switch the panel had.
+        //
+        // Checking it per dispatch costs one map lookup and buys a real off
+        // switch. Standing down is safe and needs no fallback of its own:
+        // X-Plane's own dispatch has ALREADY been recorded above this point,
+        // so declining to overwrite its result simply leaves the sim's own
+        // upscale on screen. Nothing is skipped, nothing is left unwritten.
+        //
+        // Note this direction is not symmetric, and the panel says so: turning
+        // FSR OFF takes effect on the next frame, turning it ON still needs the
+        // launch that latched fsr.replace.
+        if (ours && fsr3Wanted() &&
+            out != VK_NULL_HANDLE && colour != VK_NULL_HANDLE &&
             depth != VK_NULL_HANDLE && mv != VK_NULL_HANDLE && rw && rh && ow && oh &&
             fsr3::state().ready) {
             // ---- THE UNITS, FROM THE RESOLVE'S OWN ACCESSORS.
@@ -12079,6 +12414,16 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
             }
 
             fsr3::state().debugView = live::f("fsr.debug", nullptr, 0.0f) > 0.5f;
+            fsr3::state().sharpness = live::f("fsr.sharpness", nullptr, 0.0f);
+            // Whether FSR3 is told about the jitter. Auto (the default, -1)
+            // decides it from what actually happened this frame: hand the
+            // offset over only when nothing has already cancelled it. See the
+            // long note at the jitter arguments below.
+            const float fsrJitterMode = live::f("fsr.jitter", nullptr, -1.0f);
+            const bool  fsrJitterPass =
+                fsrJitterMode < -0.5f
+                    ? !(g_taaResolvedThisFrame && taaUnjitter())
+                    : fsrJitterMode > 0.5f;
             fsr3Ran = fsr3::dispatch(
                 dd->cmdPipelineBarrier, cb,
                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, g_sceneDepthLayout,
@@ -12091,8 +12436,41 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
                 // layer actually applied - the resolve converts the same pair
                 // to NDC with 2*j*scale/width, so taking it before that
                 // conversion is the pixel value.
-                g_velSnap.jitterX * g_jitterScale,
-                g_velSnap.jitterY * g_jitterScale,
+                //
+                // ---- BUT NOT WHEN THE RESOLVE HAS ALREADY REMOVED IT.
+                //
+                // This is the whole of "FSR breaks TAA", and it is a units bug
+                // of the kind that smears rather than fails.
+                //
+                // jitterOffset is FSR3 being TOLD how far the raster it is
+                // about to read was displaced, so it can shift its history
+                // lookup by the same amount and land on the geometry. That is
+                // correct when FSR3 reads the raw jittered raster. It is not
+                // what happens here.
+                //
+                // Our resolve runs FIRST, and its entire unjitter stage exists
+                // to fetch at uv + S and cancel exactly this displacement; the
+                // result is copied into the scene target, and THAT is the image
+                // handed to FSR3 below as d.color. The jitter is already gone.
+                // Passing it anyway makes FSR3 compensate for a displacement
+                // that is not there, so its history lookup misses by a full
+                // jitter amplitude EVERY frame - not once, not on disocclusion,
+                // every frame - and it re-smears precisely the edges the
+                // resolve had just converged. TAA on plus FSR on therefore
+                // looks worse than TAA on alone, which is the report.
+                //
+                // Zero is not "disabling" anything. It is the true offset of
+                // the image FSR3 actually receives, and it leaves FSR3 doing
+                // the job it is here for - spatial upscale plus temporal
+                // stability - while the resolve keeps doing the antialiasing
+                // it is already measurably good at. Two temporal passes both
+                // claiming the same jitter is the configuration that cannot
+                // work.
+                //
+                // Live, because the claim above is falsifiable: fsr.jitter=1
+                // restores the old pass-through and the smear should return.
+                fsrJitterPass ? g_velSnap.jitterX * g_jitterScale : 0.0f,
+                fsrJitterPass ? g_velSnap.jitterY * g_jitterScale : 0.0f,
                 vs * (float)rw, vs * ys * (float)rh,
                 // ---- SPLIT FSR3 IN HALF, LIVE.
                 //
@@ -13587,6 +13965,95 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
           "deliberately does not",
           haveIndependentBlend ? 1 : 0, patchedFeatures ? 1 : 0);
 
+    // ---- EXTRA QUEUES FOR FRAME GENERATION. THE ONLY MOMENT THIS IS POSSIBLE.
+    //
+    // VkFrameInterpolationInfoFFX wants four queues - game, async compute,
+    // present and image-acquire - and a queue cannot be created after the
+    // device. X-Plane asks for what it needs and no more, so without this the
+    // frame-interpolation swapchain has nothing to run on and the feature is
+    // unavailable for the life of the process.
+    //
+    // ---- WHY THIS IS DEFAULT OFF.
+    //
+    // Device creation is the single most dangerous thing this layer touches. It
+    // has already taken the sim down once - a physical-device function resolved
+    // from the wrong instance, answered by __fastfail rather than an error, no
+    // window, no log. Asking for queues a family does not have is a validation
+    // error at best and a refused device at worst, and a refused device means
+    // X-Plane does not start. Nobody debugging a black launch will guess that a
+    // motion-vector mod asked for a fourth queue.
+    //
+    // So: taa.fg_queues, off unless explicitly set. The retry below already
+    // covers a refusal, but not starting at all is not a failure mode worth
+    // risking by default before the feature that needs it even runs.
+    //
+    // ---- WHAT IT ACTUALLY DOES.
+    //
+    // Only ever RAISES queueCount on families X-Plane already asked for, and
+    // never past what the family reports. Adding a new family would change
+    // which queues exist and could disturb the sim's own indexing; raising a
+    // count it already uses cannot, because queue indices are per family and
+    // the ones X-Plane takes keep the indices it expects.
+    //
+    // loadNow() FIRST, or this reads a default that was never in the file.
+    // Device creation happens before anything has polled the live config, so an
+    // ordinary read here answers with the built-in default whatever the file
+    // says - the identical trap fsrReplaceEnabled() documents, where module
+    // substitution and its own tag disagreed about the same shader because one
+    // ran before the first poll and one after. Measured here too: the file said
+    // 1, the block never ran, and the log showed no FG QUEUES line at all.
+    std::vector<VkDeviceQueueCreateInfo> qcis;
+    std::vector<std::vector<float> >     qprios;
+    live::loadNow();
+    if (live::onoff("taa.fg_queues", "TAA_FG_QUEUES", false) &&
+        ci->queueCreateInfoCount && g_getPhysQueueFamProps) {
+        uint32_t famCount = 0;
+        g_getPhysQueueFamProps(phys, &famCount, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(famCount ? famCount : 1);
+        if (famCount) g_getPhysQueueFamProps(phys, &famCount, fams.data());
+
+        // FFX asks for four; X-Plane's own queue is one of them, so three spare
+        // is the most that can ever be wanted.
+        const uint32_t kWantExtra = 3;
+        qcis.assign(ci->pQueueCreateInfos,
+                    ci->pQueueCreateInfos + ci->queueCreateInfoCount);
+        qprios.resize(qcis.size());
+        bool raised = false;
+        for (size_t i = 0; i < qcis.size(); ++i) {
+            const uint32_t fam = qcis[i].queueFamilyIndex;
+            if (fam >= famCount) continue;
+            const uint32_t have = fams[fam].queueCount;
+            const uint32_t want = qcis[i].queueCount + kWantExtra;
+            const uint32_t use  = want < have ? want : have;
+            if (use <= qcis[i].queueCount) {
+                trace("FG QUEUES: family %u already at its limit (%u of %u) - "
+                      "no spare to take", fam, qcis[i].queueCount, have);
+                continue;
+            }
+            // Priorities are per queue and the array must be at least as long
+            // as queueCount. X-Plane's own entries are copied so its queues keep
+            // the priority it chose; ours are appended at the same value as its
+            // last, which is the least surprising thing to hand the scheduler.
+            qprios[i].assign(qcis[i].pQueuePriorities,
+                             qcis[i].pQueuePriorities + qcis[i].queueCount);
+            const float pad = qprios[i].empty() ? 1.0f : qprios[i].back();
+            qprios[i].resize(use, pad);
+            trace("FG QUEUES: family %u raised %u -> %u (family reports %u)",
+                  fam, qcis[i].queueCount, use, have);
+            FgRaise fr;
+            fr.orig  = qcis[i].queueCount;   // before the raise, i.e. the sim's
+            fr.total = use;
+            g_fgRaised[fam] = fr;
+            qcis[i].queueCount       = use;
+            qcis[i].pQueuePriorities = qprios[i].data();
+            raised = true;
+        }
+        if (raised) {
+            ci2.queueCreateInfoCount = (uint32_t)qcis.size();
+            ci2.pQueueCreateInfos    = qcis.data();
+        }
+    }
+
     VkResult r = nextCreate(phys, &ci2, alloc, out);
 
     // If the modified create fails, fall back to X-Plane's original request.
@@ -13610,6 +14077,7 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     // never changed - which is what makes reading them without g_lock safe.
     g_ffxDevice = *out;
     g_ffxGdpa   = nextGDPA;
+    g_ffxPhys   = phys;
     dd.destroyDevice = (PFN_vkDestroyDevice)nextGDPA(*out, "vkDestroyDevice");
     dd.createImage   = (PFN_vkCreateImage)nextGDPA(*out, "vkCreateImage");
     dd.destroyImage  = (PFN_vkDestroyImage)nextGDPA(*out, "vkDestroyImage");
@@ -13968,6 +14436,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
               mod.minImageCount, wantImages, (int)mod.presentMode);
         mod.minImageCount = wantImages;
     }
+    // ---- REPORT THE FRAME-GENERATION QUEUES BEFORE ANYTHING DEPENDS ON THEM.
+    //
+    // Deliberately a dry run for now: it selects and logs, and the swapchain is
+    // still created normally below. Replacing X-Plane's presentation path is the
+    // step that can hang the sim with no message, so the selection is proven
+    // against real hardware first - which families the driver actually offers,
+    // whether any of them supports present, and whether the sim left our spare
+    // indices alone. All of that is answerable without touching the swapchain.
+    if (live::onoff("taa.fg", "TAA_FG", false)) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            FgQueues fq = fgPickQueues(device, g_ffxPhys, ci->surface);
+            trace("FG: queue selection %s - game fam %u, present fam %u, "
+                  "acquire fam %u, asyncCompute %s",
+                  fq.ok ? "OK" : "INCOMPLETE",
+                  fq.gameFam, fq.presentFam, fq.acquireFam,
+                  fq.asyncCompute ? "yes" : "none");
+        }
+    }
+
     trace("SWAPCHAIN: %ux%u images=%u presentMode=%d (0=IMM 1=MBOX 2=FIFO "
           "3=RELAXED) fmt=%d",
           mod.imageExtent.width, mod.imageExtent.height, mod.minImageCount,

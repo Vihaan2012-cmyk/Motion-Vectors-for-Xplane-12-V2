@@ -211,8 +211,72 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     if (s.failed) return false;
     if (s.ready && s.renderW == renderW && s.renderH == renderH &&
         s.outW == outW && s.outH == outH) return true;
-    if (s.ready) return true;          // size changed; recreation is a later concern
     if (!renderW || !renderH || !outW || !outH) return false;
+
+    // ---- THE SIZE CHANGED, AND THAT USED TO BE "A LATER CONCERN".
+    //
+    // What stood here was `if (s.ready) return true;` - keep the old context,
+    // carry on. That is not a deferral, it is a promise to run FSR3 with the
+    // WRONG DIMENSIONS, and it is unsound in a way that reaches the GPU:
+    //
+    //   dispatch() below builds every FfxResource from s.renderW/s.renderH and
+    //   s.outW/s.outH, and sets d.renderSize and d.upscaleSize from them too.
+    //   After a resize those are the OLD extents while the VkImages actually
+    //   bound are the NEW ones. FFX then dispatches a grid sized for one extent
+    //   over images of another, and the reads and writes past the edge are
+    //   whatever the allocator has there.
+    //
+    // X-Plane rebuilds every offscreen on a window resize AND at flight start -
+    // "Rebuilding offscreens for window resize" in Log.txt - so this is not a
+    // rare path reached by dragging a window edge. It is on the way into a
+    // flight.
+    //
+    // Recreating properly needs the GPU to be finished with what is about to be
+    // freed. vkDeviceWaitIdle is the blunt instrument and it is the correct one
+    // here: this happens on a resize, once, in a frame that is already stalled
+    // rebuilding every render target in the sim. Destroying an image the queue
+    // still references is a second crash on top of the first.
+    if (s.ready) {
+        trace("FSR3: size changed %ux%u->%ux%u becomes %ux%u->%ux%u; "
+              "tearing the context down and rebuilding it.",
+              s.renderW, s.renderH, s.outW, s.outH, renderW, renderH, outW, outH);
+
+        PFN_vkDeviceWaitIdle waitIdle =
+            (PFN_vkDeviceWaitIdle)gdpa(device, "vkDeviceWaitIdle");
+        PFN_vkDestroyImage   destroyImage =
+            (PFN_vkDestroyImage)gdpa(device, "vkDestroyImage");
+        PFN_vkFreeMemory     freeMem =
+            (PFN_vkFreeMemory)gdpa(device, "vkFreeMemory");
+        if (waitIdle) waitIdle(device);
+
+        ffxFsr3UpscalerContextDestroy(&s.ctx);
+
+        // Ours, so ours to free. vkDestroyImage on VK_NULL_HANDLE is legal and
+        // a no-op, but the handles are cleared anyway - a stale non-null handle
+        // in this struct is exactly the bug the DestroyImage guard in layer.cpp
+        // exists to document.
+        for (int i = 0; i < 3; ++i) {
+            if (destroyImage && s.shared[i]) destroyImage(device, s.shared[i], nullptr);
+            if (freeMem && s.sharedMem[i])   freeMem(device, s.sharedMem[i], nullptr);
+            s.shared[i] = VK_NULL_HANDLE;
+            s.sharedMem[i] = VK_NULL_HANDLE;
+        }
+        if (destroyImage && s.ownOut)    destroyImage(device, s.ownOut, nullptr);
+        if (freeMem && s.ownOutMem)      freeMem(device, s.ownOutMem, nullptr);
+        s.ownOut = VK_NULL_HANDLE;
+        s.ownOutMem = VK_NULL_HANDLE;
+
+        // The scratch buffer backs the FFX backend context that was just
+        // destroyed. It is re-allocated below - reusing it would hand
+        // CreateBackendContextVK a non-zero refCount, which is the exact
+        // uninitialised-state bug the calloc note further down was written for.
+        free(s.scratch);
+        s.scratch = nullptr;
+        s.scratchSize = 0;
+
+        s.ready = false;
+        s.sharedReady = false;
+    }
 
     // ---- FFX RESOLVES THROUGH THE NEXT LAYER, NOT THE LOADER.
     //
@@ -346,8 +410,15 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
         od.resourceDescription = describeTex2D(outW, outH,
             FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT, FFX_RESOURCE_USAGE_UAV);
         if (createShared(device, phys, od, 0, gdpa, getMemProps)) {
-            s.ownOut = s.shared[0];
-            s.shared[0] = VK_NULL_HANDLE;   // slot reused below for the real one
+            // The MEMORY moves with the image. Taking only the handle left
+            // sharedMem[0] pointing at this allocation, and the createShared
+            // for the real slot 0 below then overwrote it - so the isolation
+            // image's memory could never be freed, and the teardown above
+            // would free the wrong allocation.
+            s.ownOut    = s.shared[0];
+            s.ownOutMem = s.sharedMem[0];
+            s.shared[0]    = VK_NULL_HANDLE;   // slot reused below for the real one
+            s.sharedMem[0] = VK_NULL_HANDLE;
             trace("FSR3: ISOLATION MODE - writing our own %ux%u image, not "
                   "X-Plane's. Nothing will reach the screen; this only asks "
                   "whether writing the sim's image is what kills it.",
@@ -481,6 +552,53 @@ inline bool dispatch(PFN_vkCmdPipelineBarrier cmdBarrier,
     // work. If a layout ever genuinely disagrees, the answer is to learn what
     // it is, not to assert one.
 
+    // ---- PUT THE IMAGES IN THE LAYOUTS WE ARE ABOUT TO CLAIM THEY ARE IN.
+    //
+    // ffxGetResourceVK() DECLARES a resource state; it does not transition
+    // anything. Declaring COMPUTE_READ for an image sitting in
+    // COLOR_ATTACHMENT_OPTIMAL does not make it so - it makes FFX build
+    // descriptors that lie, and reading or writing through a descriptor whose
+    // layout does not match the image is undefined. Validation named both:
+    //
+    //   "r_input_motion_vectors"  SHADER_READ_ONLY_OPTIMAL declared,
+    //                             COLOR_ATTACHMENT_OPTIMAL actual
+    //   "rw_upscaled_output"      GENERAL declared,
+    //                             SHADER_READ_ONLY_OPTIMAL actual
+    //
+    // The second is the one that reaches the screen: FSR3's entire output was
+    // written through a mismatched layout every frame. Undefined stores to the
+    // presented image is exactly the blown-out picture, and it is why no change
+    // to FSR3's inputs ever altered the result.
+    //
+    // The velocity target is in COLOR_ATTACHMENT_OPTIMAL because our own
+    // velocity pass just wrote it as an attachment; X-Plane's upscale output is
+    // in SHADER_READ_ONLY_OPTIMAL because the sim samples it. Both are borrowed,
+    // so both are handed back below exactly as they were found.
+    VkImageMemoryBarrier pre[2];
+    memset(pre, 0, sizeof(pre));
+    for (int i = 0; i < 2; ++i) {
+        pre[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        pre[i].srcQueueFamilyIndex = pre[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pre[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        pre[i].subresourceRange.levelCount = 1;
+        pre[i].subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+    }
+    pre[0].image         = mvImg;
+    pre[0].oldLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    pre[0].newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    pre[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    pre[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    pre[1].image         = outImg;
+    pre[1].oldLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    pre[1].newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+    pre[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    pre[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    if (cmdBarrier)
+        cmdBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                   0, nullptr, 0, nullptr, 2, pre);
+
     FfxFsr3UpscalerDispatchDescription d;
     memset(&d, 0, sizeof(d));
     d.commandList = ffxGetCommandListVK(cb);
@@ -556,8 +674,10 @@ inline bool dispatch(PFN_vkCmdPipelineBarrier cmdBarrier,
     d.upscaleSize.width  = s.outW;
     d.upscaleSize.height = s.outH;
 
-    d.enableSharpening = false;
-    d.sharpness        = 0.0f;
+    // RCAS runs only when there is something to do; 0 keeps the pass out of the
+    // frame entirely rather than sharpening by zero.
+    d.enableSharpening = (s.sharpness > 0.001f);
+    d.sharpness        = s.sharpness;
     d.frameTimeDelta   = deltaMs > 0.0f ? deltaMs : 16.6f;
     d.preExposure      = 1.0f;
     d.reset            = reset;
@@ -599,6 +719,27 @@ inline bool dispatch(PFN_vkCmdPipelineBarrier cmdBarrier,
         s.failed = true;
         return false;
     }
+
+    // ---- HAND THE BORROWED IMAGES BACK.
+    //
+    // X-Plane will barrier from the layouts it last knew, and a mismatched
+    // oldLayout lets the driver discard contents. Returning them is not
+    // tidiness, it is correctness for the sim's own next use.
+    VkImageMemoryBarrier post[2];
+    memcpy(post, pre, sizeof(post));
+    post[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    post[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    post[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    post[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    post[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    post[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    post[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    post[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    if (cmdBarrier)
+        cmdBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                   0, nullptr, 0, nullptr, 2, post);
 
     // And order FSR3's writes before whatever X-Plane does next with the
     // output image - the same argument in the other direction.
