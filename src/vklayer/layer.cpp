@@ -499,6 +499,19 @@ extern "C" void mvFgTrace(const char *fmt, ...)
     trace("%s", buf);
 }
 
+// Live isolation control for the frame-generation callback - see fg_backend.h.
+// taa.fg_fi=0 dispatches optical flow only, skipping interpolation, to bisect
+// the interpolation-path GPU fault. Defaults on, so normal runs interpolate.
+extern "C" int mvFgWantFI()
+{
+    return live::onoff("taa.fg_fi", "TAA_FG_FI", true) ? 1 : 0;
+}
+
+extern "C" int mvFgWantOF()
+{
+    return live::onoff("taa.fg_of", "TAA_FG_OF", true) ? 1 : 0;
+}
+
 extern "C" PFN_vkVoidFunction mvFfxInstanceProc(const char *name)
 {
     if (g_appInstance == VK_NULL_HANDLE || !g_appGipa) return nullptr;
@@ -3535,6 +3548,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImageView(
         }
         if (tagged && (imgUsage & VK_IMAGE_USAGE_STORAGE_BIT)) {
             if (use != &ci2) { ci2 = *ci; use = &ci2; }
+            // Prepend a usage override that drops STORAGE. X-Plane may already
+            // supply its own VkImageViewUsageCreateInfo (the sType-unique
+            // validation note), but a duplicate is only a warning: the driver
+            // takes the FIRST in the chain, which is ours, so the effective
+            // usage is the narrowed one. This is the form that has loaded
+            // reliably; a chain-rewrite that tried to be tidier destabilised
+            // load, so it is deliberately left as a prepend.
             memset(&viewUsage, 0, sizeof(viewUsage));
             viewUsage.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
             viewUsage.pNext = ci2.pNext;
@@ -7655,7 +7675,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         const bool canInterp = u.ready && !u.failed &&
                                u.shared[0] != VK_NULL_HANDLE &&
                                u.shared[1] != VK_NULL_HANDLE &&
-                               u.shared[2] != VK_NULL_HANDLE;
+                               u.shared[2] != VK_NULL_HANDLE &&
+                               // Isolation override: taa.fg_gen=0 forces
+                               // generation OFF while the proxy swapchain and the
+                               // upscaler stay live, to tell the generation-present
+                               // machinery apart from FSR3 / the proxy itself.
+                               live::onoff("taa.fg_gen", "TAA_FG_GEN", true);
         if (!g_fgConfigApplied || canInterp != g_fgGenEnabled) {
             g_fgConfigApplied = true;
             g_fgGenEnabled    = canInterp;

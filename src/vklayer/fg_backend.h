@@ -40,6 +40,16 @@
 #include <FidelityFX/host/ffx_opticalflow.h>
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
 
+// Live isolation control, implemented in layer.cpp where the live config lives.
+// Returns non-zero when frame interpolation should run (taa.fg_fi, default on).
+// Lets optical flow and interpolation be dispatched independently to bisect a
+// fault between them without a rebuild.
+extern "C" int mvFgWantFI();
+// Returns non-zero when the callback should record ANY work (taa.fg_of, default
+// on). fg_of=0 makes the callback a no-op, to tell an optical-flow/interpolation
+// fault apart from the upscaler or the swapchain present path running alongside.
+extern "C" int mvFgWantOF();
+
 namespace fg {
 
 struct State {
@@ -285,6 +295,19 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
         }
     }
 
+    // ---- ISOLATION CONTROL: dispatch NOTHING. taa.fg_of=0 returns before
+    // optical flow (and so before interpolation). If the "0x0 Compute" fault
+    // survives with the callback recording no work at all, it is not in our
+    // optical-flow or interpolation dispatch - it is the upscaler running
+    // alongside, or the swapchain's own present path. Default on.
+    if (!mvFgWantOF()) {
+        static bool said = false;
+        if (!said) { said = true;
+            trace("FG: taa.fg_of=0 - callback records nothing (no optical flow, "
+                  "no interpolation)."); }
+        return FFX_OK;
+    }
+
     FfxOpticalflowDispatchDescription od;
     memset(&od, 0, sizeof(od));
     od.commandList       = p->commandList;
@@ -302,6 +325,19 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
         static bool said = false;
         if (!said) { said = true; trace("FG: optical flow dispatch failed (%d)", (int)rc); }
         return rc;
+    }
+
+    // ---- ISOLATION CONTROL: skip frame interpolation, run optical flow only.
+    //
+    // taa.fg_fi=0 stops here after optical flow, presenting the real frame. Used
+    // to bisect the interpolation crash: if the "0x0 Compute" fault survives
+    // with interpolation OFF, the faulting shader is in optical flow, not the
+    // interpolation dispatch. Default on.
+    if (!mvFgWantFI()) {
+        static bool said = false;
+        if (!said) { said = true;
+            trace("FG: taa.fg_fi=0 - optical flow only, interpolation skipped."); }
+        return FFX_OK;
     }
 
     // The upscaler's three shared outputs. Held by fsr3::state(), produced this
