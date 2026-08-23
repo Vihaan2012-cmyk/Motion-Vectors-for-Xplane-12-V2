@@ -1637,6 +1637,41 @@ static FgQueues fgPickQueues(VkDevice device, VkPhysicalDevice phys,
 }
 
 #include "fsr3_backend_impl.h"
+// Frame generation reads the upscaler's shared outputs, so it comes after it.
+#include "fg_backend.h"
+
+// ---- THE FRAME-INTERPOLATION SWAPCHAIN IS NOT A VkSwapchainKHR.
+//
+// ffxReplaceSwapchainForFrameinterpolationVK ends with
+//
+//     gameSwapChain = reinterpret_cast<VkSwapchainKHR>(pSwapChainVK);
+//
+// - a pointer to an FFX C++ object wearing a Vulkan handle's type. Hand that to
+// X-Plane and its next vkGetSwapchainImagesKHR reaches the driver with an
+// address the driver has never seen.
+//
+// FFX's answer is ffxGetSwapchainReplacementFunctionsVK: implementations of the
+// five entry points that must go to the proxy instead of the driver. Routing
+// calls is what a layer already is, so this is the one part of frame generation
+// that fits the existing architecture exactly rather than fighting it.
+//
+// g_fgActive gates every one of them. While it is false the handles are real
+// driver swapchains and every call goes down the chain untouched, which is what
+// makes this safe to ship switched off.
+struct FgSwap {
+    FfxSwapchainReplacementFunctions fn;
+    FfxSwapchain                     proxy   = nullptr;
+    VkSwapchainKHR                   handle  = VK_NULL_HANDLE;  // what XP holds
+    bool                             have    = false;
+};
+static FgSwap            g_fgSwap;
+static std::atomic<bool> g_fgActive(false);
+
+// Swapchain images, by swapchain. Declared HERE rather than beside the present
+// path that fills it, because the synchronization2 barrier hook above reads it
+// to find the backbuffer whose PRESENT_SRC transition must be rewritten.
+static std::map<VkSwapchainKHR, std::vector<VkImage> > g_swapImages;
+
 
 // Defined with the probe below; called from the present path, which comes
 // first in this file.
@@ -2627,15 +2662,81 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdPipelineBarrier2(
                 vram::contentInvalidate(info->pImageMemoryBarriers[i].image);
         }
 
-    if (!g_pagerDropAbove || !info || !info->imageMemoryBarrierCount) {
+    // ---- PRESENT_SRC_KHR IS THE WRONG LAYOUT WHEN FFX OWNS THE SWAPCHAIN.
+    //
+    // X-Plane transitions its backbuffer to PRESENT_SRC_KHR before presenting,
+    // which is correct - it believes it is handing an image to a driver
+    // swapchain. Under frame generation it is not: it is handing FFX a texture
+    // to SAMPLE, and FFX's own barrier for that image uses
+    // SHADER_READ_ONLY_OPTIMAL as BOTH old and new layout (a pure queue
+    // ownership transfer, ReplacementBufferTransferState). It expects the image
+    // to already be there, and its header says so plainly:
+    //
+    //   "queuePresentKHR: when using this one, the presenting image should be
+    //    in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL state"
+    //
+    // Handing it a PRESENT_SRC_KHR image means sampling in the wrong layout,
+    // which is undefined - a black or torn interpolated frame, with validation
+    // the only thing that would say why.
+    //
+    // Rewriting the destination layout is the smallest correct fix and it is
+    // exactly what a layer is for. The alternative - our own barrier and submit
+    // before each present - adds a queue submission per frame to the one path
+    // that must not stall.
+    //
+    // Scoped hard: only while frame generation is ACTIVE, only for images
+    // belonging to the proxy swapchain, and only for transitions whose
+    // destination is PRESENT_SRC_KHR. Every other barrier in the frame is
+    // untouched, and with FG off this whole block is skipped on a single
+    // relaxed atomic load.
+    const bool fgRewrite = g_fgActive.load(std::memory_order_relaxed) &&
+                           g_fgSwap.have && info &&
+                           info->imageMemoryBarrierCount;
+    bool needRewrite = false;
+    if (fgRewrite) {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator si =
+            g_swapImages.find(g_fgSwap.handle);
+        if (si != g_swapImages.end())
+            for (uint32_t i = 0; i < info->imageMemoryBarrierCount && !needRewrite; ++i)
+                if (info->pImageMemoryBarriers[i].newLayout ==
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR &&
+                    std::find(si->second.begin(), si->second.end(),
+                              info->pImageMemoryBarriers[i].image) != si->second.end())
+                    needRewrite = true;
+    }
+
+    if (!needRewrite && (!g_pagerDropAbove || !info || !info->imageMemoryBarrierCount)) {
         g_nextCmdPipelineBarrier2KHR(cb, info);
         return;
     }
     std::vector<VkImageMemoryBarrier2> fixed(
         info->pImageMemoryBarriers,
         info->pImageMemoryBarriers + info->imageMemoryBarrierCount);
-    for (size_t i = 0; i < fixed.size(); ++i)
-        pagerClampRange(fixed[i].image, &fixed[i].subresourceRange);
+    if (g_pagerDropAbove)
+        for (size_t i = 0; i < fixed.size(); ++i)
+            pagerClampRange(fixed[i].image, &fixed[i].subresourceRange);
+    if (needRewrite) {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator si =
+            g_swapImages.find(g_fgSwap.handle);
+        for (size_t i = 0; i < fixed.size() && si != g_swapImages.end(); ++i) {
+            if (fixed[i].newLayout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) continue;
+            if (std::find(si->second.begin(), si->second.end(), fixed[i].image)
+                    == si->second.end()) continue;
+            fixed[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            // The access mask has to follow the layout or the barrier promises
+            // a visibility it does not make: FFX samples this image.
+            fixed[i].dstAccessMask |= VK_ACCESS_2_SHADER_READ_BIT;
+            fixed[i].dstStageMask  |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            static uint64_t said = 0;
+            if ((said++ % 600) == 0)
+                trace("FG: rewrote a backbuffer transition PRESENT_SRC -> "
+                      "SHADER_READ_ONLY for FFX to sample (%llu so far)",
+                      (unsigned long long)said);
+        }
+    }
 
     VkDependencyInfo info2 = *info;
     info2.pImageMemoryBarriers = fixed.data();
@@ -4218,7 +4319,6 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetViewport(
 // Swapchain images, recorded from vkGetSwapchainImagesKHR. Declared up here
 // because the scene-target selection needs to ask whether a pass is drawing
 // straight into the presented image, and that runs long before present.
-static std::map<VkSwapchainKHR, std::vector<VkImage> > g_swapImages;
 
 // ---- THE SIZE AND FORMAT OF WHAT WE PRESENT INTO, WHICH WE NEVER READ.
 //
@@ -7189,9 +7289,68 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
     if (next) next(cb, bp, layout, first, n, sets, nd, dyn);
 }
 
+// ---- ACQUIRE AND DESTROY, INTERCEPTED ONLY BECAUSE FRAME GENERATION NEEDS IT.
+//
+// Neither was hooked before: the layer had no reason to see them. They are here
+// now because the proxy swapchain is not a driver object, so these two calls
+// would reach the driver with an address it does not recognise.
+//
+// Both are pure pass-throughs while g_fgActive is false, which is the shipped
+// state. That matters more than it looks: adding an interception to a layer
+// means every future call goes through code that did not exist before, and the
+// cost of getting one wrong is a class of bug this file has repeatedly paid for.
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_AcquireNextImageKHR(
+    VkDevice device, VkSwapchainKHR sc, uint64_t timeout,
+    VkSemaphore semaphore, VkFence fence, uint32_t *pImageIndex)
+{
+    if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
+        sc == g_fgSwap.handle && g_fgSwap.fn.acquireNextImageKHR)
+        return g_fgSwap.fn.acquireNextImageKHR(device, sc, timeout, semaphore,
+                                               fence, pImageIndex);
+    PFN_vkAcquireNextImageKHR next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.acquireNextImageKHR;
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    return next(device, sc, timeout, semaphore, fence, pImageIndex);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroySwapchainKHR(
+    VkDevice device, VkSwapchainKHR sc, const VkAllocationCallbacks *alloc)
+{
+    if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
+        sc == g_fgSwap.handle && g_fgSwap.fn.destroySwapchainKHR) {
+        g_fgSwap.fn.destroySwapchainKHR(device, sc, alloc);
+        // The proxy is gone; anything still holding this handle must not be
+        // routed to it again.
+        g_fgSwap.have   = false;
+        g_fgSwap.handle = VK_NULL_HANDLE;
+        g_fgSwap.proxy  = nullptr;
+        g_fgActive.store(false, std::memory_order_relaxed);
+        trace("FG: proxy swapchain destroyed - routing returns to the driver.");
+        return;
+    }
+    PFN_vkDestroySwapchainKHR next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.destroySwapchainKHR;
+    }
+    if (next) next(device, sc, alloc);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL Layer_GetSwapchainImagesKHR(
     VkDevice device, VkSwapchainKHR sc, uint32_t *count, VkImage *images)
 {
+    // The handle X-Plane holds is FFX's proxy object, not a driver swapchain -
+    // see FgSwap. Asking the driver about it would be asking about an address
+    // it has never seen.
+    if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
+        sc == g_fgSwap.handle && g_fgSwap.fn.getSwapchainImagesKHR)
+        return g_fgSwap.fn.getSwapchainImagesKHR(device, sc, count, images);
+
     PFN_vkGetSwapchainImagesKHR next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -7234,6 +7393,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // once per frame and is already past the submit that carried them.
     fsrProbeResolve();
 
+
     // ---- BUILD THE FSR3 CONTEXT HERE, NOT IN THE DISPATCH.
     //
     // Present is the one point per frame where no command buffer is being
@@ -7267,6 +7427,46 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                               g_sceneDepth, g_sceneDepthFormat, rw, rh);
         if (dev && ph && gd && rw && rh && ow && oh && rw < ow)
             fsr3::ensure(dev, ph, gd, g_getPhysMemProps, rw, rh, ow, oh);
+
+        // ---- FRAME GENERATION IS BUILT HERE, NOT AT SWAPCHAIN CREATION.
+        //
+        // It was, and it never once succeeded. Interpolation consumes the
+        // UPSCALER's dilated depth and motion vectors, so it needs the
+        // upscaler's render size - and at vkCreateSwapchainKHR the upscaler does
+        // not exist yet. fsr3::state().renderW was still 0, ensure() rejected
+        // the zero extent, and the log read "contexts unavailable" while the
+        // swapchain went right on owning presentation: full cost, no benefit,
+        // and nothing in the symptom pointing at ordering.
+        //
+        // The upscaler is built here for the reason its own file records -
+        // creating pipelines while a command buffer is recording killed the sim
+        // once - and frame generation inherits that constraint and its
+        // ordering both. Immediately after it, where the sizes are real.
+        if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
+            !fg::state().ready && !fg::state().failed &&
+            dev && ph && gd && ow && oh && fsr3::state().ready) {
+            if (fg::ensure(dev, ph, gd, g_getPhysMemProps,
+                           fsr3::state().renderW, fsr3::state().renderH,
+                           ow, oh, g_sceneColor.format)) {
+                FfxFrameGenerationConfig cfg;
+                memset(&cfg, 0, sizeof(cfg));
+                cfg.swapChain               = g_fgSwap.proxy;
+                cfg.frameGenerationEnabled  = true;
+                cfg.frameGenerationCallback = fg::dispatchCallback;
+                cfg.frameGenerationCallbackContext = nullptr;
+                // Synchronous: FFX's own guidance is to avoid its async path
+                // when the engine already uses async compute, and X-Plane does.
+                cfg.allowAsyncWorkloads     = false;
+                cfg.onlyPresentInterpolated = false;
+                cfg.frameID                 = 0;
+                const FfxErrorCode ce =
+                    ffxSetFrameGenerationConfigToSwapchainVK(&cfg);
+                trace("FG: frame generation config %s (%d) - interpolation is %s.",
+                      ce == FFX_OK ? "accepted" : "REJECTED", (int)ce,
+                      ce == FFX_OK ? "live"
+                                   : "not running, so the swapchain is overhead");
+            }
+        }
     }
 
     // Last frame's timings, read without blocking - waiting on them would
@@ -8815,7 +9015,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // CPU-bound, which is a different problem with a different fix.
     if (!g_nextQueuePresent) return VK_SUCCESS;
     const uint64_t pt0 = nowUs();
-    VkResult pr = g_nextQueuePresent(queue, info);
+    // ---- FRAME GENERATION PRESENTS, BUT ONLY THE PRESENT IS HANDED OVER.
+    //
+    // This replaced an early return at the TOP of this function, which was
+    // wrong in a way worth recording: everything between there and here is
+    // per-frame work the rest of the layer depends on - the frame counter, the
+    // probe resolve, VRAM accounting, the resolve duty tracking. Returning
+    // early skipped all of it, and the symptom was not a crash but the velocity
+    // target never being sized at all ("velocity target 0x0" on every gate),
+    // because the state that sizes it is maintained here.
+    //
+    // A present info can name several swapchains; ours is one object, so the
+    // handover is taken only when the proxy is the sole entry. Anything else
+    // goes to the driver untouched rather than being half-redirected.
+    VkResult pr;
+    if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
+        g_fgSwap.fn.queuePresentKHR && info &&
+        info->swapchainCount == 1 && info->pSwapchains &&
+        info->pSwapchains[0] == g_fgSwap.handle) {
+        pr = g_fgSwap.fn.queuePresentKHR(queue, info);
+    } else {
+        pr = g_nextQueuePresent(queue, info);
+    }
     g_blkPresentUs.fetch_add(nowUs() - pt0, std::memory_order_relaxed);
     {
         static uint64_t lastReport = 0, lastFrames = 0;
@@ -14073,11 +14294,41 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     dd.device        = *out;
     dd.phys          = phys;
     dd.gdpa          = nextGDPA;
-    // The lock-free pair the FidelityFX forwarders read. Set here, once, and
-    // never changed - which is what makes reading them without g_lock safe.
-    g_ffxDevice = *out;
-    g_ffxGdpa   = nextGDPA;
-    g_ffxPhys   = phys;
+    // ---- THE FIRST DEVICE, AND ONLY THE FIRST. MEASURED, NOT ASSUMED.
+    //
+    // The comment that stood here said "set once and never changed - which is
+    // what makes reading them without g_lock safe". That was the intent and it
+    // was not true: this runs on EVERY vkCreateDevice, and this process creates
+    // TWO ("XP DEVICE REQUEST" appears twice in the trace). The second one
+    // silently rebound all three, so every FidelityFX forwarder afterwards
+    // answered for a device its callers were not using.
+    //
+    // That is the same shape as the instance bug this file already carries a
+    // fix for, a few hundred lines up: a handle resolved against one object and
+    // then used with another is not reported as an error - the loader
+    // __fastfails, and the event log blames vulkan-1.dll. The instance side got
+    // g_instanceGettersBound; the device side never did.
+    //
+    // It surfaced through frame generation, which keeps ONE proxy swapchain in
+    // a global: with two devices it was built against one and driven with the
+    // other. But the exposure is not limited to frame generation - the upscaler
+    // reads these same globals, so this was latent for FSR3 too.
+    //
+    // First wins. The application's real device is created before any probe's,
+    // and it outlives them.
+    if (g_ffxDevice == VK_NULL_HANDLE) {
+        g_ffxDevice = *out;
+        g_ffxGdpa   = nextGDPA;
+        g_ffxPhys   = phys;
+        trace("DEVICE: FidelityFX bound to device %p (the first created). Any "
+              "later device is tracked normally but will not rebind this.",
+              (void*)*out);
+    } else if (*out != g_ffxDevice) {
+        trace("DEVICE: a second device %p was created; FidelityFX stays bound "
+              "to %p. Rebinding here is what made a proxy swapchain built "
+              "against one device be driven with another.",
+              (void*)*out, (void*)g_ffxDevice);
+    }
     dd.destroyDevice = (PFN_vkDestroyDevice)nextGDPA(*out, "vkDestroyDevice");
     dd.createImage   = (PFN_vkCreateImage)nextGDPA(*out, "vkCreateImage");
     dd.destroyImage  = (PFN_vkDestroyImage)nextGDPA(*out, "vkDestroyImage");
@@ -14436,24 +14687,148 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
               mod.minImageCount, wantImages, (int)mod.presentMode);
         mod.minImageCount = wantImages;
     }
-    // ---- REPORT THE FRAME-GENERATION QUEUES BEFORE ANYTHING DEPENDS ON THEM.
+    // ---- HAND THE SWAPCHAIN TO FRAME INTERPOLATION.
     //
-    // Deliberately a dry run for now: it selects and logs, and the swapchain is
-    // still created normally below. Replacing X-Plane's presentation path is the
-    // step that can hang the sim with no message, so the selection is proven
-    // against real hardware first - which families the driver actually offers,
-    // whether any of them supports present, and whether the sim left our spare
-    // indices alone. All of that is answerable without touching the swapchain.
-    if (live::onoff("taa.fg", "TAA_FG", false)) {
+    // This is the point of no return for the presentation path, so every exit
+    // below leaves X-Plane with an ordinary driver swapchain and the layer
+    // behaving exactly as it does with the feature off. Nothing here is allowed
+    // to be fatal: a sim that will not present is worse than one without frame
+    // generation.
+    //
+    // Ordering matters. ffxReplaceSwapchainForFrameinterpolationVK takes the
+    // create-info, builds its own swapchain from it, DESTROYS whatever old
+    // swapchain it was handed, and returns a pointer to its C++ object wearing
+    // a VkSwapchainKHR's type. So we pass VK_NULL_HANDLE as the old one and let
+    // it create fresh - passing a real swapchain here would have it destroyed
+    // out from under the caller on the failure path too.
+    // ---- A SECOND SWAPCHAIN WHILE A PROXY EXISTS IS A CRASH, NOT A RETRY.
+    //
+    // Measured: X-Plane recreates its swapchain during "Rebuilding offscreens",
+    // and the log showed FG: ACTIVE twice with two different proxies. Two
+    // things go wrong at once there, and both are fatal.
+    //
+    // First, ci->oldSwapchain is whatever X-Plane last held - which is OUR
+    // PROXY POINTER, not a Vulkan handle. Passing that down to the driver, or
+    // back into FFX, hands a C++ object to something that will dereference it
+    // as a VkSwapchainKHR.
+    //
+    // Second, the frame-generation config still names the FIRST proxy. Even if
+    // the second replacement succeeded, the contexts would be driving a
+    // swapchain that no longer exists.
+    //
+    // So a recreation tears the existing proxy down first and clears
+    // oldSwapchain, which is the only value that is true of the swapchain FFX
+    // is about to build. Getting this wrong is not a lost feature, it is the
+    // sim exiting - which is exactly what it did.
+    if (g_fgSwap.have && ci->oldSwapchain != VK_NULL_HANDLE &&
+        ci->oldSwapchain == g_fgSwap.handle) {
+        trace("FG: X-Plane is recreating its swapchain and handed back our "
+              "proxy as oldSwapchain - tearing it down first.");
+        if (g_fgSwap.fn.destroySwapchainKHR)
+            g_fgSwap.fn.destroySwapchainKHR(device, g_fgSwap.handle, alloc);
+        g_fgSwap.have   = false;
+        g_fgSwap.handle = VK_NULL_HANDLE;
+        g_fgSwap.proxy  = nullptr;
+        g_fgActive.store(false, std::memory_order_relaxed);
+        mod.oldSwapchain = VK_NULL_HANDLE;
+    }
+    // Any other recreation while a proxy is live: refuse rather than orphan the
+    // first one. One proxy, one config - the second FG: ACTIVE in that log was
+    // already a bug before anything dereferenced anything.
+    if (g_fgSwap.have && live::onoff("taa.fg", "TAA_FG", false)) {
         static bool said = false;
         if (!said) {
             said = true;
-            FgQueues fq = fgPickQueues(device, g_ffxPhys, ci->surface);
-            trace("FG: queue selection %s - game fam %u, present fam %u, "
-                  "acquire fam %u, asyncCompute %s",
-                  fq.ok ? "OK" : "INCOMPLETE",
-                  fq.gameFam, fq.presentFam, fq.acquireFam,
-                  fq.asyncCompute ? "yes" : "none");
+            trace("FG: a swapchain is being created while the proxy is still "
+                  "live - leaving this one to the driver. Frame generation "
+                  "stays bound to the proxy it was configured for.");
+        }
+    }
+    // Only ever for the device FidelityFX is bound to. A swapchain created on a
+    // second device would build a proxy whose contexts, queues and resources all
+    // belong to the first - which is the mismatch that crashed this.
+    if (live::onoff("taa.fg", "TAA_FG", false) && !g_fgSwap.have &&
+        device == g_ffxDevice && g_ffxDevice != VK_NULL_HANDLE) {
+        FgQueues fq = fgPickQueues(device, g_ffxPhys, ci->surface);
+        trace("FG: queue selection %s - game fam %u, present fam %u, "
+              "acquire fam %u, asyncCompute %s",
+              fq.ok ? "OK" : "INCOMPLETE",
+              fq.gameFam, fq.presentFam, fq.acquireFam,
+              fq.asyncCompute ? "yes" : "none");
+
+        if (fq.ok) {
+            // ---- THIS ONE WANTS THE RAW VkDevice, NOT ffxGetDeviceVK'S.
+            //
+            // The SDK is inconsistent about what an FfxDevice is, and it costs
+            // a crash to find out. ffxGetDeviceVK returns a VkDeviceContext*
+            // wearing the FfxDevice type - that is what every context-creation
+            // call expects. But ffxGetSwapchainReplacementFunctionsVK does
+            //
+            //     VkDevice device = static_cast<VkDevice>(ffxDevice);
+            //     vkGetDeviceProcAddr(device, "vkSetHdrMetadataEXT")
+            //
+            // i.e. it casts straight to a device handle. Handing it the context
+            // pointer means it calls vkGetDeviceProcAddr with the ADDRESS OF A
+            // STRUCT, which the log named precisely:
+            //
+            //   FFX SHIM: asked for vkSetHdrMetadataEXT on device
+            //   00007ffffa02e1d0, but the context was built for ...
+            //
+            // The first fix here made that struct static, on the theory it was
+            // a dangling stack pointer. It was not - the address was simply
+            // never a device at all, and making it static only made the wrong
+            // pointer stable. The device is what this call wants.
+            FfxDevice ffxDev = (FfxDevice)device;
+
+            VkFrameInterpolationInfoFFX fi;
+            memset(&fi, 0, sizeof(fi));
+            fi.device                    = device;
+            fi.physicalDevice            = g_ffxPhys;
+            fi.gameQueue.queue           = fq.game;
+            fi.gameQueue.familyIndex     = fq.gameFam;
+            fi.presentQueue.queue        = fq.present;
+            fi.presentQueue.familyIndex  = fq.presentFam;
+            fi.imageAcquireQueue.queue   = fq.acquire;
+            fi.imageAcquireQueue.familyIndex = fq.acquireFam;
+            fi.asyncComputeQueue.queue   = fq.asyncCompute;
+            fi.asyncComputeQueue.familyIndex = fq.asyncFam;
+            // NOT_FORCED lets FFX pick from what the queues can actually do.
+            // The two forced modes each require a capability of the present
+            // queue that we have not verified, and getting that wrong is a
+            // deadlock rather than a refusal.
+            fi.compositionMode           = VK_COMPOSITION_MODE_NOT_FORCED_FFX;
+            fi.pAllocator                = alloc;
+
+            FfxSwapchain proxy = ffxGetSwapchainVK(VK_NULL_HANDLE);
+            FfxErrorCode fe = ffxReplaceSwapchainForFrameinterpolationVK(
+                ffxGetCommandQueueVK(fq.game), proxy, &mod, &fi);
+            if (fe == FFX_OK && proxy) {
+                FfxSwapchainReplacementFunctions fns;
+                memset(&fns, 0, sizeof(fns));
+                if (ffxGetSwapchainReplacementFunctionsVK(ffxDev, &fns) == FFX_OK
+                    && fns.queuePresentKHR && fns.getSwapchainImagesKHR
+                    && fns.acquireNextImageKHR && fns.destroySwapchainKHR) {
+                    g_fgSwap.fn     = fns;
+                    g_fgSwap.proxy  = proxy;
+                    g_fgSwap.handle = ffxGetVKSwapchain(proxy);
+                    g_fgSwap.have   = true;
+                    *out = g_fgSwap.handle;
+                    g_fgActive.store(true, std::memory_order_relaxed);
+                    trace("FG: ACTIVE - the frame-interpolation swapchain now "
+                          "owns presentation (proxy %p).", (void*)g_fgSwap.handle);
+
+                    return VK_SUCCESS;
+                }
+                // Functions unavailable: the proxy exists but nothing can drive
+                // it, so it must not be handed to X-Plane.
+                trace("FG: replacement functions unavailable - tearing the proxy "
+                      "down and creating an ordinary swapchain.");
+                if (fns.destroySwapchainKHR)
+                    fns.destroySwapchainKHR(device, ffxGetVKSwapchain(proxy), alloc);
+            } else {
+                trace("FG: ffxReplaceSwapchainForFrameinterpolationVK failed "
+                      "(%d) - falling back to an ordinary swapchain.", (int)fe);
+            }
         }
     }
 
@@ -14494,6 +14869,9 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkDestroyBuffer",       Layer_DestroyBuffer)
     RETURN_IF("vkQueuePresentKHR",     Layer_QueuePresentKHR)
     RETURN_IF("vkGetSwapchainImagesKHR", Layer_GetSwapchainImagesKHR)
+    // Hooked for frame generation only; pass-throughs while it is off.
+    RETURN_IF("vkAcquireNextImageKHR", Layer_AcquireNextImageKHR)
+    RETURN_IF("vkDestroySwapchainKHR", Layer_DestroySwapchainKHR)
     RETURN_IF("vkCmdBlitImage",        Layer_CmdBlitImage)
     RETURN_IF("vkCmdResolveImage",     Layer_CmdResolveImage)
     RETURN_IF("vkUpdateDescriptorSets", Layer_UpdateDescriptorSets)
