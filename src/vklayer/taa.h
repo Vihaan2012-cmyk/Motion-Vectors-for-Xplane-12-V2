@@ -59,6 +59,20 @@ struct TaaState {
     VkDeviceMemory  historyMem[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkImageView     historyView[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     uint32_t        historyWrite   = 0;   // index written this frame
+    // ---- THE SHARPEN TARGET. A THIRD BUFFER THAT NEVER FEEDS BACK.
+    //
+    // MODE_SHARPEN reads the resolved history and writes here; the copy-to-screen
+    // then reads HERE instead of the history. Because nothing ever samples this
+    // as history, the sharpen cannot compound into the accumulation - which is
+    // the whole reason the sharpen is a separate buffer and not an in-resolve
+    // step. Optional: if creation fails the resolve runs exactly as before and
+    // the sharpen is simply unavailable.
+    VkImage         sharpImage  = VK_NULL_HANDLE;
+    VkDeviceMemory  sharpMem    = VK_NULL_HANDLE;
+    VkImageView     sharpView   = VK_NULL_HANDLE;
+    // Tracked so the pre-dispatch barrier names the right source: UNDEFINED on
+    // first use, GENERAL every frame after (the copy-back returns it to GENERAL).
+    VkImageLayout   sharpLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     // ---- ONE VIEW PER SCENE IMAGE, CACHED, NEVER TORN DOWN MID-SESSION.
     //
     // X-Plane alternates between two HDR scene targets. Keying re-initialisation
@@ -102,7 +116,13 @@ struct TaaState {
     // A ring, not one set. The predecessor exhausted a single-set pool after
     // eight frames and stopped silently - the resolve simply stopped running
     // and nothing said so.
-    static const uint32_t kSets = 8;
+    // ---- 16, NOT 8: THE SHARPEN PASS TAKES A SECOND SET PER FRAME.
+    //
+    // With MODE_SHARPEN on, a resolve frame consumes two sets from this ring
+    // (resolve + sharpen) instead of one. Eight left barely two frames of
+    // in-flight headroom before a set still referenced by a submitted command
+    // buffer could be overwritten; doubling the ring restores the margin.
+    static const uint32_t kSets = 16;
     VkDescriptorSet sets[kSets] = { VK_NULL_HANDLE };
     uint32_t        nextSet = 0;
 
@@ -201,6 +221,10 @@ struct TaaPush {
     float   movedDead;
     float   alphaMoving;
     float   alphaMovingPx;
+    // Strength of the post-resolve MODE_SHARPEN pass. 0 disables it and the
+    // record path skips the second dispatch entirely. Must be the LAST field so
+    // it mirrors the shader's Params block byte for byte.
+    float   sharpen;
 };
 
 enum {
@@ -247,6 +271,16 @@ static float taaAlphaMoving(){ return live::f("taa.alpha_moving", "TAA_ALPHA_MOV
 static float taaAlphaMovingPx(){ return live::f("taa.alpha_moving_px", "TAA_ALPHA_MOVING_PX", 3.0f); }
 static int   taaViz()      { return live::i("taa.viz",   "TAA_VIZ",   0); }
 static float taaVizScale() { return live::f("taa.viz_scale", nullptr, 1.0f); }
+// ---- POST-RESOLVE SHARPEN. THE ANSWER TO "TAA IS TOO SOFT".
+//
+// TAA resamples history every frame, so a low alpha (long, well-antialiased
+// history) is also a heavily blurred one - fine detail is averaged out. Raising
+// alpha trades that blur straight back for aliasing; a sharpen pass recovers the
+// detail WITHOUT shortening the history, which is why every shipping TAA pairs
+// the two. Runs as MODE_SHARPEN on a dedicated buffer so it never feeds back.
+// 0 = off (the record path then skips the second dispatch and copies the
+// resolved image straight to screen, i.e. exactly the pre-sharpen behaviour).
+static float taaSharpen()  { return live::f("taa.sharpen", "TAA_SHARPEN", 0.0f); }
 
 // ---- REMOVE ONE INPUT AT A TIME.
 //
@@ -348,6 +382,9 @@ static void taaDestroyState(DeviceData &dd, TaaState &g_taa)
         if (g_taa.history[i])    dd.destroyImage(g_taa.device, g_taa.history[i], nullptr);
         if (g_taa.historyMem[i]) dd.freeMemory(g_taa.device, g_taa.historyMem[i], nullptr);
     }
+    if (g_taa.sharpView)  dd.destroyImageView(g_taa.device, g_taa.sharpView, nullptr);
+    if (g_taa.sharpImage) dd.destroyImage(g_taa.device, g_taa.sharpImage, nullptr);
+    if (g_taa.sharpMem)   dd.freeMemory(g_taa.device, g_taa.sharpMem, nullptr);
     TaaState fresh;
     fresh.device = g_taa.device;
     g_taa = fresh;
@@ -447,6 +484,35 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
         dd.bindImageMemory(dev, g_taa.history[hi], g_taa.historyMem[hi], 0);
     }
 
+    // ---- THE SHARPEN TARGET. Same shape and usage as a history image (it is
+    // written by a compute dispatch and copied to the scene), but it is NEVER
+    // sampled as history, so the sharpen it holds cannot compound. Optional: on
+    // any failure it is left null and taaRecordResolve falls back to copying the
+    // resolved history straight to screen, exactly as before the sharpen existed.
+    g_taa.sharpLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (dd.createImage(dev, &ici, nullptr, &g_taa.sharpImage) == VK_SUCCESS) {
+        VkMemoryRequirements mr;
+        dd.getImageMemReq(dev, g_taa.sharpImage, &mr);
+        VkMemoryAllocateInfo mai;
+        memset(&mai, 0, sizeof(mai));
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = taaFindMemory(dd, mr.memoryTypeBits,
+                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mai.memoryTypeIndex != UINT32_MAX &&
+            dd.allocateMemory(dev, &mai, nullptr, &g_taa.sharpMem) == VK_SUCCESS) {
+            dd.bindImageMemory(dev, g_taa.sharpImage, g_taa.sharpMem, 0);
+        } else {
+            trace("TAA: sharpen image memory allocation failed - sharpen disabled");
+            if (g_taa.sharpImage) dd.destroyImage(dev, g_taa.sharpImage, nullptr);
+            g_taa.sharpImage = VK_NULL_HANDLE;
+            g_taa.sharpMem   = VK_NULL_HANDLE;
+        }
+    } else {
+        trace("TAA: sharpen image creation failed - sharpen disabled");
+        g_taa.sharpImage = VK_NULL_HANDLE;
+    }
+
     VkImageViewCreateInfo ivci;
     memset(&ivci, 0, sizeof(ivci));
     ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -458,6 +524,19 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     for (int hi = 0; hi < 2; ++hi) {
         ivci.image = g_taa.history[hi];
         if (dd.createImageView(dev, &ivci, nullptr, &g_taa.historyView[hi]) != VK_SUCCESS) return false;
+    }
+    // The sharpen target's view. If it fails, disable the sharpen rather than
+    // the whole resolve - the copy-back falls back to the history image.
+    if (g_taa.sharpImage != VK_NULL_HANDLE) {
+        ivci.image = g_taa.sharpImage;
+        if (dd.createImageView(dev, &ivci, nullptr, &g_taa.sharpView) != VK_SUCCESS) {
+            trace("TAA: sharpen image view creation failed - sharpen disabled");
+            dd.destroyImage(dev, g_taa.sharpImage, nullptr);
+            if (g_taa.sharpMem) dd.freeMemory(dev, g_taa.sharpMem, nullptr);
+            g_taa.sharpImage = VK_NULL_HANDLE;
+            g_taa.sharpMem   = VK_NULL_HANDLE;
+            g_taa.sharpView  = VK_NULL_HANDLE;
+        }
     }
     ivci.image = scene;
     if (dd.createImageView(dev, &ivci, nullptr, &g_taa.sceneView) != VK_SUCCESS) return false;
@@ -1157,6 +1236,12 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.movedDead = taaMovedDead();
     pcv.alphaMoving = taaAlphaMoving();
     pcv.alphaMovingPx = taaAlphaMovingPx();
+    // Read once; the main dispatch ignores it (mode != SHARPEN) but it must be
+    // defined, and the sharpen pass below reuses this same block.
+    const float sharpAmt  = taaSharpen();
+    const bool  doSharpen = sharpAmt > 0.0f && g_taa.sharpImage != VK_NULL_HANDLE
+                            && g_taa.sharpView != VK_NULL_HANDLE;
+    pcv.sharpen = sharpAmt;
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
@@ -1192,12 +1277,99 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // z = layers, matching gl_GlobalInvocationID.z in the shader.
     dd.cmdDispatch(cb, (g_taa.w + 7) / 8, (g_taa.h + 7) / 8, g_taa.layers);
 
+    // ---- OPTIONAL SHARPEN PASS (MODE_SHARPEN) ON A DEDICATED BUFFER.
+    //
+    // A second dispatch of the SAME pipeline, reading the resolved history just
+    // written and writing g_taa.sharpImage. The accumulation history is never
+    // touched, so the sharpen cannot compound - the mistake that turned an
+    // in-resolve sharpen into runaway grain. Skipped entirely when taa.sharpen
+    // is 0, in which case the copy below is byte-for-byte the old path.
+    if (doSharpen) {
+        VkImageMemoryBarrier sp[2];
+        memset(sp, 0, sizeof(sp));
+        for (int i = 0; i < 2; ++i) {
+            sp[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            sp[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            sp[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            sp[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            sp[i].subresourceRange.levelCount = 1;
+            sp[i].subresourceRange.layerCount = g_taa.layers;
+        }
+        // The resolve's write to history[hw_] -> readable by this dispatch.
+        sp[0].image = g_taa.history[hw_];
+        sp[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        sp[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        sp[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        sp[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        // The sharpen target -> writable. UNDEFINED on first use (contents are
+        // fully overwritten, so discarding them is correct); GENERAL and last
+        // read by the previous frame's copy thereafter.
+        sp[1].image = g_taa.sharpImage;
+        sp[1].oldLayout = g_taa.sharpLayout;
+        sp[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        sp[1].srcAccessMask = (g_taa.sharpLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+                                ? 0 : VK_ACCESS_TRANSFER_READ_BIT;
+        sp[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                              0, nullptr, 0, nullptr, 2, sp);
+
+        VkDescriptorSet sset = g_taa.sets[g_taa.nextSet];
+        g_taa.nextSet = (g_taa.nextSet + 1) % TaaState::kSets;
+
+        // Bindings 0/2/4 are reused from the resolve set purely to keep every
+        // statically-used descriptor valid; MODE_SHARPEN reads neither. Binding
+        // 3 is the resolved image (read), binding 1 the sharpen target (write).
+        VkDescriptorImageInfo si[5];
+        memset(si, 0, sizeof(si));
+        si[0] = ii[0];
+        si[1].imageView = g_taa.sharpView; si[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        si[2] = ii[2];
+        si[3].imageView = g_taa.historyView[hw_];
+        si[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        si[3].sampler   = g_taa.sampler;
+        si[4] = ii[4];
+
+        VkWriteDescriptorSet sw[5];
+        memset(sw, 0, sizeof(sw));
+        for (int i = 0; i < 5; ++i) {
+            sw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            sw[i].dstSet = sset;
+            sw[i].dstBinding = (uint32_t)i;
+            sw[i].descriptorCount = 1;
+            sw[i].pImageInfo = &si[i];
+        }
+        sw[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sw[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        sw[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sw[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sw[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        dd.updateDescriptorSets(g_taa.device, 5, sw, 0, nullptr);
+
+        // Pipeline is still bound from the resolve; only the set and the push
+        // constant's mode change.
+        dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                 g_taa.pipeLayout, 0, 1, &sset, 0, nullptr);
+        TaaPush spc = pcv;
+        spc.mode = 4;              // MODE_SHARPEN
+        spc.sharpen = sharpAmt;
+        dd.cmdPushConstants(cb, g_taa.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                            0, sizeof(spc), &spc);
+        dd.cmdDispatch(cb, (g_taa.w + 7) / 8, (g_taa.h + 7) / 8, g_taa.layers);
+    }
+
     // ---- COPY THE RESULT INTO THE SCENE TARGET.
     //
     // Separate command, explicit ordering: everything the dispatch reads is
     // finished before anything is written back. In place would reintroduce the
     // neighbourhood race the read-only binding just removed.
     {
+        // The sharpen wrote g_taa.sharpImage; copy THAT to screen and leave the
+        // resolved history[hw_] untouched (it stays pristine as next frame's
+        // sample source). Without the sharpen, copy history[hw_] as before.
+        VkImage copySrc = doSharpen ? g_taa.sharpImage : g_taa.history[hw_];
+
         VkImageMemoryBarrier pre[2];
         pre[0] = bar[0];
         pre[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1205,7 +1377,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         pre[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         pre[1] = bar[1];
-        pre[1].image = g_taa.history[hw_];
+        pre[1].image = copySrc;
         pre[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         pre[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         pre[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1220,7 +1392,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         cp.srcSubresource.layerCount = g_taa.layers;
         cp.dstSubresource = cp.srcSubresource;
         cp.extent.width = g_taa.w; cp.extent.height = g_taa.h; cp.extent.depth = 1;
-        dd.cmdCopyImage(cb, g_taa.history[hw_], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        dd.cmdCopyImage(cb, copySrc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         g_taa.sceneImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
 
         VkImageMemoryBarrier post = pre[1];
@@ -1231,6 +1403,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                               0, nullptr, 0, nullptr, 1, &post);
+
+        // copySrc is GENERAL again. For the sharpen target that is the state the
+        // next frame's pre-dispatch barrier expects; record it.
+        if (doSharpen) g_taa.sharpLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
     // The destination stage for this transition back is COLOR_ATTACHMENT_OUTPUT

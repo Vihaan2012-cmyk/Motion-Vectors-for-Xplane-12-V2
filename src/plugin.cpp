@@ -3349,6 +3349,30 @@ static float matrixCallback(float sinceLast, float, int, void *)
         };
         static bool   resolved = false, bodyTrusted = false;
         static int    bodyMode = 0;
+        // ---- FORCE THE BODY-FRAME CONVENTION SO THE COCKPIT WORKS PARKED.
+        //
+        // The 192-candidate handedness search only resolves while the AIRCRAFT
+        // physically rotates, so a parked cockpit never calibrates - the panel
+        // frame around the windscreen then carries world-frame motion and
+        // smears on a pan (the "box" smear). X-Plane's quaternion convention is
+        // fixed: sim/flightmodel/position/q is [w x y z] = candidate 0, the
+        // mapping the code always assumed. Hardcode it and skip the search.
+        // TAA_BODY_FORCE_MODE: >=0 forces that candidate (0 = [wxyz]), -1 keeps
+        // the live measurement.
+        {
+            static bool applied = false;
+            if (!applied) {
+                applied = true;
+                const char *fm = getenv("TAA_BODY_FORCE_MODE");
+                int fmi = fm ? atoi(fm) : 0;   // default 0 = [wxyz]
+                if (fmi >= 0 && fmi < BODY_CANDS) {
+                    resolved = true; bodyMode = fmi; bodyTrusted = true;
+                    xlog("body frame: FORCED to candidate %d ([wxyz]=0) - works "
+                         "PARKED, no rotation search. TAA_BODY_FORCE_MODE=-1 to "
+                         "measure instead.", fmi);
+                }
+            }
+        }
         static double drift[BODY_CANDS];
         static float  lastCam[BODY_CANDS][3];
         static bool   haveLast = false;

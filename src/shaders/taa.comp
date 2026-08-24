@@ -158,6 +158,11 @@ layout(push_constant) uniform Params {
     float movedDead;    // deadband on the clamp correction, in units of floorS
     float alphaMoving;  // blend weight while the camera is moving
     float alphaMovingPx;// px/frame at which alphaMoving is fully applied
+    // Strength of the MODE_SHARPEN pass. 0 disables it (the layer then skips the
+    // pass entirely and copies the resolved image straight to screen). ~0.2-0.5
+    // is a normal range; higher bites harder without ever ringing, because the
+    // result is clamped to the local neighbourhood.
+    float sharpen;
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -223,6 +228,22 @@ const int MODE_FULL        = 2;
 // the history binding or the copy back - and not in any resolve logic, which is
 // a different search and a much shorter one.
 const int MODE_CLEAN       = 3;
+// ---- MODE 4: RCAS-STYLE SHARPEN, RUN AS A SEPARATE PASS AFTER THE RESOLVE.
+//
+// TAA is a low-pass filter: every history fetch is a resample, and at a low
+// alpha a sample is resampled for as many frames as it survives, so fine
+// detail - panel text, runway paint, instrument glass - is averaged away. The
+// fix every shipping TAA uses is a sharpening pass, NOT a shorter history
+// (which just trades the blur for aliasing).
+//
+// The trap is where it runs. Folding a sharpen into the resolve writes the
+// boosted value into the very buffer next frame samples as history, so the
+// boost compounds every frame into runaway grain - measured, and the reason an
+// earlier attempt was reverted. This mode instead reads the ALREADY-resolved
+// image and writes to a DEDICATED target that only the copy-to-screen consumes.
+// The accumulation history stays pristine; only the displayed copy is
+// sharpened, so nothing feeds back.
+const int MODE_SHARPEN     = 4;
 
 // RGB to YCoCg. The neighbourhood clamp is done in YCoCg because clamping in
 // RGB clips hue as well as luminance, which is what turns a rejected sample
@@ -343,6 +364,36 @@ void main()
     ivec3 size3 = textureSize(uScene, 0);
     ivec2 size  = size3.xy;
     if (px.x >= size.x || px.y >= size.y || layer >= size3.z) return;
+
+    // ---- MODE 4: the sharpen pass. See the note at MODE_SHARPEN.
+    //
+    // Reads the resolved image through uHistorySampler (bound here to the buffer
+    // the resolve just wrote) and writes a sharpened copy to uHistory (bound
+    // here to the throwaway sharpen target, NOT the accumulation history). A
+    // 5-tap cross unsharp mask - centre plus its four axial neighbours - clamped
+    // to the local per-channel min/max so it can lift edge contrast but never
+    // overshoot past colours already present, which is what keeps it from
+    // ringing or manufacturing grain. Flat regions have a zero Laplacian and are
+    // returned unchanged. Neighbour taps are clamped to the image so the border
+    // reads no garbage.
+    if (pc.mode == MODE_SHARPEN) {
+        ivec2 hi2 = size - 1;
+        vec3 e  = texelFetch(uHistorySampler, ivec3(px, layer), 0).rgb;
+        vec3 up = texelFetch(uHistorySampler,
+                    ivec3(clamp(px + ivec2(0, -1), ivec2(0), hi2), layer), 0).rgb;
+        vec3 dn = texelFetch(uHistorySampler,
+                    ivec3(clamp(px + ivec2(0,  1), ivec2(0), hi2), layer), 0).rgb;
+        vec3 lf = texelFetch(uHistorySampler,
+                    ivec3(clamp(px + ivec2(-1, 0), ivec2(0), hi2), layer), 0).rgb;
+        vec3 rt = texelFetch(uHistorySampler,
+                    ivec3(clamp(px + ivec2( 1, 0), ivec2(0), hi2), layer), 0).rgb;
+        vec3 lo = min(e, min(min(up, dn), min(lf, rt)));
+        vec3 hi = max(e, max(max(up, dn), max(lf, rt)));
+        vec3 sharp = e + pc.sharpen * (4.0 * e - up - dn - lf - rt);
+        sharp = clamp(sharp, lo, hi);
+        imageStore(uHistory, ivec3(px, layer), vec4(max(sharp, vec3(0.0)), 1.0));
+        return;
+    }
 
     vec3 curr = texelFetch(uScene, ivec3(px, layer), 0).rgb;
 
