@@ -101,11 +101,14 @@ if (Test-Path "$root\lua\MotionVectors.lua") {
     Copy-Item "$root\lua\MotionVectors.lua" "$stage\Resources\plugins\FlyWithLua\Scripts\"
 }
 
-# The tuned settings, for reference. NOT required: every value here is also a
-# compiled default, so a fresh install with no settings file behaves the same.
-# It is included so a user can see what the knobs are and edit them.
+# The tuned settings, shipped as the live file. It sits beside the launcher,
+# which seeds it into %TEMP%\taa_live.ini on first run (only if the user has no
+# file there yet), so a fresh install applies this exact tuning out of the box
+# while existing tweaks are left untouched. It is also plain text the user can
+# read and edit - every value is additionally a compiled default, so deleting it
+# only falls back to those defaults.
 if (Test-Path "$root\config\taa_live.ini") {
-    Copy-Item "$root\config\taa_live.ini" "$stage\MotionVectors\taa_live.ini.reference"
+    Copy-Item "$root\config\taa_live.ini" "$stage\MotionVectors\taa_live.ini"
 }
 
 # GPL-3.0 requires the licence to accompany the binaries, so it ships in the

@@ -77,7 +77,7 @@ local C_LOG       = 0x6A101010   -- log box, translucent like the panel
 
 -- Version the panel reports, and the newest X-Plane this build has been tested
 -- against. No network check: bump this constant per release.
-local MOD_VERSION      = "0.0.18"
+local MOD_VERSION      = "1.1.0"
 local MAX_TESTED_XP    = "12.43.11"
 
 -- A style push that cannot quarantine the script.
@@ -140,8 +140,30 @@ end
   anyone editing it by hand.
 --------------------------------------------------------------------------- ]]
 local function ini_path()
+    -- TAA_LIVE_FILE FIRST, exactly as the layer resolves it.
+    --
+    -- live::path() checks this variable before falling back to %TEMP%, and the
+    -- launcher sets it. Checking only %TEMP% here meant that under the dev
+    -- launcher the panel edited one file while the layer read another, and
+    -- every setting written from the panel silently did nothing.
+    local e = os.getenv("TAA_LIVE_FILE")
+    if e and e ~= "" then return e end
     local t = os.getenv("TEMP") or os.getenv("TMP") or "."
     return t .. "\\taa_live.ini"
+end
+
+-- The file may not exist yet: the layer writes a template on first run, so a
+-- panel opened before the layer has ever attached has nothing to edit. Create
+-- it rather than refusing, so the panel works on a fresh install.
+local function ini_ensure()
+    local f = io.open(ini_path(), "r")
+    if f then f:close(); return true end
+    f = io.open(ini_path(), "w")
+    if not f then return false end
+    f:write("# Motion Vectors live control file.\n" ..
+            "# Written by the panel. The layer re-reads it every few frames.\n")
+    f:close()
+    return true
 end
 
 local function ini_read()
@@ -150,6 +172,38 @@ local function ini_read()
     local s = f:read("*a")
     f:close()
     return s
+end
+
+-- A PARSED CACHE, because the panel now shows 88 settings.
+--
+-- ini_get() re-opened and re-read the whole file per call. At six settings that
+-- was merely wasteful; at eighty-eight it is eighty-eight file opens per frame,
+-- inside the ImGui builder, on the main thread. Parsed once every refresh
+-- instead, and invalidated the moment we write.
+local ini_map, ini_map_at = {}, -1e9
+
+local function ini_refresh(force)
+    local now = os.clock()
+    if not force and (now - ini_map_at) < 0.5 then return end
+    ini_map_at = now
+    local m = {}
+    local txt = ini_read()
+    if txt then
+        for line in txt:gmatch("[^\r\n]+") do
+            if not line:match("^%s*[#;]") then
+                local k, v = line:match("^%s*([%w_.]+)%s*=%s*(.-)%s*$")
+                if k then m[k] = v end
+            end
+        end
+    end
+    ini_map = m
+end
+
+-- nil when the key is absent, which is what "still at the compiled default"
+-- looks like. Distinguishing that from an explicit value is the whole point:
+-- the panel must not claim a user set something they did not.
+local function ini_raw(key)
+    return ini_map[key]
 end
 
 local function ini_get(key, default)
@@ -177,6 +231,24 @@ local function ini_set(key, value)
     if not f then return false end
     f:write(s)
     f:close()
+    ini_refresh(true)
+    return true
+end
+
+-- Remove a key entirely, which is how a setting goes back to the value
+-- compiled into the layer. Writing the default back as a literal would look
+-- identical in the file and behave differently the day the default changes.
+local function ini_clear(key)
+    local txt = ini_read()
+    if not txt then return false end
+    local pat = key:gsub("%.", "%%.")
+    txt = txt:gsub("[\r\n]" .. pat .. "%s*=[^\r\n]*", "")
+    txt = txt:gsub("^" .. pat .. "%s*=[^\r\n]*[\r\n]?", "")
+    local f = io.open(ini_path(), "w")
+    if not f then return false end
+    f:write(txt)
+    f:close()
+    ini_refresh(true)
     return true
 end
 
@@ -234,16 +306,22 @@ local function verify_integrity()
         return nil
     end
 
+    -- THREE layouts now. The product split moved development output to
+    -- build\\<product>\\vklayer, and dropping the old path without
+    -- adding the new one made the panel report MISSING for a layer that was
+    -- loaded and running - the same self-contradiction the comment above
+    -- records, reintroduced from the other direction.
     local dll  = { base .. "VkLayer_mv.dll",
+                   base .. "build\\MotionVectors\\vklayer\\VkLayer_mv.dll",
                    base .. "build\\vklayer\\VkLayer_mv.dll" }
     local json = { base .. "VkLayer_mv.json",
+                   base .. "build\\MotionVectors\\vklayer\\VkLayer_mv.json",
                    base .. "build\\vklayer\\VkLayer_mv.json" }
 
     local checks = {
         { "Vulkan layer",     first_existing(dll)  or dll[1]  },
         { "Layer manifest",   first_existing(json) or json[1] },
         { "Plugin",           root .. "Resources\\plugins\\MotionVectors\\64\\win.xpl" },
-        { "Live controls",    ini_path() },
     }
     local bad = 0
     logf(C_AMBER, "Verifying files...")
@@ -255,6 +333,31 @@ local function verify_integrity()
             bad = bad + 1
         end
     end
+    -- ---- THE LIVE CONTROL FILE IS NOT AN INSTALLATION FILE.
+    --
+    -- It used to sit in the list above and be counted as a failure, so every
+    -- clean install reported "Integrity check found 1 problem(s)" the first
+    -- time it ran - on an installation with nothing whatsoever wrong with it.
+    --
+    -- Its absence is the NORMAL state before anyone has changed a setting. The
+    -- layer says so itself, in its own words, in the log a few lines earlier:
+    -- "no config at ... - using defaults". A file the layer is documented to
+    -- do without is not part of whether the mod is installed.
+    --
+    -- What IS worth reporting is being unable to create it, because then the
+    -- panel cannot write a setting and every control in it would silently do
+    -- nothing - which is a real fault, and one that looks like the panel being
+    -- broken rather than like a permissions problem.
+    if file_exists(ini_path()) then
+        logf(C_GREEN, "  OK      Live controls")
+    elseif ini_ensure() then
+        logf(C_GREEN, "  OK      Live controls (created - defaults until changed)")
+    else
+        logf(C_RED,   "  PROBLEM Cannot create %s - the panel will not be able "
+                      .. "to save anything", ini_path())
+        bad = bad + 1
+    end
+
     -- The layer being present on disk says nothing about it being LOADED. That
     -- is a separate failure with a separate fix, so it is a separate line.
     -- ---- ATTACHMENT IS NOT KNOWN YET AT SCRIPT LOAD.
@@ -360,24 +463,383 @@ end
 --------------------------------------------------------------------------- ]]
 local BACKENDS = { "TAA", "DLSS", "FSR", "XeSS", "DLAA", "FG", "MFG" }
 
+-- BEGIN GENERATED SETTINGS -- produced by gen_lua.py from the layer
+-- source; every live:: key in src/vklayer is listed here. Do not edit
+-- by hand: a hand-kept copy is what left writeTemplate() at 6 of 88.
+local SETTINGS = {
+  { key = "crash.enable", label = "enable", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "CRASH", help = "" },
+  { key = "rd.capture", label = "capture", kind = "int", def = 0, lo = nil, hi = nil,
+    group = "DEBUG", help = "" },
+  { key = "report", label = "report", kind = "int", def = 0, lo = nil, hi = nil,
+    group = "DEBUG", help = "One-shot: fires once and clears its own key, so leaving it set in the file by accident costs one report rather than one per frame forever." },
+  { key = "report.every", label = "every", kind = "int", def = 0, lo = nil, hi = nil,
+    group = "DEBUG", help = "" },
+  { key = "taa.alpha", label = "alpha", kind = "float", def = 0.05, lo = 0.01, hi = 1.0,
+    group = "TAA", help = "" },
+  { key = "taa.alpha_moving", label = "alpha_moving", kind = "float", def = 0.35, lo = 0.01, hi = 1.0,
+    group = "TAA", help = "Blend weight while the camera moves." },
+  { key = "taa.alpha_moving_px", label = "alpha_moving_px", kind = "float", def = 3.0, lo = 0.0, hi = 16.0,
+    group = "TAA", help = "Speed, in px/frame, at which alpha_moving is fully applied." },
+  { key = "taa.clear_after_resolve", label = "clear_after_resolve", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.enable", label = "enable", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "---- EVERY KNOB IS LIVE." },
+  { key = "taa.force_reset", label = "force_reset", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.freeze_history", label = "freeze_history", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.gain", label = "gain", kind = "float", def = 4.0, lo = 0.0, hi = 16.0,
+    group = "TAA", help = "" },
+  { key = "taa.hist_catmull", label = "hist_catmull", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "TAA", help = "Sharp history resampling." },
+  { key = "taa.jitter_scale", label = "jitter_scale", kind = "float", def = 0.0, lo = 0.0, hi = 2.0,
+    group = "TAA", help = "Jitter defaults OFF even with the resolve on: the unjitter cancellation has never been verified on screen, and the first flight that ran it showed exa" },
+  { key = "taa.max_resolves", label = "max_resolves", kind = "int", def = 1, lo = 1, hi = 8,
+    group = "TAA", help = "" },
+  { key = "taa.mode", label = "mode", kind = "int", def = 0, lo = 0, hi = 3,
+    group = "TAA", help = "0 passthrough, 1 reproject, 2 full (variance clip), 3 clean" },
+  { key = "taa.moved_dead", label = "moved_dead", kind = "float", def = 0.0, lo = 0.0, hi = 4.0,
+    group = "TAA", help = "Deadband on the clamp correction, in units of the noise floor." },
+  { key = "taa.moved_eps", label = "moved_eps", kind = "float", def = 1e-4, lo = nil, hi = nil,
+    group = "TAA", help = "Not camDelta: that is translation only, and a camera rotating in place moves every pixel while translating zero." },
+  { key = "taa.mv_pass", label = "mv_pass", kind = "int", def = -2, lo = -2, hi = 13,
+    group = "TAA", help = "-2 census winner, -1 all passes, 0..13 pin one" },
+  { key = "taa.nearfield_m", label = "nearfield_m", kind = "float", def = nil, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.nearfield_view", label = "nearfield_view", kind = "int", def = -1, lo = -1, hi = 2000,
+    group = "TAA", help = "---- NEAR-FIELD DISTANCE, in metres, into the spare .z of the jitter vec4." },
+  { key = "taa.no_accum", label = "no_accum", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.no_motion", label = "no_motion", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.novec_alpha", label = "novec_alpha", kind = "float", def = 0.05, lo = 0.0, hi = 1.0,
+    group = "TAA", help = "0.5 was chosen to stop the ground crawling, but it also refuses to accumulate on every pixel the sentinel calls unwritten - which is most of an extern" },
+  { key = "taa.novec_by_vel", label = "novec_by_vel", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.novec_cov", label = "novec_cov", kind = "float", def = -1.0, lo = nil, hi = nil,
+    group = "TAA", help = "---- THE UNWRITTEN-PIXEL REJECTION IS OFF BY DEFAULT." },
+  { key = "taa.objflags", label = "objflags", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "TAA", help = "The gbuffer_vel weight override - on by default because everything it addresses (prop halo, airframe streaks, cockpit shake) is worse than the aliasin" },
+  { key = "taa.quad_needs_depth", label = "quad_needs_depth", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.quad_needs_pull", label = "quad_needs_pull", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.reactive", label = "reactive", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "The C14 reactive mask - on by default for the same reason as the flag override: flicker parked in history is worse than aliasing on the flickering con" },
+  { key = "taa.smul_x", label = "smul_x", kind = "float", def = 0.5, lo = -2.0, hi = 2.0,
+    group = "TAA", help = "" },
+  { key = "taa.smul_y", label = "smul_y", kind = "float", def = -0.5, lo = -2.0, hi = 2.0,
+    group = "TAA", help = "" },
+  { key = "taa.sticky_colour", label = "sticky_colour", kind = "int", def = -1, lo = -1, hi = 1,
+    group = "TAA", help = "" },
+  { key = "taa.unjitter", label = "unjitter", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "TAA", help = "The unjitter alignment - isolation knob for the aligned sampling, so its contribution can be removed live without touching the jitter itself." },
+  { key = "taa.varclip", label = "varclip", kind = "float", def = 8.0, lo = 0.5, hi = 16.0,
+    group = "TAA", help = "8.0, not 1.25." },
+  { key = "taa.vel_max", label = "vel_max", kind = "float", def = 1.0, lo = nil, hi = nil,
+    group = "TAA", help = "" },
+  { key = "taa.vel_scale", label = "vel_scale", kind = "float", def = 1.0, lo = 0.0, hi = 4.0,
+    group = "TAA", help = "---- REMOVE ONE INPUT AT A TIME." },
+  { key = "taa.vel_ypos", label = "vel_ypos", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "-1.0 is the shipping belief (negative-height viewport => d(uv_y) = -vel_y)." },
+  { key = "taa.viz", label = "viz", kind = "int", def = 0, lo = 0, hi = 10,
+    group = "TAA", help = "0 off, 1 motion, 2 magnitude, 3 invalid, 4 history, 5 weight, 6 clamp, 8 written, 10 view depth" },
+  { key = "taa.viz_scale", label = "viz_scale", kind = "float", def = 1.0, lo = 0.0, hi = 8.0,
+    group = "TAA", help = "" },
+  { key = "vram.adaptive", label = "adaptive", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.age_frames", label = "age_frames", kind = "int", def = 1800, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.bench", label = "bench", kind = "int", def = 0, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.budget_alpha", label = "budget_alpha", kind = "float", def = 0.02, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.deflate_frames", label = "deflate_frames", kind = "int", def = 600, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.deflate_mb", label = "deflate_mb", kind = "int", def = 512, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.enable", label = "enable", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.explain", label = "explain", kind = "int", def = 1, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.governor", label = "governor", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.hold_max_mb", label = "hold_max_mb", kind = "int", def = 512, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.lookahead", label = "lookahead", kind = "int", def = 300, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.migrate", label = "migrate", kind = "int", def = 1, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.migrate_every", label = "migrate_every", kind = "int", def = 300, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.priority", label = "priority", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.recycle", label = "recycle", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.recycle_hold_frames", label = "recycle_hold_frames", kind = "int", def = 180, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.recycle_max_mb", label = "recycle_max_mb", kind = "int", def = 256, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.recycle_pressure_mb", label = "recycle_pressure_mb", kind = "int", def = 64, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.report", label = "report", kind = "int", def = 0, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.reserve_c", label = "reserve_c", kind = "int", def = 768, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.reserve_g", label = "reserve_g", kind = "int", def = 128, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.reserve_o", label = "reserve_o", kind = "int", def = 384, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.reserve_r", label = "reserve_r", kind = "int", def = 512, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.reserve_y", label = "reserve_y", kind = "int", def = 256, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.retain_max_mb", label = "retain_max_mb", kind = "int", def = 256, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.rot_floor_deg", label = "rot_floor_deg", kind = "float", def = 1.0, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.shape", label = "shape", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.speed_reserve", label = "speed_reserve", kind = "float", def = 0.01, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.teleport_frames", label = "teleport_frames", kind = "int", def = 900, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.teleport_m", label = "teleport_m", kind = "float", def = 2000.0, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.tex_drop_above", label = "tex_drop_above", kind = "int", def = 0, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.tex_streamed_to", label = "tex_streamed_to", kind = "int", def = 0, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.trace_every", label = "trace_every", kind = "int", def = 600, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.upload_c", label = "upload_c", kind = "int", def = 8, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.upload_cache", label = "upload_cache", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.upload_g", label = "upload_g", kind = "int", def = 0, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.upload_max_hold", label = "upload_max_hold", kind = "int", def = 2, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.upload_o", label = "upload_o", kind = "int", def = 64, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.upload_r", label = "upload_r", kind = "int", def = 24, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.upload_y", label = "upload_y", kind = "int", def = 0, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.w_category", label = "w_category", kind = "float", def = 0.40, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.w_frequency", label = "w_frequency", kind = "float", def = 0.15, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.w_recency", label = "w_recency", kind = "float", def = 0.25, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.w_recreate", label = "w_recreate", kind = "float", def = 0.10, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.w_size", label = "w_size", kind = "float", def = 0.10, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.w_spatial", label = "w_spatial", kind = "float", def = 0.20, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.warmup_frames", label = "warmup_frames", kind = "int", def = 900, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+  { key = "vram.warmup_mb", label = "warmup_mb", kind = "int", def = 512, lo = nil, hi = nil,
+    group = "VRAM", help = "" },
+}
+-- END GENERATED SETTINGS
+
+
+--[[ ---------------------------------------------------------------------------
+  The settings browser.
+
+  Every live:: key in the layer, edited here and written straight into the
+  control file the layer polls. There is no dataref in this path and no restart:
+  the layer re-reads the file on a timestamp change every fifteen frames, so a
+  slider moved here takes effect in well under a second.
+
+  Two rules the rest of this file also follows.
+
+  A key that is ABSENT from the file is not the same as a key set to its default
+  value. Absent means "whatever the layer was compiled with", and that is the
+  value that ships. So a row shows "default" in dim text until it is explicitly
+  overridden, and Reset deletes the line rather than writing the default back.
+
+  A range is a claim about what is useful. Only the keys someone has actually
+  reasoned about carry lo/hi and get a slider; the rest get a number box, which
+  is honest about not knowing rather than putting a confident-looking slider on
+  a span nobody has thought about.
+--------------------------------------------------------------------------- ]]
+local SET_GROUPS = { "TAA", "VRAM", "CRASH", "DEBUG" }
+local set_group  = "TAA"
+local set_edit   = {}      -- key -> in-progress text, so typing is not fought
+
+-- FlyWithLua builds differ in which imgui entry points exist, and calling a
+-- missing one quarantines the script. Same defence as pushcol().
+local function imhas(fn) return imgui and type(imgui[fn]) == "function" end
+
+local function set_default_str(sd)
+    if sd.def == nil then return "?" end
+    if sd.kind == "bool" then return sd.def and "on" or "off" end
+    if sd.kind == "int"  then return string.format("%d", sd.def) end
+    return string.format("%.4g", sd.def)
+end
+
+local function setting_row(sd)
+    local rawv       = ini_raw(sd.key)
+    local overridden = (rawv ~= nil)
+
+    -- Label, coloured by whether the user owns this value or the layer does.
+    text(overridden and C_TEXT or C_DIM, "  " .. sd.label)
+    same(190)
+
+    if sd.kind == "bool" then
+        local cur
+        if overridden then cur = not (rawv == "0" or rawv == "off" or rawv == "false")
+        else                cur = (sd.def == true) end
+        if styled_button((cur and "On" or "Off") .. "##" .. sd.key, 54, 18,
+                         cur and C_GREEN or C_GREY_ED,
+                         cur and C_GREEN_BG or C_GREY_BG, true) then
+            ini_ensure()
+            ini_set(sd.key, cur and "0" or "1")
+            logf(C_AMBER, "%s = %s", sd.key, cur and "0" or "1")
+        end
+    else
+        local cur = tonumber(rawv) or tonumber(sd.def) or 0
+        if sd.lo and sd.hi and imhas("SliderFloat") then
+            imgui.PushItemWidth(210)
+            local fmt = (sd.kind == "int") and "%.0f" or "%.3f"
+            local ch, v = imgui.SliderFloat("##" .. sd.key, cur, sd.lo, sd.hi, fmt)
+            imgui.PopItemWidth()
+            if ch then
+                ini_ensure()
+                local out = (sd.kind == "int")
+                            and string.format("%d", math.floor(v + 0.5))
+                            or  string.format("%.4f", v)
+                ini_set(sd.key, out)
+            end
+        elseif imhas("InputText") then
+            -- Held in set_edit while typing: writing the file on every
+            -- keystroke would make the layer reload mid-word and would fight
+            -- the caret.
+            local buf = set_edit[sd.key]
+            if buf == nil then
+                buf = overridden and rawv or set_default_str(sd)
+            end
+            imgui.PushItemWidth(150)
+            local ch, v = imgui.InputText("##" .. sd.key, buf, 32)
+            imgui.PopItemWidth()
+            if ch then set_edit[sd.key] = v end
+            same(350)
+            if styled_button("Set##" .. sd.key, 44, 18, C_GREEN, C_GREEN_BG, true) then
+                local val = set_edit[sd.key] or buf
+                if tonumber(val) then
+                    ini_ensure()
+                    ini_set(sd.key, val)
+                    set_edit[sd.key] = nil
+                    logf(C_AMBER, "%s = %s", sd.key, val)
+                else
+                    logf(C_RED, "%s: %q is not a number", sd.key, tostring(val))
+                end
+            end
+        else
+            text(C_DIM, overridden and rawv or set_default_str(sd))
+        end
+    end
+
+    -- Reset: delete the line. Only offered when there IS a line to delete.
+    if overridden then
+        same(470)
+        if styled_button("Reset##" .. sd.key, 52, 18, C_GREY_ED, C_GREY_BG, true) then
+            ini_clear(sd.key)
+            set_edit[sd.key] = nil
+            logf(C_AMBER, "%s back to default (%s)", sd.key, set_default_str(sd))
+        end
+    else
+        same(470)
+        text(C_DIM, "default " .. set_default_str(sd))
+    end
+
+    if sd.help ~= "" then text(C_DIM, "      " .. sd.help) end
+end
+
+function settings_browser()
+    ini_refresh(false)
+
+    -- Group tabs. Counted from the table, so a new key in a new group appears
+    -- without this function being told about it.
+    local counts = {}
+    for _, sd in ipairs(SETTINGS) do
+        counts[sd.group] = (counts[sd.group] or 0) + 1
+    end
+    for i, g in ipairs(SET_GROUPS) do
+        if i > 1 then same() end
+        local on = (set_group == g)
+        if styled_button(string.format("%s (%d)", g, counts[g] or 0), 104, 20,
+                         on and C_GREEN or C_GREY_ED,
+                         on and C_GREEN_BG or C_GREY_BG, true) then
+            set_group = g
+        end
+    end
+
+    -- How many in this group the user has actually overridden, so "am I running
+    -- stock?" is answerable without scrolling the list.
+    local n_over = 0
+    for _, sd in ipairs(SETTINGS) do
+        if sd.group == set_group and ini_raw(sd.key) ~= nil then n_over = n_over + 1 end
+    end
+    text(n_over > 0 and C_AMBER or C_DIM,
+         string.format("  %d of %d overridden in this file", n_over,
+                       counts[set_group] or 0))
+    text(C_DIM, "  " .. ini_path())
+    imgui.Separator()
+
+    local child = imhas("BeginChild")
+    if child then imgui.BeginChild("mv_settings", 690, 260, true) end
+    for _, sd in ipairs(SETTINGS) do
+        if sd.group == set_group then setting_row(sd) end
+    end
+    if child then imgui.EndChild() end
+
+    imgui.Separator()
+    if styled_button("Reset this group to defaults", 240, 20, C_RED, C_RED_BG, true) then
+        local n = 0
+        for _, sd in ipairs(SETTINGS) do
+            if sd.group == set_group and ini_raw(sd.key) ~= nil then
+                ini_clear(sd.key); n = n + 1
+            end
+        end
+        set_edit = {}
+        logf(C_AMBER, "%s: cleared %d override(s).", set_group, n)
+    end
+end
+
 local show_advanced = false
 
-local win_bg_pushed = 0
 
 local wnd = nil
 local close_requested = false
+-- Set by build() once it has run a frame WITHOUT the trailing WindowBg push,
+-- so the ImGui colour stack is balanced before the window is destroyed. See
+-- the close sequence at the bottom of build().
+local safe_to_close = false
+local close_ticks   = 0
 
 -- Window geometry, tracked here because FlyWithLua can set it but not report
 -- it. XPLM screen coordinates: origin bottom-left, so top > bottom.
 local win_l, win_t = 120, 0        -- filled in on open()
 local WIN_W, WIN_H = 720, 360
+-- The settings browser needs room the status panel does not. Kept as a
+-- separate constant so the closed panel is exactly the size it always was.
+local WIN_H_ADV = 720
 local dragging   = false
 local title_held = false
 local drag_mx, drag_my = 0, 0
 
 local function apply_geometry()
     if wnd then
-        float_wnd_set_geometry(wnd, win_l, win_t, win_l + WIN_W, win_t - WIN_H)
+        -- The browser needs the taller body; the status panel keeps the size
+        -- it has always had. Resizing on the toggle rather than opening large
+        -- means the common case is unchanged.
+        local h = show_advanced and WIN_H_ADV or WIN_H
+        float_wnd_set_geometry(wnd, win_l, win_t, win_l + WIN_W, win_t - h)
     end
 end
 
@@ -438,6 +900,8 @@ local function title_bar()
     imgui.Separator()
 end
 
+local win_bg_pushed = 0
+
 local function build(w, x, y)
     -- Balance last frame's push before doing anything else.
     if win_bg_pushed > 0 then popcol(win_bg_pushed); win_bg_pushed = 0 end
@@ -463,9 +927,35 @@ local function build(w, x, y)
     -- on WindowBg arrives too late. A full-size child with ChildBg is what
     -- gives the whole plugin one background, and its alpha is what lets the
     -- scene through the way the reference dialog does.
-    local nWin = pushcol("ChildBg", 0x00000000)   -- the WINDOW carries the tint;
-                                              -- tinting here too stacked two
-                                              -- dark layers into a black band
+    -- ---- THE WINDOW CARRIES THE TINT. THE CHILD STAYS TRANSPARENT.
+    --
+    -- Moving the colour here to silence an ImGui style-stack assert cost the
+    -- panel its transparency AND its drag: FlyWithLua's own window kept its
+    -- default opaque background, the child painted over it, and the drag
+    -- strips stopped behaving. "The panel looks the same" was wrong.
+    --
+    -- The assert is cosmetic. A panel you cannot see through or move is not.
+    -- So the cross-frame push is back, and the ImGui message with it, until
+    -- there is a fix that does not cost the look - most likely painting the
+    -- background with a draw-list rectangle, which touches no style stack at
+    -- all.
+    -- ---- BACKGROUND BY DRAW LIST, NOT BY A CROSS-FRAME STYLE PUSH.
+    --
+    -- The panel tint used to be a WindowBg colour pushed at the END of build()
+    -- to reach the NEXT Begin(), then popped at the start of the next build().
+    -- That push outlived a single frame, so destroying the window between the
+    -- push and the pop orphaned it on ImGui's global colour stack, and
+    -- reopening popped a stack that no longer held it - PopStyleColor on an
+    -- empty vector, which took X-Plane down. Painting the same translucent
+    -- rectangle straight onto the window draw list happens inside THIS frame
+    -- and touches no style stack, so nothing is left dangling to crash on.
+    -- This is exactly the fix the old comment above said was needed.
+    if imgui.DrawList_AddRectFilled then
+        imgui.DrawList_AddRectFilled(0, 0,
+            imgui.GetWindowWidth(), imgui.GetWindowHeight(), C_PANEL)
+    end
+
+    local nWin = pushcol("ChildBg", 0x00000000)
     imgui.BeginChild("panel", -1, -1, false)
     title_bar()
     -- Drag strips live in genuinely empty space, so they can never sit on top
@@ -544,6 +1034,7 @@ local function build(w, x, y)
     if imgui.Button(show_advanced and "Hide advanced settings"
                                    or "Show advanced settings", 220, 22) then
         show_advanced = not show_advanced
+        apply_geometry()
     end
 
     -- Backends live down here, not at the top. Only one of them exists, so a
@@ -565,29 +1056,7 @@ local function build(w, x, y)
         text(C_DIM, "not obvious until you are moving.")
         imgui.TextUnformatted("")
 
-        local function num_setting(key, label, lo, hi)
-            local cur = tonumber(ini_get(key, "0")) or 0
-            imgui.PushItemWidth(200)
-            local changed, v = imgui.SliderFloat(label, cur, lo, hi, "%.3f")
-            imgui.PopItemWidth()
-            if changed then ini_set(key, string.format("%.3f", v)) end
-        end
-        local function int_setting(key, label, lo, hi, default)
-            local cur = tonumber(ini_get(key, tostring(default))) or default
-            imgui.PushItemWidth(200)
-            local ch, v = imgui.SliderFloat(label, cur, lo, hi, "%.0f")
-            imgui.PopItemWidth()
-            if ch then ini_set(key, string.format("%d", math.floor(v + 0.5))) end
-        end
-
-        num_setting("taa.alpha",        "alpha",        0.01, 1.0)
-        num_setting("taa.alpha_moving", "alpha_moving", 0.01, 1.0)
-        num_setting("taa.jitter_scale", "jitter_scale", 0.0,  1.0)
-        num_setting("taa.vel_scale",    "vel_scale",    0.0,  2.0)
-        int_setting("taa.mv_pass",      "mv_pass",     -2,   13, -1)
-        int_setting("taa.clear_mode",   "clear_mode",   0,    2,  1)
-        text(C_DIM, "mv_pass: -2 census winner, -1 all passes, 0..13 pin one.")
-        text(C_DIM, "clear_mode: 0 never, 1 in-pass, 2 after the resolve.")
+        settings_browser()
     end
 
     ------------------------------------------------------------- diagnostics
@@ -627,17 +1096,26 @@ local function build(w, x, y)
     imgui.EndChild()
     popcol(nWin)
 
-    -- Applies to the NEXT Begin(), which is the only way to reach a window
-    -- FlyWithLua has already opened. Popped at the top of the next frame.
-    win_bg_pushed = pushcol("WindowBg", C_PANEL)
+    -- No cross-frame style push any more: the background is painted by the
+    -- draw-list rectangle at the top of build(), so the colour stack is already
+    -- balanced right here and the window can be torn down on ANY frame without
+    -- orphaning anything. win_bg_pushed stays 0 (the start-of-build balance is
+    -- now a permanent no-op) and the close no longer has to be staged - but the
+    -- signal is kept so mv_tick() still performs the teardown it owns.
+    win_bg_pushed = 0
+    if close_requested then safe_to_close = true end
 end
 
 function mv_open()
     if wnd then
-        float_wnd_destroy(wnd)
-        wnd = nil
+        -- Request, do not destroy. Tearing the window down here skips the
+        -- balancing frame and leaves the colour stack dangling, which is the
+        -- crash described at the bottom of build().
+        close_requested = true
         return
     end
+    safe_to_close = false
+    close_ticks   = 0
     -- decoration 0: no X-Plane frame. Its colour cannot be changed, so the
     -- only way to make the border match the panel is not to have one.
     wnd = float_wnd_create(WIN_W, WIN_H, 0, true)
@@ -651,14 +1129,31 @@ end
 
 function onclose(w)
     wnd = nil
+    -- Closed from outside our own sequence, so the balancing frame never ran
+    -- and a push may still be on the stack. Forgetting it leaks one entry;
+    -- remembering it makes the next build() pop a stack that may no longer
+    -- hold it, which is the crash. A cosmetic leak beats a crash.
+    win_bg_pushed = 0
+    close_requested = false
+    safe_to_close   = false
 end
 
 -- Destroying the window from inside its own ImGui builder is not safe, so the
 -- close box only sets a flag and the deferred callback acts on it.
 function mv_tick()
     if close_requested then
-        close_requested = false
-        if wnd then float_wnd_destroy(wnd); wnd = nil end
+        -- Wait for build() to run its balancing frame. If it never does - the
+        -- window is not being drawn at all - close anyway rather than leave a
+        -- panel that will not shut, and drop the count instead of popping a
+        -- stack we can no longer reason about.
+        close_ticks = close_ticks + 1
+        if safe_to_close or close_ticks > 4 then
+            if not safe_to_close then win_bg_pushed = 0 end
+            close_requested = false
+            safe_to_close   = false
+            close_ticks     = 0
+            if wnd then float_wnd_destroy(wnd); wnd = nil end
+        end
     end
 end
 do_often("mv_tick()")

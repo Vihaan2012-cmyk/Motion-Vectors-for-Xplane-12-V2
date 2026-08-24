@@ -37,6 +37,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   // getenv, for the TEMP path the layer reads its config from
 
 // Everything after our own arguments is handed to X-Plane untouched, so
 // --load_smo and friends still work through the launcher.
@@ -98,6 +99,26 @@ int main(int argc, char **argv)
 
     SetEnvironmentVariableA("VK_LAYER_PATH", layerDir);
     SetEnvironmentVariableA("VK_LOADER_LAYERS_ENABLE", kLayerName);
+
+    // ---- SEED THE TUNED SETTINGS ON FIRST RUN.
+    //
+    // The layer reads its live config from %TEMP%\taa_live.ini (getenv("TEMP")),
+    // and writes a blank template there if none exists - so a fresh machine
+    // would start on compiled defaults, not the tuning this build ships with.
+    // Copy the packaged taa_live.ini (beside this launcher) into place, but ONLY
+    // if the user has no file yet: existing tweaks are never overwritten, and the
+    // shipped settings apply out of the box otherwise. Same TEMP resolution the
+    // layer uses, so the launcher writes exactly the file the layer will read.
+    {
+        char shipped[MAX_PATH];
+        snprintf(shipped, sizeof(shipped), "%s\\taa_live.ini", layerDir);
+        const char *tmp = getenv("TEMP");
+        if (tmp && *tmp && fileExists(shipped)) {
+            char dst[MAX_PATH];
+            snprintf(dst, sizeof(dst), "%s\\taa_live.ini", tmp);
+            CopyFileA(shipped, dst, TRUE);   // TRUE = keep any existing user file
+        }
+    }
 
     // Rebuild the command line: our own path first, then anything the user
     // passed, quoted so paths with spaces survive.

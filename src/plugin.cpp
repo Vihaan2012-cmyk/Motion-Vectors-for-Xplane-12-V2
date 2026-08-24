@@ -67,6 +67,18 @@
 
 static std::string g_configPath;
 
+// ---- A DEDICATED LOG FILE FOR THE MOD.
+//
+// Everything xlog() prints already goes to X-Plane's Log.txt via
+// XPLMDebugString, but that file is enormous and shared with the whole sim, so
+// finding the mod's own lines in it is painful. MotionVectors.txt is this mod's
+// dedicated log, written to the X-Plane root right beside Log.txt, so its status
+// can be read at a glance. Opened lazily on the first message (XPLM is up by
+// then), truncated once per session, and flushed every line so a crash still
+// leaves the tail on disk. The Vulkan layer's full debug trace, when enabled, is
+// a separate and much larger file - this one is the readable summary.
+static FILE *g_logFile = nullptr;
+
 static void xlog(const char *fmt, ...)
 {
     char buf[1024];
@@ -78,6 +90,26 @@ static void xlog(const char *fmt, ...)
     char line[1200];
     snprintf(line, sizeof(line), "TAAImpl: %s\n", buf);
     XPLMDebugString(line);
+
+    if (!g_logFile) {
+        char base[1024] = {0};
+        XPLMGetSystemPath(base);
+        char path[1200];
+        snprintf(path, sizeof(path), "%sMotionVectors.txt", base);
+        g_logFile = fopen(path, "w");
+        if (g_logFile)
+            fprintf(g_logFile,
+                    "MotionVectors for X-Plane 12 - plugin v%s\n"
+                    "The mod's own log. The Vulkan layer's full debug trace, when\n"
+                    "enabled, is written separately and is far larger than this.\n"
+                    "============================================================\n",
+                    TAA_PLUGIN_VERSION);
+    }
+    if (g_logFile) {
+        fputs(buf, g_logFile);
+        fputc('\n', g_logFile);
+        fflush(g_logFile);
+    }
 }
 
 // ---------------------------------------------- dataref lookups, audited
@@ -4170,7 +4202,10 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
     return 1;
 }
 
-PLUGIN_API void XPluginStop(void) {}
+PLUGIN_API void XPluginStop(void)
+{
+    if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
+}
 
 PLUGIN_API int XPluginEnable(void)
 {
