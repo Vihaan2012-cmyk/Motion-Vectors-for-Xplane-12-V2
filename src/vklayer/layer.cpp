@@ -3572,9 +3572,22 @@ static bool isSceneSized(uint32_t w, uint32_t h, uint32_t colourCount = 1)
     // pass writes several targets at once; shadow maps write depth only,
     // post-process passes write one, and the UI writes one. So the pass with
     // the MOST colour attachments wins, and size only breaks ties.
+    // ---- FOLLOW THE RENDER SIZE, DO NOT LATCH THE LARGEST.
+    //
+    // A higher colour-attachment count always wins (the G-buffer is the scene).
+    // Among passes of that same winning shape, the size used to latch the
+    // LARGEST ever seen (w > g_renderW). That is a one-way ratchet: after 4K,
+    // g_renderW stays 3840 forever, so when the render size DROPS - the user
+    // switches 4K -> 1440p - the real 2560x1440 scene pass no longer equals
+    // g_renderW, isSceneSized returns false for it, jitter and scene tracking
+    // stop recognising it, g_detectedSceneW never updates, and the whole resolve
+    // silently dies until a restart. The G-buffer is one pass at one size per
+    // frame, so its extent IS the render size: FOLLOW it (w != g_renderW), which
+    // is identical to the old behaviour on a fresh start or a size INCREASE and
+    // only differs on a decrease - exactly the case that was broken.
     bool better = (colourCount > g_sceneColourCount) ||
                   (colourCount == g_sceneColourCount &&
-                   (w > g_renderW || h > g_renderH));
+                   (w != g_renderW || h != g_renderH));
     if (better) {
         bool first = (g_renderW == 0);
         g_sceneColourCount = colourCount;
