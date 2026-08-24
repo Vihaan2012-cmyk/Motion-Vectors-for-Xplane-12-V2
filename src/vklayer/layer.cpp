@@ -1543,6 +1543,15 @@ static VkImage g_gbufferVelCandidate = VK_NULL_HANDLE;
 static void mvLogInjectReasons();
 static uint64_t g_layoutPatched, g_layoutSkipped;
 static ColorTarget g_sceneColor;                       // the 3D one, this frame
+// The render size of the last full-viewport depth pass, from isSceneSized -
+// which measures against the DISPLAY (g_share->viewportW/H), so it is
+// independent of the velocity target. This is the size the scene is ACTUALLY
+// rendering at right now, the ground truth the velocity target must match. It
+// is recorded even when the HDR census leaves g_sceneColor stuck at the old
+// size - which is exactly when the velocity target has latched the wrong size
+// and TAA has silently stopped. See the stale-size recovery in the present path.
+static std::atomic<uint32_t> g_detectedSceneW{0};
+static std::atomic<uint32_t> g_detectedSceneH{0};
 static bool        g_sceneColorReported = false;
 static uint32_t    g_sceneResolveMode   = 0;
 static VkImage     g_sceneResolveImage  = VK_NULL_HANDLE;
@@ -4288,6 +4297,16 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
             if (isSceneSized(info->renderArea.extent.width,
                              info->renderArea.extent.height,
                              info->colorAttachmentCount)) {
+                // Ground truth for the render size: a full-viewport depth pass
+                // is world geometry, and its extent is where the scene renders
+                // NOW - recorded independently of the velocity target so the
+                // recovery in the present path can see a size the stale target
+                // cannot. Relaxed atomics: it is a size read once per present,
+                // never a synchronisation point.
+                g_detectedSceneW.store(info->renderArea.extent.width,
+                                       std::memory_order_relaxed);
+                g_detectedSceneH.store(info->renderArea.extent.height,
+                                       std::memory_order_relaxed);
                 std::lock_guard<std::mutex> g(g_lock);
 
                 // Full viewport AND depth: this pass draws world geometry, so
@@ -7582,6 +7601,41 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         if (mvi != g_devices.end())
             mvCreate(mvi->second, mvi->second.device, mvi->second.phys,
                      g_sceneColor.w, g_sceneColor.h);
+    }
+
+    // ---- STALE-SIZE RECOVERY: "TAA stops after I change resolution".
+    //
+    // The build gate above sizes the velocity target from g_sceneColor, which
+    // the HDR census can leave stuck at the old size (or NULL) after a
+    // resolution / render-scale / aircraft change. The target then keeps its
+    // old dimensions forever, every scene pass is rejected on size (the
+    // "candidate rejected on SIZE alone" gate), nothing binds velocity, and the
+    // resolve silently STOPS - measured as velocity target 2560x1440 while the
+    // scene renders 3840x2160, bindAge in the thousands, only a restart curing
+    // it.
+    //
+    // g_detectedSceneW/H is the extent a full-viewport depth pass is ACTUALLY
+    // using now, from isSceneSized (measured against the DISPLAY, so independent
+    // of the stale target). When the target has not bound for several seconds
+    // AND that ground truth disagrees with it, rebuild straight to the detected
+    // size, bypassing the stuck g_sceneColor. It fires once; the target then
+    // matches, the scene pass binds velocity, the litPass rebuilds g_taa to the
+    // new size, and the resolve resumes - the restart, made automatic.
+    {
+        const uint32_t dw = g_detectedSceneW.load(std::memory_order_relaxed);
+        const uint32_t dh = g_detectedSceneH.load(std::memory_order_relaxed);
+        const uint64_t staleFrames = g_frameCount - g_mvLastBindFrame.load();
+        if (velOrInjected && dw && dh && g_mv.ready && !g_mv.failed &&
+            (g_mv.w != dw || g_mv.h != dh) && staleFrames > 240) {
+            trace("MV TARGET: RECOVERY - velocity target %ux%u but the scene has "
+                  "rendered %ux%u for %llu frames with nothing binding. Rebuilding "
+                  "to the detected size; g_sceneColor stuck (%ux%u img=%p).",
+                  g_mv.w, g_mv.h, dw, dh, (unsigned long long)staleFrames,
+                  g_sceneColor.w, g_sceneColor.h, (void*)g_sceneColor.image);
+            std::map<void*, DeviceData>::iterator mvi = g_devices.begin();
+            if (mvi != g_devices.end())
+                mvCreate(mvi->second, mvi->second.device, mvi->second.phys, dw, dh);
+        }
     }
 
 
