@@ -78,6 +78,14 @@ local C_LOG       = 0x6A101010   -- log box, translucent like the panel
 -- Version the panel reports, and the newest X-Plane this build has been tested
 -- against. No network check: bump this constant per release.
 local MOD_VERSION      = "1.1.0"
+
+-- ---- BUG REPORT DISCORD WEBHOOK.
+--
+-- Paste a Discord webhook URL between the quotes to enable one-click upload of
+-- the bug report (description + MotionVectors_Debug.txt + a screenshot). Leave
+-- it empty and "Report a bug" still writes the debug dump and takes the shot
+-- locally in the X-Plane folder - it just does not upload.
+local BUG_WEBHOOK = ""
 local MAX_TESTED_XP    = "12.43.11"
 
 -- A style push that cannot quarantine the script.
@@ -839,6 +847,7 @@ local function apply_geometry()
         -- it has always had. Resizing on the toggle rather than opening large
         -- means the common case is unchanged.
         local h = show_advanced and WIN_H_ADV or WIN_H
+        if bug_open then h = h + 150 end   -- room for the bug description box
         float_wnd_set_geometry(wnd, win_l, win_t, win_l + WIN_W, win_t - h)
     end
 end
@@ -901,6 +910,131 @@ local function title_bar()
 end
 
 local win_bg_pushed = 0
+
+-- ============================================================================
+--  BUG REPORTER
+--
+--  "Report a bug" asks the user what went wrong, writes MotionVectors_Debug.txt
+--  (versions, launched-by, render/injection state, VRAM, the live settings),
+--  takes one X-Plane screenshot, and uploads the description + both files to a
+--  Discord webhook. The upload is a detached curl in a one-shot .bat so the sim
+--  never freezes on it. All local-only if BUG_WEBHOOK is left empty.
+-- ============================================================================
+bug_open            = false    -- module global: apply_geometry() (defined above) reads it
+local bug_text      = ""
+local bug_status    = ""
+local bug_upload_at = nil      -- os.clock() moment to run the upload; nil = idle
+local bug_before    = {}       -- screenshots on disk before the shot was taken
+local bug_debug     = nil      -- path of the debug dump awaiting upload
+
+local function bug_shot_dir()
+    return (SYSTEM_DIRECTORY or "") .. "Output\\screenshots\\"
+end
+
+-- The set of screenshot names on disk now, so the shot taken for THIS report
+-- can be picked out afterwards by set difference (Lua has no reliable mtime).
+local function bug_ss_set()
+    local set = {}
+    if directory_to_table then
+        local ok, t = pcall(directory_to_table, bug_shot_dir())
+        if ok and t then
+            for _, n in ipairs(t) do
+                if type(n) == "string" and n:lower():match("%.png$") then set[n] = true end
+            end
+        end
+    end
+    return set
+end
+
+local function bug_write_debug(desc)
+    local path = (SYSTEM_DIRECTORY or "") .. "MotionVectors_Debug.txt"
+    local f = io.open(path, "w")
+    if not f then return nil end
+    local att = get("taaimpl/layer_attached", 0)
+    f:write("MotionVectors bug report\n========================\n")
+    f:write("mod version : " .. tostring(MOD_VERSION) .. "\n")
+    f:write("X-Plane ver : " .. tostring(get("sim/version/xplane_internal_version", "?")) .. "\n")
+    f:write("launched by : " .. ((att == 1)
+        and "MotionVectors launcher (Vulkan layer attached)"
+        or  "NOT via the launcher - Vulkan layer is NOT attached") .. "\n")
+    f:write("\n--- user description ---\n" .. (desc ~= "" and desc or "(none provided)") .. "\n")
+    f:write("\n--- render / injection ---\n")
+    f:write(string.format("resolution         = %d x %d\n", get("taaimpl/viewport_w",0), get("taaimpl/viewport_h",0)))
+    f:write(string.format("render_scale       = %.2f\n", get("taaimpl/render_scale",1.0)))
+    f:write(string.format("reverse_z          = %s\n", tostring(get("taaimpl/reverse_z",0))))
+    f:write(string.format("jitter_phases      = %d\n", get("taaimpl/jitter_phases",0)))
+    f:write(string.format("moving_objects     = %d\n", get("taaimpl/moving_objects",0)))
+    f:write(string.format("pipelines_patched  = %d\n", get("taaimpl/pipelines_patched",0)))
+    f:write(string.format("pipelines_rejected = %d\n", get("taaimpl/pipelines_rejected",0)))
+    f:write(string.format("lod_bias           = %.2f\n", get("taaimpl/lod_bias",0)))
+    f:write("\n--- vram (MB) ---\n")
+    f:write(string.format("used=%d  budget=%d  total=%d  velocity=%d\n",
+        get("taaimpl/vram_used_mb",0), get("taaimpl/vram_budget_mb",0),
+        get("taaimpl/vram_total_mb",0), get("taaimpl/velocity_mb",0)))
+    f:write("\n--- live settings (taa_live.ini) ---\n")
+    local ini = io.open(ini_path(), "r")
+    if ini then f:write(ini:read("*a") or ""); ini:close()
+    else f:write("(no file at " .. tostring(ini_path()) .. ")\n") end
+    f:close()
+    return path
+end
+
+local function json_escape(s)
+    return (s or ""):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\r", ""):gsub("\n", "\\n")
+end
+
+local function bug_do_upload(debugPath, shotPath, desc)
+    if BUG_WEBHOOK == nil or BUG_WEBHOOK == "" then
+        bug_status = "Saved locally - set BUG_WEBHOOK to upload."
+        return
+    end
+    local root = SYSTEM_DIRECTORY or ""
+    local payload = root .. "MotionVectors_payload.json"
+    local pf = io.open(payload, "w")
+    if pf then
+        local content = "**MotionVectors bug** - mod " .. tostring(MOD_VERSION)
+            .. " / X-Plane " .. tostring(get("sim/version/xplane_internal_version", "?"))
+            .. " / layer " .. ((get("taaimpl/layer_attached",0) == 1) and "attached" or "NOT attached")
+            .. "\\n" .. json_escape(desc ~= "" and desc or "(no description)")
+        pf:write('{"content":"' .. content .. '"}')
+        pf:close()
+    end
+    -- Quoting lives inside the .bat, away from cmd's own start-parsing.
+    local cmd = 'curl.exe -s -m 30 '
+        .. '-F "payload_json=<' .. payload .. ';type=application/json" '
+        .. '-F "files[0]=@' .. debugPath .. ';type=text/plain" '
+    if shotPath then cmd = cmd .. '-F "files[1]=@' .. shotPath .. ';type=image/png" ' end
+    cmd = cmd .. '"' .. BUG_WEBHOOK .. '"'
+    local batp = root .. "MotionVectors_send.bat"
+    local bf = io.open(batp, "w")
+    if bf then bf:write("@echo off\r\n" .. cmd .. "\r\n"); bf:close() end
+    os.execute('start "" /b "' .. batp .. '"')   -- detached: no sim freeze
+    bug_status = "Report sent."
+end
+
+-- Runs from mv_tick (do_often) so it completes even with the panel closed.
+function bug_tick()
+    if not bug_upload_at then return end
+    if os.clock() < bug_upload_at then return end
+    bug_upload_at = nil
+    local shot = nil
+    for name in pairs(bug_ss_set()) do
+        if not bug_before[name] then shot = bug_shot_dir() .. name; break end
+    end
+    bug_do_upload(bug_debug, shot, bug_text)
+end
+
+local function bug_start()
+    bug_debug = bug_write_debug(bug_text)
+    if not bug_debug then bug_status = "Could not write the debug file."; return end
+    bug_before = bug_ss_set()
+    if XPLMFindCommand and XPLMCommandOnce then
+        local c = XPLMFindCommand("sim/operation/screenshot")
+        if c then XPLMCommandOnce(c) end
+    end
+    bug_status = "Collecting screenshot..."
+    bug_upload_at = os.clock() + 1.2   -- give X-Plane a moment to write the PNG
+end
 
 local function build(w, x, y)
     -- Balance last frame's push before doing anything else.
@@ -1037,6 +1171,30 @@ local function build(w, x, y)
         apply_geometry()
     end
 
+    ------------------------------------------------------------ report a bug
+    same(232)
+    if imgui.Button(bug_open and "Cancel##bug" or "Report a bug", 160, 22) then
+        bug_open = not bug_open
+        if bug_open then bug_status = "" end
+        apply_geometry()   -- grow/shrink the window for the description box
+    end
+    if bug_open then
+        text(C_TEXT, "What went wrong? (a sentence is plenty)")
+        if imhas("InputText") then
+            imgui.PushItemWidth(WIN_W - 40)
+            local ch, v = imgui.InputText("##bugtext", bug_text, 512)
+            imgui.PopItemWidth()
+            if ch then bug_text = v end
+        end
+        if styled_button("Send report", 160, 22, C_GREEN, C_GREEN_BG, true) then
+            bug_start()
+        end
+        if bug_status ~= "" then same(180); text(C_AMBER, bug_status) end
+        text(C_DIM, "Writes MotionVectors_Debug.txt + a screenshot to your X-Plane"
+                 .. " folder" .. (BUG_WEBHOOK ~= "" and " and uploads them to Discord."
+                                                    or " (set BUG_WEBHOOK to upload)."))
+    end
+
     -- Backends live down here, not at the top. Only one of them exists, so a
     -- row of greyed buttons was taking the most valuable space on the panel to
     -- advertise things that do nothing.
@@ -1155,6 +1313,7 @@ function mv_tick()
             if wnd then float_wnd_destroy(wnd); wnd = nil end
         end
     end
+    bug_tick()
 end
 do_often("mv_tick()")
 
