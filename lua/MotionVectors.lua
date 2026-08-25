@@ -43,6 +43,10 @@ try_dataref("taaimpl/vram_total_mb",      "readonly")
 try_dataref("taaimpl/velocity_mb",        "readonly")
 try_dataref("taaimpl/pipelines_patched",  "readonly")
 try_dataref("taaimpl/pipelines_rejected", "readonly")
+try_dataref("taaimpl/enabled",            "readonly")
+try_dataref("taaimpl/mv_residual_px",     "readonly")
+try_dataref("taaimpl/mv_residual_p95_px", "readonly")
+try_dataref("taaimpl/mv_samples",         "readonly")
 try_dataref("sim/version/xplane_internal_version", "readonly")
 
 local function get(name, default)
@@ -77,7 +81,7 @@ local C_LOG       = 0x6A101010   -- log box, translucent like the panel
 
 -- Version the panel reports, and the newest X-Plane this build has been tested
 -- against. No network check: bump this constant per release.
-local MOD_VERSION      = "1.1.0"
+local MOD_VERSION      = "1.1.1"
 
 -- ---- BUG REPORT DISCORD WEBHOOK.
 --
@@ -85,7 +89,7 @@ local MOD_VERSION      = "1.1.0"
 -- the bug report (description + MotionVectors_Debug.txt + a screenshot). Leave
 -- it empty and "Report a bug" still writes the debug dump and takes the shot
 -- locally in the X-Plane folder - it just does not upload.
-local BUG_WEBHOOK = ""
+local BUG_WEBHOOK = "https://discord.com/api/webhooks/1541762723807891587/jPBYZvgpodrv4vPWLRjFOR3gCj44lL3ysNzGaB6eSYa3YARNV7D1lXYE79NTn8AVw8tb"
 local MAX_TESTED_XP    = "12.43.11"
 
 -- A style push that cannot quarantine the script.
@@ -971,10 +975,12 @@ local function bug_write_debug(desc)
     f:write(string.format("used=%d  budget=%d  total=%d  velocity=%d\n",
         get("taaimpl/vram_used_mb",0), get("taaimpl/vram_budget_mb",0),
         get("taaimpl/vram_total_mb",0), get("taaimpl/velocity_mb",0)))
-    f:write("\n--- live settings (taa_live.ini) ---\n")
-    local ini = io.open(ini_path(), "r")
-    if ini then f:write(ini:read("*a") or ""); ini:close()
-    else f:write("(no file at " .. tostring(ini_path()) .. ")\n") end
+    f:write("\n--- resolve / velocity ---\n")
+    f:write(string.format("layer_attached     = %s\n", tostring(get("taaimpl/layer_attached",0))))
+    f:write(string.format("taa_enabled        = %s\n", tostring(get("taaimpl/enabled",0))))
+    f:write(string.format("mv_residual_px     = %.4f  (p95 %.4f)\n",
+        get("taaimpl/mv_residual_px",0), get("taaimpl/mv_residual_p95_px",0)))
+    f:write(string.format("mv_samples         = %d\n", get("taaimpl/mv_samples",0)))
     f:close()
     return path
 end
@@ -992,23 +998,58 @@ local function bug_do_upload(debugPath, shotPath, desc)
     local payload = root .. "MotionVectors_payload.json"
     local pf = io.open(payload, "w")
     if pf then
-        local content = "**MotionVectors bug** - mod " .. tostring(MOD_VERSION)
-            .. " / X-Plane " .. tostring(get("sim/version/xplane_internal_version", "?"))
-            .. " / layer " .. ((get("taaimpl/layer_attached",0) == 1) and "attached" or "NOT attached")
-            .. "\\n" .. json_escape(desc ~= "" and desc or "(no description)")
-        pf:write('{"content":"' .. content .. '"}')
+        -- A proper Discord rich embed: the description carries the user's text,
+        -- the state goes in inline fields, and the screenshot is shown inside
+        -- the embed via attachment:// (curl renames it to screenshot.png below).
+        local function fld(name, value, inline)
+            return string.format('{"name":"%s","value":"%s","inline":%s}',
+                                  name, value, inline and "true" or "false")
+        end
+        local layer = (get("taaimpl/layer_attached",0) == 1) and "attached" or "NOT attached"
+        local embed = '{"embeds":[{'
+            .. '"title":"MotionVectors bug report",'
+            .. '"description":"' .. json_escape(desc ~= "" and desc or "(no description)") .. '",'
+            .. '"color":15158332,'
+            .. '"timestamp":"' .. os.date("!%Y-%m-%dT%H:%M:%SZ") .. '",'
+            .. '"fields":['
+            ..   fld("Mod", tostring(MOD_VERSION), true) .. ','
+            ..   fld("X-Plane", tostring(get("sim/version/xplane_internal_version","?")), true) .. ','
+            ..   fld("Vulkan layer", layer, true) .. ','
+            ..   fld("TAA", (get("taaimpl/enabled",0) == 1) and "on" or "off", true) .. ','
+            ..   fld("Resolution", string.format("%dx%d", get("taaimpl/viewport_w",0), get("taaimpl/viewport_h",0)), true) .. ','
+            ..   fld("Render scale", string.format("%.2fx", get("taaimpl/render_scale",1.0)), true) .. ','
+            ..   fld("Pipelines", string.format("%d patched / %d rej", get("taaimpl/pipelines_patched",0), get("taaimpl/pipelines_rejected",0)), true) .. ','
+            ..   fld("MV residual", string.format("%.3f px", get("taaimpl/mv_residual_px",0)), true) .. ','
+            ..   fld("Velocity buf", string.format("%d MB", get("taaimpl/velocity_mb",0)), true)
+            .. ']'
+            .. (shotPath and ',"image":{"url":"attachment://screenshot.png"}' or '')
+            .. ',"footer":{"text":"MotionVectors bug reporter"}'
+            .. '}]}'
+        pf:write(embed)
         pf:close()
     end
     -- Quoting lives inside the .bat, away from cmd's own start-parsing.
-    local cmd = 'curl.exe -s -m 30 '
+    local cmd = 'curl.exe -s -o nul -m 30 '
         .. '-F "payload_json=<' .. payload .. ';type=application/json" '
         .. '-F "files[0]=@' .. debugPath .. ';type=text/plain" '
-    if shotPath then cmd = cmd .. '-F "files[1]=@' .. shotPath .. ';type=image/png" ' end
+    if shotPath then cmd = cmd .. '-F "files[1]=@' .. shotPath .. ';filename=screenshot.png;type=image/png" ' end
     cmd = cmd .. '"' .. BUG_WEBHOOK .. '"'
+    -- Run curl FULLY HIDDEN: the .bat silences every stream (no Discord JSON in a
+    -- console), and a one-line VBS shim launches it with window style 0 so no
+    -- console window ever pops. Detached (Run ..., 0, False) so the sim never
+    -- waits on the upload. Falls back to a plain detached start if VBS is absent.
     local batp = root .. "MotionVectors_send.bat"
     local bf = io.open(batp, "w")
-    if bf then bf:write("@echo off\r\n" .. cmd .. "\r\n"); bf:close() end
-    os.execute('start "" /b "' .. batp .. '"')   -- detached: no sim freeze
+    if bf then bf:write("@echo off\r\n" .. cmd .. " >nul 2>&1\r\n"); bf:close() end
+    local vbsp = root .. "MotionVectors_send.vbs"
+    local vf = io.open(vbsp, "w")
+    if vf then
+        vf:write('CreateObject("WScript.Shell").Run """' .. batp .. '""", 0, False\r\n')
+        vf:close()
+        os.execute('start "" /b wscript //nologo "' .. vbsp .. '"')
+    else
+        os.execute('start "" /b "' .. batp .. '"')
+    end
     bug_status = "Report sent."
 end
 

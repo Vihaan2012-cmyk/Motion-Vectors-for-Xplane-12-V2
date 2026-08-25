@@ -282,7 +282,11 @@ struct TaaShare {
     uint32_t magic;
     uint32_t version;
     uint32_t structSize;      // reader bails cleanly if this disagrees
-    uint32_t pad0;
+    // Set by the plugin: 1 = the layer stands FULLY down (no injection, no MV
+    // target, no resolve) and passes every frame through untouched. Used for the
+    // 777 airframes, whose deferred path crashes our resolve. Was pad0; same
+    // offset and size, so old readers see 0 (mod on) and structSize is unchanged.
+    uint32_t bypass;
 
     uint64_t frame;           // increments once per rendered frame
     double   simTime;

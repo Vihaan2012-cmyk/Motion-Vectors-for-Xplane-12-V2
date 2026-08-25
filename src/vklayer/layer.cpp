@@ -124,6 +124,12 @@ static HANDLE    g_shareHandle = nullptr;
 static TaaShare *g_share       = nullptr;
 static bool      g_shareOpen   = false;
 
+// The plugin raises g_share->bypass for airframes the mod must not touch (the
+// 777s, which crash our resolve). When set, every scene-identification, MV-target
+// build and resolve below is skipped, so the layer is inert and X-Plane renders
+// natively. Null share (not yet mapped) reads as not-bypassed: fail safe to ON.
+static inline bool mvBypassed() { return g_share && g_share->bypass != 0; }
+
 // MUST retry. Vulkan initialises long before X-Plane loads plugins, so the
 // first attempt always fails - the plugin has not created the mapping yet.
 // Trying once and giving up meant the sibling project's layer never saw the
@@ -3965,7 +3971,7 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
         info->renderArea.extent.height == g_mv.h;
     bool hasDepth = info->pDepthAttachment &&
                     info->pDepthAttachment->imageView != VK_NULL_HANDLE;
-    bool isScene  = fullViewport && hasDepth && g_mv.ready;
+    bool isScene  = fullViewport && hasDepth && g_mv.ready && !mvBypassed();
 
     // ---- ONLY THE FIRST QUALIFYING PASS.
     //
@@ -5336,6 +5342,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     const bool reprojUsable = !g_share || g_share->reprojValid != 0;
     if (!reprojUsable) g_taaStaleResume = true;
     do if (litPass && taaEnabled() && !g_mv.wantDump && reprojUsable &&
+        !mvBypassed() &&
         resolvesThisPresent < maxResolves &&
         mvBindAge <= 1) {
         gateReach(2);
@@ -7607,7 +7614,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                   (void*)g_sceneColor.image, g_sceneColor.w, g_sceneColor.h,
                   g_sceneColorStable);
     }
-    if (velOrInjected && stableEnough && !g_mv.ready && !g_mv.failed &&
+    if (velOrInjected && stableEnough && !g_mv.ready && !g_mv.failed && !mvBypassed() &&
         g_sceneColor.image != VK_NULL_HANDLE && g_sceneColor.w && g_sceneColor.h &&
         g_sceneColorStable >= 120) {
         std::map<void*, DeviceData>::iterator mvi = g_devices.begin();
@@ -7638,7 +7645,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         const uint32_t dw = g_detectedSceneW.load(std::memory_order_relaxed);
         const uint32_t dh = g_detectedSceneH.load(std::memory_order_relaxed);
         const uint64_t staleFrames = g_frameCount - g_mvLastBindFrame.load();
-        if (velOrInjected && dw && dh && g_mv.ready && !g_mv.failed &&
+        if (velOrInjected && dw && dh && g_mv.ready && !g_mv.failed && !mvBypassed() &&
             (g_mv.w != dw || g_mv.h != dh) && staleFrames > 240) {
             trace("MV TARGET: RECOVERY - velocity target %ux%u but the scene has "
                   "rendered %ux%u for %llu frames with nothing binding. Rebuilding "
@@ -10088,6 +10095,41 @@ static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
     return out;
 }
 
+// ---- IDENTIFYING AND MASKING A SEE-THROUGH SURFACE'S VELOCITY.
+//
+// A study-level cockpit (FF777) draws its canopy glass over the already-rendered
+// world. The glass is patched and, classified opaque in X-Plane's deferred path
+// (blendEnable false), it STAMPS its own near-field velocity onto the buildings
+// visible through it - which then reproject by the glass and shimmer. The
+// pass-level exclusion is impossible (dynamic rendering requires every pipeline
+// in a pass to match its attachment layout), so the fix is per-pipeline: keep
+// the velocity slot but mask its write to 0 for the offending shader.
+//
+// The shader is named by a stable FNV-1a hash of its SPIR-V. The diagnostic
+// below logs every distinct patched fragment once with the traits that pick out
+// a see-through surface, so the glass hash can be found and listed in
+// TAA_MASK_FRAG. A masked fragment still patches (so the format stays
+// consistent) but writes no motion vector, so the world behind it keeps its own.
+static uint64_t mvFragHash(const std::vector<uint32_t> &code)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < code.size(); ++i) { h ^= (uint64_t)code[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static bool mvFragMasked(uint64_t hash)
+{
+    if (!hash) return false;
+    static const std::string list = []{
+        const char *e = getenv("TAA_MASK_FRAG");
+        return std::string(e ? e : "");
+    }();
+    if (list.empty()) return false;
+    char hexb[24];
+    snprintf(hexb, sizeof(hexb), "%llx", (unsigned long long)hash);
+    return list.find(hexb) != std::string::npos;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
     VkDevice device, VkPipelineCache cache, uint32_t count,
     const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *alloc,
@@ -10468,10 +10510,45 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
 
             // PATCH THE FRAGMENT SHADER HERE, now that the attachment index and
             bool fragPatched = false;
+            uint64_t fragHash = 0;      // FNV-1a of the original fragment SPIR-V
+            bool     maskVelocity = false;  // in TAA_MASK_FRAG -> write no velocity
             stages[i].assign(ci[i].pStages, ci[i].pStages + ci[i].stageCount);
             bool vertPatched = false;
             for (uint32_t s = 0; !noPatch && s < ci[i].stageCount; ++s) {
                 if (ci[i].pStages[s].stage & VK_SHADER_STAGE_FRAGMENT_BIT) {
+                    // Identify the fragment for naming / masking BEFORE patching,
+                    // from the original module's stored SPIR-V.
+                    {
+                        std::lock_guard<std::mutex> g(g_lock);
+                        std::map<VkShaderModule, std::vector<uint32_t> >::iterator mc =
+                            g_moduleCode.find(ci[i].pStages[s].module);
+                        if (mc != g_moduleCode.end()) fragHash = mvFragHash(mc->second);
+                    }
+                    maskVelocity = mvFragMasked(fragHash);
+                    // ---- OPTION-2 COARSE MASK (TAA_MASK_SEETHROUGH).
+                    //
+                    // The FF777 canopy is structurally identical to the rest of
+                    // its cockpit geometry - blend off, no depth write, single
+                    // colour - so rather than isolate one shader we stop that
+                    // whole see-through-signature set from stamping velocity. The
+                    // world's own motion comes from the 5-attachment deferred
+                    // G-buffer, which this never matches, so the buildings seen
+                    // through the glass keep their vectors while the overlay stops
+                    // overwriting them. Coarse but effective; default off.
+                    if (!maskVelocity) {
+                        static const bool maskSeeThrough =
+                            (getenv("TAA_MASK_SEETHROUGH") != nullptr);
+                        const VkPipelineColorBlendStateCreateInfo *cb2 =
+                            ci[i].pColorBlendState;
+                        const bool blend2 = cb2 && cb2->attachmentCount > 0 &&
+                            cb2->pAttachments[0].blendEnable == VK_TRUE;
+                        const VkPipelineDepthStencilStateCreateInfo *ds2 =
+                            ci[i].pDepthStencilState;
+                        const bool depthW = ds2 && ds2->depthWriteEnable;
+                        if (maskSeeThrough && !blend2 && !depthW &&
+                            src->colorAttachmentCount == 1)
+                            maskVelocity = true;
+                    }
                     // Genuine transparency, read from the pipeline's own blend
                     // state rather than guessed from a G-buffer channel.
                     const VkPipelineColorBlendStateCreateInfo *cb =
@@ -10499,6 +10576,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // partner gives undefined inputs, which read as zero and produce a
             // velocity field of zeros that looks like working plumbing.
             mvPatchedThisCall[i] = (fragPatched && vertPatched);
+
+            // Name each distinct patched fragment once, with the traits that pick
+            // out a see-through surface (blend off + not writing depth), so the
+            // canopy glass can be found and added to TAA_MASK_FRAG.
+            if (fragHash && fragPatched) {
+                static std::set<uint64_t> namedFrag;
+                bool isNew = false;
+                {
+                    std::lock_guard<std::mutex> g(g_lock);
+                    if (namedFrag.size() < 256)
+                        isNew = namedFrag.insert(fragHash).second;
+                }
+                if (isNew) {
+                    const VkPipelineColorBlendStateCreateInfo *cb0 = ci[i].pColorBlendState;
+                    bool blend = cb0 && cb0->attachmentCount > 0 &&
+                                 cb0->pAttachments[0].blendEnable == VK_TRUE;
+                    const VkPipelineDepthStencilStateCreateInfo *ds0 = ci[i].pDepthStencilState;
+                    trace("MV FRAG %llx: blend=%d depthWrite=%d colour=%u%s - see-through "
+                          "candidates are blend=0 depthWrite=0; add the glass hash to "
+                          "TAA_MASK_FRAG to stop it stamping velocity on the world behind it",
+                          (unsigned long long)fragHash, blend ? 1 : 0,
+                          ds0 ? (int)ds0->depthWriteEnable : -1,
+                          src->colorAttachmentCount,
+                          maskVelocity ? "  [VELOCITY MASKED]" : "");
+                }
+            }
 
             // ---- WHICH PIPELINES FAIL, AND ON WHICH STAGE.
             //
@@ -10630,7 +10733,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             const VkColorComponentFlags mvMaskOn =
                   VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-            mvBlend.colorWriteMask = fragPatched ? mvMaskOn : 0;
+            // maskVelocity: a see-through surface (canopy glass) named in
+            // TAA_MASK_FRAG - patched for format consistency, but its velocity
+            // write is masked so the world behind it keeps its own motion.
+            mvBlend.colorWriteMask = (fragPatched && !maskVelocity) ? mvMaskOn : 0;
             // ---- ALPHA-BLENDED PIPELINES GET A PER-PIXEL SELECT, NOT A STAMP.
             //
             // With blending off, the propeller disc and the canopy glass write

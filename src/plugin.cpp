@@ -157,6 +157,28 @@ static void taaLogDrefAudit()
 static HANDLE    g_shareHandle = nullptr;
 static TaaShare *g_share       = nullptr;
 
+// ---- STAND DOWN ON THE 777 AIRFRAMES.
+//
+// The FlightFactor/Laminar 777s (777-200ER, 777-*_xp12, 777-F, ...) crash the
+// layer's resolve in X-Plane's deferred path. Rather than fight it, the mod
+// turns itself OFF whenever the user's aircraft is a 777: detected from the
+// .acf filename (they all carry "777"), published to the layer as
+// g_share->bypass, which makes the layer pass every frame through untouched.
+// Re-checked on every aircraft load, so switching away turns the mod back on.
+// TAA_KEEP_ON_777=1 overrides for debugging.
+static bool g_is777 = false;
+static void mvRefreshAircraft()
+{
+    if (getenv("TAA_KEEP_ON_777")) { g_is777 = false; return; }
+    char fn[256] = {0}, path[512] = {0};
+    XPLMGetNthAircraftModel(0, fn, path);          // index 0 = the user's aircraft
+    bool was = g_is777;
+    g_is777 = (std::string(fn).find("777") != std::string::npos);
+    if (g_is777 != was)
+        xlog("aircraft '%s' -> MotionVectors %s", fn,
+             g_is777 ? "OFF (777 airframe - layer stands down)" : "ON");
+}
+
 // projection_matrix is whatever the LAST render pass set, which from a flight
 // loop is the 2D UI pass - it comes back as an orthographic pixel-to-NDC matrix
 // (row0[0] = 2/2560 = 0.0008) and is useless here. projection_matrix_3d is the
@@ -972,6 +994,17 @@ static HeldControl g_held[] = {
     // Held only after the flight has settled - see above.
     { "sim/private/controls/tex/paging/downscale_cooldown",
       "TAA_DOWNSCALE_COOLDOWN",nullptr, 0.0f, 0.0f, 0, 900 },
+    // ---- FOREST LOD: PUSH THE 3D TREES FURTHER OUT.
+    //
+    // Distant forest is drawn as flat, darker 2D billboard impostors; the full
+    // 3D green trees only render inside forest/lod_multiplier's distance. At the
+    // default (1.0) that swap sits close in, which reads as trees "going from
+    // dark to green" as you approach. Held above the default so the 3D forest
+    // reaches further and the near/mid field is green rather than impostor-dark.
+    // Re-asserted every frame because X-Plane rewrites it on any settings touch.
+    // Costs some GPU; TAA_FOREST_LOD tunes it (=1 disables the boost).
+    { "sim/private/controls/forest/lod_multiplier",
+      "TAA_FOREST_LOD",        nullptr, 0.0f, 0.0f, 0, 0 },
 };
 
 static void patchTextureScaleFreeze();   // defined below, applied from here
@@ -3845,6 +3878,13 @@ static float matrixCallback(float sinceLast, float, int, void *)
     g_prevSimTime  = simTime;
     g_prevSpeed    = speed;
 
+    // Stand-down flag for the layer. Checked once here in case the aircraft was
+    // already loaded before we ran; the PLANE_LOADED handler keeps it current
+    // after. Not seqlock-protected data - a single word the layer reads directly.
+    static bool s_acftChecked = false;
+    if (!s_acftChecked) { mvRefreshAircraft(); s_acftChecked = true; }
+    s->bypass = g_is777 ? 1u : 0u;
+
     // frame and valid go LAST. The layer reads this without a lock, using the
     // frame counter as a seqlock, so the counter must never advertise data that
     // is still half-written.
@@ -4189,6 +4229,8 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
         64.0f,      // max_overdrive     - how far the pager may run ahead
         0.75f,      // size_fudge_factor - shrinks its size estimate
         0.0f,       // downscale_cooldown - 0 leaves X-Plane's own value alone
+        2.0f,       // forest/lod_multiplier - push 3D trees further out (green
+                    // sooner instead of dark impostors); TAA_FOREST_LOD tunes it
     };
     for (size_t i = 0; i < sizeof(g_held)/sizeof(g_held[0]); ++i) {
         const char *v = getenv(g_held[i].env);
@@ -4264,4 +4306,11 @@ PLUGIN_API void XPluginDisable(void)
     if (g_ctlHandle) { CloseHandle(g_ctlHandle); g_ctlHandle = nullptr; }
 }
 
-PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int, void *) {}
+PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void *param)
+{
+    // Re-check the airframe whenever the USER's aircraft (index 0) is (re)loaded,
+    // so the mod stands down the instant a 777 is loaded and returns for anything
+    // else. param carries the aircraft index as a pointer-sized int.
+    if (msg == XPLM_MSG_PLANE_LOADED && param == (void*)0)   // 0 = the user's plane
+        mvRefreshAircraft();
+}

@@ -100,6 +100,17 @@ int main(int argc, char **argv)
     SetEnvironmentVariableA("VK_LAYER_PATH", layerDir);
     SetEnvironmentVariableA("VK_LOADER_LAYERS_ENABLE", kLayerName);
 
+    // ---- ACTUALLY TURN THE MOD ON.  (v1.1.0 shipped without this.)
+    //
+    // Attaching the layer is not enough. The layer only INJECTS motion vectors
+    // when TAA_VELOCITY=1 (velArmed, layer.cpp), and only RESOLVES when
+    // TAA_RESOLVE=1 or taa.enable=1 in the live config. The dev launch script
+    // set TAA_VELOCITY; this launcher did not - so every v1.1.0 user got the
+    // layer loaded but ZERO velocity, hence no TAA at all. Set both here so the
+    // mod works out of the box even if the taa_live.ini seed below is skipped.
+    SetEnvironmentVariableA("TAA_VELOCITY", "1");
+    SetEnvironmentVariableA("TAA_RESOLVE",  "1");
+
     // ---- SEED THE TUNED SETTINGS ON FIRST RUN.
     //
     // The layer reads its live config from %TEMP%\taa_live.ini (getenv("TEMP")),
