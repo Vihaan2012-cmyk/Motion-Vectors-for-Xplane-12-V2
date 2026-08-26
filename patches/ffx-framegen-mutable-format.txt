@@ -1,0 +1,48 @@
+# FFX SDK local fixes — third_party/ is gitignored (823 MB), so these live here.
+#
+# Restoring the SDK from upstream WITHOUT re-applying this reintroduces the
+# frame-generation device-lost crash: X-Plane creates an sRGB view of the
+# UNORM backbuffer the layer substituted, which is illegal without
+# MUTABLE_FORMAT, so vkCreateImageView returns null and the compute pass
+# that samples it reads virtual address 0x0.
+#
+# File: third_party/FidelityFX-SDK/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+# Marker: search for 'MV: MUTABLE_FORMAT is REQUIRED here'
+# Pair:  Layer_CreateImageView strips STORAGE from those sRGB views (in-repo).
+
+    }
+
+    // create the fake backbuffer images
+    FFX_ASSERT_MESSAGE(pCreateInfo->minImageCount <= FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT, "Too many backbuffer requested");
+    gameBufferCount = pCreateInfo->minImageCount;
+
+    VkImageCreateInfo info = {};
+    info.sType             = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.pNext             = nullptr;
+    // MV: MUTABLE_FORMAT is REQUIRED here - it is the frame-generation crash fix.
+    //
+    // The layer substitutes the UNORM twin of X-Plane's sRGB swapchain so these
+    // images can carry STORAGE (no _SRGB format can be a storage image). But
+    // X-Plane never saw that substitution: it still believes the swapchain is
+    // sRGB and creates an sRGB VIEW of this UNORM image. Without MUTABLE_FORMAT
+    // that view is illegal (VUID-VkImageViewCreateInfo-image-12397), fails, and
+    // X-Plane binds the resulting null view - the compute pass that samples it
+    // then reads virtual address 0x0 and the device is lost. That is the crash.
+    //
+    // The old worry that this flag would flip the description to sRGB via
+    // ffx_vk.cpp's "if mutable, assume sRGB" path does NOT apply: that path is
+    // in ffxGetImageResourceDescriptionVK, which has NO callers in the SDK and
+    // is never run on these backbuffers - createImage sets their description
+    // explicitly, as UNORM. So image and description stay UNORM; only the flag
+    // is added, which merely WIDENS which view formats are legal. The remaining
+    // half - an sRGB view must not inherit the image's STORAGE usage
+    // (VUID-...-02275) - is handled in the layer's Layer_CreateImageView, which
+    // narrows exactly those views.
+    info.flags             = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    info.imageType         = VK_IMAGE_TYPE_2D;
+    info.format            = pCreateInfo->imageFormat;
+    info.extent.width      = pCreateInfo->imageExtent.width;
+    info.extent.height     = pCreateInfo->imageExtent.height;
+    info.extent.depth      = 1;
+    info.mipLevels         = 1;
+    info.arrayLayers       = 1;
