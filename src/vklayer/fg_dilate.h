@@ -37,6 +37,11 @@ struct State {
     VkCommandPool   pool   = VK_NULL_HANDLE;
     VkCommandBuffer cb     = VK_NULL_HANDLE;
     VkFence         fence  = VK_NULL_HANDLE;
+    // Per-slot buffers and fences for the double-buffered prepare path. The
+    // single cb/fence above still serve the legacy upscaler-harvest route.
+    VkCommandBuffer cb2[2]    = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkFence         fence2[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    bool            submitted[2] = { false, false };
     VkQueue         queue  = VK_NULL_HANDLE;
     uint32_t        queueFamily = 0;
 
@@ -149,6 +154,21 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
         s.failed = true; return false;
     }
 
+    // A buffer and a fence PER SLOT for the double-buffered prepare path. Two
+    // of each is what lets a frame be submitted without waiting for it: the
+    // only thing ever waited on is the submit into this slot from two frames
+    // ago, which has long since finished.
+    ai.commandBufferCount = 2;
+    if (allocCb(device, &ai, s.cb2) != VK_SUCCESS) {
+        trace("FG DILATE: per-slot command buffers failed - side-car off.");
+        s.failed = true; return false;
+    }
+    for (int k = 0; k < 2; ++k)
+        if (createFence(device, &fci, nullptr, &s.fence2[k]) != VK_SUCCESS) {
+            trace("FG DILATE: per-slot fence %d failed - side-car off.", k);
+            s.failed = true; return false;
+        }
+
     // Throwaway output at display extent, R16F, storage-capable. Reuses the
     // frame-gen backend's image helper so the format and memory choice match.
     FfxResourceDescription od;
@@ -223,25 +243,71 @@ inline bool run(VkImage colour, VkFormat colourFmt, VkImageLayout colourLayout,
     // is skipped completely here - which is what removes it, and its ~1 GB,
     // from the frame-generation path.
     if (fgprep::state().ready && !fgprep::state().failed) {
+        // ---- DO NOT WAIT ON WORK WE JUST SUBMITTED.
+        //
+        // The wait below used to be immediate: submit the pass, then block the
+        // CPU until the GPU finished it. That is a full sync point every frame -
+        // nothing overlaps across it, so CPU time and GPU time add instead of
+        // running together. It was tolerable when this ran a whole FSR3
+        // upscaler and the work dwarfed the stall; with the work down to one
+        // compute dispatch, the stall IS the cost.
+        //
+        // So the pass writes into the slot interpolation is not reading, and
+        // the only thing waited on is the submit from the PREVIOUS frame -
+        // which has had an entire frame to finish and is normally already
+        // signalled, so the wait returns immediately.
+        fgprep::State &g = fgprep::state();
+        const uint32_t slot = g.writeSlot;
+
+        // The previous submit into THIS slot (two frames ago) must be done
+        // before the buffer is re-recorded. Long finished in practice; the wait
+        // is a correctness guard, not a stall.
+        if (s.submitted[slot]) {
+            const VkResult fw2 = s.waitFences(s.device, 1, &s.fence2[slot], VK_TRUE,
+                                              1000ull * 1000ull * 1000ull);
+            if (fw2 != VK_SUCCESS) { s.inFlight = true; return false; }
+            s.submitted[slot] = false;
+        }
+        s.inFlight = false;
+
+        // The prologue above began s.cb for the legacy upscaler route. This
+        // path uses its own per-slot buffer, so it records the depth copy and
+        // the prepare pass into THAT one instead - a buffer must be begun
+        // before anything is recorded into it, and s.cb is not the buffer being
+        // submitted here.
+        if (s.reset(s.cb2[slot], 0) != VK_SUCCESS) return false;
+        VkCommandBufferBeginInfo bi2;
+        memset(&bi2, 0, sizeof(bi2));
+        bi2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (s.begin(s.cb2[slot], &bi2) != VK_SUCCESS) return false;
+        depthcopy::record(s.bindPipe, s.bindSets, s.dispatch, s.barrier,
+                          s.cb2[slot], depthRawLayout);
+
         fgprep::record(s.bindPipe, s.bindSets, s.dispatch, s.barrier,
-                       s.pushConst, s.clearImg, s.cb,
-                       mvScaleX, mvScaleY, reverseZ);
-        if (s.end(s.cb) != VK_SUCCESS) return false;
-        s.resetFences(s.device, 1, &s.fence);
+                       s.pushConst, s.clearImg, s.cb2[slot],
+                       mvScaleX, mvScaleY, reverseZ, slot);
+        if (s.end(s.cb2[slot]) != VK_SUCCESS) return false;
+        s.resetFences(s.device, 1, &s.fence2[slot]);
         VkSubmitInfo si2;
         memset(&si2, 0, sizeof(si2));
         si2.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si2.commandBufferCount = 1;
-        si2.pCommandBuffers = &s.cb;
-        if (s.submit(s.queue, 1, &si2, s.fence) != VK_SUCCESS) return false;
-        const VkResult fw2 = s.waitFences(s.device, 1, &s.fence, VK_TRUE,
-                                          1000ull * 1000ull * 1000ull);
-        if (fw2 != VK_SUCCESS) { s.inFlight = true; return false; }
-        s.inFlight = false;
+        si2.pCommandBuffers = &s.cb2[slot];
+        if (s.submit(s.queue, 1, &si2, s.fence2[slot]) != VK_SUCCESS) return false;
+        s.submitted[slot] = true;
+
+        // What interpolation may read is the slot completed LAST frame, not the
+        // one now in flight. Publishing it here is what keeps FFX off a texture
+        // the GPU is still writing.
+        g.readySlot = (int32_t)(1u - slot);
+        g.writeSlot = 1u - slot;
+        ++g.runs;
         ++s.runs;
         if (s.runs == 1 || (s.runs % 600) == 0)
-            trace("FG DILATE: %llu side-car dispatches (own prepare pass - no "
-                  "upscaler).", (unsigned long long)s.runs);
+            trace("FG DILATE: %llu side-car dispatches (own prepare pass, "
+                  "double-buffered - the CPU no longer waits on the GPU).",
+                  (unsigned long long)s.runs);
         return true;
     }
 

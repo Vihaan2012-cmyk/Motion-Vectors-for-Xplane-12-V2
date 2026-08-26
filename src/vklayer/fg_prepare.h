@@ -43,15 +43,32 @@ struct State {
     // The three FFX consumes. Formats are dictated by
     // ffxFrameInterpolationGetSharedResourceDescriptions and are NOT free to
     // change: R32_FLOAT, R16G16_FLOAT, R32_UINT, all at render size.
-    VkImage        dilDepth  = VK_NULL_HANDLE;
-    VkImage        dilMv     = VK_NULL_HANDLE;
-    VkImage        prevDepth = VK_NULL_HANDLE;
-    VkDeviceMemory dilDepthMem = VK_NULL_HANDLE;
-    VkDeviceMemory dilMvMem    = VK_NULL_HANDLE;
-    VkDeviceMemory prevDepthMem = VK_NULL_HANDLE;
-    VkImageView    dilDepthView  = VK_NULL_HANDLE;
-    VkImageView    dilMvView     = VK_NULL_HANDLE;
-    VkImageView    prevDepthView = VK_NULL_HANDLE;
+    // ---- TWO SETS, BECAUSE THE CPU NO LONGER WAITS FOR THE GPU.
+    //
+    // The side-car used to submit this pass and block on its fence before
+    // returning, so a single set of images was safe: nothing read them until
+    // the write had finished. That wait is a full CPU-GPU sync every frame and
+    // it is exactly what stops the two overlapping.
+    //
+    // With the wait gone, THIS frame's write is still in flight while FFX reads
+    // the results of the LAST one - and with one set those are the same images.
+    // So there are two: the pass writes one while interpolation reads the
+    // other, and they swap. Three small render-resolution images duplicated is
+    // a few MB, against a pipeline stall every frame.
+    VkImage        dilDepth[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImage        dilMv[2]     = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImage        prevDepth[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceMemory dilDepthMem[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceMemory dilMvMem[2]     = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceMemory prevDepthMem[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView    dilDepthView[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView    dilMvView[2]     = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView    prevDepthView[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    // Which set the pass writes next, and which one holds a COMPLETE frame that
+    // interpolation may read. readySlot stays -1 until the first write lands,
+    // which is what stops FFX reading undefined memory and presenting black.
+    uint32_t       writeSlot = 0;
+    int32_t        readySlot = -1;
 
     // Inputs. The depth view is over depthcopy's R32_SFLOAT image, not
     // X-Plane's combined depth-stencil - the same reason depthcopy exists at
@@ -64,7 +81,7 @@ struct State {
 
     VkDescriptorSetLayout setLayout  = VK_NULL_HANDLE;
     VkDescriptorPool      pool       = VK_NULL_HANDLE;
-    VkDescriptorSet       set        = VK_NULL_HANDLE;
+    VkDescriptorSet       set[2]     = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkPipelineLayout      pipeLayout = VK_NULL_HANDLE;
     VkPipeline            pipeline   = VK_NULL_HANDLE;
 
@@ -184,14 +201,16 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     if (getMemProps) getMemProps(phys, &mp);
 
     // The three, in FFX's formats. Not negotiable - see the header note.
-    if (!makeImage(device, gdpa, mp, w, h, VK_FORMAT_R32_SFLOAT,
-                   &s.dilDepth, &s.dilDepthMem, &s.dilDepthView) ||
-        !makeImage(device, gdpa, mp, w, h, VK_FORMAT_R16G16_SFLOAT,
-                   &s.dilMv, &s.dilMvMem, &s.dilMvView) ||
-        !makeImage(device, gdpa, mp, w, h, VK_FORMAT_R32_UINT,
-                   &s.prevDepth, &s.prevDepthMem, &s.prevDepthView)) {
-        trace("FG PREPARE: could not allocate the three interpolation inputs");
-        s.failed = true; return false;
+    for (int k = 0; k < 2; ++k) {
+        if (!makeImage(device, gdpa, mp, w, h, VK_FORMAT_R32_SFLOAT,
+                       &s.dilDepth[k], &s.dilDepthMem[k], &s.dilDepthView[k]) ||
+            !makeImage(device, gdpa, mp, w, h, VK_FORMAT_R16G16_SFLOAT,
+                       &s.dilMv[k], &s.dilMvMem[k], &s.dilMvView[k]) ||
+            !makeImage(device, gdpa, mp, w, h, VK_FORMAT_R32_UINT,
+                       &s.prevDepth[k], &s.prevDepthMem[k], &s.prevDepthView[k])) {
+            trace("FG PREPARE: could not allocate interpolation input set %d", k);
+            s.failed = true; return false;
+        }
     }
 
     PFN_vkCreateImageView createView = (PFN_vkCreateImageView)gdpa(device, "vkCreateImageView");
@@ -258,12 +277,12 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     // drivers do not return OUT_OF_POOL_MEMORY as they should.
     VkDescriptorPoolSize ps[2];
     memset(ps, 0, sizeof(ps));
-    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = 2;
-    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          ps[1].descriptorCount = 3;
+    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = 4;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          ps[1].descriptorCount = 6;
     VkDescriptorPoolCreateInfo pci;
     memset(&pci, 0, sizeof(pci));
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
+    pci.maxSets = 2; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
     PFN_vkCreateDescriptorPool mkPool =
         (PFN_vkCreateDescriptorPool)gdpa(device, "vkCreateDescriptorPool");
     if (!mkPool || mkPool(device, &pci, nullptr, &s.pool) != VK_SUCCESS) {
@@ -274,38 +293,42 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     memset(&dsai, 0, sizeof(dsai));
     dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dsai.descriptorPool = s.pool;
-    dsai.descriptorSetCount = 1; dsai.pSetLayouts = &s.setLayout;
+    const VkDescriptorSetLayout layouts2[2] = { s.setLayout, s.setLayout };
+    dsai.descriptorSetCount = 2; dsai.pSetLayouts = layouts2;
     PFN_vkAllocateDescriptorSets allocSets =
         (PFN_vkAllocateDescriptorSets)gdpa(device, "vkAllocateDescriptorSets");
-    if (!allocSets || allocSets(device, &dsai, &s.set) != VK_SUCCESS) {
-        trace("FG PREPARE: descriptor set failed"); s.failed = true; return false;
+    if (!allocSets || allocSets(device, &dsai, s.set) != VK_SUCCESS) {
+        trace("FG PREPARE: descriptor sets failed"); s.failed = true; return false;
     }
 
-    VkDescriptorImageInfo ii[5];
-    memset(ii, 0, sizeof(ii));
-    ii[0].sampler = s.sampler; ii[0].imageView = s.depthView;
-    ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    ii[1].sampler = s.sampler; ii[1].imageView = s.velView;
-    ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    ii[2].imageView = s.dilDepthView;  ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    ii[3].imageView = s.dilMvView;     ii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    ii[4].imageView = s.prevDepthView; ii[4].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-    VkWriteDescriptorSet w5[5];
-    memset(w5, 0, sizeof(w5));
-    for (int i = 0; i < 5; ++i) {
-        w5[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w5[i].dstSet = s.set;
-        w5[i].dstBinding = (uint32_t)i;
-        w5[i].descriptorCount = 1;
-        w5[i].descriptorType = (i < 2) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                       : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w5[i].pImageInfo = &ii[i];
-    }
     PFN_vkUpdateDescriptorSets updSets =
         (PFN_vkUpdateDescriptorSets)gdpa(device, "vkUpdateDescriptorSets");
     if (!updSets) { s.failed = true; return false; }
-    updSets(device, 5, w5, 0, nullptr);
+    // One set per slot. The two inputs are shared; only the three outputs differ.
+    for (int k = 0; k < 2; ++k) {
+        VkDescriptorImageInfo ii[5];
+        memset(ii, 0, sizeof(ii));
+        ii[0].sampler = s.sampler; ii[0].imageView = s.depthView;
+        ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ii[1].sampler = s.sampler; ii[1].imageView = s.velView;
+        ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ii[2].imageView = s.dilDepthView[k];  ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ii[3].imageView = s.dilMvView[k];     ii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ii[4].imageView = s.prevDepthView[k]; ii[4].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet w5[5];
+        memset(w5, 0, sizeof(w5));
+        for (int i = 0; i < 5; ++i) {
+            w5[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w5[i].dstSet = s.set[k];
+            w5[i].dstBinding = (uint32_t)i;
+            w5[i].descriptorCount = 1;
+            w5[i].descriptorType = (i < 2) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                           : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w5[i].pImageInfo = &ii[i];
+        }
+        updSets(device, 5, w5, 0, nullptr);
+    }
 
     VkPushConstantRange pcr;
     memset(&pcr, 0, sizeof(pcr));
@@ -373,7 +396,8 @@ inline void record(PFN_vkCmdBindPipeline bindPipe,
                    PFN_vkCmdPushConstants pushFn,
                    PFN_vkCmdClearColorImage clearFn,
                    VkCommandBuffer cb,
-                   float mvScaleX, float mvScaleY, bool reverseZ)
+                   float mvScaleX, float mvScaleY, bool reverseZ,
+                   uint32_t slot)
 {
     State &s = state();
     if (!s.ready || s.failed) return;
@@ -385,7 +409,7 @@ inline void record(PFN_vkCmdBindPipeline bindPipe,
 
     VkImageMemoryBarrier toGeneral[3];
     memset(toGeneral, 0, sizeof(toGeneral));
-    VkImage imgs[3] = { s.dilDepth, s.dilMv, s.prevDepth };
+    VkImage imgs[3] = { s.dilDepth[slot], s.dilMv[slot], s.prevDepth[slot] };
     for (int i = 0; i < 3; ++i) {
         toGeneral[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         toGeneral[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -416,7 +440,7 @@ inline void record(PFN_vkCmdBindPipeline bindPipe,
     // sample wins the max.
     VkClearColorValue zero;
     memset(&zero, 0, sizeof(zero));
-    clearFn(cb, s.prevDepth, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rng);
+    clearFn(cb, s.prevDepth[slot], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rng);
 
     VkImageMemoryBarrier afterClear;
     memset(&afterClear, 0, sizeof(afterClear));
@@ -425,7 +449,7 @@ inline void record(PFN_vkCmdBindPipeline bindPipe,
     afterClear.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     afterClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     afterClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    afterClear.image = s.prevDepth;
+    afterClear.image = s.prevDepth[slot];
     afterClear.subresourceRange = rng;
     afterClear.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     afterClear.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -434,7 +458,7 @@ inline void record(PFN_vkCmdBindPipeline bindPipe,
               1, &afterClear);
 
     bindPipe(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeline);
-    bindSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeLayout, 0, 1, &s.set, 0, nullptr);
+    bindSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeLayout, 0, 1, &s.set[slot], 0, nullptr);
 
     Push p;
     memset(&p, 0, sizeof(p));

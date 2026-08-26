@@ -373,7 +373,20 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
                   "frames only (%llu frames held).", (unsigned long long)held);
         return FFX_OK;
     }
+    // ---- READY IS NOT THE SAME AS WRITTEN.
+    //
+    // This asked only whether the prepare pass had been BUILT. Its images exist
+    // from that moment but contain nothing until it has actually dispatched, so
+    // interpolation spent the first frames reading undefined memory and the
+    // swapchain presented the result: black frames, flickering, until the pass
+    // caught up.
+    //
+    // That is the same failure 62d744e fixed for the upscaler path - enabling
+    // generation before its inputs exist - reintroduced here because "ready"
+    // reads like it means the data is there. runs > 0 is the honest test: the
+    // three textures have been written at least once.
     const bool ownInputs = fgprep::state().ready && !fgprep::state().failed &&
+                           fgprep::state().readySlot >= 0 &&
                            live::onoff("taa.fg_own_prepare", "TAA_FG_OWN_PREPARE", true);
     if (!ownInputs &&
         (!u.ready || u.failed ||
@@ -430,14 +443,18 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
         memset(&sh, 0, sizeof(sh));
         if (ffxFrameInterpolationGetSharedResourceDescriptions(&s.fiCtx, &sh) == FFX_OK) {
             fgprep::State &g = fgprep::state();
+            // The COMPLETED slot, never the one in flight. readySlot is set only
+            // after a submit finishes, so this can never be a texture the GPU is
+            // still writing.
+            const uint32_t r = (uint32_t)g.readySlot;
             fd.reconstructedPrevDepth =
-                ffxGetResourceVK(g.prevDepth, sh.reconstructedPrevNearestDepth.resourceDescription,
+                ffxGetResourceVK(g.prevDepth[r], sh.reconstructedPrevNearestDepth.resourceDescription,
                                  nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
             fd.dilatedDepth =
-                ffxGetResourceVK(g.dilDepth, sh.dilatedDepth.resourceDescription,
+                ffxGetResourceVK(g.dilDepth[r], sh.dilatedDepth.resourceDescription,
                                  nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
             fd.dilatedMotionVectors =
-                ffxGetResourceVK(g.dilMv, sh.dilatedMotionVectors.resourceDescription,
+                ffxGetResourceVK(g.dilMv[r], sh.dilatedMotionVectors.resourceDescription,
                                  nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
             static bool told = false;
             if (!told) {
