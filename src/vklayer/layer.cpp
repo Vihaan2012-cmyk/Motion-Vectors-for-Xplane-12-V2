@@ -1624,6 +1624,12 @@ struct FgQueues {
     bool     ok = false;
 };
 
+// The chosen queues, kept for the present path. fgPickQueues runs once at
+// swapchain creation and its result was local, but the dilation side-car needs
+// the GAME queue and its family every present: submitting there orders the
+// dilation after X-Plane's render, which is the whole reason it is safe.
+static FgQueues g_fgQ;
+
 static FgQueues fgPickQueues(VkDevice device, VkPhysicalDevice phys,
                              VkSurfaceKHR surface)
 {
@@ -1705,6 +1711,10 @@ static FgQueues fgPickQueues(VkDevice device, VkPhysicalDevice phys,
 #include "fsr3_backend_impl.h"
 // Frame generation reads the upscaler's shared outputs, so it comes after it.
 #include "fg_backend.h"
+// The dilation side-car. Runs FSR3 on a command buffer THIS LAYER owns and
+// submits at present, so the upscaler never records into X-Plane's command
+// stream - which is the measured device-lost the frame-gen work stopped at.
+#include "fg_dilate.h"
 
 // ---- THE FRAME-INTERPOLATION SWAPCHAIN IS NOT A VkSwapchainKHR.
 //
@@ -7792,6 +7802,50 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                               g_sceneDepth, g_sceneDepthFormat, rw, rh);
         if (dev && ph && gd && rw && rh && ow && oh && rw < ow)
             fsr3::ensure(dev, ph, gd, g_getPhysMemProps, rw, rh, ow, oh);
+        // The side-car's own command pool, buffer, fence and throwaway output.
+        // Built here for the same reason as the two above: creating pipelines
+        // while a command buffer is being recorded is what killed the sim
+        // earlier. Needs the GAME queue, which fgPickQueues chose at swapchain
+        // creation and g_fgQ now keeps.
+        if (dev && ph && gd && ow && oh && g_fgQ.game != VK_NULL_HANDLE)
+            fgdilate::ensure(dev, ph, gd, g_getPhysMemProps,
+                             g_fgQ.gameFam, g_fgQ.game, ow, oh);
+    }
+
+    // ---- PRODUCE THE DILATED RESOURCES, OFF X-PLANE'S COMMAND BUFFER.
+    //
+    // Frame interpolation needs dilatedDepth, dilatedMotionVectors and
+    // reconstructedPrevDepth, and they exist only as a by-product of the FSR3
+    // upscaler's reconstruct-and-dilate pass. The in-render path that produced
+    // them records FSR3 into X-Plane's own command buffer, and doing that while
+    // the interpolation proxy swapchain is live is the measured device-lost -
+    // isolated exactly by taa.fsr_run=0 (off: stable for minutes; on: crash at
+    // ~30 s).
+    //
+    // So they are produced here instead, on a command buffer this layer owns
+    // and submits itself. Present runs once per frame, X-Plane's render for the
+    // frame is already submitted to the game queue, and submitting to that SAME
+    // queue orders this after it - so the colour, depth and motion vectors read
+    // are the finished frame, with no cross-queue race and no borrowed fence.
+    // run() waits on its own fence before returning, so shared[] is complete
+    // before the config below reads it.
+    //
+    // taa.fg_dilate=0 disables the side-car without disturbing anything else,
+    // which is also the A/B against the in-render path.
+    if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
+        fgdilate::state().ready && g_sceneColor.image != VK_NULL_HANDLE &&
+        g_sceneDepth != VK_NULL_HANDLE && g_mv.ready &&
+        live::onoff("taa.fg_dilate", "TAA_FG_DILATE", true)) {
+        const float vs = taaVelScale() * live::f("fsr.mv_x", nullptr, 1.0f);
+        const float ys = taaVelYSign() * live::f("fsr.mv_y", nullptr, 1.0f);
+        fgdilate::run(g_sceneColor.image, g_sceneColor.format, g_sceneColor.layout,
+                      g_sceneDepth, g_sceneDepthFormat, g_sceneDepthLayout,
+                      g_mv.image, kMvFormat,
+                      g_sceneColor.w, g_sceneColor.h,
+                      g_velSnap.jitterX * g_jitterScale,
+                      g_velSnap.jitterY * g_jitterScale,
+                      vs * (float)g_sceneColor.w, vs * ys * (float)g_sceneColor.h,
+                      false);
     }
 
     // ---- APPLY THE FRAME-GENERATION CONFIG - INDEPENDENT OF THE UPSCALER.
@@ -13337,7 +13391,19 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
         // so this asks whether intercepting X-Plane's dispatch and running FSR3
         // on its command buffer is what crashes under the proxy - the last
         // untested variable behind the FSR3+proxy fault.
-        if (ours && fsr3Wanted() &&
+        // ---- STAND DOWN WHEN THE SIDE-CAR IS DOING THIS.
+        //
+        // Recording FSR3 here, into X-Plane's command buffer, is the measured
+        // device-lost under the interpolation proxy. When the side-car is up it
+        // produces the same dilated resources at present on our own buffer, so
+        // running here as well would both reintroduce the crash and do the work
+        // twice. The side-car wins; this path remains for the no-frame-gen case
+        // and as the A/B.
+        const bool sideCarOwnsDilation =
+            g_fgActive.load(std::memory_order_relaxed) &&
+            fgdilate::state().ready &&
+            live::onoff("taa.fg_dilate", "TAA_FG_DILATE", true);
+        if (ours && fsr3Wanted() && !sideCarOwnsDilation &&
             live::onoff("taa.fsr_run", "TAA_FSR_RUN", true) &&
             out != VK_NULL_HANDLE && colour != VK_NULL_HANDLE &&
             depth != VK_NULL_HANDLE && mv != VK_NULL_HANDLE && rw && rh && ow && oh &&
@@ -15680,6 +15746,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
         !g_fgSwap.have &&
         device == g_ffxDevice && g_ffxDevice != VK_NULL_HANDLE) {
         FgQueues fq = fgPickQueues(device, g_ffxPhys, ci->surface);
+        g_fgQ = fq;
         trace("FG: queue selection %s - game fam %u, present fam %u, "
               "acquire fam %u, asyncCompute %s",
               fq.ok ? "OK" : "INCOMPLETE",
