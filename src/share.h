@@ -600,6 +600,21 @@ struct TaaShare {
     uint32_t mvInjMalformed;       // SPIR-V the injector would not touch
     uint32_t mvInjNoPosition;      // vertex stage never writes gl_Position
 
+    // ---- STAND FRAME GENERATION DOWN ACROSS AN AIRCRAFT SWAP.
+    //
+    // Loading an aircraft is the peak memory moment of a session: X-Plane
+    // streams a new airframe and its textures while frame generation is still
+    // holding its own working set. On an 8 GB card that is where the sim died,
+    // every time, with heavy_pressure in X-Plane's log and nothing at all from
+    // validation - because running out of memory is not an API misuse.
+    //
+    // The plugin is the only thing that KNOWS a swap is happening. Non-zero
+    // means hold: the layer stops generating and stops producing interpolation
+    // inputs until it returns to zero. Counted down in frames after the load
+    // completes rather than cleared immediately, because the load finishing is
+    // not the same as the scene being settled.
+    uint32_t fgHold;
+
     int32_t valid;            // 0 until two frames of history exist
 };
 

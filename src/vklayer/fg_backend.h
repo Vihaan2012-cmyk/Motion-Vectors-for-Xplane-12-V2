@@ -365,6 +365,14 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     // depth/MV path would plug in". This is that path: fgprep produces the same
     // three textures directly, so interpolation no longer needs the upscaler to
     // have run - which is what frees the gigabyte the upscaler was costing.
+    // An aircraft swap holds generation off entirely - see fgHeldForAircraftSwap.
+    if (fgHeldForAircraftSwap()) {
+        static uint64_t held = 0;
+        if ((held++ % 300) == 0)
+            trace("FG: holding - aircraft swap in progress, presenting real "
+                  "frames only (%llu frames held).", (unsigned long long)held);
+        return FFX_OK;
+    }
     const bool ownInputs = fgprep::state().ready && !fgprep::state().failed &&
                            live::onoff("taa.fg_own_prepare", "TAA_FG_OWN_PREPARE", true);
     if (!ownInputs &&

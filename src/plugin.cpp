@@ -167,6 +167,23 @@ static TaaShare *g_share       = nullptr;
 // Re-checked on every aircraft load, so switching away turns the mod back on.
 // TAA_KEEP_ON_777=1 overrides for debugging.
 static bool g_is777 = false;
+// ---- HOLD FRAME GENERATION ACROSS AN AIRCRAFT SWAP.
+//
+// Loading an aircraft is the peak memory moment of a session, and it is where
+// the sim died with frame generation on: X-Plane streams a new airframe and its
+// textures while frame generation is still holding its working set, on a card
+// that had no room for both.
+//
+// The plugin is the only half that KNOWS a swap is happening - the layer sees
+// images appear and disappear and cannot tell a reload from a scenery change.
+// So the plugin raises a hold and the layer stops generating until it clears.
+//
+// Counted in frames rather than cleared on PLANE_LOADED, because that message
+// means "the aircraft is loaded", not "the scene has settled": textures keep
+// streaming well past it, which is precisely the window being protected.
+static uint32_t g_fgHoldFrames = 0;
+static const uint32_t kFgHoldAfterLoad = 900;   // ~15 s at 60 fps
+
 static void mvRefreshAircraft()
 {
     if (getenv("TAA_KEEP_ON_777")) { g_is777 = false; return; }
@@ -3908,6 +3925,10 @@ static float matrixCallback(float sinceLast, float, int, void *)
     g_jitterIndex = (g_jitterIndex + 1) % phases;
 
     s->lodBias     = g_lodBias;
+    // Counted down here because this runs once per rendered frame, which is the
+    // unit the hold is expressed in.
+    if (g_fgHoldFrames) --g_fgHoldFrames;
+    s->fgHold = g_fgHoldFrames;
     s->renderScale = g_renderScale;
 
     // Only meaningful from inside the cockpit. In an external view the near
@@ -4360,6 +4381,20 @@ PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void *param)
     // Re-check the airframe whenever the USER's aircraft (index 0) is (re)loaded,
     // so the mod stands down the instant a 777 is loaded and returns for anything
     // else. param carries the aircraft index as a pointer-sized int.
-    if (msg == XPLM_MSG_PLANE_LOADED && param == (void*)0)   // 0 = the user's plane
+    if (msg == XPLM_MSG_PLANE_LOADED && param == (void*)0) { // 0 = the user's plane
         mvRefreshAircraft();
+        // The load has finished; the streaming has not. Hold through the settle.
+        g_fgHoldFrames = kFgHoldAfterLoad;
+        xlog("aircraft loaded - holding frame generation for %u frames while the "
+             "scene settles; this is the window the sim used to die in",
+             kFgHoldAfterLoad);
+    }
+    // UNLOADED fires when the OLD aircraft is removed, which is the start of the
+    // swap - before the new one allocates anything. Waiting for PLANE_LOADED
+    // would raise the hold after the dangerous part was already over.
+    if (msg == XPLM_MSG_PLANE_UNLOADED && param == (void*)0) {
+        g_fgHoldFrames = kFgHoldAfterLoad;
+        xlog("aircraft unloaded - frame generation held from here through the "
+             "reload");
+    }
 }

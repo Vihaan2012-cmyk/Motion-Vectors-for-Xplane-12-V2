@@ -155,6 +155,23 @@ static bool      g_shareOpen   = false;
 // fail-safe direction, and changing MSAA needs a renderer restart anyway.
 static bool g_msaaStandDown = false;
 
+// ---- IS AN AIRCRAFT SWAP IN PROGRESS?
+//
+// The plugin raises this on PLANE_UNLOADED - the start of the swap - and holds
+// it for a settle period after PLANE_LOADED, because the load finishing is not
+// the same as the streaming finishing. While it is up, frame generation stops
+// generating and stops producing its inputs, so its working set is not
+// competing with a new airframe and its textures for a card that has room for
+// one of them.
+//
+// The layer cannot work this out for itself: it sees images created and
+// destroyed and cannot tell an aircraft reload from a scenery change or a
+// resolution change. The plugin is the only half that knows.
+static inline bool fgHeldForAircraftSwap()
+{
+    return g_share && g_share->magic == TAA_MAGIC && g_share->fgHold != 0;
+}
+
 // The plugin raises g_share->bypass for airframes the mod must not touch (the
 // 777s, which crash our resolve). When set, every scene-identification, MV-target
 // build and resolve below is skipped, so the layer is inert and X-Plane renders
@@ -7918,6 +7935,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // when the scene is safe to touch.
     if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
         fgdilate::state().ready && g_sceneColorStable >= 120 &&
+        !fgHeldForAircraftSwap() &&
         g_sceneColor.image != VK_NULL_HANDLE &&
         g_sceneDepth != VK_NULL_HANDLE && g_mv.ready &&
         live::onoff("taa.fg_dilate", "TAA_FG_DILATE", true)) {
