@@ -359,10 +359,19 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     // frame this time, so it presents the real one - the correct behaviour
     // until the upscaler is producing, and the natural place a future
     // self-contained depth/MV path would plug in.
-    if (!u.ready || u.failed ||
-        u.shared[0] == VK_NULL_HANDLE ||
-        u.shared[1] == VK_NULL_HANDLE ||
-        u.shared[2] == VK_NULL_HANDLE) {
+    // ---- OUR OWN INPUTS COUNT AS INPUTS.
+    //
+    // The note above called this "the natural place a future self-contained
+    // depth/MV path would plug in". This is that path: fgprep produces the same
+    // three textures directly, so interpolation no longer needs the upscaler to
+    // have run - which is what frees the gigabyte the upscaler was costing.
+    const bool ownInputs = fgprep::state().ready && !fgprep::state().failed &&
+                           live::onoff("taa.fg_own_prepare", "TAA_FG_OWN_PREPARE", true);
+    if (!ownInputs &&
+        (!u.ready || u.failed ||
+         u.shared[0] == VK_NULL_HANDLE ||
+         u.shared[1] == VK_NULL_HANDLE ||
+         u.shared[2] == VK_NULL_HANDLE)) {
         static uint64_t skipped = 0;
         if ((skipped++ % 300) == 0)
             trace("FG: upscaler resources not ready (ready=%d) - presenting the "
@@ -404,12 +413,40 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     fd.opticalFlowScale.y = 1.0f / (float)s.dispH;
     fd.opticalFlowBlockSize = 8;
 
-    fd.reconstructedPrevDepth = ffxGetResourceVK(u.shared[0], u.sharedDesc[0], nullptr,
-                                                 FFX_RESOURCE_STATE_UNORDERED_ACCESS);
-    fd.dilatedDepth           = ffxGetResourceVK(u.shared[1], u.sharedDesc[1], nullptr,
-                                                 FFX_RESOURCE_STATE_UNORDERED_ACCESS);
-    fd.dilatedMotionVectors   = ffxGetResourceVK(u.shared[2], u.sharedDesc[2], nullptr,
-                                                 FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+    // The descriptions are asked of the INTERPOLATION context rather than
+    // restated here. It is the authority on what it consumes, it answers
+    // without an upscaler existing, and a description written out by hand is
+    // one that silently stops matching after an SDK update.
+    if (ownInputs) {
+        FfxFrameInterpolationSharedResourceDescriptions sh;
+        memset(&sh, 0, sizeof(sh));
+        if (ffxFrameInterpolationGetSharedResourceDescriptions(&s.fiCtx, &sh) == FFX_OK) {
+            fgprep::State &g = fgprep::state();
+            fd.reconstructedPrevDepth =
+                ffxGetResourceVK(g.prevDepth, sh.reconstructedPrevNearestDepth.resourceDescription,
+                                 nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+            fd.dilatedDepth =
+                ffxGetResourceVK(g.dilDepth, sh.dilatedDepth.resourceDescription,
+                                 nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+            fd.dilatedMotionVectors =
+                ffxGetResourceVK(g.dilMv, sh.dilatedMotionVectors.resourceDescription,
+                                 nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+            static bool told = false;
+            if (!told) {
+                told = true;
+                trace("FG: interpolation is reading OUR dilated depth/motion and "
+                      "reconstructed previous depth - the FSR3 upscaler is no "
+                      "longer in the frame-generation path.");
+            }
+        }
+    } else {
+        fd.reconstructedPrevDepth = ffxGetResourceVK(u.shared[0], u.sharedDesc[0], nullptr,
+                                                     FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+        fd.dilatedDepth           = ffxGetResourceVK(u.shared[1], u.sharedDesc[1], nullptr,
+                                                     FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+        fd.dilatedMotionVectors   = ffxGetResourceVK(u.shared[2], u.sharedDesc[2], nullptr,
+                                                     FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
     // Same camera constants the upscaler is dispatched with. They describe the
     // same frame; two different answers here would reproject the interpolated

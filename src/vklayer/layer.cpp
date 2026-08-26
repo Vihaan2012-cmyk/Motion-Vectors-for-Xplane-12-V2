@@ -1710,6 +1710,10 @@ static FgQueues fgPickQueues(VkDevice device, VkPhysicalDevice phys,
 
 #include "fsr3_backend_impl.h"
 // Frame generation reads the upscaler's shared outputs, so it comes after it.
+// Produces frame interpolation's three inputs directly, so the FSR3 upscaler
+// is not needed to harvest them. See the header for the VRAM measurement that
+// motivated it.
+#include "fg_prepare.h"
 #include "fg_backend.h"
 // The dilation side-car. Runs FSR3 on a command buffer THIS LAYER owns and
 // submits at present, so the upscaler never records into X-Plane's command
@@ -7829,8 +7833,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     const bool needFsr3    = !fsr3::state().ready      && !fsr3::state().failed;
     const bool needDepthCp = !depthcopy::state().ready && !depthcopy::state().failed;
     const bool needSideCar = !fgdilate::state().ready  && !fgdilate::state().failed;
+    const bool needPrep    = !fgprep::state().ready    && !fgprep::state().failed;
     if (fsrReplaceEnabled() && fsr3Wanted() &&
-        (needFsr3 || needDepthCp || needSideCar)) {
+        (needFsr3 || needDepthCp || needSideCar || needPrep)) {
         VkDevice dev = VK_NULL_HANDLE; VkPhysicalDevice ph = VK_NULL_HANDLE;
         PFN_vkGetDeviceProcAddr gd = nullptr;
         uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
@@ -7870,6 +7875,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         if (dev && ph && gd && ow && oh && g_fgQ.game != VK_NULL_HANDLE)
             fgdilate::ensure(dev, ph, gd, g_getPhysMemProps,
                              g_fgQ.gameFam, g_fgQ.game, ow, oh);
+        // The self-contained prepare pass. Needs depthcopy's R32_SFLOAT image
+        // (a compute shader cannot sample X-Plane's combined depth-stencil) and
+        // our velocity target, so it is built after both exist.
+        if (dev && ph && gd && rw && rh &&
+            depthcopy::state().ready && g_mv.ready)
+            fgprep::ensure(dev, ph, gd, g_getPhysMemProps,
+                           depthcopy::state().image, g_mv.image, kMvFormat, rw, rh);
     }
 
     // ---- PRODUCE THE DILATED RESOURCES, OFF X-PLANE'S COMMAND BUFFER.
@@ -7918,7 +7930,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                       g_velSnap.jitterX * g_jitterScale,
                       g_velSnap.jitterY * g_jitterScale,
                       vs * (float)g_sceneColor.w, vs * ys * (float)g_sceneColor.h,
-                      false);
+                      false,
+                      // Depth convention, from the share block the plugin
+                      // publishes. Getting it wrong dilates AWAY from the
+                      // camera, which reprojects edges onto the wrong surface.
+                      g_share && g_share->reverseZ != 0);
     }
 
     // ---- APPLY THE FRAME-GENERATION CONFIG - INDEPENDENT OF THE UPSCALER.

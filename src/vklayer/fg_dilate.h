@@ -62,6 +62,10 @@ struct State {
     PFN_vkCmdPipelineBarrier  barrier = nullptr;
     PFN_vkCmdBindPipeline     bindPipe = nullptr;
     PFN_vkCmdBindDescriptorSets bindSets = nullptr;
+    // Needed by the self-contained prepare pass: it pushes its own constants
+    // and clears the scatter target every frame.
+    PFN_vkCmdPushConstants    pushConst = nullptr;
+    PFN_vkCmdClearColorImage  clearImg  = nullptr;
     PFN_vkCmdDispatch         dispatch = nullptr;
 
     uint64_t runs = 0;
@@ -105,11 +109,13 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     s.barrier     = (PFN_vkCmdPipelineBarrier)gdpa(device, "vkCmdPipelineBarrier");
     s.bindPipe    = (PFN_vkCmdBindPipeline)gdpa(device, "vkCmdBindPipeline");
     s.bindSets    = (PFN_vkCmdBindDescriptorSets)gdpa(device, "vkCmdBindDescriptorSets");
+    s.pushConst   = (PFN_vkCmdPushConstants)gdpa(device, "vkCmdPushConstants");
+    s.clearImg    = (PFN_vkCmdClearColorImage)gdpa(device, "vkCmdClearColorImage");
     s.dispatch    = (PFN_vkCmdDispatch)gdpa(device, "vkCmdDispatch");
 
     if (!createPool || !allocCb || !createFence || !s.begin || !s.end || !s.reset ||
         !s.submit || !s.waitFences || !s.resetFences || !s.barrier || !s.bindPipe ||
-        !s.bindSets || !s.dispatch) {
+        !s.bindSets || !s.dispatch || !s.pushConst || !s.clearImg) {
         trace("FG DILATE: a required device entry point is missing - side-car off.");
         s.failed = true; return false;
     }
@@ -179,7 +185,7 @@ inline bool run(VkImage colour, VkFormat colourFmt, VkImageLayout colourLayout,
                 uint32_t renderW, uint32_t renderH,
                 float jitterX, float jitterY,
                 float mvScaleX, float mvScaleY,
-                bool reset)
+                bool reset, bool reverseZ)
 {
     State &s = state();
     std::lock_guard<std::mutex> guard(s.lock);
@@ -208,6 +214,36 @@ inline bool run(VkImage colour, VkFormat colourFmt, VkImageLayout colourLayout,
     // depth-copy first: it turns X-Plane's depth-format image into the plain
     // R32_SFLOAT the upscaler reads, and leaves it GENERAL.
     depthcopy::record(s.bindPipe, s.bindSets, s.dispatch, s.barrier, s.cb, depthRawLayout);
+
+    // ---- OUR OWN PREPARE PASS, IF IT IS UP.
+    //
+    // This is the whole point of fg_prepare: the three textures interpolation
+    // needs, computed directly, instead of running an entire FSR3 upscaler and
+    // discarding its output to harvest them. When it is available the upscaler
+    // is skipped completely here - which is what removes it, and its ~1 GB,
+    // from the frame-generation path.
+    if (fgprep::state().ready && !fgprep::state().failed) {
+        fgprep::record(s.bindPipe, s.bindSets, s.dispatch, s.barrier,
+                       s.pushConst, s.clearImg, s.cb,
+                       mvScaleX, mvScaleY, reverseZ);
+        if (s.end(s.cb) != VK_SUCCESS) return false;
+        s.resetFences(s.device, 1, &s.fence);
+        VkSubmitInfo si2;
+        memset(&si2, 0, sizeof(si2));
+        si2.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si2.commandBufferCount = 1;
+        si2.pCommandBuffers = &s.cb;
+        if (s.submit(s.queue, 1, &si2, s.fence) != VK_SUCCESS) return false;
+        const VkResult fw2 = s.waitFences(s.device, 1, &s.fence, VK_TRUE,
+                                          1000ull * 1000ull * 1000ull);
+        if (fw2 != VK_SUCCESS) { s.inFlight = true; return false; }
+        s.inFlight = false;
+        ++s.runs;
+        if (s.runs == 1 || (s.runs % 600) == 0)
+            trace("FG DILATE: %llu side-car dispatches (own prepare pass - no "
+                  "upscaler).", (unsigned long long)s.runs);
+        return true;
+    }
 
     // Then the upscaler. Output is the throwaway image; the shared dilated
     // resources are the point. Camera constants match the in-render path.
