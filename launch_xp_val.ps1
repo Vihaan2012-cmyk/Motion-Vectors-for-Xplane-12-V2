@@ -1,24 +1,27 @@
-# GPU-Assisted Validation launch - name the MSAA null-descriptor crash.
+# X-Plane under validation WITH frame generation, plus loader diagnostics.
 #
-# Chain: app -> VK_LAYER_mv -> VK_LAYER_KHRONOS_validation -> driver, so the
-# validation layer sees everything OUR layer injects. GPU-AV instruments the
-# shaders and reports the exact failed view / null descriptor instead of a
-# silent device loss. Expect a heavy FPS hit - this is a diagnosis run.
-#
-# Repro conditions armed on purpose:
-#   - renopt_MSAA 1 in prefs (set before this launch)
-#   - TAA_KEEP_ON_777=1 so the 777 bypass does NOT stand the mod down
-$root = "d:\Steam Games\steamapps\common\X-Plane 12\MotionVectors"
-$xp   = "d:\Steam Games\steamapps\common\X-Plane 12"
-$sdk  = "C:\VulkanSDK\1.4.357.0\Bin"
+# VK_LOADER_DEBUG=layer makes the loader print the layer chain it actually
+# builds, in order. That settles whether our layer sits above or below
+# validation instead of it being inferred - and layer order is the whole
+# question here, because FFX hands X-Plane a proxy swapchain handle that only
+# works if WE absorb it before validation ever sees it.
+$root = (Get-Location).Path
+$xp   = Split-Path $root -Parent
+$sdk  = (Get-ChildItem "C:\VulkanSDK\*" -Directory | Sort-Object Name | Select-Object -Last 1).FullName + "\Bin"
 
 $env:VK_LAYER_PATH           = (Join-Path $root "build\vklayer") + ";" + $sdk
-$env:VK_LOADER_LAYERS_ENABLE = "VK_LAYER_mv,VK_LAYER_KHRONOS_validation"
+$env:VK_INSTANCE_LAYERS      = "VK_LAYER_KHRONOS_validation;VK_LAYER_mv"
+Remove-Item Env:VK_LOADER_LAYERS_ENABLE -ErrorAction SilentlyContinue
 $env:VK_LAYER_SETTINGS_PATH  = Join-Path $root "gpuav_lite"
+$env:VK_LOADER_DEBUG         = "layer"
 $env:TAA_VELOCITY            = "1"
 $env:TAA_LAYER_TRACE         = "1"
-$env:TAA_KEEP_ON_777         = "1"
 
-Remove-Item (Join-Path $root "gpuav\val_log.txt") -ErrorAction SilentlyContinue
-Start-Process -FilePath (Join-Path $xp "X-Plane.exe") -WorkingDirectory $xp
-Write-Host "launched with GPU-AV (log: MotionVectors\gpuav\val_log.txt)"
+$loaderLog = Join-Path $root "gpuav_lite\loader.txt"
+Remove-Item $loaderLog -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $root "gpuav_lite\val_log.txt") -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $env:TEMP "taa_layer.txt") -Force -ErrorAction SilentlyContinue
+
+Start-Process -FilePath (Join-Path $xp "X-Plane.exe") -WorkingDirectory $xp `
+              -RedirectStandardError $loaderLog -RedirectStandardOutput "$loaderLog.out"
+Write-Host "launched with VK_LOADER_DEBUG=layer -> gpuav_lite\loader.txt"

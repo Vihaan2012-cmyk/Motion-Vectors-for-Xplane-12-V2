@@ -8012,7 +8012,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         // Zero while frame generation is off, and the sim's own count is then
         // the honest answer for both rows rather than a zero that reads as a
         // stall.
-        g_share->framesDisplayed = frames;
+        // ---- THE TWO FIGURES MUST NOT COME FROM THE SAME COUNTER.
+        //
+        // This assigned `frames` - the sim's own present count - to BOTH, so
+        // fpsDisplayed / fpsPresented was arithmetically forced to exactly
+        // 1.00x no matter what frame generation did. The log line under it then
+        // printed "frame generation is NOT doubling" every half second, for a
+        // whole session, while interpolation was demonstrably dispatching
+        // thousands of frames. A readout that cannot report success is worse
+        // than none: it was read as evidence and it was arithmetic.
+        //
+        // What reaches the monitor is the sim's presents PLUS the frames the
+        // interpolation actually produced, and fg::state().dispatches already
+        // counts exactly those - it is what the "N interpolated frames
+        // dispatched" trace is printed from. So displayed is derived from a
+        // different quantity than presented, which is the entire point.
+        g_share->framesDisplayed = frames + fg::state().dispatches;
 
         if (windowStart.QuadPart == 0) {
             windowStart = now;

@@ -1,0 +1,26 @@
+Validation Error: [ VUID-StandaloneSpirv-None-10684 ] | MessageID = 0xb210f7c2
+vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+Invalid explicit layout decorations on type for operand '492[%492]', the Workgroup storage class has a explicit layout from the ArrayStride decoration.
+  %slice_planes = OpVariable %_ptr_Workgroup__arr__arr_v4float_uint_2_uint_2 Workgroup
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --allow-localsizeid --target-env vulkan1.3
+
+The Vulkan spec states: All variables must have valid explicit layout decorations as described in Shader Interfaces (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-None-10684)
+
+Validation Error: [ VUID-StandaloneSpirv-None-10684 ] | MessageID = 0xb210f7c2
+vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+Invalid explicit layout decorations on type for operand '492[%492]', the Workgroup storage class has a explicit layout from the ArrayStride decoration.
+  %slice_planes = OpVariable %_ptr_Workgroup__arr__arr_v4float_uint_2_uint_2 Workgroup
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --allow-localsizeid --target-env vulkan1.3
+
+The Vulkan spec states: All variables must have valid explicit layout decorations as described in Shader Interfaces (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-None-10684)
+
+Validation Error: [ VUID-vkCmdEndDebugUtilsLabelEXT-commandBuffer-01912 ] | MessageID = 0x56146426
+vkQueueSubmit(): pSubmits[0].pCommandBuffers[0] (VkCommandBuffer 0x23c9ddea0d0[begin render window 0000023D2797AC80]) contains vkCmdEndDebugUtilsLabelEXT that does not have a matching vkCmdBeginDebugUtilsLabelEXT in this or one of the previously submitted command buffers. There are no previous debug regions before the invalid command.
+The Vulkan spec states: There must be an outstanding vkCmdBeginDebugUtilsLabelEXT command prior to the vkCmdEndDebugUtilsLabelEXT on the queue that commandBuffer is submitted to (https://docs.vulkan.org/spec/latest/chapters/debugging.html#VUID-vkCmdEndDebugUtilsLabelEXT-commandBuffer-01912)
+Objects: 1
+    [0] VkCommandBuffer 0x23c9ddea0d0[begin render window 0000023D2797AC80]
+
