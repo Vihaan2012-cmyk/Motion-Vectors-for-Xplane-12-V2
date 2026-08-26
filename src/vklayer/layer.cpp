@@ -3604,10 +3604,51 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImageView(
             // usage is the narrowed one. This is the form that has loaded
             // reliably; a chain-rewrite that tried to be tidier destabilised
             // load, so it is deliberately left as a prepend.
+            // ---- AND DO NOT LEAVE A DUPLICATE BEHIND.
+            //
+            // The note above called the duplicate "only a warning". It is a
+            // Validation ERROR (VUID-VkImageViewCreateInfo-sType-unique), and
+            // the consequence is not cosmetic: with the validation layer loaded
+            // the call is rejected, X-Plane binds the null view it gets back,
+            // and the sim dies at startup - the same null-view chain fd018d6
+            // was written to fix. Measured: X-Plane died at an identical point
+            // on every validated run, with this as the only error reported.
+            //
+            // That made frame generation impossible to validate at all, which
+            // matters more than the duplicate itself: the aircraft-change crash
+            // cannot be diagnosed with the tool that would name it.
+            //
+            // Fixed for the case that actually occurs - X-Plane's own usage
+            // struct at the HEAD of the chain - by linking past it rather than
+            // in front of it, so ours replaces theirs instead of shadowing it.
+            // Ours is strictly narrower (theirs, minus STORAGE), so nothing is
+            // lost. A struct found deeper would need the chain rebuilt, which
+            // is the rewrite that destabilised load before; that case is left
+            // alone and reported instead of guessed at.
             memset(&viewUsage, 0, sizeof(viewUsage));
             viewUsage.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
-            viewUsage.pNext = ci2.pNext;
             viewUsage.usage = imgUsage & ~VK_IMAGE_USAGE_STORAGE_BIT;
+            const VkBaseInStructure *head = (const VkBaseInStructure *)ci2.pNext;
+            if (head && head->sType ==
+                    VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO) {
+                // Theirs is first: skip it entirely.
+                viewUsage.pNext = (void *)head->pNext;
+            } else {
+                viewUsage.pNext = ci2.pNext;
+                for (const VkBaseInStructure *n = head; n; n = n->pNext)
+                    if (n->sType == VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO) {
+                        static bool told = false;
+                        if (!told) {
+                            told = true;
+                            trace("FG: an application VkImageViewUsageCreateInfo "
+                                  "sits deeper in the pNext chain - prepending "
+                                  "ours leaves a duplicate, which validation "
+                                  "rejects. Not seen in practice; rebuilding the "
+                                  "chain is the fix if it ever is.");
+                        }
+                        break;
+                    }
+            }
             ci2.pNext = &viewUsage;
             static uint64_t n = 0;
             if (++n <= 6)
@@ -7769,8 +7810,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // Everything it needs settles at different times - the sub-native render
     // size, the output image the probe identifies - so this simply retries each
     // frame until they are all present, and does nothing once built.
-    if (fsrReplaceEnabled() && fsr3Wanted() && !fsr3::state().ready &&
-        !fsr3::state().failed) {
+    // ---- THE RETRY MUST COVER EVERYTHING THIS BLOCK BUILDS, NOT JUST FSR3.
+    //
+    // This was gated on !fsr3::state().ready alone, and the block builds THREE
+    // things: the depth copy, the FSR3 context, and the dilation side-car. So
+    // the first one to succeed switched the retry off for the other two.
+    //
+    // That is exactly what happened. depthcopy::ensure returns silently when
+    // the scene depth image has not been identified yet, and depth settles
+    // LATER than the render size FSR3 waits on - so FSR3 became ready, the
+    // block stopped running, and the depth copy was never built. The side-car
+    // then refused every frame on !depthcopy::state().ready, no dilated
+    // resources were produced, canInterp stayed false, and frame generation
+    // reported "clean passthrough - interpolation inputs absent" forever.
+    //
+    // Nothing traced, because that early-out is the one silent path in a
+    // function that otherwise logs every outcome.
+    const bool needFsr3    = !fsr3::state().ready      && !fsr3::state().failed;
+    const bool needDepthCp = !depthcopy::state().ready && !depthcopy::state().failed;
+    const bool needSideCar = !fgdilate::state().ready  && !fgdilate::state().failed;
+    if (fsrReplaceEnabled() && fsr3Wanted() &&
+        (needFsr3 || needDepthCp || needSideCar)) {
         VkDevice dev = VK_NULL_HANDLE; VkPhysicalDevice ph = VK_NULL_HANDLE;
         PFN_vkGetDeviceProcAddr gd = nullptr;
         uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
@@ -7832,8 +7892,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     //
     // taa.fg_dilate=0 disables the side-car without disturbing anything else,
     // which is also the A/B against the in-render path.
+    // ---- NOT WHILE THE SCENE IS BEING REBUILT.
+    //
+    // The three images below are handed to FSR3 by handle every present.
+    // Loading an aircraft destroys and recreates the render targets, so mid-swap
+    // those handles are stale and the upscaler reads freed memory - which is
+    // what took the sim down on an aircraft change.
+    //
+    // g_sceneColorStable is the existing answer to this: it resets to 0 whenever
+    // the HDR target set changes and the velocity target already waits for 120
+    // before rebuilding. Reusing it rather than inventing a second notion of
+    // "settled" means the side-car and the velocity target cannot disagree about
+    // when the scene is safe to touch.
     if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
-        fgdilate::state().ready && g_sceneColor.image != VK_NULL_HANDLE &&
+        fgdilate::state().ready && g_sceneColorStable >= 120 &&
+        g_sceneColor.image != VK_NULL_HANDLE &&
         g_sceneDepth != VK_NULL_HANDLE && g_mv.ready &&
         live::onoff("taa.fg_dilate", "TAA_FG_DILATE", true)) {
         const float vs = taaVelScale() * live::f("fsr.mv_x", nullptr, 1.0f);

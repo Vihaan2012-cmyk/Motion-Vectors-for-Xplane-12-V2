@@ -1,0 +1,15 @@
+# Core validation only - no GPU-assisted shader instrumentation.
+#
+# Full GPU-AV instruments every shader and could not survive X-Plane's startup
+# with frame generation on, so it never reached the aircraft change we are
+# trying to capture. Core validation still checks object lifetimes, handle use
+# after free and synchronisation - which is the class an aircraft-change crash
+# belongs to - at a fraction of the cost.
+khronos_validation.validate_gpu_based = GPU_BASED_NONE
+khronos_validation.gpuav_shader_instrumentation = false
+khronos_validation.gpuav_descriptor_checks = false
+khronos_validation.validate_core = true
+khronos_validation.validate_sync = false
+khronos_validation.report_flags = error
+khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG
+khronos_validation.log_filename = D:\Steam Games\steamapps\common\X-Plane 12\MotionVectors\gpuav_lite\val_log.txt

@@ -46,6 +46,10 @@ struct State {
     VkImage         outImg = VK_NULL_HANDLE;
     VkDeviceMemory  outMem = VK_NULL_HANDLE;
     uint32_t        outW = 0, outH = 0;
+    // Set when a fence wait timed out: the submit is still running and the
+    // buffer must not be touched until it completes.
+    bool            inFlight = false;
+    uint64_t        timeouts = 0;
     VkFormat        outFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
 
     // Resolved once from the device. Only the handful the side-car records with.
@@ -180,6 +184,14 @@ inline bool run(VkImage colour, VkFormat colourFmt, VkImageLayout colourLayout,
     State &s = state();
     std::lock_guard<std::mutex> guard(s.lock);
     if (!s.ready || s.failed) return false;
+    // A previous submit may not have finished. Never reset or re-record a
+    // command buffer while the GPU still owns it - poll once, and skip this
+    // frame if it is not done.
+    if (s.inFlight) {
+        if (s.waitFences(s.device, 1, &s.fence, VK_TRUE, 0) != VK_SUCCESS)
+            return false;
+        s.inFlight = false;
+    }
     if (colour == VK_NULL_HANDLE || depthRaw == VK_NULL_HANDLE || mv == VK_NULL_HANDLE)
         return false;
     if (!fsr3::state().ready || fsr3::state().failed) return false;
@@ -221,7 +233,32 @@ inline bool run(VkImage colour, VkFormat colourFmt, VkImageLayout colourLayout,
     if (s.submit(s.queue, 1, &si, s.fence) != VK_SUCCESS) return false;
     // Synchronous: the interpolation callback reads shared[] later this present,
     // so the dilation must be finished on the GPU before we return.
-    s.waitFences(s.device, 1, &s.fence, VK_TRUE, 1000ull * 1000ull * 1000ull);
+    //
+    // ---- AND THE TIMEOUT IS NOT ADVISORY.
+    //
+    // This ignored the result. A timeout then meant the command buffer was
+    // STILL EXECUTING while the next present called reset() on it, which is
+    // undefined behaviour and reaches the driver as a device-lost.
+    //
+    // It is not a theoretical window. Loading an aircraft drops the sim to a
+    // few frames a second while textures stream, and a one-second wait at 3 fps
+    // is a wait that can genuinely expire - which is exactly when the sim died.
+    //
+    // On timeout the buffer is left alone and the side-car stands down until a
+    // later wait succeeds. Skipping a frame of dilation costs one uninterpolated
+    // frame; resetting a live command buffer costs the session.
+    const VkResult fw = s.waitFences(s.device, 1, &s.fence, VK_TRUE,
+                                     1000ull * 1000ull * 1000ull);
+    if (fw != VK_SUCCESS) {
+        s.inFlight = true;
+        if (++s.timeouts <= 3 || (s.timeouts % 100) == 0)
+            trace("FG DILATE: fence wait returned %d (%llu so far) - the dilation "
+                  "is still on the GPU. Standing down rather than resetting a "
+                  "command buffer that is executing.",
+                  (int)fw, (unsigned long long)s.timeouts);
+        return false;
+    }
+    s.inFlight = false;
 
     ++s.runs;
     if (s.runs == 1 || (s.runs % 300) == 0)
