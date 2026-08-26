@@ -222,9 +222,11 @@ struct TaaPush {
     float   alphaMoving;
     float   alphaMovingPx;
     // Strength of the post-resolve MODE_SHARPEN pass. 0 disables it and the
-    // record path skips the second dispatch entirely. Must be the LAST field so
-    // it mirrors the shader's Params block byte for byte.
+    // record path skips the second dispatch entirely.
     float   sharpen;
+    // Weight forced on transparent-covered pixels. 1.0 = the original
+    // all-or-nothing mask; lower lets them still accumulate. See taa.comp.
+    float   reactiveAlpha;
     // ---- AMBIENT OCCLUSION, APPENDED AFTER sharpen.
     //
     // The comment above says sharpen must be LAST so the block mirrors the
@@ -246,9 +248,11 @@ enum {
     kTaaFlagNoUnjitter    = 1 << 4,
     kTaaFlagCatmull       = 1 << 5,
     kTaaFlagNoVecByVel    = 1 << 6,
+    kTaaFlagCrUnjitter    = 1 << 7,
     // Velocity dilation: take the closest neighbour's vector at silhouettes.
-    // Default ON - it is a correctness fix for thin geometry, not an effect.
-    kTaaFlagDilate        = 1 << 7,
+    // Default ON - a correctness fix for thin geometry, not an effect. Bit 8
+    // because 7 was already taken on the frame-gen branch.
+    kTaaFlagDilate        = 1 << 8,
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -305,7 +309,6 @@ static float taaVizScale() { return live::f("taa.viz_scale", nullptr, 1.0f); }
 // the two. Runs as MODE_SHARPEN on a dedicated buffer so it never feeds back.
 // 0 = off (the record path then skips the second dispatch and copies the
 // resolved image straight to screen, i.e. exactly the pre-sharpen behaviour).
-static float taaSharpen()  { return live::f("taa.sharpen", "TAA_SHARPEN", 0.0f); }
 
 // ---- REMOVE ONE INPUT AT A TIME.
 //
@@ -378,6 +381,21 @@ static float taaAoRadius()   { return live::f("taa.ao_radius", "TAA_AO_RADIUS", 
 // The unjitter alignment - isolation knob for the aligned sampling, so its
 // contribution can be removed live without touching the jitter itself.
 static bool taaUnjitter() { return live::onoff("taa.unjitter", nullptr, true); }
+// ---- THE TWO KNOBS THAT ANSWER "TAA ON IS SOFTER THAN TAA OFF".
+//
+// taa.cr_unjitter resamples the current frame's unjitter fetch with
+// Catmull-Rom instead of bilinear. This is not a preference: the bilinear
+// fetch at uv + S is a low-pass filter that runs on EVERY frame, parked
+// included, and history accumulates its output - so it is baked into the
+// converged image. Default ON for the same reason taa.hist_catmull is.
+//
+// taa.sharpen puts back what the resample cannot recover. Default 0.35: enough
+// to read as sharper than TAA-off on text and panel edges, well below where
+// the limiter in sharpenCurrent starts clipping on ordinary content. 0 turns
+// the pass off entirely rather than sharpening by zero.
+static bool  taaCrUnjitter() { return live::onoff("taa.cr_unjitter", nullptr, true); }
+static float taaSharpen()    { return live::f("taa.sharpen", "TAA_SHARPEN", 0.35f); }
+static float taaReactiveAlpha() { return live::f("taa.reactive_alpha", nullptr, 1.0f); }
 static bool taaFreezeHistory() { return live::onoff("taa.freeze_history", nullptr, false); }
 static bool taaNoMotion()      { return live::onoff("taa.no_motion",      nullptr, false); }
 static bool taaNoAccum()       { return live::onoff("taa.no_accum",       nullptr, false); }
@@ -1284,15 +1302,17 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     const float sharpAmt  = taaSharpen();
     const bool  doSharpen = sharpAmt > 0.0f && g_taa.sharpImage != VK_NULL_HANDLE
                             && g_taa.sharpView != VK_NULL_HANDLE;
-    pcv.sharpen = sharpAmt;
-    pcv.aoStrength = taaAoStrength();
-    pcv.aoRadius   = taaAoRadius();
+    pcv.sharpen       = sharpAmt;
+    pcv.reactiveAlpha = taaReactiveAlpha();
+    pcv.aoStrength    = taaAoStrength();
+    pcv.aoRadius      = taaAoRadius();
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
                  | (taaReactive()      ? kTaaFlagReactive      : 0)
                  | (taaUnjitter()      ? 0 : kTaaFlagNoUnjitter)
                  | (taaCatmull()       ? kTaaFlagCatmull       : 0)
+                 | (taaCrUnjitter()    ? kTaaFlagCrUnjitter    : 0)
                  | (live::onoff("taa.novec_by_vel", nullptr, false)
                         ? kTaaFlagNoVecByVel : 0)
                  | (taaDilate()        ? kTaaFlagDilate        : 0);

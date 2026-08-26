@@ -42,9 +42,9 @@ DisableWelcomePage=no
 WelcomeLabel2=This installs motion vectors for X-Plane 12.%n%nStart the sim from the shortcut this creates - it enables the layer for X-Plane only, so no other Vulkan application is affected.%n%nChoose your X-Plane 12 folder on the next page - the one containing X-Plane.exe.
 
 [Files]
-Source: "build\MotionVectors.xpl";        DestDir: "{app}\Resources\plugins\MotionVectors\64"; DestName: "win.xpl"; Flags: ignoreversion
-Source: "build\vklayer\VkLayer_mv.dll";   DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
-Source: "build\vklayer\VkLayer_mv.json";  DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
+Source: "build\MotionVectors\MotionVectors.xpl";        DestDir: "{app}\Resources\plugins\MotionVectors\64"; DestName: "win.xpl"; Flags: ignoreversion
+Source: "build\MotionVectors\vklayer\VkLayer_mv.dll";   DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
+Source: "build\MotionVectors\vklayer\VkLayer_mv.json";  DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
 ; The Qt launcher and its runtime. recursesubdirs picks up the platform,
 ; imageformat and tls plugin folders windeployqt produced - Qt will not start
 ; without platforms\qwindows.dll, and a missing plugin folder fails at run time
@@ -53,9 +53,9 @@ Source: "build\vklayer\VkLayer_mv.json";  DestDir: "{app}\MotionVectors";       
 ; console - because they share one Qt runtime. Shipping them separately would
 ; mean two ~40 MB copies of Qt for two executables that differ by a few hundred
 ; kilobytes.
-Source: "build\qtlauncher\*"; DestDir: "{app}\MotionVectors\launcher"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "build\MotionVectors\qtlauncher\*"; DestDir: "{app}\MotionVectors\launcher"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Kept as a fallback: no dependencies, works even if the Qt runtime is broken.
-Source: "build\MotionVectorsLauncher.exe"; DestDir: "{app}\MotionVectors";                    Flags: ignoreversion
+Source: "build\MotionVectors\MotionVectorsLauncher.exe"; DestDir: "{app}\MotionVectors";                    Flags: ignoreversion
 Source: "lua\MotionVectors.lua";           DestDir: "{app}\Resources\plugins\FlyWithLua\Scripts"; Flags: ignoreversion; Check: FlyWithLuaPresent
 Source: "README.md";                      DestDir: "{app}\MotionVectors";                      Flags: ignoreversion
 

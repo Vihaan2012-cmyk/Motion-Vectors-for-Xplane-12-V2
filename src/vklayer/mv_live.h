@@ -185,17 +185,18 @@ inline void writeTemplate()
 
 // Re-read if the file changed. Called once per frame; the common case is one
 // GetFileAttributesEx and a 64-bit compare.
-inline void poll()
+// Load the file RIGHT NOW, ignoring the poll interval.
+//
+// poll() only reads every Nth frame, which is right for a hot-reload but wrong
+// for a value that is latched once at startup: the first caller would latch a
+// default and keep it for the life of the process however often the file is
+// edited. fsr.replace is exactly that kind of key, so it needs a forced read.
+inline void loadNow()
 {
-    static uint32_t counter = 0;
-    static uint32_t everyN = 0;
-    if (!everyN) {
-        everyN = getenv("TAA_LIVE_POLL") ? (uint32_t)atoi(getenv("TAA_LIVE_POLL")) : 15;
-        if (!everyN) everyN = 15;
-        writeTemplate();
-    }
-    if (++counter % everyN) return;
-
+    // The template has to exist before it can be read. poll() does this on its
+    // first call; loadNow() may well BE the first call.
+    static bool templated = false;
+    if (!templated) { templated = true; writeTemplate(); }
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (!GetFileAttributesExA(path(), GetFileExInfoStandard, &fad)) return;
     uint64_t stamp = ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) |
@@ -247,6 +248,20 @@ inline void poll()
     g_everSeen = true;
     ++g_reloads;
 }
+
+inline void poll()
+{
+    static uint32_t counter = 0;
+    static uint32_t everyN = 0;
+    if (!everyN) {
+        everyN = getenv("TAA_LIVE_POLL") ? (uint32_t)atoi(getenv("TAA_LIVE_POLL")) : 15;
+        if (!everyN) everyN = 15;
+        writeTemplate();
+    }
+    if (++counter % everyN) return;
+    loadNow();
+}
+
 
 // Clear a one-shot key back to 0 in the file itself, so `report=1` fires once
 // rather than every frame until somebody notices. Rewrites the line in place and

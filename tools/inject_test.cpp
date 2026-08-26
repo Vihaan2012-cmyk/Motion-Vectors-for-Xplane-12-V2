@@ -207,6 +207,10 @@ int main(int argc, char **argv)
                 }
             }
             std::vector<uint32_t> fout;
+            // alphaBlended is a per-PIPELINE property (blend state), which a
+            // corpus of bare modules cannot know. false is the conservative
+            // choice: it exercises the same injection path without claiming a
+            // transparency gate the module itself does not carry.
             spvinj::Result fr = spvinj::injectFragment(in.data(), in.size() * 4,
                                                        fout, maxLoc, false);
             if (fr != spvinj::INJ_OK) continue;

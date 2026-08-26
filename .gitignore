@@ -22,8 +22,19 @@ tools/*.exe
 tools/inject_test.exe
 xp-shot.ps1
 __pycache__/
-
-# Vendored FidelityFX SDK (823 MB). Restored out-of-band, never committed.
-third_party/
-gpuav/
 validation.txt
+gpuav/
+
+# Vendor upscaler SDKs. Not ours to redistribute - this project is
+# GPL-3.0 and DLSS in particular ships under NVIDIA's own terms - and
+# they are hundreds of MB that every clone would otherwise pay for.
+# build.ps1 detects whatever is present and compiles the matching
+# backend; absent means the backend reports no-library, which is a
+# correct answer rather than an error.
+#
+# The local MUTABLE_FORMAT fix inside the SDK is NOT recoverable from
+# upstream - see patches/ffx-framegen-mutable-format.txt.
+third_party/
+third_party/FidelityFX-SDK/
+build/
+dist/
