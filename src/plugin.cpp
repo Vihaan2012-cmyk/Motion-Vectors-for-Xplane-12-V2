@@ -4385,6 +4385,8 @@ PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void *param)
         mvRefreshAircraft();
         // The load has finished; the streaming has not. Hold through the settle.
         g_fgHoldFrames = kFgHoldAfterLoad;
+        // PUBLISHED HERE, NOT LEFT TO THE FLIGHT LOOP. See the note below.
+        if (g_share) g_share->fgHold = g_fgHoldFrames;
         xlog("aircraft loaded - holding frame generation for %u frames while the "
              "scene settles; this is the window the sim used to die in",
              kFgHoldAfterLoad);
@@ -4394,7 +4396,24 @@ PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void *param)
     // would raise the hold after the dangerous part was already over.
     if (msg == XPLM_MSG_PLANE_UNLOADED && param == (void*)0) {
         g_fgHoldFrames = kFgHoldAfterLoad;
+        // ---- WRITE IT TO THE SHARED BLOCK RIGHT NOW.
+        //
+        // Setting the counter was not enough: it was only PUBLISHED from the
+        // per-frame flight loop, and X-Plane does not run flight loops while an
+        // aircraft is loading. So the layer went on reading the previous value -
+        // zero - for the entire swap, and frame generation kept generating
+        // straight through it.
+        //
+        // The symptom named the mechanism exactly: the real frames were
+        // X-Plane's loading screen while the INTERPOLATED frames still showed
+        // the old aircraft, because interpolation was blending the loading
+        // screen against a stale flight frame. Then it died.
+        //
+        // The hold has to reach the layer at the moment the swap starts, which
+        // is here, on this thread, before any flight loop runs again.
+        if (g_share) g_share->fgHold = g_fgHoldFrames;
         xlog("aircraft unloaded - frame generation held from here through the "
-             "reload");
+             "reload (published immediately; flight loops do not run during a "
+             "load)");
     }
 }

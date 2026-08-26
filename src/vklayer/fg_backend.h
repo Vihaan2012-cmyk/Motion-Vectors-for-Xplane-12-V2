@@ -367,10 +367,23 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     // have run - which is what frees the gigabyte the upscaler was costing.
     // An aircraft swap holds generation off entirely - see fgHeldForAircraftSwap.
     if (fgHeldForAircraftSwap()) {
+        // ---- AND THROW THE INPUTS AWAY, NOT JUST SKIP A FRAME.
+        //
+        // The prepare pass stops running while held, so its last results sit
+        // there looking valid. Leaving readySlot alone means the moment the
+        // hold lifts, interpolation blends against textures describing a scene
+        // that no longer exists.
+        //
+        // That is precisely what was seen: real frames showing X-Plane's
+        // loading screen while the interpolated ones still showed the previous
+        // aircraft in flight. Marking the inputs stale forces interpolation to
+        // wait for a genuinely fresh pair.
+        fgprep::state().readySlot = -1;
         static uint64_t held = 0;
         if ((held++ % 300) == 0)
             trace("FG: holding - aircraft swap in progress, presenting real "
-                  "frames only (%llu frames held).", (unsigned long long)held);
+                  "frames only and discarding stale interpolation inputs "
+                  "(%llu frames held).", (unsigned long long)held);
         return FFX_OK;
     }
     // ---- READY IS NOT THE SAME AS WRITTEN.
