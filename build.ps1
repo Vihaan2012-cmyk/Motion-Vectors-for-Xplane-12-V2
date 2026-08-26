@@ -142,6 +142,42 @@ for ($i = 0; $i -lt $fwords.Count; $i += 8) {
 Set-Content -Path "$src\vklayer\xpfsr_spv.h" -Value $fsb.ToString() -Encoding utf8 -NoNewline
 Write-Host "  xpfsr_spv.h: $($fwords.Count) words"
 
+# ---- THE FRAME-INTERPOLATION PREPARE SHADER.
+#
+# Produces the three textures FFX frame interpolation needs - dilatedDepth,
+# dilatedMotionVectors and reconstructedPrevNearestDepth - which were previously
+# harvested as a by-product of running the entire FSR3 upscaler and discarding
+# its output. Generated from source for the same reason as the two above.
+Write-Host "Compiling frame-gen prepare shader..."
+$fgTmp = Join-Path $env:TEMP "fg_prepare.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/fg_prepare.comp" -o $fgTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "fg_prepare.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $fgTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "fg_prepare.comp failed spirv-val" }
+}
+$gbytes = [System.IO.File]::ReadAllBytes($fgTmp)
+if ($gbytes.Length % 4) { throw "fg_prepare SPIR-V is not a whole number of words" }
+$gwords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $gbytes.Length; $i += 4) {
+    $gwords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($gbytes, $i)))
+}
+$gsb = New-Object System.Text.StringBuilder
+[void]$gsb.AppendLine("// Generated from src/shaders/fg_prepare.comp by build.ps1 - do not edit.")
+[void]$gsb.AppendLine("#pragma once")
+[void]$gsb.AppendLine("#include <stdint.h>")
+[void]$gsb.AppendLine("")
+[void]$gsb.AppendLine("static const uint32_t kFgPrepareSpv[] = {")
+for ($i = 0; $i -lt $gwords.Count; $i += 8) {
+    $n = [Math]::Min(8, $gwords.Count - $i)
+    [void]$gsb.AppendLine("    " + (($gwords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$gsb.AppendLine("};")
+[void]$gsb.AppendLine("")
+[void]$gsb.AppendLine("static const size_t kFgPrepareSpvWords = $($gwords.Count);")
+Set-Content -Path "$src/vklayer/fg_prepare_spv.h" -Value $gsb.ToString() -Encoding utf8 -NoNewline
+Write-Host "  fg_prepare_spv.h: $($gwords.Count) words"
+
 # ---- THE FIDELITYFX OBJECTS.
 #
 # Compiled once and reused. ffx_fsr3upscaler_shaderblobs.cpp alone is 1.5 MB of

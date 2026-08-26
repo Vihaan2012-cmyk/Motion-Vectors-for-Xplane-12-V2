@@ -10,6 +10,6 @@ khronos_validation.gpuav_shader_instrumentation = false
 khronos_validation.gpuav_descriptor_checks = false
 khronos_validation.validate_core = true
 khronos_validation.validate_sync = false
-khronos_validation.report_flags = error
+khronos_validation.report_flags = error,warn
 khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG
 khronos_validation.log_filename = D:\Steam Games\steamapps\common\X-Plane 12\MotionVectors\gpuav_lite\val_log.txt

@@ -1,0 +1,111 @@
+#version 450
+
+// ---- THE THREE TEXTURES FRAME INTERPOLATION ACTUALLY NEEDS.
+//
+// FFX frame interpolation consumes exactly three resources it does not produce:
+// dilatedDepth, dilatedMotionVectors and reconstructedPrevNearestDepth. They
+// are normally a BY-PRODUCT of the FSR3 upscaler's reconstruct-and-dilate pass,
+// and there is no dilate-only entry point - so the whole upscaler was being
+// stood up, run every frame, and its display-sized colour output thrown away,
+// purely to harvest these three.
+//
+// That cost about a gigabyte of VRAM: the upscaler's entire working set plus a
+// 3840x2160 output image nothing ever read. On an 8 GB card already sitting at
+// 5.6 GB it left ~1.4 GB for an aircraft reload, and the sim died on the next
+// aircraft change with X-Plane logging heavy memory pressure to the last line.
+//
+// Nothing here needs an upscaler. The formats come from
+// ffxFrameInterpolationGetSharedResourceDescriptions, which the interpolation
+// context answers on its own:
+//
+//     dilatedDepth                    R32_FLOAT     render size
+//     dilatedMotionVectors            R16G16_FLOAT  render size
+//     reconstructedPrevNearestDepth   R32_UINT      render size
+//
+// The inputs are things this layer already has: the depth copy (X-Plane's
+// combined depth-stencil turned into plain R32_SFLOAT, because FSR3 could not
+// read the original either) and our own velocity target.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D   uDepth;      // R32_SFLOAT, render size
+layout(binding = 1) uniform sampler2DArray uVelocity; // our MV target
+layout(binding = 2, r32f)  uniform writeonly image2D uDilatedDepth;
+layout(binding = 3, rg16f) uniform writeonly image2D uDilatedMv;
+layout(binding = 4, r32ui) uniform uimage2D          uPrevNearestDepth;
+
+layout(push_constant) uniform Params {
+    ivec2 size;        // render resolution
+    vec2  mvScale;     // our velocity is in UV; FFX wants pixels
+    int   reverseZ;    // 1 = larger depth value is NEARER
+    int   pad0, pad1, pad2;
+} pc;
+
+void main()
+{
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= pc.size.x || px.y >= pc.size.y) return;
+
+    const vec2 uv = (vec2(px) + 0.5) / vec2(pc.size);
+
+    // ---- DILATION: THE CLOSEST FRAGMENT IN A 3x3 WINS THE TEXEL.
+    //
+    // A silhouette pixel is a blend of foreground and background but carries one
+    // depth and one vector - whichever surface happened to own the texel centre.
+    // On thin geometry that is usually the BACKGROUND, so an edge reprojects as
+    // though it were the sky behind it. Taking the nearest neighbour's values
+    // instead is what makes an edge follow the object in front of it, and it is
+    // the same search the TAA resolve does for its own history fetch.
+    float bestDepth = pc.reverseZ != 0 ? -1.0 : 2.0;
+    ivec2 bestPx    = px;
+
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const ivec2 q = clamp(px + ivec2(dx, dy), ivec2(0), pc.size - 1);
+            const float d = texelFetch(uDepth, q, 0).r;
+            // Reverse-Z puts the near plane at 1.0, so "nearest" is the LARGEST
+            // value there and the smallest otherwise. Getting this backwards
+            // does not fail - it dilates away from the camera, which reprojects
+            // edges to the wrong surface and looks like the artefact dilation
+            // exists to remove.
+            const bool nearer = (pc.reverseZ != 0) ? (d > bestDepth) : (d < bestDepth);
+            if (nearer) { bestDepth = d; bestPx = q; }
+        }
+
+    // Velocity at the winning texel. Ours is stored in UV and cleared to a
+    // sentinel where nothing wrote; FFX wants pixels, and an unwritten texel
+    // must read as no motion rather than as an enormous one.
+    const vec4 v = texelFetch(uVelocity, ivec3(bestPx, 0), 0);
+    const bool unwritten = (v.x < -1000.0 || v.y < -1000.0);
+    const vec2 mvPix = unwritten ? vec2(0.0) : v.xy * pc.mvScale;
+
+    imageStore(uDilatedDepth, px, vec4(bestDepth, 0.0, 0.0, 0.0));
+    imageStore(uDilatedMv,    px, vec4(mvPix, 0.0, 0.0));
+
+    // ---- RECONSTRUCTED PREVIOUS NEAREST DEPTH.
+    //
+    // Where this pixel's surface WAS last frame, and how near it was. Written by
+    // scatter: follow the motion vector back and record this depth at the
+    // destination. Several pixels can land on the same texel, so the write has
+    // to be atomic and has to keep the NEAREST - which is a max under reverse-Z
+    // and a min otherwise.
+    //
+    // The image is R32_UINT and holds raw float bits. That is not a trick for
+    // its own sake: IEEE-754 non-negative floats compare in the same order as
+    // their bit patterns read as unsigned, so an integer atomicMax over the bits
+    // is exactly a float max over the depths - and there is no atomicMax for
+    // floats. Depth is in [0,1] here, so the sign bit is never set and the
+    // ordering holds.
+    //
+    // Under standard Z the comparison is inverted by storing the complement, so
+    // the same atomicMax still selects the nearest.
+    if (!unwritten) {
+        const vec2 prevUv = uv + v.xy;
+        if (prevUv.x >= 0.0 && prevUv.x < 1.0 && prevUv.y >= 0.0 && prevUv.y < 1.0) {
+            const ivec2 dst = ivec2(prevUv * vec2(pc.size));
+            const uint bits = floatBitsToUint(clamp(bestDepth, 0.0, 1.0));
+            imageAtomicMax(uPrevNearestDepth, dst,
+                           pc.reverseZ != 0 ? bits : (0xFFFFFFFFu - bits));
+        }
+    }
+}

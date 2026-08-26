@@ -1,0 +1,215 @@
+Validation Layer Info - Logging validation error to D:\Steam Games\steamapps\common\X-Plane 12\MotionVectors\gpuav_lite\val_log.txt
+Prop found:jxplm.plugin.name=XJet
+Prop found:jxplm.plugin.sig=com.airfoillabs.xjet
+Prop found:jxplm.plugin.desc=Airfoillabs - XPlane Java Enabled Plugin (XJet)
+Prop found:jxplm.plugin.class=com.airfoillabs.xjet.GlobalPlugin
+Prop found:jxplm.plugin.postponeLoad=false
+Prop found:java.opts=-Djdk.lang.Process.launchMechanism=FORK
+Prop found:java.home=Resources/plugins/xjet/jre
+Prop:-Djdk.lang.Process.launchMechanism=FORK
+DEBUG StatusConsoleListener Apache Log4j Core 2.20 initializing configuration XmlConfiguration[location=D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml]
+DEBUG StatusConsoleListener PluginManager 'Core' found 131 plugins
+DEBUG StatusConsoleListener PluginManager 'Level' found 0 plugins
+DEBUG StatusConsoleListener Building Plugin[name=property, class=org.apache.logging.log4j.core.config.Property].
+DEBUG StatusConsoleListener PluginManager 'TypeConverter' found 26 plugins
+DEBUG StatusConsoleListener createProperty(name="filename", value="Resources/plugins/xjet/xjet.log", Configuration(D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml))
+DEBUG StatusConsoleListener Building Plugin[name=properties, class=org.apache.logging.log4j.core.config.PropertiesPlugin].
+DEBUG StatusConsoleListener configureSubstitutor(={filename=Resources/plugins/xjet/xjet.log}, Configuration(D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml))
+DEBUG StatusConsoleListener PluginManager 'Lookup' found 16 plugins
+DEBUG StatusConsoleListener Building Plugin[name=layout, class=org.apache.logging.log4j.core.layout.PatternLayout].
+DEBUG StatusConsoleListener PatternLayout$Builder(pattern="%d [%p] %c{1} – %m%n", PatternSelector=null, Configuration(D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml), Replace=null, charset="null", alwaysWriteExceptions="null", disableAnsi="null", noConsoleNoAnsi="null", header="null", footer="null")
+DEBUG StatusConsoleListener PluginManager 'Converter' found 45 plugins
+DEBUG StatusConsoleListener Building Plugin[name=appender, class=org.apache.logging.log4j.core.appender.FileAppender].
+DEBUG StatusConsoleListener FileAppender$Builder(fileName="Resources/plugins/xjet/xjet.log", append="false", locking="null", advertise="null", advertiseUri="null", createOnDemand="null", filePermissions="null", fileOwner="null", fileGroup="null", bufferedIo="null", bufferSize="null", immediateFlush="null", ignoreExceptions="null", PatternLayout(%d [%p] %c{1} – %m%n), name="FileAppender", Configuration(D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml), Filter=null, ={})
+DEBUG StatusConsoleListener Starting FileManager Resources/plugins/xjet/xjet.log
+DEBUG StatusConsoleListener Building Plugin[name=layout, class=org.apache.logging.log4j.core.layout.PatternLayout].
+DEBUG StatusConsoleListener PatternLayout$Builder(pattern="%d [%p] %c{1} – %m%n", PatternSelector=null, Configuration(D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml), Replace=null, charset="null", alwaysWriteExceptions="null", disableAnsi="null", noConsoleNoAnsi="null", header="null", footer="null")
+DEBUG StatusConsoleListener Building Plugin[name=filter, class=org.apache.logging.log4j.core.filter.ThresholdFilter].
+DEBUG StatusConsoleListener createFilter(level="INFO", onMatch="null", onMismatch="null")
+DEBUG StatusConsoleListener Building Plugin[name=appender, class=com.airfoillabs.xjet.util.JXPLMLogAppender].
+DEBUG StatusConsoleListener createAppender(name="XPlaneLogAppender", PatternLayout(%d [%p] %c{1} – %m%n), ThresholdFilter(INFO))
+DEBUG StatusConsoleListener Building Plugin[name=appenders, class=org.apache.logging.log4j.core.config.AppendersPlugin].
+DEBUG StatusConsoleListener createAppenders(={FileAppender, XPlaneLogAppender})
+DEBUG StatusConsoleListener Building Plugin[name=AppenderRef, class=org.apache.logging.log4j.core.config.AppenderRef].
+DEBUG StatusConsoleListener createAppenderRef(ref="FileAppender", level="null", Filter=null)
+DEBUG StatusConsoleListener Building Plugin[name=AppenderRef, class=org.apache.logging.log4j.core.config.AppenderRef].
+DEBUG StatusConsoleListener createAppenderRef(ref="XPlaneLogAppender", level="null", Filter=null)
+DEBUG StatusConsoleListener Building Plugin[name=root, class=org.apache.logging.log4j.core.config.LoggerConfig$RootLogger].
+DEBUG StatusConsoleListener LoggerConfig$RootLogger$Builder(additivity="null", level="DEBUG", levelAndRefs="null", includeLocation="null", ={FileAppender, XPlaneLogAppender}, ={}, Configuration(D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml), Filter=null)
+DEBUG StatusConsoleListener Building Plugin[name=loggers, class=org.apache.logging.log4j.core.config.LoggersPlugin].
+DEBUG StatusConsoleListener createLoggers(={root})
+DEBUG StatusConsoleListener Configuration XmlConfiguration[location=D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml] initialized
+DEBUG StatusConsoleListener Starting configuration XmlConfiguration[location=D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml]
+DEBUG StatusConsoleListener Started configuration XmlConfiguration[location=D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml] OK.
+DEBUG StatusConsoleListener Shutting down OutputStreamManager SYSTEM_OUT.false.false-1
+DEBUG StatusConsoleListener OutputStream closed
+DEBUG StatusConsoleListener Shut down OutputStreamManager SYSTEM_OUT.false.false-1, all resources released: true
+DEBUG StatusConsoleListener Appender DefaultConsole-1 stopped with status true
+DEBUG StatusConsoleListener Stopped org.apache.logging.log4j.core.config.DefaultConfiguration@6c9f5c0d OK
+DEBUG StatusConsoleListener Registering MBean org.apache.logging.log4j2:type=60e53b93
+DEBUG StatusConsoleListener Registering MBean org.apache.logging.log4j2:type=60e53b93,component=StatusLogger
+DEBUG StatusConsoleListener Registering MBean org.apache.logging.log4j2:type=60e53b93,component=ContextSelector
+DEBUG StatusConsoleListener Registering MBean org.apache.logging.log4j2:type=60e53b93,component=Loggers,name=
+DEBUG StatusConsoleListener Registering MBean org.apache.logging.log4j2:type=60e53b93,component=Appenders,name=FileAppender
+DEBUG StatusConsoleListener Registering MBean org.apache.logging.log4j2:type=60e53b93,component=Appenders,name=XPlaneLogAppender
+DEBUG StatusConsoleListener org.apache.logging.log4j.core.util.SystemClock supports precise timestamps.
+DEBUG StatusConsoleListener Reconfiguration complete for context[name=60e53b93] at URI D:\Steam Games\steamapps\common\X-Plane 12\Resources\plugins\xjet\log4j2.xml (org.apache.logging.log4j.core.LoggerContext@1e6a3214) with optional ClassLoader: null
+DEBUG StatusConsoleListener Shutdown hook enabled. Registering a new one.
+DEBUG StatusConsoleListener LoggerContext[name=60e53b93, org.apache.logging.log4j.core.LoggerContext@1e6a3214] started OK.
+ERROR StatusConsoleListener An exception occurred processing Appender XPlaneLogAppender
+ java.lang.NullPointerException: Cannot invoke "org.apache.logging.log4j.core.Layout.toByteArray(org.apache.logging.log4j.core.LogEvent)" because the return value of "com.airfoillabs.xjet.util.JXPLMLogAppender.getLayout()" is null
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.doLog(JXPLMLogAppender.java:75)
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.append(JXPLMLogAppender.java:70)
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.append(JXPLMLogAppender.java:53)
+	at org.apache.logging.log4j.core.config.AppenderControl.tryCallAppender(AppenderControl.java:161)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppender0(AppenderControl.java:134)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppenderPreventRecursion(AppenderControl.java:125)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppender(AppenderControl.java:89)
+	at org.apache.logging.log4j.core.config.LoggerConfig.callAppenders(LoggerConfig.java:683)
+	at org.apache.logging.log4j.core.config.LoggerConfig.processLogEvent(LoggerConfig.java:641)
+	at org.apache.logging.log4j.core.config.LoggerConfig.log(LoggerConfig.java:624)
+	at org.apache.logging.log4j.core.config.LoggerConfig.log(LoggerConfig.java:560)
+	at org.apache.logging.log4j.core.config.AwaitCompletionReliabilityStrategy.log(AwaitCompletionReliabilityStrategy.java:82)
+	at org.apache.logging.log4j.core.Logger.log(Logger.java:163)
+	at org.apache.logging.log4j.spi.AbstractLogger.tryLogMessage(AbstractLogger.java:2168)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessageTrackRecursion(AbstractLogger.java:2122)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessageSafely(AbstractLogger.java:2105)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessage(AbstractLogger.java:1980)
+	at org.apache.logging.log4j.spi.AbstractLogger.logIfEnabled(AbstractLogger.java:1946)
+	at org.apache.logging.log4j.spi.AbstractLogger.info(AbstractLogger.java:1283)
+	at com.airfoillabs.xjet.GlobalPlugin.start(GlobalPlugin.java:261)
+ERROR StatusConsoleListener An exception occurred processing Appender XPlaneLogAppender
+ java.lang.NullPointerException: Cannot invoke "org.apache.logging.log4j.core.Layout.toByteArray(org.apache.logging.log4j.core.LogEvent)" because the return value of "com.airfoillabs.xjet.util.JXPLMLogAppender.getLayout()" is null
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.doLog(JXPLMLogAppender.java:75)
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.append(JXPLMLogAppender.java:70)
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.append(JXPLMLogAppender.java:53)
+	at org.apache.logging.log4j.core.config.AppenderControl.tryCallAppender(AppenderControl.java:161)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppender0(AppenderControl.java:134)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppenderPreventRecursion(AppenderControl.java:125)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppender(AppenderControl.java:89)
+	at org.apache.logging.log4j.core.config.LoggerConfig.callAppenders(LoggerConfig.java:683)
+	at org.apache.logging.log4j.core.config.LoggerConfig.processLogEvent(LoggerConfig.java:641)
+	at org.apache.logging.log4j.core.config.LoggerConfig.log(LoggerConfig.java:624)
+	at org.apache.logging.log4j.core.config.LoggerConfig.log(LoggerConfig.java:560)
+	at org.apache.logging.log4j.core.config.AwaitCompletionReliabilityStrategy.log(AwaitCompletionReliabilityStrategy.java:82)
+	at org.apache.logging.log4j.core.Logger.log(Logger.java:163)
+	at org.apache.logging.log4j.spi.AbstractLogger.tryLogMessage(AbstractLogger.java:2168)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessageTrackRecursion(AbstractLogger.java:2122)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessageSafely(AbstractLogger.java:2105)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessage(AbstractLogger.java:1980)
+	at org.apache.logging.log4j.spi.AbstractLogger.logIfEnabled(AbstractLogger.java:1946)
+	at org.apache.logging.log4j.spi.AbstractLogger.info(AbstractLogger.java:1283)
+	at com.airfoillabs.xjet.GlobalPlugin.start(GlobalPlugin.java:307)
+ERROR StatusConsoleListener An exception occurred processing Appender XPlaneLogAppender
+ java.lang.NullPointerException: Cannot invoke "org.apache.logging.log4j.core.Layout.toByteArray(org.apache.logging.log4j.core.LogEvent)" because the return value of "com.airfoillabs.xjet.util.JXPLMLogAppender.getLayout()" is null
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.doLog(JXPLMLogAppender.java:75)
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.append(JXPLMLogAppender.java:70)
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.append(JXPLMLogAppender.java:53)
+	at org.apache.logging.log4j.core.config.AppenderControl.tryCallAppender(AppenderControl.java:161)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppender0(AppenderControl.java:134)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppenderPreventRecursion(AppenderControl.java:125)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppender(AppenderControl.java:89)
+	at org.apache.logging.log4j.core.config.LoggerConfig.callAppenders(LoggerConfig.java:683)
+	at org.apache.logging.log4j.core.config.LoggerConfig.processLogEvent(LoggerConfig.java:641)
+	at org.apache.logging.log4j.core.config.LoggerConfig.log(LoggerConfig.java:624)
+	at org.apache.logging.log4j.core.config.LoggerConfig.log(LoggerConfig.java:560)
+	at org.apache.logging.log4j.core.config.AwaitCompletionReliabilityStrategy.log(AwaitCompletionReliabilityStrategy.java:82)
+	at org.apache.logging.log4j.core.Logger.log(Logger.java:163)
+	at org.apache.logging.log4j.spi.AbstractLogger.tryLogMessage(AbstractLogger.java:2168)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessageTrackRecursion(AbstractLogger.java:2122)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessageSafely(AbstractLogger.java:2105)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessage(AbstractLogger.java:1980)
+	at org.apache.logging.log4j.spi.AbstractLogger.logIfEnabled(AbstractLogger.java:1946)
+	at org.apache.logging.log4j.spi.AbstractLogger.info(AbstractLogger.java:1283)
+	at com.airfoillabs.xjet.GlobalPlugin.start(GlobalPlugin.java:314)
+ERROR StatusConsoleListener An exception occurred processing Appender XPlaneLogAppender
+ java.lang.NullPointerException: Cannot invoke "org.apache.logging.log4j.core.Layout.toByteArray(org.apache.logging.log4j.core.LogEvent)" because the return value of "com.airfoillabs.xjet.util.JXPLMLogAppender.getLayout()" is null
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.doLog(JXPLMLogAppender.java:75)
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.append(JXPLMLogAppender.java:70)
+	at com.airfoillabs.xjet.util.JXPLMLogAppender.append(JXPLMLogAppender.java:53)
+	at org.apache.logging.log4j.core.config.AppenderControl.tryCallAppender(AppenderControl.java:161)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppender0(AppenderControl.java:134)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppenderPreventRecursion(AppenderControl.java:125)
+	at org.apache.logging.log4j.core.config.AppenderControl.callAppender(AppenderControl.java:89)
+	at org.apache.logging.log4j.core.config.LoggerConfig.callAppenders(LoggerConfig.java:683)
+	at org.apache.logging.log4j.core.config.LoggerConfig.processLogEvent(LoggerConfig.java:641)
+	at org.apache.logging.log4j.core.config.LoggerConfig.log(LoggerConfig.java:624)
+	at org.apache.logging.log4j.core.config.LoggerConfig.log(LoggerConfig.java:560)
+	at org.apache.logging.log4j.core.config.AwaitCompletionReliabilityStrategy.log(AwaitCompletionReliabilityStrategy.java:82)
+	at org.apache.logging.log4j.core.Logger.log(Logger.java:163)
+	at org.apache.logging.log4j.spi.AbstractLogger.tryLogMessage(AbstractLogger.java:2168)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessageTrackRecursion(AbstractLogger.java:2122)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessageSafely(AbstractLogger.java:2105)
+	at org.apache.logging.log4j.spi.AbstractLogger.logMessage(AbstractLogger.java:1980)
+	at org.apache.logging.log4j.spi.AbstractLogger.logIfEnabled(AbstractLogger.java:1946)
+	at org.apache.logging.log4j.spi.AbstractLogger.info(AbstractLogger.java:1283)
+	at com.airfoillabs.xjet.GlobalPlugin.start(GlobalPlugin.java:317)
+MicroProfile: Web server started on port 1338
+Picking device: NVIDIA GeForce RTX 4060
+Device budget changed to 7.02 gb. Memory thresholds are now: heavy: 6.52 gb, slight: 6.27 gb, none: 5.77 gb, negative: 5.27 gb. Current: 7.86 mb
+Made offscreen for pre-sim render: 3840 x 2160
+Worker thread started!
+Webserver Dynamic port is: 52330
+Transition level (1300) is below transition altitude (1430) in EPOD. Discarding TRL.
+Transition level (9800) is below transition altitude (11800) in ZWFY. Discarding TRL.
+Rebuilding frame graph
+Main menu decided unilaterally that you need to init a flight!
+Transition level (9800) is below transition altitude (11800) in ZLYA. Discarding TRL.
+Transition level (5000) is below transition altitude (6000) in HUKS. Discarding TRL.
+Transition level (20000) is below transition altitude (21000) in XAY004L. Discarding TRL.
+Transition level (20000) is below transition altitude (21000) in AYBM. Discarding TRL.
+Transition level (20000) is below transition altitude (21000) in XAY000E. Discarding TRL.
+Transition level (20000) is below transition altitude (21000) in BAA. Discarding TRL.
+PERLIN AVERAGE: 126
+Clearing all patches.
+Rebuilding frame graph
+Device budget changed to 6.89 gb. Memory thresholds are now: heavy: 6.39 gb, slight: 6.14 gb, none: 5.64 gb, negative: 5.14 gb. Current: 5.16 gb
+Device budget changed to 6.75 gb. Memory thresholds are now: heavy: 6.25 gb, slight: 6.00 gb, none: 5.50 gb, negative: 5.00 gb. Current: 5.03 gb
+Device budget changed to 6.62 gb. Memory thresholds are now: heavy: 6.12 gb, slight: 5.87 gb, none: 5.37 gb, negative: 4.87 gb. Current: 5.11 gb
+Device budget changed to 6.49 gb. Memory thresholds are now: heavy: 5.99 gb, slight: 5.74 gb, none: 5.24 gb, negative: 4.74 gb. Current: 5.17 gb
+Device budget changed to 6.36 gb. Memory thresholds are now: heavy: 5.86 gb, slight: 5.61 gb, none: 5.11 gb, negative: 4.61 gb. Current: 5.32 gb
+Memory pressure changed to no_pressure
+Memory pressure changed to slight_pressure
+Device budget changed to 6.23 gb. Memory thresholds are now: heavy: 5.73 gb, slight: 5.48 gb, none: 4.98 gb, negative: 4.48 gb. Current: 5.87 gb
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Device budget changed to 6.36 gb. Memory thresholds are now: heavy: 5.86 gb, slight: 5.61 gb, none: 5.11 gb, negative: 4.61 gb. Current: 5.83 gb
+Memory pressure changed to slight_pressure
+Device budget changed to 6.48 gb. Memory thresholds are now: heavy: 5.98 gb, slight: 5.73 gb, none: 5.23 gb, negative: 4.73 gb. Current: 5.84 gb
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure changed to slight_pressure
+Memory pressure changed to heavy_pressure
+Memory pressure c

@@ -1291,6 +1291,26 @@ local function build(w, x, y)
                 C_AMBER)
         end
 
+        -- ---- FRAME RATE, INCLUDING GENERATED FRAMES.
+        --
+        -- X-Plane's own f-act counts the frames the SIM renders. With frame
+        -- generation on, the swapchain presents one more between every pair of
+        -- those and the sim never sees them, so its readout understates what is
+        -- actually on screen. These two are measured where the frames leave.
+        local fpsSim = get("taaimpl/fps_presented", 0)
+        local fpsOut = get("taaimpl/fps_displayed", 0)
+        local ratio  = get("taaimpl/fg_ratio", 0)
+        if fpsSim > 0 then
+            heading("FRAME RATE")
+            row("RENDERED BY THE SIM", string.format("%.1f fps", fpsSim))
+            row("REACHING THE SCREEN", string.format("%.1f fps", fpsOut),
+                ratio > 1.05 and C_GREEN or nil)
+            row("FRAME GENERATION", ratio > 1.05
+                    and string.format("%.2fx", ratio)
+                    or  "off (1.00x)",
+                ratio > 1.05 and C_GREEN or C_DIM)
+        end
+
         heading("RENDER")
         row("RESOLUTION", string.format("%d x %d", get("taaimpl/viewport_w", 0),
                                                   get("taaimpl/viewport_h", 0)))

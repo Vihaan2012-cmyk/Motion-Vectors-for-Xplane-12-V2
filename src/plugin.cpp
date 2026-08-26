@@ -1613,6 +1613,27 @@ static void  setEnabled(void*, int v)   { g_enabled = v ? 1 : 0; }
 
 
 static float getLodBias(void*)          { return g_lodBias; }
+
+// ---- FRAME RATE, INCLUDING THE FRAMES X-PLANE DOES NOT KNOW ABOUT.
+//
+// X-Plane's own f-act / f-sim count the frames the SIM renders. With frame
+// generation on, the interpolation swapchain presents one more between every
+// pair of those, and nothing in the sim is aware of it - so its readout is
+// correct about its own work and silent about what actually reaches the
+// monitor. There is no dataref to write that back into; the counters are
+// internal.
+//
+// These are the two honest figures, measured in vkQueuePresentKHR by the layer:
+// presented is what the sim produced, displayed is what the swapchain put on
+// screen. Their ratio is the whole point of the feature - 1.00x means frame
+// generation is doing nothing, 2.00x means it is doubling.
+static float getFpsPresented(void*)  { return g_share ? g_share->fpsPresented : 0.0f; }
+static float getFpsDisplayed(void*)  { return g_share ? g_share->fpsDisplayed : 0.0f; }
+static float getFgRatio(void*)
+{
+    if (!g_share || g_share->fpsPresented <= 0.0f) return 0.0f;
+    return g_share->fpsDisplayed / g_share->fpsPresented;
+}
 static void  setLodBias(void*, float v) { g_lodBias = v < -3.0f ? -3.0f : (v > 1.0f ? 1.0f : v); }
 
 // VRAM, as the DRIVER reports it - not as X-Plane's pager estimates it. The two
@@ -1728,6 +1749,13 @@ static void registerDatarefs()
 
     g_myLodBias  = XPLMRegisterDataAccessor("taaimpl/lod_bias", xplmType_Float, 1,
                      0,0, getLodBias, setLodBias, 0,0,0,0,0,0,0,0, nullptr, nullptr);
+    // Read-only: these report what happened, they do not steer anything.
+    XPLMRegisterDataAccessor("taaimpl/fps_presented", xplmType_Float, 0,
+                     0,0, getFpsPresented, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/fps_displayed", xplmType_Float, 0,
+                     0,0, getFpsDisplayed, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/fg_ratio", xplmType_Float, 0,
+                     0,0, getFgRatio, nullptr, 0,0,0,0,0,0,0,0, nullptr, nullptr);
 
     // VRAM, straight from the driver via the layer. Read-only - these report,
     // they do not steer.
@@ -1810,7 +1838,7 @@ static void registerDatarefs()
         getVersionString, nullptr, nullptr, nullptr);
 
     xlog("registered %d datarefs under taaimpl/ (usable from FlyWithLua or any "
-         "script); build %s", 25, MV_VERSION);
+         "script); build %s", 28, MV_VERSION);
 }
 
 static void unregisterDatarefs()

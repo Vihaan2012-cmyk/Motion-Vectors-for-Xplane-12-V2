@@ -18,8 +18,19 @@ $env:TAA_VELOCITY            = "1"
 $env:TAA_LAYER_TRACE         = "1"
 
 $loaderLog = Join-Path $root "gpuav_lite\loader.txt"
-Remove-Item $loaderLog -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $root "gpuav_lite\val_log.txt") -Force -ErrorAction SilentlyContinue
+# ---- DO NOT DELETE THE PREVIOUS RUN'S VALIDATION LOG.
+#
+# These were deleted on launch, and that lost the only record of a crash: the
+# sim died on an aircraft change, the next launch wiped the log, and whatever
+# validation had reported went with it. The layer trace survived purely because
+# it is named per-PID; the validation log was not.
+#
+# Rotated instead. The previous run's output is exactly what you need AFTER it
+# dies - and the moment you need it is the moment you start the next run.
+$stamp = Get-Date -Format "HHmmss"
+foreach ($f in @($loaderLog, (Join-Path (Join-Path $root 'gpuav_lite') 'val_log.txt'))) {
+    if (Test-Path $f) { Move-Item $f "$f.$stamp" -Force -ErrorAction SilentlyContinue }
+}
 Remove-Item (Join-Path $env:TEMP "taa_layer.txt") -Force -ErrorAction SilentlyContinue
 
 Start-Process -FilePath (Join-Path $xp "X-Plane.exe") -WorkingDirectory $xp `
