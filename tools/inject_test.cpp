@@ -208,7 +208,7 @@ int main(int argc, char **argv)
             }
             std::vector<uint32_t> fout;
             spvinj::Result fr = spvinj::injectFragment(in.data(), in.size() * 4,
-                                                       fout, maxLoc);
+                                                       fout, maxLoc, false);
             if (fr != spvinj::INJ_OK) continue;
             ++nFragPatched;
             fs::path o = tmp / ("f_" + p.filename().string());

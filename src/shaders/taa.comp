@@ -163,6 +163,10 @@ layout(push_constant) uniform Params {
     // is a normal range; higher bites harder without ever ringing, because the
     // result is clamped to the local neighbourhood.
     float sharpen;
+    // Ambient occlusion. Must stay in this order and at this position to mirror
+    // TaaPush; see the note there.
+    float aoStrength;   // 0 = off, and the shader takes no taps at all
+    float aoRadius;     // radius in pixels at render resolution
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -172,6 +176,11 @@ const int FLAG_REACTIVE       = 8;   // consume the coverage mask in .a
 const int FLAG_NO_UNJITTER    = 16;
 const int FLAG_CATMULL        = 32;  // sharp history resampling; see the
                                      // note at sampleHistory
+const int FLAG_DILATE         = 128; // borrow the closest neighbour's vector
+                                     // at silhouettes; see the search above the
+                                     // velocity fetch. Off makes every edge take
+                                     // the texel-centre sample again, which is
+                                     // the A/B for judging it.
 const int FLAG_NOVEC_BY_VEL   = 64;  // legacy: pick unwritten pixels by
                                      // vel==0 instead of by coverage  // sample the raster raw - isolation only
 
@@ -389,7 +398,42 @@ void main()
                     ivec3(clamp(px + ivec2( 1, 0), ivec2(0), hi2), layer), 0).rgb;
         vec3 lo = min(e, min(min(up, dn), min(lf, rt)));
         vec3 hi = max(e, max(max(up, dn), max(lf, rt)));
-        vec3 sharp = e + pc.sharpen * (4.0 * e - up - dn - lf - rt);
+        // ---- SHARPEN WHAT HAS CONVERGED, NOT WHAT JUST ARRIVED.
+        //
+        // This applied the same strength to every pixel. A disoccluded one -
+        // freshly revealed, no history behind it, still noisy - was sharpened
+        // exactly as hard as a pixel that had been accumulating for a hundred
+        // frames. Sharpening amplifies whatever is there, so on a trail of
+        // fresh pixels it amplifies the difference between neighbouring frames:
+        // that is the crawl along disocclusion edges.
+        //
+        // Two gates, both from data already to hand:
+        //
+        // CONFIDENCE - the resolve now leaves its blend weight in history alpha.
+        // 0 is fully accumulated, 1 is raw current frame. (1 - a) is therefore
+        // how much of this pixel is real history, and is exactly how much of it
+        // is worth sharpening.
+        //
+        // MOTION - a fast-moving pixel is reconstructed from fewer usable
+        // samples and is the least stable thing on screen. Sharpening it makes
+        // motion crawl. Faded out over ~8 px/frame, which is gentle enough not
+        // to visibly switch off on a slow pan.
+        float conf = 1.0 - clamp(texelFetch(uHistorySampler, ivec3(px, layer), 0).a,
+                                 0.0, 1.0);
+        // ---- NO MOTION TERM. IT WAS A MISTAKE.
+        //
+        // This also faded sharpening out with velocity, over ~8 px/frame. That
+        // sounded reasonable and is wrong in a cockpit: panning the view moves
+        // panel pixels well past 8 px/frame, so sharpening switched off exactly
+        // when the camera moved and the panel text went soft on every head
+        // turn. The reported symptom was 'text gets blurry when I move', and
+        // it was this line.
+        //
+        // The defect being fixed was that sharpen could not tell a converged
+        // pixel from a freshly disoccluded one. Confidence answers that. Motion
+        // is a different question and did not need answering.
+        float amt  = pc.sharpen * conf;
+        vec3 sharp = e + amt * (4.0 * e - up - dn - lf - rt);
         sharp = clamp(sharp, lo, hi);
         imageStore(uHistory, ivec3(px, layer), vec4(max(sharp, vec3(0.0)), 1.0));
         return;
@@ -454,7 +498,37 @@ void main()
     // ndc_y = +1 is at the TOP and uv_y = 0.5 - 0.5 * ndc_y. That makes
     // d(uv_y) = -vel_y while d(uv_x) = +vel_x. The same sign that took the
     // field's own diagnostic from 4.8 px to 0.0015 px applies here.
-    vec4 velS = texture(uVelocity, vec3(uv + S, float(layer)));
+    // ---- VELOCITY DILATION: BORROW THE CLOSEST NEIGHBOUR'S VECTOR.
+    //
+    // A silhouette pixel is a blend of foreground and background, but it gets
+    // ONE velocity - whichever surface happened to win the texel centre. On a
+    // gear strut, an antenna, a wire or a pylon edge that is usually the
+    // BACKGROUND, so the edge is reprojected as though it were the sky behind
+    // it and drags a ghost every frame the camera moves. Thin geometry is
+    // exactly where this is most visible and exactly where the centre sample is
+    // least likely to be right.
+    //
+    // The fix every TAA implementation uses: search the 3x3 and take the vector
+    // of the CLOSEST fragment, so an edge follows the object in front rather
+    // than the void behind. Depth comes from B (clip w, written by the injector)
+    // because this shader has no depth binding.
+    //
+    // Unwritten texels are skipped by the R sentinel, never by depth - their B
+    // is a cleared zero, which would otherwise read as nearer than everything
+    // real and win every comparison.
+    vec2 dilate = vec2(0.0);
+    if ((pc.flags & FLAG_DILATE) != 0) {
+        vec2 dtsz = 1.0 / vec2(size);
+        float bestW = 1.0e30;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                vec2 o = vec2(dx, dy) * dtsz;
+                vec4 n = texture(uVelocity, vec3(uv + S + o, float(layer)));
+                if (n.x < -1000.0 || n.y < -1000.0) continue;  // nothing wrote
+                if (n.z > 0.0 && n.z < bestW) { bestW = n.z; dilate = o; }
+            }
+    }
+    vec4 velS = texture(uVelocity, vec3(uv + S + dilate, float(layer)));
     // The target is cleared to a sentinel, so "nobody wrote here" is a fact
     // rather than an inference from a zero vector. Bilinear filtering can blend
     // a sentinel texel with a real one, so the test is a threshold well below
@@ -495,12 +569,22 @@ void main()
     // pixels as raw current every frame. A mask that fires takes the jittered
     // frame whole, which is why the resulting shake never scaled with the
     // jitter amplitude: it is a threshold flipping, not a displacement.
+    // ---- NINE FETCHES FOR A CONSUMER THAT SHIPS DISABLED.
+    //
+    // Both readers of covMax (the disocclusion term below and the reactive
+    // override near the end) test FLAG_REACTIVE themselves, and the mask ships
+    // off - so this ran nine texture fetches per pixel per frame to produce a
+    // value nothing was allowed to use. Left at 0.0 when the flag is clear,
+    // which is what both tests already fall through on, so the picture is
+    // bit-identical and the work is simply not done.
     float covMax = 0.0;
-    vec2 ctsz = 1.0 / vec2(size);
-    for (int cy = -1; cy <= 1; ++cy)
-        for (int cx = -1; cx <= 1; ++cx)
-            covMax = max(covMax, texture(uVelocity,
-                vec3(uv + S + vec2(cx, cy) * ctsz, float(layer))).w);
+    if ((pc.flags & FLAG_REACTIVE) != 0) {
+        vec2 ctsz = 1.0 / vec2(size);
+        for (int cy = -1; cy <= 1; ++cy)
+            for (int cx = -1; cx <= 1; ++cx)
+                covMax = max(covMax, texture(uVelocity,
+                    vec3(uv + S + vec2(cx, cy) * ctsz, float(layer))).w);
+    }
     // ---- REJECT A VECTOR THAT IS NOT A NUMBER.
     //
     // MEASURED: with velocity live, alpha does NOTHING - 1.0 and 0.01 give the
@@ -654,6 +738,67 @@ void main()
     // texelFetches because a box built from the actual raster is still the
     // right box, S being well under one texel.
     vec3 currA = texture(uScene, vec3(uv + S, float(layer))).rgb;
+
+    // ---- AMBIENT OCCLUSION, FROM THE DEPTH ALREADY IN THE VELOCITY TARGET.
+    //
+    // X-Plane ships SSAO, but it is spatial: a small sample budget re-drawn
+    // every frame, so it is coarse and cannot resolve the small geometry a
+    // cockpit is made of - switch bases, bezel edges, panel seams, the gap
+    // under the glareshield. That scale of contact darkening is most of what
+    // separates modelled from rendered.
+    //
+    // WHY THIS NEEDS NO NEW RESOURCES. Occlusion wants a depth buffer, and this
+    // shader has none bound. It does not need one: the injector now writes clip
+    // w into the velocity target's B channel (added for dilation), and clip w
+    // IS view-space distance. So the depth is already here, in a texture
+    // already bound, at no cost - no image, no view, no descriptor, no dispatch,
+    // no barrier.
+    //
+    // WHY IT IS APPLIED TO currA AND NOT AFTERWARDS. Multiplying the CURRENT
+    // frame means the occlusion goes through the same history blend as
+    // everything else, so TAA accumulates it across frames for free. That is
+    // the temporal denoise a separate AO pass would have had to build - a
+    // rotated 8-tap pattern per frame converges to a far smoother result than 8
+    // taps ever look on their own, which is exactly why a half-resolution pass
+    // with its own history buffer was not worth its machinery.
+    //
+    // The radius is in PIXELS rather than metres. Converting a world radius
+    // needs the projection, and there is no matrix in this push block; a fixed
+    // screen radius is the standard approximation and behaves predictably.
+    //
+    // Sky and anything else nothing wrote is skipped by the sentinel - w there
+    // is a cleared zero, which would read as infinitely near and blacken the
+    // horizon.
+    if (pc.aoStrength > 0.0 && !unwritten && velS.z > 0.0) {
+        float w0 = velS.z;
+        // Per-pixel rotation (interleaved gradient noise). Without it the eight
+        // taps land on the same eight angles everywhere and the occlusion shows
+        // its sampling pattern as a visible texture.
+        float ign = fract(52.9829189 * fract(dot(vec2(px), vec2(0.06711056, 0.00583715))));
+        float rot = ign * 6.2831853;
+        const int   AO_TAPS = 8;
+        float occ = 0.0;
+        for (int i = 0; i < AO_TAPS; ++i) {
+            float ang = rot + float(i) * (6.2831853 / float(AO_TAPS));
+            // sqrt spacing spreads the taps evenly over the DISC rather than
+            // bunching them at the centre.
+            float rad = pc.aoRadius * sqrt((float(i) + 0.5) / float(AO_TAPS));
+            vec2  o   = vec2(cos(ang), sin(ang)) * rad / vec2(size);
+            float wn  = texture(uVelocity, vec3(uv + S + o, float(layer))).z;
+            if (wn <= 0.0) continue;                 // nothing wrote there
+            float d = w0 - wn;                       // >0 => neighbour is nearer
+            if (d <= 0.0) continue;                  // behind us, not an occluder
+            // Range limit, scaled with distance so the effect stays the same
+            // size on screen as geometry recedes. Without it a distant
+            // background silhouetted against near geometry occludes the whole
+            // frame edge.
+            float maxD = 0.05 * w0 + 0.02;
+            if (d > maxD) continue;
+            occ += d / (d + 0.5 * maxD);             // soft, saturating
+        }
+        float ao = 1.0 - pc.aoStrength * (occ / float(AO_TAPS));
+        currA *= clamp(ao, 0.0, 1.0);
+    }
 
     if (pc.reset != 0 || !valid || noVector) {
         imageStore(uHistory, ivec3(px, layer), vec4(currA, 1.0));
@@ -987,5 +1132,16 @@ void main()
     // high-contrast edges, and flooring costs nothing.
     vec3 outc = max(mix(hist, currA, a), vec3(0.0));
 
-    imageStore(uHistory, ivec3(px, layer), vec4(outc, 1.0));
+    // ---- ALPHA CARRIES CONFIDENCE, SO THE SHARPEN PASS CAN SEE IT.
+    //
+    // History is RGBA16F and its alpha wrote a constant 1.0 that nothing ever
+    // read. The sharpen pass runs as a separate dispatch with an early return,
+    // so it has no access to a, moved or covMax - which is why it sharpens a
+    // disoccluded pixel exactly as hard as a fully converged one, and why
+    // disocclusion trails crawl.
+    //
+    // a IS the confidence: 0 means the pixel is entirely accumulated history,
+    // 1 means it is raw current frame with nothing behind it. Storing it here
+    // costs nothing and hands the next pass the one number it was missing.
+    imageStore(uHistory, ivec3(px, layer), vec4(outc, a));
 }

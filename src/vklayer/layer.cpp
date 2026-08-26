@@ -128,7 +128,31 @@ static bool      g_shareOpen   = false;
 // 777s, which crash our resolve). When set, every scene-identification, MV-target
 // build and resolve below is skipped, so the layer is inert and X-Plane renders
 // natively. Null share (not yet mapped) reads as not-bypassed: fail safe to ON.
-static inline bool mvBypassed() { return g_share && g_share->bypass != 0; }
+// ---- THE SECOND REASON, AND THE ONE THAT ACTUALLY CRASHES.
+//
+// The airframe bypass guards the wrong condition. It keys on the aircraft's
+// NAME, but nothing about a 777 is dangerous - MSAA is. The velocity attachment
+// is created VK_SAMPLE_COUNT_1_BIT (mv_target.h) and appended to passes without
+// anyone reading rasterizationSamples, so a 1x image lands beside N-sample
+// attachments, violates Vulkan's same-sample-count rule, and reaches the driver
+// unchecked. That is a VK_ERROR_DEVICE_LOST, and it was reproduced the moment a
+// Felis 742 was loaded with MSAA at 2x: not a 777, therefore not bypassed,
+// therefore dead. Every non-777 airframe was exposed the whole time.
+//
+// So MSAA stands the layer down on its own evidence - the sample count of a
+// pipeline we were about to inject into - rather than on a dataref name that
+// X-Plane does not publish. Sticky for the process on purpose: this is the
+// fail-safe direction, and changing MSAA needs a renderer restart anyway.
+static bool g_msaaStandDown = false;
+
+// The plugin raises g_share->bypass for airframes the mod must not touch (the
+// 777s, which crash our resolve). When set, every scene-identification, MV-target
+// build and resolve below is skipped, so the layer is inert and X-Plane renders
+// natively. Null share (not yet mapped) reads as not-bypassed: fail safe to ON.
+static inline bool mvBypassed()
+{
+    return g_msaaStandDown || (g_share && g_share->bypass != 0);
+}
 
 // MUST retry. Vulkan initialises long before X-Plane loads plugins, so the
 // first attempt always fails - the plugin has not created the mapping yet.
@@ -3591,12 +3615,42 @@ static bool isSceneSized(uint32_t w, uint32_t h, uint32_t colourCount = 1)
     // frame, so its extent IS the render size: FOLLOW it (w != g_renderW), which
     // is identical to the old behaviour on a fresh start or a size INCREASE and
     // only differs on a decrease - exactly the case that was broken.
+    // ---- THE COUNT WAS STILL A ONE-WAY RATCHET.
+    //
+    // Size was fixed to FOLLOW; the attachment count was left latching upward
+    // forever, which is the same defect one field over. If the real scene
+    // pass's colour count ever legitimately drops - a renderer setting that
+    // changes the G-buffer's shape - nothing in the frame can equal the old
+    // high-water mark again, isSceneSized returns false for the true scene
+    // pass, and the resolve dies exactly as it did on a 4K -> 1440p change.
+    //
+    // It cannot simply become !=, because within a single frame this count is
+    // also the discriminator that picks the G-buffer out of the post-process
+    // and UI passes - "most attachments wins". So it keeps winning upward
+    // immediately, and only RELEASES downward after the latched count has gone
+    // unseen for a while. Same shape as the resolve target's latch: derive,
+    // hold, release on absence.
+    static uint64_t sceneColourSeen = 0;
+    if (colourCount == g_sceneColourCount) sceneColourSeen = g_frameCount;
+    const bool countStale = g_sceneColourCount != 0 &&
+                            (g_frameCount - sceneColourSeen) > 120;
     bool better = (colourCount > g_sceneColourCount) ||
+                  (colourCount < g_sceneColourCount && countStale) ||
                   (colourCount == g_sceneColourCount &&
                    (w != g_renderW || h != g_renderH));
+    if (colourCount < g_sceneColourCount && countStale)
+        trace("SCENE SHAPE: colour attachment count %u -> %u after %llu frames "
+              "without the old shape - the G-buffer changed, following it down "
+              "rather than latching (a one-way count is how the resolve used to "
+              "die silently on a settings change).",
+              g_sceneColourCount, colourCount,
+              (unsigned long long)(g_frameCount - sceneColourSeen));
     if (better) {
         bool first = (g_renderW == 0);
         g_sceneColourCount = colourCount;
+        // Adopt immediately, so a stale latch cannot be released twice inside
+        // one frame and let a post-process pass take the scene's place.
+        sceneColourSeen    = g_frameCount;
         g_renderW = w; g_renderH = h;
 
         // Hand the measured size back to the plugin. It sizes the jitter
@@ -7979,14 +8033,43 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // Tied to the live enable per frame, so switching the resolve off also
     // stops the jitter - jitter with nothing accumulating it is deliberate
     // edge crawl. TAA_JITTER still forces it for measurement.
-    g_jitterArmed = taaEnabled() || (getenv("TAA_JITTER") != nullptr);
-    // Jitter defaults OFF even with the resolve on: the unjitter
-    // cancellation has never been verified on screen, and the first flight
-    // that ran it showed exactly what uncancelled jitter looks like - a
-    // trembling panel and crawling smear in motion. Sub-pixel AA returns
-    // via taa.jitter_scale=1 only after a run proves the cancellation
-    // (static scene, jitter on: the image must not move AT ALL).
-    g_jitterScale = live::f("taa.jitter_scale", "TAA_JITTER_SCALE", 0.0f);
+    // ---- A BYPASSED LAYER MUST NOT JITTER EITHER.
+    //
+    // The rule above ties jitter to the resolve, but the 777 stand-down turns
+    // the resolve off WITHOUT going through taaEnabled() - so jitter stayed
+    // armed with nothing accumulating it, and every frame showed the raw offset
+    // raster. That is a permanently trembling picture: strictly worse than not
+    // running at all, which is the one thing a bypass must never be. Bypass now
+    // disarms jitter unconditionally, TAA_JITTER included, because "inert" has
+    // to mean inert.
+    g_jitterArmed = mvBypassed()
+                  ? false
+                  : (taaEnabled() || (getenv("TAA_JITTER") != nullptr));
+    // ---- THE CANCELLATION TEST HAS NOW BEEN RUN, AND IT PASSED.
+    //
+    // This defaulted to 0.0 pending exactly one experiment: "static scene,
+    // jitter on: the image must not move AT ALL". That run has happened -
+    // parked, jitter at 1.0, the image did not move. The unjitter cancels.
+    //
+    // The "trembling panel" that justified the zero was real but misattributed.
+    // It was not the cancellation failing; it was taa.nearfield_m shipping as 0,
+    // which disarmed the near-field select and reprojected cockpit geometry in
+    // the WORLD frame - telling a panel bolted to the camera that it had moved
+    // most of a screen. Proven by isolation: with velocity ignored the shake
+    // stopped and with nearfield_m=2.0 it stopped for good, jitter still on.
+    //
+    // So the reason for the zero is gone, and the zero itself was the more
+    // expensive half of a three-way disagreement: code 0.0, shipped ini 1.0,
+    // Lua panel 0.0. Same family as the nearfield bug - a correct value in one
+    // file quietly cancelled in another. All three now read 1.0, which is what
+    // the ini already shipped and what every user with a config file was
+    // already running. Without jitter TAA can only stabilise; it cannot
+    // anti-alias, which is most of the point.
+    g_jitterScale = live::f("taa.jitter_scale", "TAA_JITTER_SCALE", 1.0f);
+    // Belt and braces with the disarm above: zero AMPLITUDE as well, so even a
+    // push path that ignores g_jitterArmed cannot displace a vertex while the
+    // layer is standing down.
+    if (mvBypassed()) g_jitterScale = 0.0f;
     {
         float nf = live::f("taa.nearfield_m", "TAA_NEARFIELD_M", g_nearFieldM);
         if (nf < 0.0f)  nf = 0.0f;
@@ -8526,6 +8609,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
 // establishes how many samplers exist and what bias they already carry, so a
 // change can be attributed rather than assumed.
 static uint64_t g_samplerCount = 0;
+static uint64_t g_samplerBiased = 0;   // how many took the LOD bias
 static bool     g_samplerReported = false;
 
 static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSampler(
@@ -8539,7 +8623,81 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSampler(
               ci->anisotropyEnable ? ci->maxAnisotropy : 0.0f, (int)ci->mipmapMode);
     }
     ++g_samplerCount;
-    return g_nextCreateSampler ? g_nextCreateSampler(device, ci, alloc, out)
+
+    // ---- APPLY THE TEXTURE LOD BIAS. THE OTHER END OF A PIPE THAT ALREADY EXISTED.
+    //
+    // The plugin has computed g_lodBias (default -0.5) and published it to
+    // share->lodBias for a long time; the layer already snapshots it; the panel
+    // already has a slider bound to it. Nothing ever applied it to a sampler, so
+    // the whole chain terminated one step short of doing anything.
+    //
+    // WHY A NEGATIVE BIAS IS CORRECT HERE, AND ONLY HERE. Jitter moves the
+    // sample grid by a sub-pixel offset each frame and the resolve accumulates
+    // those into detail finer than one pixel. The hardware's mip selection knows
+    // none of that - it picks a level for a single unjittered sample - so it
+    // discards exactly the detail the accumulation was collecting. Biasing down
+    // hands that detail back. Every temporal upscaler ships this for the same
+    // reason, and X-Plane's own spatial FSR is resampling on top, which softens
+    // it further.
+    //
+    // Gated on TAA actually running: with no accumulation a negative bias is
+    // just aliasing, which is strictly worse than leaving it alone.
+    //
+    // Clamped to +-2.0 rather than queried against maxSamplerLodBias, because
+    // Vulkan guarantees that limit is AT LEAST 2.0 - so this range needs no
+    // device query and cannot fail sampler creation on any conformant driver.
+    // Added to whatever the application asked for rather than replacing it: the
+    // bias is a nudge to their intent, not a substitute for it.
+    //
+    // Samplers with no mip range are skipped - biasing them is meaningless - and
+    // our own samplers never reach here at all, since taa.h creates those
+    // through dd.createSampler, which is the next layer's function, not this
+    // hook.
+    //
+    // NOTE: samplers are immutable. Moving the slider affects samplers created
+    // AFTER the change, not the ones X-Plane already made at load. That is a
+    // property of Vulkan, not a bug to fix here.
+    // ---- READ FROM THE INI, NOT THE SHARED BLOCK.
+    //
+    // The first version took share->lodBias and never once fired. The trace says
+    // why in three lines: "SAMPLER first" at line 75, "SHARE: not published yet"
+    // at 82, "SHARE: attached" at 555. X-Plane builds its samplers before the
+    // plugin has published anything, so g_share was null every time this ran.
+    //
+    // And there is no version of that which works. A VkSampler is immutable -
+    // the bias is fixed at creation, and creation happens once, at load. So this
+    // is a LAUNCH-TIME setting by nature, not a live one, and it has to come
+    // from a source that exists before the plugin does. The ini file is exactly
+    // that: on disk, readable from the moment the layer is loaded, no handshake.
+    //
+    // The panel's slider still writes its dataref, but it cannot retroactively
+    // change a sampler that already exists - which is a property of Vulkan and
+    // not something a different plumbing choice would fix.
+    const float wantBias = live::f("taa.lod_bias", "TAA_LOD_BIAS", -0.5f);
+    const VkSamplerCreateInfo *use = ci;
+    VkSamplerCreateInfo biased;
+    if (ci && wantBias != 0.0f && ci->maxLod > ci->minLod &&
+        taaEnabled() && !mvBypassed()) {
+        float b = ci->mipLodBias + wantBias;
+        if (b < -2.0f) b = -2.0f;
+        if (b >  2.0f) b =  2.0f;
+        biased = *ci;
+        biased.mipLodBias = b;
+        use = &biased;
+        static bool told = false;
+        if (!told) {
+            told = true;
+            trace("SAMPLER LOD BIAS: applying %+.2f (app asked %+.2f, using "
+                  "%+.2f). Jitter accumulates sub-pixel detail that the mip "
+                  "selection would otherwise throw away; this hands it back. "
+                  "Only affects samplers created from now on - existing ones "
+                  "are immutable.",
+                  wantBias, ci->mipLodBias, b);
+        }
+        ++g_samplerBiased;
+    }
+
+    return g_nextCreateSampler ? g_nextCreateSampler(device, use, alloc, out)
                                : VK_ERROR_INITIALIZATION_FAILED;
 }
 
@@ -10438,6 +10596,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 noPatch = true;
             }
 
+            // ---- MSAA: STAND DOWN ON THE PIPELINE'S OWN SAMPLE COUNT.
+            //
+            // Checked here, after the full-screen-quad rule, so it only reads
+            // pipelines that draw real geometry - the ones velocity would
+            // actually be injected into, and therefore the ones that would bind
+            // our single-sample attachment beside multisampled ones.
+            //
+            // Declining THIS pipeline is not enough on its own: the depth
+            // selection accepts multisampled depth with a warning, and X-Plane's
+            // own vkCmdResolveImage would overwrite our output anyway, so a
+            // half-running mod under MSAA is a corrupt picture instead of a
+            // crash. Standing the whole layer down is the honest outcome until
+            // the MSAA cluster is actually fixed.
+            if (!g_msaaStandDown && ci[i].pMultisampleState &&
+                ci[i].pMultisampleState->rasterizationSamples != VK_SAMPLE_COUNT_1_BIT) {
+                g_msaaStandDown = true;
+                trace("MV: MSAA DETECTED (%dx on a geometry pipeline) - the layer "
+                      "is standing down for this run. The velocity attachment is "
+                      "single-sample and cannot be bound beside multisampled "
+                      "targets; doing it anyway is the VK_ERROR_DEVICE_LOST this "
+                      "guard exists to prevent. Turn MSAA off to use the mod.",
+                      (int)ci[i].pMultisampleState->rasterizationSamples);
+            }
+            if (g_msaaStandDown) noPatch = true;
+
             // One extra format, at index colorAttachmentCount - matching the
             // single extra slot the pass hook appends, and matching the
             // Location the fragment shader is patched to write.
@@ -10548,6 +10731,37 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                         if (maskSeeThrough && !blend2 && !depthW &&
                             src->colorAttachmentCount == 1)
                             maskVelocity = true;
+                        // ---- SEE-THROUGH GEOMETRY IN THE DEFERRED G-BUFFER.
+                        //
+                        // The rule above only ever matched the cockpit OVERLAY
+                        // (one colour attachment), which is why masking 259 of
+                        // those changed nothing: the FF777's windshield is drawn
+                        // into the 5-attachment G-buffer, in the same pass as
+                        // the world. BLEND_GLASS puts it there deliberately, so
+                        // the glass can take deferred lighting and keep its
+                        // reflections at full strength instead of fading them
+                        // out with alpha - the right call by the author, and not
+                        // something we get to refuse.
+                        //
+                        // What we cannot do is let it claim the pixel. Blended
+                        // and not writing depth means you are seeing THROUGH it,
+                        // so the motion of that pixel belongs to the opaque
+                        // geometry behind, not to a pane bolted to the airframe.
+                        // Stamping the pane's own near-zero velocity over the
+                        // city behind it is what made the buildings shimmer, and
+                        // masking exactly this set is what stopped it.
+                        //
+                        // Keyed on the PIPELINE, not the shader: the same module
+                        // shows up with depthWrite both set and clear, so a hash
+                        // list masks pipelines it was never meant to touch. Also
+                        // default ON - it is a correctness rule, not a probe -
+                        // with TAA_NO_GLASS_MASK to switch it off if a fleet
+                        // turns up where the heuristic misfires.
+                        static const bool glassMaskOff =
+                            (getenv("TAA_NO_GLASS_MASK") != nullptr);
+                        if (!glassMaskOff && blend2 && !depthW &&
+                            src->colorAttachmentCount >= 5)
+                            maskVelocity = true;
                     }
                     // Genuine transparency, read from the pipeline's own blend
                     // state rather than guessed from a G-buffer channel.
@@ -10583,11 +10797,43 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             if (fragHash && fragPatched) {
                 static std::set<uint64_t> namedFrag;
                 bool isNew = false;
+                // Set under the lock, reported outside it: trace() is called
+                // outside g_lock everywhere else in this function, and taking
+                // the two in opposite orders is how a logging line becomes a
+                // hang.
+                bool   justTruncated = false;
+                size_t censusMax     = 0;
                 {
                     std::lock_guard<std::mutex> g(g_lock);
-                    if (namedFrag.size() < 256)
+                    // ---- THE CAP SILENTLY TRUNCATED THE CENSUS.
+                    //
+                    // This was a flat 256, which the FF777 blows through long
+                    // before its cockpit draws - so the windshield shader was
+                    // never named, and every search for it came back "not
+                    // present" when the truth was "not logged". A census that
+                    // stops counting without saying so is worse than no census:
+                    // it answers questions it can no longer see.
+                    //
+                    // 4096 covers the whole observed population with room to
+                    // spare, and TAA_FRAG_CENSUS overrides it for the pathological
+                    // case. The limit exists only to bound the trace, so the one
+                    // thing it must not do is hide the shader being hunted.
+                    static const size_t kCensusMax = []{
+                        const char *e = getenv("TAA_FRAG_CENSUS");
+                        const long v = e ? atol(e) : 0;
+                        return v > 0 ? (size_t)v : (size_t)4096;
+                    }();
+                    static bool censusTrunc = false;
+                    censusMax = kCensusMax;
+                    if (namedFrag.size() < kCensusMax)
                         isNew = namedFrag.insert(fragHash).second;
+                    else if (!censusTrunc) { censusTrunc = true; justTruncated = true; }
                 }
+                if (justTruncated)
+                    trace("MV FRAG CENSUS TRUNCATED at %llu shaders - raise "
+                          "TAA_FRAG_CENSUS; names beyond this are NOT missing, "
+                          "they are unlogged",
+                          (unsigned long long)censusMax);
                 if (isNew) {
                     const VkPipelineColorBlendStateCreateInfo *cb0 = ci[i].pColorBlendState;
                     bool blend = cb0 && cb0->attachmentCount > 0 &&
@@ -10749,9 +10995,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // colour alpha thresholded at 0.5), and SRC_ALPHA blending with a
             // binary source is a select - opaque texels replace the velocity,
             // transparent texels keep the one underneath. The blend stage reads
-            // source alpha from the shader output, so this works on the
-            // two-channel RG16F attachment; the format merely has nowhere to
-            // STORE alpha, which is fine because nothing reads it back.
+            // source alpha from the shader output, so the select works purely
+            // from the fragment's own alpha.
+            //
+            // ---- CORRECTED: THE ALPHA IS STORED, AND IT IS READ BACK.
+            //
+            // This used to read "the two-channel RG16F attachment; the format
+            // merely has nowhere to STORE alpha, which is fine because nothing
+            // reads it back" - contradicting the RGBA16F note twenty lines
+            // above, in the same function. Both cannot be true. kMvFormat is
+            // VK_FORMAT_R16G16B16A16_SFLOAT: there IS an alpha channel, it
+            // holds the coverage gate, and taa.comp samples it as .w to build
+            // covMax.
+            //
+            // The stale half is not harmless bookkeeping - it is load-bearing
+            // misinformation. Believing alpha is never read back is exactly
+            // what makes dstAlphaBlendFactor=ZERO look like a free choice, and
+            // that is defect #7: a transparent texel force-resets stored
+            // coverage to 0 while the RG select beside it correctly preserves
+            // the world's velocity, so coverage and velocity disagree and the
+            // reactive mask fires on pixels that were right all along.
             //
             // Only for pipelines whose OWN attachment 0 blends - opaque draws
             // keep the plain replace - and only outside the debug channel
@@ -10768,8 +11031,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     mvBlend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
                     mvBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
                     mvBlend.colorBlendOp        = VK_BLEND_OP_ADD;
+                    // ---- COVERAGE MUST FOLLOW THE SAME SELECT AS VELOCITY.
+                    //
+                    // This was ONE / ZERO, which makes the result unconditionally
+                    // the source alpha. So a texel this draw considers fully
+                    // TRANSPARENT wrote a coverage of 0 over whatever was already
+                    // there - while the RG channels beside it, blending
+                    // SRC_ALPHA / ONE_MINUS_SRC_ALPHA with the same binary alpha,
+                    // correctly KEPT the velocity underneath.
+                    //
+                    // Coverage and velocity then describe different surfaces. The
+                    // resolve's reactive mask reads coverage (covMax < 0.5) and
+                    // fires on pixels whose vector was right all along, taking
+                    // them as raw current frame every frame: flicker and ghosting
+                    // along every glass edge in the scene.
+                    //
+                    // ONE_MINUS_SRC_ALPHA makes alpha a select too:
+                    //   srcA = 1 -> 1*1 + 0*dst = 1   (opaque wins, as before)
+                    //   srcA = 0 -> 1*0 + 1*dst = dst (transparent keeps it)
+                    // which is exactly what the colour channels already do, so
+                    // the two can no longer disagree. BLEND_OP_MAX would also
+                    // work; this is chosen because it is the SAME expression as
+                    // the colour path rather than a second rule to keep in step.
                     mvBlend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-                    mvBlend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                    mvBlend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
                     mvBlend.alphaBlendOp        = VK_BLEND_OP_ADD;
                 }
             }
@@ -11517,10 +11802,19 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         float h = (float)(g_renderH ? g_renderH : (uint32_t)g_velSnap.viewportH);
         if (w > 0.0f && h > 0.0f) {
             float ySign = g_viewportYFlipped ? -1.0f : 1.0f;
-            // g_jitterScale is the live amplitude knob - see fsr2_pass.h. FSR2
-            // is told the same scaled value, so the two cannot drift apart.
-            // ---- JITTER IS PHASE TWO. AMPLITUDE IS ZERO.
+            // g_jitterScale is the live amplitude knob (set from
+            // taa.jitter_scale where g_jitterArmed is decided, above). The
+            // resolve's unjitter derives its shift from the same scaled value,
+            // so the applied offset and the compensation cannot drift apart.
+            // The old "see fsr2_pass.h" pointed at a file that does not exist
+            // in this tree.
+            // ---- SUPERSEDED: AMPLITUDE IS NO LONGER ZERO. ----
+            // Three strata follow, each correcting the one above it; the last
+            // is current and the default is now 1.0. Kept because the reasoning
+            // is worth reading, headed because a reader who stops at the first
+            // line would otherwise take away the exact opposite of the truth.
             //
+            // (1) JITTER IS PHASE TWO, AMPLITUDE IS ZERO:
             // The vectors are the product right now, and they are measured
             // against an unjittered render - which removes a whole class of
             // sign and amplitude bugs from the calibration. The injection path
@@ -11724,6 +12018,12 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     if (g_share && g_share->magic == TAA_MAGIC) {
         g_share->mvPipelinesPatched  = (uint32_t)g_pipeGeometry;
         g_share->mvPipelinesRejected = (uint32_t)g_pipeRejected;
+        // The injector's own refusals, which the driver count says nothing
+        // about. g_injReason is already maintained for the trace; this only
+        // moves it somewhere a user can see without TAA_LAYER_TRACE.
+        g_share->mvInjLocationTaken = (uint32_t)g_injReason[spvinj::INJ_LOCATION_TAKEN];
+        g_share->mvInjMalformed     = (uint32_t)g_injReason[spvinj::INJ_MALFORMED];
+        g_share->mvInjNoPosition    = (uint32_t)g_injReason[spvinj::INJ_NO_POSITION];
     }
 }
 
@@ -12714,6 +13014,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
     VkDevice device, const VkSwapchainCreateInfoKHR *ci,
     const VkAllocationCallbacks *alloc, VkSwapchainKHR *out)
 {
+    // ---- LET THE MSAA STAND-DOWN RECOVER.
+    //
+    // It was sticky for the process, which meant turning MSAA off left the mod
+    // dead until a restart - the same "restart to fix" defect this project
+    // already carries as finding #16, reintroduced by the guard that was meant
+    // to be an improvement.
+    //
+    // Changing MSAA rebuilds the renderer, and the swapchain is recreated with
+    // it, so this is the event that says "the graphics config just changed -
+    // re-decide". Cleared here and re-armed by the pipeline check, which trips
+    // again on the first multisampled geometry pipeline if MSAA is still on.
+    // Worst case on an unrelated recreate (a window resize) is one extra log
+    // line; the decision is re-derived from evidence either way.
+    if (g_msaaStandDown) {
+        g_msaaStandDown = false;
+        trace("MV: swapchain recreated - MSAA stand-down cleared, re-deciding "
+              "from the next geometry pipeline's sample count");
+    }
+
     VkSwapchainCreateInfoKHR mod = *ci;
     const char *e = getenv("TAA_PRESENT_MODE");
     if (e && e[0]) {

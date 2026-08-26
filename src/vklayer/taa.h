@@ -225,6 +225,17 @@ struct TaaPush {
     // record path skips the second dispatch entirely. Must be the LAST field so
     // it mirrors the shader's Params block byte for byte.
     float   sharpen;
+    // ---- AMBIENT OCCLUSION, APPENDED AFTER sharpen.
+    //
+    // The comment above says sharpen must be LAST so the block mirrors the
+    // shader byte for byte. That constraint is about the two structs AGREEING,
+    // not about which field ends them - so these go after it, and the shader's
+    // Params block gets the same two in the same order.
+    //
+    // aoStrength 0 disables the whole thing at zero cost: the shader branches
+    // out before taking a single tap.
+    float   aoStrength;   // 0 = off, ~0.5 typical
+    float   aoRadius;     // sampling radius in PIXELS at the render resolution
 };
 
 enum {
@@ -235,6 +246,9 @@ enum {
     kTaaFlagNoUnjitter    = 1 << 4,
     kTaaFlagCatmull       = 1 << 5,
     kTaaFlagNoVecByVel    = 1 << 6,
+    // Velocity dilation: take the closest neighbour's vector at silhouettes.
+    // Default ON - it is a correctness fix for thin geometry, not an effect.
+    kTaaFlagDilate        = 1 << 7,
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -245,7 +259,18 @@ enum {
 // and buys the ability to answer a question in the ten seconds it takes to save
 // a file instead of the four minutes it takes to relaunch.
 static bool  taaEnabled()  { return live::onoff("taa.enable", "TAA_RESOLVE", false); }
-static int   taaMode()     { return live::i("taa.mode",  "TAA_MODE",  0); }
+// 2 (MODE_FULL), not 0 (MODE_PASSTHROUGH). The mode defaulted to a no-op
+// INDEPENDENTLY of taa.enable, so "TAA on, mode unset" ran the whole pipeline -
+// velocity, jitter, history, dispatch - and then copied the frame through
+// untouched. Nothing reports that: the panel says On, the duty counter says
+// 100%, and the picture is stock.
+//
+// It only ever bit when the two came apart, but the shipping ini is exactly
+// where they come apart: %TEMP%\taa_live.ini does not exist on a new install
+// (see the varclip note below), so on a fresh machine the compiled default IS
+// the configuration, and a user who enables TAA gets passthrough. A default
+// that does nothing is the wrong answer to "is it on?".
+static int   taaMode()     { return live::i("taa.mode",  "TAA_MODE",  2); }
 static float taaAlpha()    { return live::f("taa.alpha", "TAA_ALPHA", 0.05f); }
 static float taaGain()     { return live::f("taa.gain",  "TAA_GAIN",  4.0f); }
 // 8.0, not 1.25. A tight clamp rejects history wherever it differs from the
@@ -332,6 +357,24 @@ static bool taaObjFlags() { return live::onoff("taa.objflags", nullptr, true); }
 // and the knob remains for propeller aircraft, where the artefact it targets
 // is real and this test aircraft has none.
 static bool taaReactive() { return live::onoff("taa.reactive", "TAA_REACTIVE", false); }
+// Velocity dilation. ON by default: a silhouette pixel that takes the texel
+// centre's vector is reprojected as the BACKGROUND it partially covers, which
+// is why thin geometry - struts, antennas, wires, blade edges - ghosts. Set 0
+// to A/B it; the difference shows on edges under camera motion, nowhere else.
+static bool taaDilate() { return live::onoff("taa.dilate", "TAA_DILATE", true); }
+// ---- AMBIENT OCCLUSION.
+//
+// Computed inside the resolve from the clip w the injector writes into the
+// velocity target, so it costs eight texture taps and nothing else - no image,
+// no pass, no VRAM. X-Plane's own SSAO is coarse and spatial; this one is
+// accumulated by the history blend, which is where the quality comes from.
+//
+// 0 disables it before a single tap is taken. Default 0.5 - visible in cockpit
+// creases without looking like a filter.
+static float taaAoStrength() { return live::f("taa.ao",        "TAA_AO",        0.5f); }
+// Radius in PIXELS at render resolution. Small on purpose: this is contact
+// darkening at the scale of a switch base, not a large-scale ambient term.
+static float taaAoRadius()   { return live::f("taa.ao_radius", "TAA_AO_RADIUS", 12.0f); }
 // The unjitter alignment - isolation knob for the aligned sampling, so its
 // contribution can be removed live without touching the jitter itself.
 static bool taaUnjitter() { return live::onoff("taa.unjitter", nullptr, true); }
@@ -1242,6 +1285,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     const bool  doSharpen = sharpAmt > 0.0f && g_taa.sharpImage != VK_NULL_HANDLE
                             && g_taa.sharpView != VK_NULL_HANDLE;
     pcv.sharpen = sharpAmt;
+    pcv.aoStrength = taaAoStrength();
+    pcv.aoRadius   = taaAoRadius();
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
@@ -1249,7 +1294,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                  | (taaUnjitter()      ? 0 : kTaaFlagNoUnjitter)
                  | (taaCatmull()       ? kTaaFlagCatmull       : 0)
                  | (live::onoff("taa.novec_by_vel", nullptr, false)
-                        ? kTaaFlagNoVecByVel : 0);
+                        ? kTaaFlagNoVecByVel : 0)
+                 | (taaDilate()        ? kTaaFlagDilate        : 0);
     pcv.velScale = taaVelScale();
     pcv.velYSign = taaVelYSign();
     pcv.flagsValid = (g_taa.flagsValid && taaObjFlags()) ? 1 : 0;

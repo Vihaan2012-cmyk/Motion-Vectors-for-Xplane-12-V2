@@ -31,6 +31,16 @@
 struct MvTarget {
     bool ready  = false;
     bool failed = false;
+    // ---- WHAT IT FAILED AT, SO IT CAN BE RETRIED.
+    //
+    // `failed` used to be set in five places and cleared in none, so a single
+    // transient allocation failure disabled velocity and TAA for the life of
+    // the process - the "restart to fix" symptom. These record the shape that
+    // failed and how long ago, which is enough to tell a permanent refusal
+    // (this device will never give us this image) from a passing one (VRAM was
+    // momentarily exhausted by a scenery load).
+    uint32_t failedW = 0, failedH = 0;
+    uint32_t failedSkips = 0;
 
     VkDevice         device = VK_NULL_HANDLE;
     VkPhysicalDevice phys   = VK_NULL_HANDLE;
@@ -225,12 +235,46 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
 {
     MvTarget &m = g_mv;
     if (m.ready && m.w == w && m.h == h) return true;
-    if (m.failed) return false;
+    // ---- A FAILURE IS A SETBACK, NOT A SENTENCE.
+    //
+    // Two ways out, both cheap. A DIFFERENT shape is a genuinely new request -
+    // whatever was refused before says nothing about this one - so it retries
+    // at once. The SAME shape retries on a cooldown, because the usual cause is
+    // transient VRAM pressure during a scenery or aircraft load, and by the
+    // time the user notices TAA is gone the memory is long since free.
+    //
+    // The cooldown is counted in calls rather than frames because this header
+    // is included before the frame counter exists. mvCreate is reached roughly
+    // once a frame while velocity is wanted, so ~600 is on the order of ten
+    // seconds - long enough not to hammer a device that is genuinely refusing,
+    // short enough that recovery feels automatic instead of needing a restart.
+    if (m.failed) {
+        if (w != m.failedW || h != m.failedH) {
+            trace("MV: retrying velocity target at a new shape %ux%u (the "
+                  "%ux%u attempt failed; a different request is not bound by "
+                  "that answer)", w, h, m.failedW, m.failedH);
+            m.failed = false;
+            m.failedSkips = 0;
+        } else if (++m.failedSkips >= 600) {
+            trace("MV: retrying velocity target %ux%u after %u skipped "
+                  "attempts - the earlier failure was most likely transient, "
+                  "and staying dead until a restart is worse than trying again",
+                  w, h, m.failedSkips);
+            m.failed = false;
+            m.failedSkips = 0;
+        } else {
+            return false;
+        }
+    }
 
     mvDestroy(dd);
     m.device = device;
     m.phys   = phys;
     m.w = w; m.h = h;
+    // The shape now being attempted. Every `failed = true` below happens after
+    // this line, so recording it once here covers all five of them, and it is
+    // only ever read while `failed` is set - i.e. describing this attempt.
+    m.failedW = w; m.failedH = h;
 
     VkImageCreateInfo ici;
     memset(&ici, 0, sizeof(ici));
@@ -254,7 +298,7 @@ static bool mvCreate(DeviceData &dd, VkDevice device, VkPhysicalDevice phys,
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     if (dd.createImage(device, &ici, nullptr, &m.image) != VK_SUCCESS) {
-        trace("MV: image creation failed (%ux%u R16G16_SFLOAT)", w, h);
+        trace("MV: image creation failed (%ux%u R16G16B16A16_SFLOAT)", w, h);
         m.failed = true;
         return false;
     }

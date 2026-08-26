@@ -1671,6 +1671,16 @@ static int   getMvPatched(void*)
     { return g_share ? (int)g_share->mvPipelinesPatched : 0; }
 static int   getMvRejected(void*)
     { return g_share ? (int)g_share->mvPipelinesRejected : 0; }
+// The injector's own refusals. Separate from the driver's, because they fail
+// differently: a driver rejection loses the pipeline outright and is obvious,
+// while a location collision keeps rendering, writes no velocity, and shimmers
+// with every readout still green.
+static int   getMvInjCollided(void*)
+    { return g_share ? (int)g_share->mvInjLocationTaken : 0; }
+static int   getMvInjMalformed(void*)
+    { return g_share ? (int)g_share->mvInjMalformed : 0; }
+static int   getMvInjNoPosition(void*)
+    { return g_share ? (int)g_share->mvInjNoPosition : 0; }
 
 // The build's own version, so a bug report names a build. MV_VERSION comes from
 // the VERSION file by way of build.ps1; the fallback is deliberately not a
@@ -1789,12 +1799,18 @@ static void registerDatarefs()
         getMvPatched, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
     XPLMRegisterDataAccessor("taaimpl/pipelines_rejected", xplmType_Int, 0,
         getMvRejected, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/inj_collided", xplmType_Int, 0,
+        getMvInjCollided, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/inj_malformed", xplmType_Int, 0,
+        getMvInjMalformed, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/inj_no_position", xplmType_Int, 0,
+        getMvInjNoPosition, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
     XPLMRegisterDataAccessor("taaimpl/version", xplmType_Data, 0,
         nullptr, nullptr, nullptr, nullptr, 0,0,0,0,0,0,
         getVersionString, nullptr, nullptr, nullptr);
 
     xlog("registered %d datarefs under taaimpl/ (usable from FlyWithLua or any "
-         "script); build %s", 22, MV_VERSION);
+         "script); build %s", 25, MV_VERSION);
 }
 
 static void unregisterDatarefs()
@@ -2601,9 +2617,14 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // every session so far fsr/enable stayed at 1 and X-Plane spatially upscaled
     // 2953x1661 to the window UNDERNEATH our temporal upscaler. Two upscalers on
     // one image, and the spatial one resamples away the sub-pixel detail the
-    // temporal one is trying to accumulate - fsr2_pass.h says exactly this:
-    // "a spatial upscale smears a sub-pixel offset across a resample kernel
-    // before our resolve sees it, so no jitterOffset can recover it."
+    // temporal one is trying to accumulate: a spatial upscale smears a
+    // sub-pixel offset across a resample kernel before our resolve sees it, so
+    // no jitterOffset can recover it.
+    //
+    // (That sentence used to be quoted from fsr2_pass.h. No such file exists in
+    // this tree - a citation to a file nobody can open is worse than no
+    // citation, because it reads as authority. The claim is stated directly
+    // here now and stands on its own.)
     //
     // TAA_XP_FSR: -1 disables it (render native, our FSR2 becomes pure TAA at
     // render==display), 0..4 sets its quality. TAA_XP_FSR_BYPASS=1 keeps the

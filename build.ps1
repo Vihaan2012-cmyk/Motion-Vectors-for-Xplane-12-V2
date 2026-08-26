@@ -7,6 +7,9 @@ param([switch]$Installer, [switch]$Dev)
 # them at all, so there is nothing to gate.
 
 $ErrorActionPreference = "Stop"
+# Set if the optional Qt launcher fails; reported at the end so it stays visible
+# without aborting the build before the plugin is installed.
+$script:qtLauncherFailed = $false
 $root  = $PSScriptRoot
 
 # ---- ONE SOURCE OF TRUTH FOR THE VERSION.
@@ -166,12 +169,44 @@ if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
     # previous Qt version would be shipped alongside the current one.
     if (Test-Path $qtOut) { Remove-Item -Recurse -Force $qtOut }
     New-Item -ItemType Directory -Force $qtOut | Out-Null
+    # ---- ITS STDERR MUST NOT BE FATAL EITHER.
+    #
+    # Silencing the throw below was not enough. With $ErrorActionPreference =
+    # "Stop", ANY line this compiler writes to stderr becomes a terminating
+    # NativeCommandError the moment the script is invoked with a redirection
+    # (build.ps1 2>&1, which is how every automated caller runs it). g++ emits
+    # include-trace noise on stderr even when it succeeds, so the build died on
+    # a warning and skipped the install - the plugin then sat fourteen hours
+    # stale while the layer kept updating in place.
+    #
+    # Dropped to Continue for this one call and restored immediately after, so
+    # the strict setting still governs everything that actually matters.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     & $qtcxx -o (Join-Path $qtOut "MotionVectors.exe") "$src\qtlauncher\main.cpp" `
       "-I$qtRoot\include" "-I$qtRoot\include\QtCore" "-I$qtRoot\include\QtGui" `
       "-I$qtRoot\include\QtWidgets" "-I$qtRoot\include\QtNetwork" `
       -m64 -O2 -std=c++17 -mwindows -DQT_NO_DEBUG -DNDEBUG "-DMV_VERSION=\`"$mvVersion\`"" `
       "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network
-    if ($LASTEXITCODE -ne 0) { throw "Qt launcher build failed" }
+    # ---- AN OPTIONAL COMPONENT MUST NOT ABORT THE BUILD.
+    #
+    # This used to throw. With $ErrorActionPreference = "Stop" that ends the
+    # script - and the plugin INSTALL step is further down, so a failed Qt
+    # launcher silently left Resources\plugins\...\win.xpl at whatever version
+    # it happened to be. The layer still updated (it is loaded in place from
+    # VK_LAYER_PATH), so builds looked fine and only the plugin was stale.
+    #
+    # That cost real time: a TaaShare field added to the layer made structSize
+    # disagree with the fourteen-hour-old plugin, which then reported "VULKAN
+    # LAYER NOT ATTACHED" - a handshake failure presented as a missing layer.
+    #
+    # The launcher is a convenience UI. It must be able to fail without taking
+    # the binaries anyone actually flies with down alongside it. Recorded and
+    # reported loudly at the end instead.
+    if ($LASTEXITCODE -ne 0) {
+        $script:qtLauncherFailed = $true
+        Write-Host "  Qt launcher build FAILED - continuing so the plugin and layer still install." -ForegroundColor Yellow
+    }
     # ---- THE DEBUG CONSOLE.
     #
     # Built into the SAME directory as the public app, deliberately: they share
@@ -188,18 +223,22 @@ if ((Test-Path (Join-Path $qtRoot "bin\windeployqt.exe")) -and -not $qtcxx) {
       "-I$qtRoot\include\QtWidgets" `
       -m64 -O2 -std=c++17 -mwindows -DQT_NO_DEBUG -DNDEBUG "-DMV_VERSION=\`"$mvVersion\`"" `
       "-L$qtRoot\lib" -lQt6Widgets -lQt6Gui -lQt6Core
-    if ($LASTEXITCODE -ne 0) { throw "debug console build failed" }
+    if ($LASTEXITCODE -ne 0) { $script:qtLauncherFailed = $true; Write-Host "  debug console build FAILED - continuing." -ForegroundColor Yellow }
 
     & (Join-Path $qtRoot "bin\windeployqt.exe") --release --no-translations `
       (Join-Path $qtOut "MotionVectors.exe") | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+    if ($LASTEXITCODE -ne 0) { $script:qtLauncherFailed = $true; Write-Host "  windeployqt FAILED - continuing." -ForegroundColor Yellow }
     # Again for the console: it links QtWidgets/Gui/Core like the launcher, so
     # this adds nothing new today - but running it means a future dependency in
     # only one of the two cannot be missed, which is precisely the failure the
     # stale-launcher comment above records.
     & (Join-Path $qtRoot "bin\windeployqt.exe") --release --no-translations `
       (Join-Path $qtOut "MotionVectorsDebug.exe") | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "windeployqt failed for the debug console" }
+    if ($LASTEXITCODE -ne 0) { $script:qtLauncherFailed = $true; Write-Host "  windeployqt (debug console) FAILED - continuing." -ForegroundColor Yellow }
+    # Strictness restored here, at the END of the optional block - not midway
+    # through it, which left the debug console and both windeployqt calls back
+    # under Stop and reproduced the original abort one command further along.
+    $ErrorActionPreference = $prevEAP
 } else {
     Write-Host "Qt not found at $qtRoot - skipping the Qt launcher" -ForegroundColor Yellow
 }
@@ -224,4 +263,9 @@ if ($Installer) {
     Write-Host "  dist\MotionVectors-$mvVersion-setup.exe" -ForegroundColor Green
 }
 
+if ($script:qtLauncherFailed) {
+    Write-Host ""
+    Write-Host "BUILD COMPLETED, BUT THE QT LAUNCHER DID NOT." -ForegroundColor Yellow
+    Write-Host "  Plugin and layer installed correctly; only the launcher UI is stale." -ForegroundColor Yellow
+}
 Write-Host "Done." -ForegroundColor Green

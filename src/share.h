@@ -583,6 +583,23 @@ struct TaaShare {
     uint32_t measRenderW, measRenderH;
     uint32_t measDisplayW, measDisplayH;
 
+    // ---- WHY THE INJECTOR REFUSED, NOT JUST HOW MANY THE DRIVER DID.
+    //
+    // mvPipelinesRejected counts pipelines the DRIVER refused, and that is the
+    // only injection health figure that reaches the panel or a bug report - so
+    // the panel prints a green zero while the injector is silently declining
+    // shaders for its own reasons. Those two failures look identical on screen
+    // and completely different in cause.
+    //
+    // A location collision is the one that matters: the draw keeps rendering,
+    // writes NO velocity, reprojects from depth only, and shimmers. Nothing
+    // anywhere told anyone. Publishing the counts makes the difference between
+    // "the injector is fine" and "a fifth of the scene writes no vectors"
+    // visible without a trace file.
+    uint32_t mvInjLocationTaken;   // collided with our varying pair
+    uint32_t mvInjMalformed;       // SPIR-V the injector would not touch
+    uint32_t mvInjNoPosition;      // vertex stage never writes gl_Position
+
     int32_t valid;            // 0 until two frames of history exist
 };
 

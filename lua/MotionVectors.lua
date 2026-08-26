@@ -505,8 +505,8 @@ local SETTINGS = {
     group = "TAA", help = "" },
   { key = "taa.hist_catmull", label = "hist_catmull", kind = "bool", def = true, lo = nil, hi = nil,
     group = "TAA", help = "Sharp history resampling." },
-  { key = "taa.jitter_scale", label = "jitter_scale", kind = "float", def = 0.0, lo = 0.0, hi = 2.0,
-    group = "TAA", help = "Jitter defaults OFF even with the resolve on: the unjitter cancellation has never been verified on screen, and the first flight that ran it showed exa" },
+  { key = "taa.jitter_scale", label = "jitter_scale", kind = "float", def = 1.0, lo = 0.0, hi = 2.0,
+    group = "TAA", help = "Sub-pixel jitter amplitude. Without it TAA can only stabilise, not anti-alias. Cancellation is verified (parked, jitter on, image static). Set 0 only to isolate jitter from a suspected artefact." },
   { key = "taa.max_resolves", label = "max_resolves", kind = "int", def = 1, lo = 1, hi = 8,
     group = "TAA", help = "" },
   { key = "taa.mode", label = "mode", kind = "int", def = 0, lo = 0, hi = 3,
@@ -970,6 +970,10 @@ local function bug_write_debug(desc)
     f:write(string.format("moving_objects     = %d\n", get("taaimpl/moving_objects",0)))
     f:write(string.format("pipelines_patched  = %d\n", get("taaimpl/pipelines_patched",0)))
     f:write(string.format("pipelines_rejected = %d\n", get("taaimpl/pipelines_rejected",0)))
+    f:write(string.format("inj_collided       = %d   (varying collision: draws render, write NO velocity)\n",
+                          get("taaimpl/inj_collided",0)))
+    f:write(string.format("inj_malformed      = %d\n", get("taaimpl/inj_malformed",0)))
+    f:write(string.format("inj_no_position    = %d\n", get("taaimpl/inj_no_position",0)))
     f:write(string.format("lod_bias           = %.2f\n", get("taaimpl/lod_bias",0)))
     f:write("\n--- vram (MB) ---\n")
     f:write(string.format("used=%d  budget=%d  total=%d  velocity=%d\n",
@@ -1272,6 +1276,20 @@ local function build(w, x, y)
             string.format("%d", get("taaimpl/pipelines_patched", 0)))
         row("REJECTED BY THE DRIVER", string.format("%d", rejected),
             rejected == 0 and C_GREEN or C_RED)
+        -- A driver rejection is loud; an injector refusal is not. A collided
+        -- shader keeps drawing, writes no velocity, and shimmers, with every
+        -- other number on this panel still green. Shown separately because the
+        -- causes and the fixes are different.
+        local collided = get("taaimpl/inj_collided", 0)
+        local malformed = get("taaimpl/inj_malformed", 0)
+        local nopos = get("taaimpl/inj_no_position", 0)
+        row("VARYING COLLISIONS", string.format("%d", collided),
+            collided == 0 and C_GREEN or C_RED)
+        if malformed > 0 or nopos > 0 then
+            row("OTHER REFUSALS",
+                string.format("%d malformed, %d no position", malformed, nopos),
+                C_AMBER)
+        end
 
         heading("RENDER")
         row("RESOLUTION", string.format("%d x %d", get("taaimpl/viewport_w", 0),

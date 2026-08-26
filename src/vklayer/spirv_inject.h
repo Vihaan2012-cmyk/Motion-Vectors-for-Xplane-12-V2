@@ -486,6 +486,50 @@ inline uint32_t head(uint16_t op, uint16_t len)
     return ((uint32_t)len << 16) | (uint32_t)op;
 }
 
+// ---- STRUCTURAL SELF-CHECK ON WHAT WE EMIT.
+//
+// The injector writes SPIR-V by hand, into modules it has never seen. When it
+// gets that wrong the driver is the first thing to notice, and what the driver
+// does about it ranges from rejecting the pipeline (loud, recoverable) to
+// accepting it and rendering something subtly wrong (silent, and the failure
+// mode this project keeps re-learning).
+//
+// This is not spirv-val - it does not typecheck, and it is not meant to. It
+// catches the specific class of mistake hand-emission actually makes: an
+// instruction whose word count runs off the end of the module, a zero-length
+// instruction (an infinite loop in every consumer that walks the stream), and
+// a result id at or above the header's bound, which is the classic symptom of
+// allocating ids and forgetting to raise it.
+//
+// Cheap enough to run unconditionally: one linear pass over a few thousand
+// words, once per module at pipeline creation, never per frame. Emitting bad
+// SPIR-V and hoping is not worth the microseconds saved.
+inline bool selfCheck(const std::vector<uint32_t> &m)
+{
+    if (m.size() < 5 || m[0] != 0x07230203u) return false;
+    if (m[3] == 0) return false;                 // bound never written
+    size_t i = 5;
+    while (i < m.size()) {
+        const uint32_t len = m[i] >> 16;
+        if (len == 0) return false;              // would never terminate
+        if (i + len > m.size()) return false;    // runs past the end
+        i += len;
+    }
+    // Lands exactly on the end, not one word short or long. A stream that
+    // walks cleanly and terminates exactly is the property every consumer -
+    // driver included - assumes and none of them check for us.
+    //
+    // Deliberately NOT checked here: that every id is below the header bound.
+    // It is the mistake hand-emission is most likely to make, but it cannot be
+    // tested without knowing which words are ids, and guessing costs more than
+    // it catches: words 1 and 2 hold literals in plenty of instructions
+    // (OpSource carries a version like 450 in word 2), so a module with a small
+    // bound would be rejected for being correct. Refusing a valid injection
+    // loses the velocity write outright - a worse outcome than the bug this
+    // would have caught.
+    return i == m.size();
+}
+
 enum Result {
     INJ_OK = 0,
     INJ_NOT_VERTEX,       // fragment/compute - nothing to do, not a failure
@@ -1317,6 +1361,15 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         }
     }
 
+    // Emitted by hand into a module we have never seen - check the stream walks
+    // before handing it to a driver. INJ_MALFORMED rather than a silent pass:
+    // both-or-neither then discards the fragment side too, so the draw renders
+    // unpatched instead of rendering through SPIR-V we know is broken.
+    if (!selfCheck(out)) {
+        trace("MV VS: emitted module failed the structural self-check - "
+              "refusing it. This is our emission bug, not the shader's.");
+        return INJ_MALFORMED;
+    }
     if (location) *location = prevClipLocation();
     return INJ_OK;
 }
@@ -1452,7 +1505,21 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     }
 
     if (!isFragment) return INJ_NOT_VERTEX;   // "not our stage" - not a failure
-    if (!idV4 || !idFloat) return INJ_MALFORMED;
+    // ---- A MISSING vec4 IS NOT A MALFORMED SHADER.
+    //
+    // This refused any fragment that did not already declare float32 and vec4,
+    // and called it INJ_MALFORMED. Neither is true: the module is valid SPIR-V
+    // that simply never needed those types - a shader writing only uint or
+    // vec3 outputs, say. Refusing cost the whole draw, because both-or-neither
+    // then discarded the vertex patch that had already succeeded, so the
+    // geometry fell back to depth-only reprojection - which is exactly what
+    // shimmers while the camera moves.
+    //
+    // In the FF777 that was ONE shader out of 118 (patched=117 malformed=1)
+    // carrying ~1.4% of the frame's geometry binds in the deferred G-buffer.
+    // The types it lacked are the two we already synthesise half a dozen
+    // others from, so there was never anything to refuse - just types to
+    // declare. Emitted below, ahead of everything that depends on them.
     if (locationTaken) return INJ_LOCATION_TAKEN;
 
     // ---- MOVE A DEAD OUTPUT ASIDE RATHER THAN REFUSING THE WHOLE SHADER.
@@ -1541,6 +1608,10 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     uint32_t bound = w[3];
     uint32_t newV2 = 0, newPtrOutV4 = 0, newPtrInV4 = 0, newHalf = 0, newZero = 0;
     uint32_t newBool = 0, newOneF = 0;
+    // float32 and vec4 are synthesised on the same terms as the rest. They must
+    // be allocated FIRST: idV2, both pointer types and every float constant
+    // below name them, and a SPIR-V type must be declared before it is used.
+    uint32_t newFloat = 0, newV4 = 0;
     // ---- A PER-PIPELINE TAG, SO THE BAD DRAWS CAN BE NAMED.
     //
     // The exact-depth prediction agrees with the epipolar metric (176.0 px
@@ -1559,6 +1630,8 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     static uint32_t s_pidCounter = 0;
     const uint32_t myPid = ++s_pidCounter;
     uint32_t newPid = 0;
+    if (!idFloat)     { newFloat    = bound++; idFloat     = newFloat; }
+    if (!idV4)        { newV4       = bound++; idV4        = newV4; }
     if (!idV2)        { newV2       = bound++; idV2        = newV2; }
     if (!idPtrOutV4)  { newPtrOutV4 = bound++; idPtrOutV4  = newPtrOutV4; }
     if (!idPtrInV4)   { newPtrInV4  = bound++; idPtrInV4   = newPtrInV4; }
@@ -1583,6 +1656,10 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     annos.push_back(head(OpDecorate, 4)); annos.push_back(idInPrev); annos.push_back(Deco_Location); annos.push_back(prevClipLocation());
     annos.push_back(head(OpDecorate, 4)); annos.push_back(idOutMV);  annos.push_back(Deco_Location); annos.push_back(attachmentIndex);
 
+    // Emitted before every other global: OpTypeFloat has no dependency, the
+    // vec4 names it, and idV2/the pointers/the constants below name both.
+    if (newFloat)    { globals.push_back(head(OpTypeFloat, 3)); globals.push_back(newFloat); globals.push_back(32); }
+    if (newV4)       { globals.push_back(head(OpTypeVector, 4)); globals.push_back(newV4); globals.push_back(idFloat); globals.push_back(4); }
     if (newV2)       { globals.push_back(head(OpTypeVector, 4)); globals.push_back(newV2); globals.push_back(idFloat); globals.push_back(2); }
     if (newPtrOutV4) { globals.push_back(head(OpTypePointer, 4)); globals.push_back(newPtrOutV4); globals.push_back(SC_Output); globals.push_back(idV4); }
     if (newPtrInV4)  { globals.push_back(head(OpTypePointer, 4)); globals.push_back(newPtrInV4);  globals.push_back(SC_Input);  globals.push_back(idV4); }
@@ -1675,7 +1752,22 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // In RGBA mode both arrive together: velocity in xy, depths in zw, so the
     // flow can be predicted from measured depth instead of from an epipolar
     // line that degenerates near the focus of expansion.
-    const uint32_t idCh2 = wantRGBA ? idCw : idConstZero;
+    // ---- B CARRIES CLIP W, BECAUSE IT WAS CARRYING NOTHING.
+    //
+    // This channel wrote a constant zero in every shipping configuration - the
+    // target is RGBA16F, so it was paid for and thrown away on every draw.
+    //
+    // Clip w is view-space distance before the divide, which is exactly the
+    // depth proxy velocity dilation needs: to borrow the vector of the CLOSEST
+    // neighbour, the resolve has to know which neighbour is closest, and it has
+    // no depth binding. Putting w here is what makes dilation possible without
+    // plumbing a whole new descriptor through the pass.
+    //
+    // Cleared to 0, which is nearer than any real geometry - so the resolve must
+    // reject unwritten texels by the R sentinel before comparing this, never by
+    // the depth alone. Under the alpha SELECT blend it follows the same binary
+    // choice as RG, so B always describes whichever surface won the texel.
+    const uint32_t idCh2 = idCw;
     // Channel 3 carries the VERTEX shader's tag, which the vertex stage stamped
     // into currClip.z - the component this shader never reads. The fragment's
     // own tag named a stage that only performs a divide; prevClip is computed
@@ -1835,6 +1927,14 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
         if (i == globalsEnd)     for (size_t k = 0; k < globals.size(); ++k) out.push_back(globals[k]);
     }
 
+    // Same check as the vertex side, and the same reasoning: refusing here
+    // costs one draw's velocity, where shipping a malformed module costs
+    // whatever the driver decides to do about it.
+    if (!selfCheck(out)) {
+        trace("MV FS: emitted module failed the structural self-check - "
+              "refusing it. This is our emission bug, not the shader's.");
+        return INJ_MALFORMED;
+    }
     return INJ_OK;
 }
 

@@ -22,3 +22,8 @@ tools/*.exe
 tools/inject_test.exe
 xp-shot.ps1
 __pycache__/
+
+# Vendored FidelityFX SDK (823 MB). Restored out-of-band, never committed.
+third_party/
+gpuav/
+validation.txt
