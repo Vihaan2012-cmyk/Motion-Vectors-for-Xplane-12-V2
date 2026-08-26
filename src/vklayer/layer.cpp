@@ -153,6 +153,19 @@ static bool      g_shareOpen   = false;
 // pipeline we were about to inject into - rather than on a dataref name that
 // X-Plane does not publish. Sticky for the process on purpose: this is the
 // fail-safe direction, and changing MSAA needs a renderer restart anyway.
+// ---- HOW LONG SINCE ANYTHING DREW THE WORLD.
+//
+// The layer can see an aircraft swap without being told: while X-Plane loads,
+// nothing renders the scene. No qualifying scene pass ends, the colour targets
+// collapse to 2x2, and the only thing on screen is the loading page.
+//
+// That is worth detecting here rather than trusting the plugin, because the
+// plugin's signal has to cross a process boundary and a thread, and it already
+// failed to arrive once: it was published from a flight loop that does not run
+// during a load. This counter cannot miss - it is the absence of the thing
+// itself, observed in the layer that would be using the results.
+static uint32_t g_framesSinceScenePass = 0;
+
 static bool g_msaaStandDown = false;
 
 // ---- IS AN AIRCRAFT SWAP IN PROGRESS?
@@ -169,6 +182,18 @@ static bool g_msaaStandDown = false;
 // resolution change. The plugin is the only half that knows.
 static inline bool fgHeldForAircraftSwap()
 {
+    // Either signal is enough, and they fail in different ways.
+    //
+    // The plugin's hold knows an aircraft swap is COMING and covers the settle
+    // afterwards, which the layer cannot infer. But it crosses a process
+    // boundary and a thread, and it has already failed to arrive once.
+    //
+    // The layer's own test is the absence of the thing itself: no scene pass
+    // has ended for a while, so nothing is drawing the world and there is
+    // nothing sane to interpolate. It cannot fail to arrive, because it is not
+    // sent. Ten frames is well past any single dropped frame and far short of
+    // anything a flying sim would produce.
+    if (g_framesSinceScenePass > 10) return true;
     return g_share && g_share->magic == TAA_MAGIC && g_share->fgHold != 0;
 }
 
@@ -270,6 +295,16 @@ struct Snapshot {
     TaaMovingObject    objects[TAA_MAX_OBJECTS];
 };
 
+// ---- WHERE THE SUN IS, FOR CONTACT SHADOWS.
+//
+// Defined here rather than in taa.h because taa.h is included far below, and
+// snapshot() - the only writer - runs long before it. taaRecordResolve() takes
+// jitter as arguments for the same ordering reason.
+//
+// Unit vector toward the sun in view space. All zero means it is below the
+// horizon, which the resolve reads as "take no taps".
+static float g_taaSunView[3] = { 0.0f, 0.0f, 0.0f };
+
 static bool snapshot(Snapshot *o)
 {
     o->valid = false;
@@ -318,6 +353,30 @@ static bool snapshot(Snapshot *o)
         o->jitterIndex   = g_share->jitterIndex;
         o->jitterPhases  = g_share->jitterPhases;
         o->lodBias       = g_share->lodBias;
+        // Straight to the resolve's global - see the note on g_taaSunView.
+        g_taaSunView[0]  = g_share->sunViewX;
+        g_taaSunView[1]  = g_share->sunViewY;
+        g_taaSunView[2]  = g_share->sunViewZ;
+        // ---- SAY WHAT THE SUN IS DOING, PERIODICALLY.
+        //
+        // Contact shadows were built with no way to see this value at all. If
+        // the plugin published zeros - wrong matrix layout, dataref renamed,
+        // sun below the horizon - the effect would do nothing and look exactly
+        // like it being switched off. That is the failure shape this codebase
+        // keeps getting caught by, and shipping another one was careless.
+        {
+            static uint64_t n = 0;
+            if ((n++ % 600) == 0)
+                trace("SUN: view=(%+.3f, %+.3f, %+.3f) len=%.3f%s",
+                      g_taaSunView[0], g_taaSunView[1], g_taaSunView[2],
+                      sqrtf(g_taaSunView[0]*g_taaSunView[0] +
+                            g_taaSunView[1]*g_taaSunView[1] +
+                            g_taaSunView[2]*g_taaSunView[2]),
+                      (g_taaSunView[0]==0.0f && g_taaSunView[1]==0.0f &&
+                       g_taaSunView[2]==0.0f)
+                          ? "  - all zero: below the horizon, or not published"
+                          : "");
+        }
         o->camX          = g_share->camX;
         o->camY          = g_share->camY;
         o->camZ          = g_share->camZ;
@@ -9416,6 +9475,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     g_velInjectedThisFrame = false;
     g_taaResolvedThisFrame = false;
     g_sceneEndsLastFrame   = g_sceneEndsThisFrame;
+    // Counted BEFORE the reset below: a frame that ended no scene pass is a
+    // frame in which nothing drew the world.
+    if (g_sceneEndsThisFrame == 0) ++g_framesSinceScenePass;
+    else                            g_framesSinceScenePass = 0;
     g_sceneEndsThisFrame   = 0;
     // Report a change rather than only carrying it: the count moving means the
     // frame's pass structure moved, and one frame's TAA landed on the pass that

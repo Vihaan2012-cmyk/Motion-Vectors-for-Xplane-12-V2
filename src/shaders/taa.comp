@@ -181,6 +181,10 @@ layout(push_constant) uniform Params {
     // TaaPush: sharpen, reactiveAlpha, aoStrength, aoRadius.
     float aoStrength;   // 0 = off, and the shader takes no taps at all
     float aoRadius;     // radius in pixels at render resolution
+    // Contact shadows. sunView is a unit vector toward the sun in VIEW space,
+    // computed by the plugin; all zero means it is below the horizon.
+    float sunViewX, sunViewY, sunViewZ;
+    float csStrength;   // 0 = off
 } pc;
 
 const int FLAG_FREEZE_HISTORY = 1;
@@ -932,6 +936,90 @@ void main()
         }
         float ao = 1.0 - pc.aoStrength * (occ / float(AO_TAPS));
         currA *= clamp(ao, 0.0, 1.0);
+    }
+
+    // ---- CONTACT SHADOWS: THE SHADOW THE SHADOW MAP IS TOO COARSE TO DRAW.
+    //
+    // Not a second helping of AO. AO darkens creases from every direction at
+    // once and is there whether or not the sun is out; this is DIRECTIONAL -
+    // it only darkens what the sun is actually blocked from reaching. That is
+    // the short, hard shadowing a cascade never resolves: the strip under a
+    // gear door on a sunlit ramp, the line where a strut meets the tarmac,
+    // panel seams, the edge of a wing on the ground.
+    //
+    // The march is along the sun's direction PROJECTED INTO SCREEN SPACE. It is
+    // not a true world-space ray - that would need the projection matrix, and
+    // the push block is full to the byte. What it is instead is an occlusion
+    // test restricted to one direction, which is enough to make the shading
+    // directional and to make it move correctly as the sun moves.
+    //
+    // Hard where AO is soft, and deliberately: the first hit ends the march and
+    // there is no distance-weighted softening. A contact shadow that fades out
+    // looks like dirt.
+    //
+    // ON THE Y SIGN. The screen-space direction reuses pc.velYSign, because the
+    // NDC-to-screen Y convention here is the same one the velocity buffer had
+    // to be swept for. If shadows ever appear thrown to the wrong side of an
+    // object, that sign is the first thing to test - not this block's logic.
+    //
+    // Sun below the horizon arrives as an all-zero vector and costs nothing.
+    vec2 sunXY = vec2(pc.sunViewX, pc.sunViewY * pc.velYSign);
+    float sunLen = length(sunXY);
+    if (pc.csStrength > 0.0 && !unwritten && velS.z > 0.0 && sunLen > 0.05) {
+        float w0 = velS.z;
+        vec2  dir = sunXY / sunLen;
+        // Shorter than the AO radius on purpose. Contact shadows are a contact
+        // effect; marching them as far as the ambient term turns every silhou-
+        // ette into a smear and starts fighting the shadow map's own edge.
+        float csLen = pc.aoRadius * 0.5;
+        // Same interleaved-gradient offset the AO uses, so the eight steps do
+        // not land on the same eight depths across a flat surface and band it.
+        float ign = fract(52.9829189 * fract(dot(vec2(px), vec2(0.06711056, 0.00583715))));
+        const int CS_STEPS = 8;
+        float shadow = 0.0;
+        for (int i = 0; i < CS_STEPS; ++i) {
+            float t = (float(i) + ign) / float(CS_STEPS);
+            vec2  o = dir * (csLen * t) / vec2(size);
+            float wn = texture(uVelocity, vec3(uv + S + o, float(layer))).z;
+            if (wn <= 0.0) continue;                 // nothing wrote there
+            float d = w0 - wn;                       // >0 => sample is nearer
+            // A bias that GROWS along the march, standing in for the ray
+            // climbing toward the sun. Without it a merely sloped surface
+            // shadows itself and everything acquires a dark rim on the sunward
+            // side - the classic self-shadowing acne.
+            float bias = (0.004 + 0.02 * t) * w0;
+            if (d <= bias) continue;
+            // ---- AN OCCLUDER MUST BE CLOSE, AND "CLOSE" IS A DISTANCE IN
+            // METRES, NOT A FRACTION OF HOW FAR AWAY WE ARE.
+            //
+            // This was 0.06 * w0 + 0.05, which is a percentage of view depth:
+            // at 100 m it accepted anything within SIX METRES as a contact
+            // occluder. That is not contact shading, it is a very short ambient
+            // term, and it smeared darkness across ground nowhere near where
+            // geometry actually touches.
+            //
+            // A contact shadow is by definition a near-field effect, so the
+            // range is now a fixed world distance with only a small allowance
+            // for depth precision falling off with distance.
+            if (d > 0.35 + 0.002 * w0) continue;
+            // ---- ACCUMULATE, DO NOT LATCH.
+            //
+            // This used to be `shadow = 1.0; break;` - binary, first hit wins.
+            // A hard 0-or-1 term is the worst possible thing to feed a temporal
+            // filter: uHistory is both the output AND the next frame's history,
+            // so a value that flips full-on to full-off as the camera moves
+            // makes the current frame disagree with history, the variance clamp
+            // throws the history away, and accumulation collapses exactly when
+            // the camera moves.
+            //
+            // Partial occlusion over the remaining steps is stable under small
+            // camera motion because one tap changing its mind moves the result
+            // by 1/8, not by 1. The edge stays tight because the steps are
+            // short; it just stops being a step function.
+            shadow += 1.0 / float(CS_STEPS);
+        }
+        shadow = clamp(shadow * 2.0, 0.0, 1.0);
+        currA *= clamp(1.0 - pc.csStrength * shadow, 0.0, 1.0);
     }
 
     if (pc.reset != 0 || !valid || noVector) {

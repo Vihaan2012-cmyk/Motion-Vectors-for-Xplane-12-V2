@@ -304,9 +304,93 @@ inline void clearOneShot(const char *key)
     g_kv[key] = "0";
 }
 
+// ---- THE SHIPPED CONFIGURATION, COMPILED IN.
+//
+// These are the values the mod is known to look correct with. They live here,
+// in the binary, rather than in a file for one reason: the file is not reliable.
+// config/taa_live.ini is not even read - the layer resolves its path to
+// TAA_LIVE_FILE or %TEMP%	aa_live.ini - so for a long time the "shipped
+// config" was a document nobody loaded, and the two had silently diverged.
+// A value that matters cannot live somewhere that might not be read.
+//
+// These OVERRIDE the ini and the environment. That is the opposite of the usual
+// precedence and it is deliberate: a tuned value that took measurement to find
+// should not be lost to a stale ini, a half-finished experiment, or a file
+// someone edited once and forgot.
+//
+// WHAT IS NOT HERE MATTERS AS MUCH AS WHAT IS. Deliberately absent:
+//   - taa.enable, and the effect toggles (ao, contact, sharpen, dilate)
+//   - taa.fg and friends
+//   - the debug and one-shot switches (viz, force_reset, freeze_history, ...)
+// Freezing those would turn every button in the panel into a decoration, and
+// the effect toggles are exactly the controls needed to A/B a change. Only the
+// deep tuning - the numbers a user has no way to rederive - is locked.
+//
+// taa.unlock=1 releases all of it, for when tuning is the point.
+struct Shipped { const char *k; const char *v; };
+static const Shipped kShipped[] = {
+    // Accumulation and clipping.
+    { "taa.mode",              "2"      },
+    { "taa.alpha",             "0.05"   },
+    { "taa.alpha_moving",      "0.35"   },
+    { "taa.alpha_moving_px",   "3.0"    },
+    { "taa.gain",              "4.0"    },
+    { "taa.varclip",           "8.0"    },
+    { "taa.moved_dead",        "0.0"    },
+    { "taa.moved_eps",         "0.0001" },
+    { "taa.novec_alpha",       "0.05"   },
+    { "taa.novec_by_vel",      "0"      },
+    { "taa.novec_cov",         "-1.0"   },
+    { "taa.reactive",          "0"      },
+    { "taa.hist_catmull",      "1"      },
+    // Jitter and the unjitter shift. smul_y is negative because the viewport
+    // height is; this pair was swept, not argued, and must not drift.
+    { "taa.jitter_scale",      "1.0"    },
+    { "taa.unjitter",          "1"      },
+    { "taa.smul_x",            "0.5"    },
+    { "taa.smul_y",            "-0.5"   },
+    // Velocity conventions.
+    { "taa.vel_scale",         "1.0"    },
+    { "taa.vel_ypos",          "0"      },
+    { "taa.vel_max",           "1.0"    },
+    // Pass identification. These are how the layer finds the scene at all.
+    { "taa.clear_mode",        "1"      },
+    { "taa.mv_pass",           "-1"     },
+    { "taa.sticky_colour",     "-1"     },
+    { "taa.max_resolves",      "1"      },
+    { "taa.quad_needs_depth",  "1"      },
+    { "taa.quad_needs_pull",   "1"      },
+    { "taa.scene_needs_depth", "1"      },
+    // Near field. 0 disarms the near-field select, which is what caused the
+    // cockpit shake; 5.0 is the measured working value.
+    { "taa.nearfield_m",       "5.0"    },
+    { "taa.nearfield_view",    "-1"     },
+    // Sampling radius for the AO term. The STRENGTH stays user-facing; only the
+    // radius is fixed, because it is a tuned number and not a preference.
+    { "taa.ao_radius",         "12.0"   },
+    // Measured at -0.5 and it cost about half the frame rate at 4K on 8 GB of
+    // VRAM. It stays at 0 unless someone deliberately unlocks and retunes it.
+    { "taa.lod_bias",          "0.0"    },
+};
+
+// Reads g_kv directly and does NOT take the lock - it is called from inside
+// lookup(), which already holds it, and std::mutex is not recursive.
+inline bool unlockedLocked()
+{
+    std::map<std::string, std::string>::iterator it = g_kv.find("taa.unlock");
+    if (it == g_kv.end()) return false;
+    return !(it->second == "0" || it->second == "off" ||
+             it->second == "false" || it->second == "no");
+}
+
 inline bool lookup(const char *key, std::string &out)
 {
     std::lock_guard<std::mutex> g(g_mtx);
+    // The shipped table wins, unless the user has explicitly unlocked it.
+    if (!unlockedLocked()) {
+        for (size_t n = 0; n < sizeof(kShipped) / sizeof(kShipped[0]); ++n)
+            if (strcmp(kShipped[n].k, key) == 0) { out = kShipped[n].v; return true; }
+    }
     std::map<std::string, std::string>::iterator it = g_kv.find(key);
     if (it == g_kv.end()) return false;
     out = it->second;

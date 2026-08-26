@@ -615,6 +615,22 @@ struct TaaShare {
     // not the same as the scene being settled.
     uint32_t fgHold;
 
+    // ---- WHERE THE SUN IS, IN VIEW SPACE.
+    //
+    // For contact shadows: the short, hard shadowing that a shadow map is too
+    // coarse to resolve - a strut on a sunlit ramp, panel lines, the edge of a
+    // wing on tarmac.
+    //
+    // Computed here rather than in the shader because this is where the camera
+    // matrices live, and because the resolve's push block has four floats of
+    // headroom left, not seven. A direction is three of them; deriving it in
+    // the shader would need the projection as well.
+    //
+    // Unit length, pointing FROM the scene TOWARD the sun, in the same view
+    // space the resolve reasons in. All zero means "no sun worth marching
+    // toward" - below the horizon - and the shader skips the work entirely.
+    float sunViewX, sunViewY, sunViewZ;
+
     int32_t valid;            // 0 until two frames of history exist
 };
 

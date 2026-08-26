@@ -238,6 +238,18 @@ struct TaaPush {
     // out before taking a single tap.
     float   aoStrength;   // 0 = off, ~0.5 typical
     float   aoRadius;     // sampling radius in PIXELS at the render resolution
+
+    // ---- CONTACT SHADOWS. The last four floats that fit.
+    //
+    // sunView is a unit vector toward the sun in view space, computed by the
+    // plugin because that is where the camera matrices live. All zero means the
+    // sun is below the horizon and the shader skips the march entirely.
+    //
+    // The direction arrives ready to use rather than being derived here from
+    // pitch and heading, because deriving it would need the projection matrix
+    // as well and there is no room: see the assert below.
+    float   sunViewX, sunViewY, sunViewZ;
+    float   csStrength;   // 0 = off, ~0.6 typical
 };
 
 enum {
@@ -375,6 +387,13 @@ static bool taaDilate() { return live::onoff("taa.dilate", "TAA_DILATE", true); 
 // 0 disables it before a single tap is taken. Default 0.5 - visible in cockpit
 // creases without looking like a filter.
 static float taaAoStrength() { return live::f("taa.ao",        "TAA_AO",        0.5f); }
+// ---- DEFAULT OFF, DELIBERATELY.
+//
+// This shipped at 0.6 and therefore turned itself on for everyone the moment
+// the build landed, before it had been looked at once. Whatever its final
+// quality, a new screen-space effect that alters every frame is opt-in until it
+// has been A/B'd - the panel has a CONTACT button for exactly that.
+static float taaCsStrength() { return live::f("taa.contact",   "TAA_CONTACT",   0.0f); }
 // Radius in PIXELS at render resolution. Small on purpose: this is contact
 // darkening at the scale of a switch base, not a large-scale ambient term.
 static float taaAoRadius()   { return live::f("taa.ao_radius", "TAA_AO_RADIUS", 12.0f); }
@@ -748,6 +767,18 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     VkPushConstantRange pcr;
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcr.offset = 0;
+    // ---- THE PUSH BLOCK HAS A CEILING, AND IT SHOULD SAY SO OUT LOUD.
+    //
+    // 128 bytes is the Vulkan guaranteed minimum for maxPushConstantsSize.
+    // Desktop drivers give 256, so overrunning it would work here and fail
+    // silently somewhere else - which is the worst failure shape there is.
+    //
+    // Contact shadows brought this to exactly 128. Anything added after this
+    // point does not fit, and this assert is what says so at compile time
+    // rather than as corrupted uniforms on someone else's GPU.
+    static_assert(sizeof(TaaPush) <= 128,
+                  "TaaPush exceeds the 128-byte guaranteed push constant limit; "
+                  "move a field into the descriptor set instead of growing it.");
     pcr.size = sizeof(TaaPush);
     VkPipelineLayoutCreateInfo plci;
     memset(&plci, 0, sizeof(plci));
@@ -1306,6 +1337,12 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.reactiveAlpha = taaReactiveAlpha();
     pcv.aoStrength    = taaAoStrength();
     pcv.aoRadius      = taaAoRadius();
+    // The sun, straight through from the plugin. Zeroed when it is below the
+    // horizon, which the shader reads as "do not march".
+    pcv.sunViewX      = g_taaSunView[0];
+    pcv.sunViewY      = g_taaSunView[1];
+    pcv.sunViewZ      = g_taaSunView[2];
+    pcv.csStrength    = taaCsStrength();
     pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)

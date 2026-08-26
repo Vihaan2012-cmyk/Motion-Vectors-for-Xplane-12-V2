@@ -81,7 +81,7 @@ local C_LOG       = 0x6A101010   -- log box, translucent like the panel
 
 -- Version the panel reports, and the newest X-Plane this build has been tested
 -- against. No network check: bump this constant per release.
-local MOD_VERSION      = "1.1.1"
+local MOD_VERSION      = "1.1.5"
 
 -- ---- BUG REPORT DISCORD WEBHOOK.
 --
@@ -475,6 +475,53 @@ end
 --------------------------------------------------------------------------- ]]
 local BACKENDS = { "TAA", "DLSS", "FSR", "XeSS", "DLAA", "FG", "MFG" }
 
+-- Last non-zero value of each float effect, so the toggle row can put back what
+-- the user had rather than the built-in default. Session-scoped on purpose: the
+-- ini already holds the persistent value.
+local g_effect_last = {}
+
+-- ---- KEYS THE BINARY OWNS.
+--
+-- Mirrors kShipped[] in mv_live.h. These are compiled into the layer and
+-- override the ini, so a slider for one of them would move and change nothing.
+-- A control that lies is worse than no control, so they are drawn as LOCKED.
+--
+-- taa.unlock=1 releases them; the button for that is at the top of the
+-- advanced section.
+local LOCKED = {
+    ["taa.mode"] = true,
+    ["taa.alpha"] = true,
+    ["taa.alpha_moving"] = true,
+    ["taa.alpha_moving_px"] = true,
+    ["taa.gain"] = true,
+    ["taa.varclip"] = true,
+    ["taa.moved_dead"] = true,
+    ["taa.moved_eps"] = true,
+    ["taa.novec_alpha"] = true,
+    ["taa.novec_by_vel"] = true,
+    ["taa.novec_cov"] = true,
+    ["taa.reactive"] = true,
+    ["taa.hist_catmull"] = true,
+    ["taa.jitter_scale"] = true,
+    ["taa.unjitter"] = true,
+    ["taa.smul_x"] = true,
+    ["taa.smul_y"] = true,
+    ["taa.vel_scale"] = true,
+    ["taa.vel_ypos"] = true,
+    ["taa.vel_max"] = true,
+    ["taa.clear_mode"] = true,
+    ["taa.mv_pass"] = true,
+    ["taa.sticky_colour"] = true,
+    ["taa.max_resolves"] = true,
+    ["taa.quad_needs_depth"] = true,
+    ["taa.quad_needs_pull"] = true,
+    ["taa.scene_needs_depth"] = true,
+    ["taa.nearfield_m"] = true,
+    ["taa.nearfield_view"] = true,
+    ["taa.ao_radius"] = true,
+    ["taa.lod_bias"] = true,
+}
+
 -- BEGIN GENERATED SETTINGS -- produced by gen_lua.py from the layer
 -- source; every live:: key in src/vklayer is listed here. Do not edit
 -- by hand: a hand-kept copy is what left writeTemplate() at 6 of 88.
@@ -495,6 +542,8 @@ local SETTINGS = {
     group = "TAA", help = "Speed, in px/frame, at which alpha_moving is fully applied." },
   { key = "taa.clear_after_resolve", label = "clear_after_resolve", kind = "bool", def = false, lo = nil, hi = nil,
     group = "TAA", help = "" },
+  { key = "taa.contact", label = "contact", kind = "float", def = 0.6, lo = 0.0, hi = 1.0,
+    group = "TAA", help = "Contact shadows: the short, hard, SUN-DIRECTIONAL shadowing a shadow map is too coarse to draw - gear and struts on a sunlit ramp, panel seams, a wing edge on tarmac. Not a second helping of ao: ao is omnidirectional and always on, this only appears where the sun actually reaches. Costs nothing at night; the sun vector is zeroed below the horizon." },
   { key = "taa.enable", label = "enable", kind = "bool", def = false, lo = nil, hi = nil,
     group = "TAA", help = "---- EVERY KNOB IS LIVE." },
   { key = "taa.force_reset", label = "force_reset", kind = "bool", def = false, lo = nil, hi = nil,
@@ -697,10 +746,18 @@ end
 local function setting_row(sd)
     local rawv       = ini_raw(sd.key)
     local overridden = (rawv ~= nil)
+    local locked     = LOCKED[sd.key] and not (ini_get("taa.unlock", "0") == "1")
 
     -- Label, coloured by whether the user owns this value or the layer does.
-    text(overridden and C_TEXT or C_DIM, "  " .. sd.label)
+    text(locked and C_DIM or (overridden and C_TEXT or C_DIM), "  " .. sd.label)
     same(190)
+
+    -- A locked key is shipped in the binary and overrides the ini. Draw what it
+    -- actually is and stop, rather than a control that silently does nothing.
+    if locked then
+        text(C_DIM, "shipped - locked")
+        return
+    end
 
     if sd.kind == "bool" then
         local cur
@@ -1208,6 +1265,7 @@ local function build(w, x, y)
         logf(C_AMBER, on and "Mod switched off." or "Mod switched on.")
     end
 
+
     ---------------------------------------------------- everything below fold
     imgui.Separator()
     if imgui.Button(show_advanced and "Hide advanced settings"
@@ -1244,15 +1302,123 @@ local function build(w, x, y)
     -- row of greyed buttons was taking the most valuable space on the panel to
     -- advertise things that do nothing.
     imgui.TextUnformatted("")
+    -- ---- FG IS NOT AN ALTERNATIVE TO TAA. IT IS A SECOND AXIS.
+    --
+    -- The others in this row are reconstruction backends and are mutually
+    -- exclusive with TAA. Frame generation is not: it interpolates BETWEEN
+    -- resolved frames, so it runs alongside the resolve rather than instead of
+    -- it. It is drawn here because this is where a user looks for it, but it
+    -- toggles independently and both can be lit at once.
+    --
+    -- Launch-time, and the caption says so. taa.fg is read once when the
+    -- swapchain is created - turning it on replaces X-Plane's swapchain with
+    -- FFX's interpolation proxy, which cannot be done to a running sim.
+    --
+    -- fg_queues moves with it, always. Interpolation needs four queues, a queue
+    -- cannot be created after the device, so they must be asked for at device
+    -- creation - before the launch that uses them. Setting one without the
+    -- other is a trap: frame generation comes up with nowhere to present and
+    -- silently does nothing, which is exactly what happened in development.
+    local fgOn = (ini_get("taa.fg", "0") == "1")
     for i, b in ipairs(BACKENDS) do
-        local enabled = (b == "TAA")
         if i > 1 then same() end
-        styled_button(b, 76, 22, enabled and C_GREEN or C_DIM,
-                      enabled and C_GREEN_BG or C_GREY_BG, enabled)
+        if b == "TAA" then
+            styled_button(b, 76, 22, C_GREEN, C_GREEN_BG, true)
+        elseif b == "FG" then
+            if styled_button(b, 76, 22, fgOn and C_GREEN or C_GREY_ED,
+                             fgOn and C_GREEN_BG or C_GREY_BG, true) then
+                local want = fgOn and "0" or "1"
+                ini_set("taa.fg", want)
+                ini_set("taa.fg_queues", want)
+                logf(C_AMBER, fgOn
+                    and "Frame generation OFF - restart X-Plane to take effect."
+                    or  "Frame generation ON - restart X-Plane to take effect.")
+            end
+        else
+            styled_button(b, 76, 22, C_DIM, C_GREY_BG, false)
+        end
     end
-    text(C_DIM, "DLSS, FSR, XeSS, DLAA, FG and MFG are not implemented yet.")
+    text(C_DIM, "DLSS, FSR, XeSS, DLAA and MFG are not implemented yet.")
+    if fgOn then
+        text(C_AMBER, "Frame generation ON - takes effect on the next launch.")
+    else
+        text(C_DIM, "FG interpolates a frame between every rendered pair."
+                 .. " Takes effect on the next launch.")
+    end
+    text(C_DIM, "Known issue: changing aircraft while FG is on crashes the sim.")
+
+    ------------------------------------------------------------------ effects
+    --
+    -- These are a SEPARATE AXIS from the row above. The backends are ways of
+    -- reconstructing the image and are mutually exclusive; these are things the
+    -- resolve does on top of whichever one is running, and any combination of
+    -- them is valid. They are drawn as their own row for that reason.
+    --
+    -- Every one of them is LIVE - no restart, unlike FG. The resolve rereads
+    -- these on the frame after the write.
+    --
+    -- ON THE FLOAT ONES. ao, contact and sharpen are strengths, not switches,
+    -- and 0 is off. Toggling therefore has to invent an "on" value, and using
+    -- the built-in default would quietly discard a value the user had tuned in
+    -- the advanced panel. So the last non-zero value is remembered for the
+    -- session and restored, and only a first-ever toggle falls back to the
+    -- default.
+    local EFFECTS = {
+        { key = "taa.ao",      label = "AO",       def = "0.5",
+          tip = "Ambient occlusion - omnidirectional creases, always on." },
+        { key = "taa.contact", label = "CONTACT",  def = "0.6",
+          tip = "Contact shadows - sun-directional, outdoors in daylight only." },
+        { key = "taa.sharpen", label = "SHARPEN",  def = "0.35",
+          tip = "Post-resolve sharpen, gated on how converged each pixel is." },
+        { key = "taa.dilate",  label = "DILATE",   def = "1", bool = true,
+          tip = "Take the closest neighbour's velocity at silhouettes." },
+    }
+    imgui.TextUnformatted("")
+    for i, e in ipairs(EFFECTS) do
+        if i > 1 then same() end
+        local cur = ini_get(e.key, e.def)
+        local on
+        if e.bool then on = (cur == "1")
+        else on = ((tonumber(cur) or 0) > 0) end
+        if styled_button(e.label, 76, 22, on and C_GREEN or C_GREY_ED,
+                         on and C_GREEN_BG or C_GREY_BG, true) then
+            if on then
+                -- Remember what it was before zeroing it, so switching back on
+                -- restores a tuned value rather than stamping the default over
+                -- it.
+                if not e.bool then g_effect_last[e.key] = cur end
+                ini_set(e.key, "0")
+            else
+                ini_set(e.key, e.bool and "1" or (g_effect_last[e.key] or e.def))
+            end
+            logf(C_AMBER, e.label .. (on and " off." or " on."))
+        end
+    end
+    text(C_DIM, "Effects run on top of the backend above and are all live.")
 
     if show_advanced then
+        imgui.TextUnformatted("")
+        -- The unlock, first, because it governs everything below it.
+        local unlocked = (ini_get("taa.unlock", "0") == "1")
+        text(C_DIM, "  tuning lock")
+        same(190)
+        if styled_button((unlocked and "UNLOCKED" or "LOCKED") .. "##taa.unlock",
+                         90, 18,
+                         unlocked and C_AMBER or C_GREEN,
+                         unlocked and C_GREY_BG or C_GREEN_BG, true) then
+            ini_ensure()
+            ini_set("taa.unlock", unlocked and "0" or "1")
+            logf(C_AMBER, unlocked
+                and "Tuning LOCKED - the shipped values are in force again."
+                or  "Tuning UNLOCKED - the ini now overrides the shipped values.")
+        end
+        if unlocked then
+            text(C_AMBER, "The shipped tuning is overridden. This is how the")
+            text(C_AMBER, "picture gets worse. LOCKED restores it instantly.")
+        else
+            text(C_DIM, "31 tuned values are compiled into the layer and shown")
+            text(C_DIM, "as 'shipped - locked'. Unlock only to experiment.")
+        end
         imgui.TextUnformatted("")
         text(C_RED, "Do not change these unless you know what you are doing.")
         text(C_DIM, "Several of them can make the picture worse in ways that are")

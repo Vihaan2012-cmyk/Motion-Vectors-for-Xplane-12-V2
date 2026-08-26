@@ -63,29 +63,10 @@ if (-not $NoBuild) {
 # launcher is optional and its build is allowed to fail without blocking a
 # release, so it is checked separately below rather than gating this.
 $need = @(
-Copy-Item "$root\build\vklayer\VkLayer_mv.dll"  "$stage\MotionVectors\"
-Copy-Item "$root\build\vklayer\VkLayer_mv.json" "$stage\MotionVectors\"
-Copy-Item "$root\build\MotionVectorsLauncher.exe" "$stage\MotionVectors\"
-
-# ---- THE QT APP SHIPS AS A DIRECTORY, NOT AS A LONE EXE.
-#
-# This looked for build\qt\MotionVectors.exe, which the build has never
-# produced - build.ps1 writes the Qt output to build\qtlauncher - so the guard
-# was always false and the zip silently shipped without the settings app. A
-# missing optional component that never reports itself missing cannot be told
-# apart from one deliberately left out.
-#
-# The whole folder is copied because MotionVectors.exe cannot start without the
-# Qt runtime windeployqt puts beside it; shipping the exe alone ships something
-# that fails on launch, which is worse than absent.
-#
-# Path note: this tree is deliberately NOT split into two products, so the
-# artefacts sit directly under build\ - not build\MotionVectors\.
-$qtSrc = "$root\build\qtlauncher"
-if (Test-Path "$qtSrc\MotionVectors.exe") {
-    Copy-Item $qtSrc "$stage\MotionVectors\launcher" -Recurse
-} else {
-    Write-Host "  (no Qt launcher in build\qtlauncher - zip ships without it)"
+    "$root\build\vklayer\VkLayer_mv.dll",
+    "$root\build\vklayer\VkLayer_mv.json",
+    "$root\build\MotionVectorsLauncher.exe",
+    "$root\build\MotionVectors.xpl"
 )
 foreach ($f in $need) {
     if (-not (Test-Path $f)) { throw "missing build artefact: $f" }
@@ -107,8 +88,22 @@ foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path $d | Out-Null 
 Copy-Item "$root\build\vklayer\VkLayer_mv.dll"  "$stage\MotionVectors\"
 Copy-Item "$root\build\vklayer\VkLayer_mv.json" "$stage\MotionVectors\"
 Copy-Item "$root\build\MotionVectorsLauncher.exe" "$stage\MotionVectors\"
-if (Test-Path "$root\build\qt\MotionVectors.exe") {
-    Copy-Item "$root\build\qt\MotionVectors.exe" "$stage\MotionVectors\MotionVectorsSettings.exe"
+# ---- THE QT APP SHIPS AS A DIRECTORY, NOT AS A LONE EXE.
+#
+# This looked for build\qt\MotionVectors.exe, which the build has never
+# produced - build.ps1 writes the Qt output to build\qtlauncher - so the guard
+# was always false and the zip silently shipped without the settings app. A
+# missing optional component that never reports itself missing cannot be told
+# apart from one deliberately left out.
+#
+# The whole folder is copied because MotionVectors.exe cannot start without the
+# Qt runtime windeployqt puts beside it; shipping the exe alone ships something
+# that fails on launch, which is worse than absent.
+$qtSrc = "$root\build\qtlauncher"
+if (Test-Path "$qtSrc\MotionVectors.exe") {
+    Copy-Item $qtSrc "$stage\MotionVectors\launcher" -Recurse
+} else {
+    Write-Host "  (no Qt launcher in build\qtlauncher - zip ships without it)"
 }
 
 # X-Plane requires the plugin at Resources/plugins/<name>/64/win.xpl

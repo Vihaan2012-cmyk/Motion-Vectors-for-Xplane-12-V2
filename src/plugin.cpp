@@ -62,6 +62,7 @@
 #include <cstdarg>
 #include <string>
 #include <vector>
+#include <cmath>
 
 #define TAA_PLUGIN_VERSION "0.2.0"
 
@@ -181,6 +182,11 @@ static bool g_is777 = false;
 // Counted in frames rather than cleared on PLANE_LOADED, because that message
 // means "the aircraft is loaded", not "the scene has settled": textures keep
 // streaming well past it, which is precisely the window being protected.
+// The sun, for contact shadows. X-Plane reports it as pitch above the horizon
+// and a compass heading; what the resolve needs is a unit vector in view space.
+static XPLMDataRef g_drSunPitch   = nullptr;
+static XPLMDataRef g_drSunHeading = nullptr;
+
 static uint32_t g_fgHoldFrames = 0;
 static const uint32_t kFgHoldAfterLoad = 900;   // ~15 s at 60 fps
 
@@ -2467,6 +2473,11 @@ static float matrixCallback(float sinceLast, float, int, void *)
         g_drFov      = taaFind("sim/graphics/view/field_of_view_deg");
         g_drRevZ     = taaFind("sim/private/controls/hdr/use_reverse_z");
         g_drViewType = taaFind("sim/graphics/view/view_type");
+        // Contact shadows need to know where the sun is. Through taaFind, so a
+        // rename in a future X-Plane shows up in the dataref audit rather than
+        // as contact shadows quietly never appearing.
+        g_drSunPitch   = taaFind("sim/graphics/scenery/sun_pitch_degrees");
+        g_drSunHeading = taaFind("sim/graphics/scenery/sun_heading_degrees");
         // Whether the camera is outside the aeroplane. The body-frame test is
         // only meaningful when it is not - see the sampling gate.
         g_drViewExternal = taaFind("sim/graphics/view/view_is_external");
@@ -3923,6 +3934,39 @@ static float matrixCallback(float sinceLast, float, int, void *)
     s->jitterIndex  = g_jitterIndex;
     s->jitterPhases = phases;
     g_jitterIndex = (g_jitterIndex + 1) % phases;
+
+    // ---- THE SUN, TURNED INTO SOMETHING THE RESOLVE CAN MARCH ALONG.
+    //
+    // pitch is degrees above the horizon, heading is a compass bearing. X-Plane
+    // local coordinates are +X east, +Y up, +Z south, so the vector pointing at
+    // the sun is the obvious spherical construction with Z negated.
+    //
+    // Then rotated into view space by the modelview's 3x3. Only the rotation
+    // matters - a direction has no position - and using the full matrix would
+    // add the camera translation to a unit vector, which is meaningless and
+    // would put the sun somewhere different at every airport.
+    if (g_drSunPitch && g_drSunHeading) {
+        const float pitch = XPLMGetDataf(g_drSunPitch) * 0.01745329252f;
+        const float head  = XPLMGetDataf(g_drSunHeading) * 0.01745329252f;
+        const float cp = cosf(pitch);
+        const float wx =  cp * sinf(head);
+        const float wy =  sinf(pitch);
+        const float wz = -cp * cosf(head);
+        // Column-major mat4: element (row r, col c) is m[c*4+r].
+        const float *m = s->modelview;
+        float vx = m[0]*wx + m[4]*wy + m[8]*wz;
+        float vy = m[1]*wx + m[5]*wy + m[9]*wz;
+        float vz = m[2]*wx + m[6]*wy + m[10]*wz;
+        const float len = sqrtf(vx*vx + vy*vy + vz*vz);
+        // Below the horizon there is nothing to cast a contact shadow, so zero
+        // it and let the shader skip the march rather than trace toward a sun
+        // that is not there.
+        if (len > 1e-6f && pitch > 0.0f) {
+            s->sunViewX = vx / len; s->sunViewY = vy / len; s->sunViewZ = vz / len;
+        } else {
+            s->sunViewX = s->sunViewY = s->sunViewZ = 0.0f;
+        }
+    }
 
     s->lodBias     = g_lodBias;
     // Counted down here because this runs once per rendered frame, which is the
