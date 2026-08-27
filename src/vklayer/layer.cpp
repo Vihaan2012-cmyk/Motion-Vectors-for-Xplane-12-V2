@@ -2006,6 +2006,25 @@ static std::map<VkCommandBuffer,  MvShadowRegion> g_cbShadowRegion;
 static std::map<VkDescriptorSet,  MvShadowRegion> g_setGbufRegion;
 static std::map<VkCommandBuffer,  MvShadowRegion> g_cbGbufRegion;
 
+// ---- DYNAMIC OFFSETS: THE LAST LOCK.
+//
+// The qualified capture proved identity and STILL dumped garbage, because the
+// engine's blocks are UNIFORM_BUFFER_DYNAMIC: one per-frame arena buffer, the
+// descriptor carries only a base, and the real location arrives as a dynamic
+// offset at vkCmdBindDescriptorSets - the dyn[] array this layer received on
+// every call and never read. The template's entry types say which bindings
+// are dynamic and Vulkan orders dyn[] by ascending binding, so the set's
+// metadata below turns dyn[] into the true offsets for bindings 14 and 18.
+struct MvSunSetMeta {
+    VkBuffer     buf = VK_NULL_HANDLE;
+    VkDeviceSize shadowBase = 0, shadowRange = 0;
+    VkDeviceSize gbufBase = 0,   gbufRange = 0;
+    bool         shadowDynamic = false, gbufDynamic = false;
+    // Ascending dynamic-UBO bindings of this set, from its template.
+    std::vector<uint32_t> dynBindings;
+};
+static std::map<VkDescriptorSet, MvSunSetMeta> g_setSunMeta;
+
 // ---- THE DESCRIPTOR-BUFFER ROUTE, WHICH IS THE ONE THE ENGINE ACTUALLY USES.
 //
 // The classic capture above logged ZERO sightings: X-Plane routes u_shadow_data
@@ -3785,6 +3804,9 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
         for (std::map<VkCommandBuffer, MvShadowRegion>::iterator cg =
                  g_cbGbufRegion.begin(); cg != g_cbGbufRegion.end(); )
             if (cg->second.buf == buf) cg = g_cbGbufRegion.erase(cg); else ++cg;
+        for (std::map<VkDescriptorSet, MvSunSetMeta>::iterator sm =
+                 g_setSunMeta.begin(); sm != g_setSunMeta.end(); )
+            if (sm->second.buf == buf) sm = g_setSunMeta.erase(sm); else ++sm;
         for (std::map<uint64_t, std::pair<VkBuffer, uint64_t>>::iterator ba =
                  g_bufAddr.begin(); ba != g_bufAddr.end(); )
             if (ba->second.first == buf) ba = g_bufAddr.erase(ba); else ++ba;
@@ -7842,23 +7864,61 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
     static std::atomic<uint32_t> useSample(0);
     bool sampleUse = (useSample.fetch_add(1) & 63) == 0;
 
-    // Frame-matched u_shadow_data: when a set the template capture has tagged
-    // is bound into this command buffer, THIS frame's region rides along.
+    // Frame-matched u_shadow_data and u_gbuffer_data: when a PROVEN set is
+    // bound into this command buffer, resolve its dynamic offsets (dyn[] is
+    // ordered by ascending binding within each set) and latch the TRUE
+    // regions. Multi-set binds where the proven set is not first cannot be
+    // indexed without the other sets' layouts - counted and skipped, so the
+    // trace says whether that case even exists rather than guessing.
     if (sets) {
         std::lock_guard<std::mutex> g(g_lock);
-        if (!g_setShadowRegion.empty() || !g_setGbufRegion.empty())
+        if (!g_setSunMeta.empty())
             for (uint32_t i = 0; i < n; ++i) {
-                std::map<VkDescriptorSet, MvShadowRegion>::iterator it =
-                    g_setShadowRegion.find(sets[i]);
-                if (it != g_setShadowRegion.end()) {
-                    g_cbShadowRegion[cb] = it->second;
+                std::map<VkDescriptorSet, MvSunSetMeta>::iterator it =
+                    g_setSunMeta.find(sets[i]);
+                if (it == g_setSunMeta.end()) continue;
+                MvSunSetMeta &m = it->second;
+                if (i != 0 && (m.shadowDynamic || m.gbufDynamic)) {
+                    static uint64_t skipped = 0;
+                    if ((skipped++ % 600) == 0)
+                        trace("SUN META: proven set bound at position %u of "
+                              "%u - dyn[] not indexable, latch skipped "
+                              "(%llu times)", i, n,
+                              (unsigned long long)skipped);
+                    continue;
+                }
+                uint32_t idx14 = UINT32_MAX, idx18 = UINT32_MAX;
+                for (uint32_t k = 0; k < (uint32_t)m.dynBindings.size(); ++k) {
+                    if (m.dynBindings[k] == 14) idx14 = k;
+                    if (m.dynBindings[k] == 18) idx18 = k;
+                }
+                if (m.shadowRange) {
+                    VkDeviceSize off = m.shadowBase;
+                    if (m.shadowDynamic) {
+                        if (idx14 == UINT32_MAX || idx14 >= nd) continue;
+                        off += dyn[idx14];
+                    }
+                    MvShadowRegion r;
+                    r.buf = m.buf; r.off = off; r.range = m.shadowRange;
+                    g_cbShadowRegion[cb] = r;
                     if (g_cbShadowRegion.size() > 512)
                         g_cbShadowRegion.erase(g_cbShadowRegion.begin());
+                    static uint64_t lseen = 0;
+                    if ((lseen++ % 3000) == 0)
+                        trace("SUN META: latched shadow off=%llu (dyn %s) "
+                              "gbufIdx=%u nd=%u",
+                              (unsigned long long)off,
+                              m.shadowDynamic ? "yes" : "no", idx18, nd);
                 }
-                std::map<VkDescriptorSet, MvShadowRegion>::iterator ig =
-                    g_setGbufRegion.find(sets[i]);
-                if (ig != g_setGbufRegion.end()) {
-                    g_cbGbufRegion[cb] = ig->second;
+                if (m.gbufRange) {
+                    VkDeviceSize off = m.gbufBase;
+                    if (m.gbufDynamic) {
+                        if (idx18 == UINT32_MAX || idx18 >= nd) continue;
+                        off += dyn[idx18];
+                    }
+                    MvShadowRegion r;
+                    r.buf = m.buf; r.off = off; r.range = m.gbufRange;
+                    g_cbGbufRegion[cb] = r;
                     if (g_cbGbufRegion.size() > 512)
                         g_cbGbufRegion.erase(g_cbGbufRegion.begin());
                 }
@@ -16557,35 +16617,70 @@ static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
             }
         }
     }
-    // ---- PASS 2: tag only what the images proved.
-    if (dstSet != VK_NULL_HANDLE && ubo14 && sawCsm) {
-        MvShadowRegion r;
-        r.buf = ubo14->buffer; r.off = ubo14->offset; r.range = ubo14->range;
-        std::lock_guard<std::mutex> g(g_lock);
-        g_setShadowRegion[dstSet] = r;
-        g_shadowDataBuf = r.buf; g_shadowDataOff = r.off;
-        g_shadowDataRange = r.range;
-        if ((g_shadowDataSeen++ % 600) == 0)
-            trace("SHADOW TAP (qualified): u_shadow_data PROVEN by "
-                  "csm_shadow_maps in the same template - buffer=%p "
-                  "range=%llu (%llu sightings)",
-                  (void*)r.buf, (unsigned long long)r.range,
-                  (unsigned long long)g_shadowDataSeen);
-        if (g_setShadowRegion.size() > 256)
-            g_setShadowRegion.erase(g_setShadowRegion.begin());
-    }
-    if (dstSet != VK_NULL_HANDLE && ubo18 && sawGbufDepth) {
-        MvShadowRegion r;
-        r.buf = ubo18->buffer; r.off = ubo18->offset; r.range = ubo18->range;
-        std::lock_guard<std::mutex> g(g_lock);
-        g_setGbufRegion[dstSet] = r;
-        static uint64_t gseen = 0;
-        if ((gseen++ % 600) == 0)
-            trace("GBUF TAP (qualified): u_gbuffer_data PROVEN by gbuf-depth "
-                  "in the same template - buffer=%p range=%llu",
-                  (void*)r.buf, (unsigned long long)r.range);
-        if (g_setGbufRegion.size() > 256)
-            g_setGbufRegion.erase(g_setGbufRegion.begin());
+    // ---- PASS 2: metadata for the sets the images proved. The dynamic-UBO
+    // binding order comes from the SAME template entries, so dyn[] at bind
+    // time indexes straight to the true offsets.
+    if (dstSet != VK_NULL_HANDLE && (ubo14 || ubo18) &&
+        (sawCsm || sawGbufDepth)) {
+        MvSunSetMeta m;
+        for (size_t e = 0; e < entries.size(); ++e)
+            if (entries[e].descriptorType ==
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+                for (uint32_t j = 0; j < entries[e].descriptorCount; ++j)
+                    m.dynBindings.push_back(entries[e].dstBinding + j);
+        std::sort(m.dynBindings.begin(), m.dynBindings.end());
+        bool any = false;
+        if (ubo14 && sawCsm) {
+            m.buf = ubo14->buffer;
+            m.shadowBase = ubo14->offset; m.shadowRange = ubo14->range;
+            for (size_t e = 0; e < entries.size(); ++e)
+                if (entries[e].descriptorType ==
+                        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+                    entries[e].dstBinding <= 14 &&
+                    14 < entries[e].dstBinding + entries[e].descriptorCount)
+                    m.shadowDynamic = true;
+            any = true;
+        }
+        if (ubo18 && sawGbufDepth) {
+            m.buf = ubo18->buffer;
+            m.gbufBase = ubo18->offset; m.gbufRange = ubo18->range;
+            for (size_t e = 0; e < entries.size(); ++e)
+                if (entries[e].descriptorType ==
+                        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+                    entries[e].dstBinding <= 18 &&
+                    18 < entries[e].dstBinding + entries[e].descriptorCount)
+                    m.gbufDynamic = true;
+            any = true;
+        }
+        if (any) {
+            std::lock_guard<std::mutex> g(g_lock);
+            // Merge: shadow and gbuf can arrive in separate template writes
+            // to the same set.
+            MvSunSetMeta &dst = g_setSunMeta[dstSet];
+            if (m.shadowRange) {
+                dst.buf = m.buf;
+                dst.shadowBase = m.shadowBase; dst.shadowRange = m.shadowRange;
+                dst.shadowDynamic = m.shadowDynamic;
+            }
+            if (m.gbufRange) {
+                dst.buf = m.buf;
+                dst.gbufBase = m.gbufBase; dst.gbufRange = m.gbufRange;
+                dst.gbufDynamic = m.gbufDynamic;
+            }
+            if (!m.dynBindings.empty()) dst.dynBindings = m.dynBindings;
+            if (g_setSunMeta.size() > 256)
+                g_setSunMeta.erase(g_setSunMeta.begin());
+            static uint64_t qseen = 0;
+            if ((qseen++ % 600) == 0)
+                trace("SUN META (qualified): set=%p shadow(base=%llu rng=%llu "
+                      "dyn=%d) gbuf(base=%llu rng=%llu dyn=%d) dynUBOs=%zu",
+                      (void*)dstSet,
+                      (unsigned long long)dst.shadowBase,
+                      (unsigned long long)dst.shadowRange, dst.shadowDynamic ? 1 : 0,
+                      (unsigned long long)dst.gbufBase,
+                      (unsigned long long)dst.gbufRange, dst.gbufDynamic ? 1 : 0,
+                      dst.dynBindings.size());
+        }
     }
 }
 
