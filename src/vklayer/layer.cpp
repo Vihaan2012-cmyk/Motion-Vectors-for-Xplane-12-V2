@@ -1940,6 +1940,55 @@ extern "C" PFN_vkVoidFunction mvNextDeviceProcAddr(VkDevice device, const char *
     if (!it->second.gdpa) return nullptr;
     return it->second.gdpa(device, name);
 }
+// ---- X-PLANE TELLS US WHAT EVERY IMAGE IS. WE JUST NEVER LISTENED.
+//
+// The engine names every VkImage it creates through
+// vkSetDebugUtilsObjectNameEXT, gated only on the loader reporting
+// VK_EXT_debug_utils - which the loader always does, because the loader itself
+// implements it. Confirmed in the decompiled engine: gfx_vk_image.cpp names the
+// image immediately after vkCreateImage, every session, not just under
+// validation.
+//
+// This mod spent weeks identifying images by SHAPE - "five colour attachments",
+// "fmt=97 at swapchain size", census heuristics - while the engine was
+// announcing "gbuffer_pos" through a call our layer simply did not intercept.
+// This map is the correction: handle -> the engine's own name for it.
+static std::map<VkImage, std::string> g_imageNames;
+
+// The image the engine names "gbuf-depth" - identified by the name listener,
+// consumed by the resolve as its depth source under taa.pos_harvest.
+static VkImage g_engineDepthImage = VK_NULL_HANDLE;
+
+// The engine's name for an image this layer identified by shape, or null.
+// The check that closes the loop: shape-identification says WHICH image,
+// the listener says WHAT the engine calls it, and disagreement is a bug in
+// the shape check, announced instead of silent.
+static const char *mvEngineNameOf(VkImage img)
+{
+    std::map<VkImage, std::string>::iterator it = g_imageNames.find(img);
+    return it == g_imageNames.end() ? nullptr : it->second.c_str();
+}
+
+// ---- CREATION RECORDS FOR EVERY IMAGE AND BUFFER, FOR THE ORACLE.
+//
+// The name listener says WHAT the engine calls a handle; these say what the
+// handle IS - format, extent, layers, samples, usage - captured at creation
+// because nothing else ever tells us. Small structs, total maps: X-Plane
+// creates a few thousand images and the cost is noise.
+struct OracleImgInfo {
+    VkFormat              format  = VK_FORMAT_UNDEFINED;
+    VkImageType           type    = VK_IMAGE_TYPE_2D;
+    uint32_t              w = 0, h = 0, layers = 1;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    VkImageUsageFlags     usage   = 0;
+};
+static std::map<VkImage, OracleImgInfo> g_allImages;
+static std::map<VkBuffer, std::string>  g_bufferNames;
+static std::map<VkBuffer, uint64_t>     g_allBuffers;   // size in bytes
+
+#include "oracle_probe_spv.h"
+#include "oracle.h"
+
 #include "taa.h"
 
 
@@ -2087,34 +2136,7 @@ static std::vector<DepthCandidate> g_depthCandidates;
 // be tied together to answer "which image does the scene actually render into".
 static std::map<VkImageView, VkImage> g_viewToImage;
 
-// ---- X-PLANE TELLS US WHAT EVERY IMAGE IS. WE JUST NEVER LISTENED.
-//
-// The engine names every VkImage it creates through
-// vkSetDebugUtilsObjectNameEXT, gated only on the loader reporting
-// VK_EXT_debug_utils - which the loader always does, because the loader itself
-// implements it. Confirmed in the decompiled engine: gfx_vk_image.cpp names the
-// image immediately after vkCreateImage, every session, not just under
-// validation.
-//
-// This mod spent weeks identifying images by SHAPE - "five colour attachments",
-// "fmt=97 at swapchain size", census heuristics - while the engine was
-// announcing "gbuffer_pos" through a call our layer simply did not intercept.
-// This map is the correction: handle -> the engine's own name for it.
-static std::map<VkImage, std::string> g_imageNames;
 
-// The image the engine names "gbuf-depth" - identified by the name listener,
-// consumed by the resolve as its depth source under taa.pos_harvest.
-static VkImage g_engineDepthImage = VK_NULL_HANDLE;
-
-// The engine's name for an image this layer identified by shape, or null.
-// The check that closes the loop: shape-identification says WHICH image,
-// the listener says WHAT the engine calls it, and disagreement is a bug in
-// the shape check, announced instead of silent.
-static const char *mvEngineNameOf(VkImage img)
-{
-    std::map<VkImage, std::string>::iterator it = g_imageNames.find(img);
-    return it == g_imageNames.end() ? nullptr : it->second.c_str();
-}
 
 // The frame-generation backbuffers the layer tagged MUTABLE_FORMAT, mapped to
 // the usage they were really created with. Layer_CreateImageView consults this
@@ -3345,6 +3367,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
     }
 
     VkResult r = next(device, (drop || addedDst || addedMutable) ? &ci2 : ci, alloc, out);
+    if (r == VK_SUCCESS && ci && out && *out != VK_NULL_HANDLE) {
+        // Creation record for the oracle: what this handle IS. ci, not ci2 -
+        // the caller's intent, though usage may have been augmented above.
+        OracleImgInfo oi;
+        oi.format  = ci->format;
+        oi.type    = ci->imageType;
+        oi.w       = ci->extent.width;
+        oi.h       = ci->extent.height;
+        oi.layers  = ci->arrayLayers;
+        oi.samples = ci->samples;
+        oi.usage   = ci->usage;
+        std::lock_guard<std::mutex> g(g_lock);
+        g_allImages[*out] = oi;
+    }
     if (r != VK_SUCCESS) return r;
 
     if (addedMutable) {
@@ -3632,6 +3668,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateBuffer(
     VkResult r = next(device, ci, alloc, out);
     if (r != VK_SUCCESS || !ci || !out || *out == VK_NULL_HANDLE) return r;
 
+    {   // Creation record for the oracle.
+        std::lock_guard<std::mutex> g(g_lock);
+        g_allBuffers[*out] = (uint64_t)ci->size;
+    }
+
     if (getReq && g_ledgerOn) {
         VkMemoryRequirements req;
         memset(&req, 0, sizeof(req));
@@ -3668,6 +3709,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
             vramRemove(ve->second.cat, ve->second.bytes);
             g_vramBuf.erase(ve);
         }
+        g_bufferNames.erase(buf);
+        g_allBuffers.erase(buf);
     }
     if (next) next(device, buf, alloc);
 }
@@ -4039,6 +4082,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
             if (vi->second == img) vi = g_viewToImage.erase(vi); else ++vi;
         }
         g_imageNames.erase(img);
+        g_allImages.erase(img);
         if (img == g_engineDepthImage) g_engineDepthImage = VK_NULL_HANDLE;
         g_fgMutableImg.erase(img);
         for (size_t i = 0; i < g_depthCandidates.size(); ++i)
@@ -7955,6 +7999,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // somewhere else would drift from this and the two would disagree in logs
     // for reasons nobody could reconstruct later.
     uint64_t frames = ++g_frameCount;
+    oracle::tick(frames);
     // One proxy image per frame, matching the sim's own rotation through them.
     if (g_fgActive.load(std::memory_order_relaxed)) ++g_fgOutIndex;
 
@@ -10878,6 +10923,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
     // than of any binding, and the gap here is fifteenfold rather than marginal.
     bool isXpFsr = ci && spirvIsXpFsr(ci->pCode, ci->codeSize / 4) &&
                    ci->codeSize >= 10000;
+
+    // The oracle reads layouts out of every module that mentions a watch-list
+    // block. Cheap for the rest: a byte scan that fails fast.
+    if (ci && ci->pCode) oracle::reflect(ci->pCode, ci->codeSize / 4);
 
     // ---- HAND THE DRIVER OUR UPSCALER INSTEAD OF X-PLANE'S.
     //
@@ -16281,6 +16330,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_SetDebugUtilsObjectNameEXT(
                       "\"%s\"", nm.c_str());
         }
         g_imageNames[img] = nm;
+    } else if (info && info->objectType == VK_OBJECT_TYPE_BUFFER &&
+               info->pObjectName && info->objectHandle != 0) {
+        // Buffers get names too - and the engine's light list, if it names it,
+        // shows up HERE, not in the image map.
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) gdpa = it->second.gdpa;
+        g_bufferNames[(VkBuffer)info->objectHandle] = info->pObjectName;
     } else {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));

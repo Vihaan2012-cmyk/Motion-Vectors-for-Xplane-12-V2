@@ -1533,6 +1533,16 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.sunViewY      = g_taaSunView[1];
     pcv.sunViewZ      = g_taaSunView[2];
     pcv.csStrength    = taaCsStrength();
+    // ---- ORACLE MEASUREMENT MODE: our own effects OFF while measuring.
+    //
+    // AO, contact shadows and sharpen all modify the output the probes and
+    // any visual comparison would read; a clean measurement sees the pipeline,
+    // not our decoration of it. TAA itself stays on - it IS the pipeline.
+    if (oracle::armed()) {
+        pcv.aoStrength = 0.0f;
+        pcv.csStrength = 0.0f;
+        pcv.sharpen    = 0.0f;
+    }
     pcv.flags    = (pcReset             ? kTaaFlagReset         : 0)
                  | (cameraMoved        ? kTaaFlagCameraMoved   : 0)
                  | ((taaPosHarvest() && g_taa.edValid) ? kTaaFlagEngineDepth : 0)
@@ -1862,6 +1872,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // One resolve per recorded frame (taa.max_resolves=1) makes per-resolve and
     // per-frame the same thing, which is the pairing the algorithm needs.
     g_taa.historyWrite ^= 1u;
+
+    // The oracle's content probe rides the same command buffer, after the
+    // resolve - scene complete, engine targets in their read layouts.
+    oracle::record(dd, g_taa.device, cb);
 
     if ((++g_taa.dispatches % 600) == 1)
         trace("TAA: dispatch %llu - mode %d alpha %.3f reset %d (%ux%u x%u)",

@@ -209,7 +209,35 @@ $haveFfx = Test-Path (Join-Path $ffxSdk "sdk\src\backends\vk\ffx_vk.cpp")
 # skips anything whose object is already newer than its source - so adding
 # a source compiles it, and an unchanged tree costs nothing.
 if ($haveFfx) {
-    Write-Host "Building FidelityFX..."
+    Write-Host "Compiling oracle probe shader..."
+$opTmp = Join-Path $env:TEMP "oracle_probe.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/oracle_probe.comp" -o $opTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "oracle_probe.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $opTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "oracle_probe.comp failed spirv-val" }
+}
+$obytes = [System.IO.File]::ReadAllBytes($opTmp)
+if ($obytes.Length % 4) { throw "oracle_probe SPIR-V is not a whole number of words" }
+$owords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $obytes.Length; $i += 4) {
+    $owords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($obytes, $i)))
+}
+$osb = New-Object System.Text.StringBuilder
+[void]$osb.AppendLine("// Generated from src/shaders/oracle_probe.comp by build.ps1 - do not edit.")
+[void]$osb.AppendLine("#pragma once")
+[void]$osb.AppendLine("#include <stdint.h>")
+[void]$osb.AppendLine("")
+[void]$osb.AppendLine("static const uint32_t kOracleProbeSpv[] = {")
+for ($i = 0; $i -lt $owords.Count; $i += 8) {
+    $n = [Math]::Min(8, $owords.Count - $i)
+    [void]$osb.AppendLine("    " + (($owords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$osb.AppendLine("};")
+Set-Content -Path "$src/vklayer/oracle_probe_spv.h" -Value $osb.ToString() -Encoding utf8
+Write-Host ("  oracle_probe_spv.h: {0} words" -f $owords.Count)
+
+Write-Host "Building FidelityFX..."
     New-Item -ItemType Directory -Force $ffxObj | Out-Null
     # ---- FFX'S DIRECT VULKAN CALLS, REDIRECTED BY NAME.
     #

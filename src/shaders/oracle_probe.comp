@@ -1,0 +1,56 @@
+#version 450
+// ============================================================ THE ORACLE PROBE
+//
+// One workgroup, one image, one answer: what is actually IN this texture?
+//
+// The debug instrument's GPU half. The layer cycles it across every engine
+// image on the watch list; each dispatch samples an 8x8 grid over the whole
+// extent plus the exact centre texel, reduces to min / max / mean, and writes
+// one 64-byte record the CPU reads a ring-lap later. Sampling rather than
+// copying, deliberately: a copy needs TRANSFER_SRC usage the engine never set,
+// while sampling needs only a view - the same trick binding 5 of the resolve
+// already proved on gbuf-depth.
+//
+// Everything is vec4 so one shader handles colour, depth (r only), and
+// whatever else turns up; the CPU knows the format and prints accordingly.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2DArray uTex;
+
+// slot * 4 vec4s: [min][max][mean][centre]
+layout(binding = 1, std430) writeonly buffer OutB { vec4 slots[]; } o;
+
+layout(push_constant) uniform P {
+    int slot;       // ring slot this result belongs to
+    int layer;      // array layer probed (cubemaps get 0..5 across visits)
+    int pad0, pad1;
+} pc;
+
+shared vec4 sMin[64];
+shared vec4 sMax[64];
+shared vec4 sSum[64];
+
+void main()
+{
+    uint li = gl_LocalInvocationIndex;
+    vec2 uv = (vec2(gl_LocalInvocationID.xy) + 0.5) / 8.0;
+    vec4 v  = textureLod(uTex, vec3(uv, float(pc.layer)), 0.0);
+    sMin[li] = v; sMax[li] = v; sSum[li] = v;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (li < s) {
+            sMin[li] = min(sMin[li], sMin[li + s]);
+            sMax[li] = max(sMax[li], sMax[li + s]);
+            sSum[li] += sSum[li + s];
+        }
+        barrier();
+    }
+    if (li == 0u) {
+        uint b = uint(pc.slot) * 4u;
+        o.slots[b + 0u] = sMin[0];
+        o.slots[b + 1u] = sMax[0];
+        o.slots[b + 2u] = sSum[0] / 64.0;
+        o.slots[b + 3u] = textureLod(uTex, vec3(0.5, 0.5, float(pc.layer)), 0.0);
+    }
+}
