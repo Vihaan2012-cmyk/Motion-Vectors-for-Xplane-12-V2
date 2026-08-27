@@ -16372,6 +16372,53 @@ static bool mvNameInteresting(const std::string &n)
     return false;
 }
 
+// The u_shadow_data signature test, shared by every path that carries a
+// VkWriteDescriptorSet - classic updates AND push descriptors, which is the
+// route X-Plane actually uses (16 push-descriptor sites in the decompiled
+// engine; zero descriptor-set allocations for this block).
+static void mvNoteShadowWrites(uint32_t n, const VkWriteDescriptorSet *w)
+{
+    for (uint32_t i = 0; i < n && w; ++i) {
+        if ((w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+             w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) &&
+            w[i].dstBinding == 14 && w[i].pBufferInfo &&
+            w[i].pBufferInfo[0].range >= 1552) {
+            std::lock_guard<std::mutex> g(g_lock);
+            g_shadowDataBuf   = w[i].pBufferInfo[0].buffer;
+            g_shadowDataOff   = w[i].pBufferInfo[0].offset;
+            g_shadowDataRange = w[i].pBufferInfo[0].range;
+            if ((g_shadowDataSeen++ % 600) == 0)
+                trace("SHADOW TAP (push descriptor): u_shadow_data candidate - "
+                      "buffer=%p offset=%llu range=%llu (%llu sightings)",
+                      (void*)g_shadowDataBuf,
+                      (unsigned long long)g_shadowDataOff,
+                      (unsigned long long)g_shadowDataRange,
+                      (unsigned long long)g_shadowDataSeen);
+        }
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSet(
+    VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout,
+    uint32_t set, uint32_t n, const VkWriteDescriptorSet *w)
+{
+    mvNoteShadowWrites(n, w);
+    PFN_vkCmdPushDescriptorSetKHR next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator it =
+                g_devices.find(dispatchKey(ci->second));
+            if (it != g_devices.end() && it->second.gdpa)
+                next = (PFN_vkCmdPushDescriptorSetKHR)
+                    it->second.gdpa(ci->second, "vkCmdPushDescriptorSetKHR");
+        }
+    }
+    if (next && next != Layer_CmdPushDescriptorSet)
+        next(cb, bp, layout, set, n, w);
+}
+
 // ---- vkGetBufferDeviceAddress: the address book.
 static VKAPI_ATTR VkDeviceAddress VKAPI_CALL Layer_GetBufferDeviceAddress(
     VkDevice device, const VkBufferDeviceAddressInfo *info)
@@ -16529,6 +16576,8 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
 {
     RETURN_IF("vkSetDebugUtilsObjectNameEXT", Layer_SetDebugUtilsObjectNameEXT)
     RETURN_IF("vkGetDescriptorEXT",           Layer_GetDescriptorEXT)
+    RETURN_IF("vkCmdPushDescriptorSet",       Layer_CmdPushDescriptorSet)
+    RETURN_IF("vkCmdPushDescriptorSetKHR",    Layer_CmdPushDescriptorSet)
     RETURN_IF("vkGetBufferDeviceAddress",     Layer_GetBufferDeviceAddress)
     RETURN_IF("vkGetBufferDeviceAddressKHR",  Layer_GetBufferDeviceAddress)
     RETURN_IF("vkCreateSwapchainKHR",  Layer_CreateSwapchainKHR)
