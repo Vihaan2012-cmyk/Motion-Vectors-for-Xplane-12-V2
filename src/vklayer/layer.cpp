@@ -2002,6 +2002,15 @@ static VkBuffer     g_shadowDataBuf    = VK_NULL_HANDLE;
 static VkDeviceSize g_shadowDataOff    = 0;
 static VkDeviceSize g_shadowDataRange  = 0;
 static uint64_t     g_shadowDataSeen   = 0;
+// The gbuf equivalent, and both hold the DYNAMIC-OFFSET-RESOLVED location as
+// of the most recent proven bind. Per-cb matching cannot work here - X-Plane
+// records deferred lighting (where these bind) and our resolve into DIFFERENT
+// command buffers - so the resolve reads the latest globally-proven region.
+// Safe now that identity is image-proven: the old strobe was impostor blocks,
+// not staleness, and cascade matrices are near-constant frame to frame.
+static VkBuffer     g_gbufDataBuf      = VK_NULL_HANDLE;
+static VkDeviceSize g_gbufDataOff      = 0;
+static VkDeviceSize g_gbufDataRange    = 0;
 
 // ---- FRAME-MATCHED u_shadow_data, BECAUSE "LATEST" WAS A STROBE.
 //
@@ -3856,6 +3865,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
         g_bufferNames.erase(buf);
         g_allBuffers.erase(buf);
         if (buf == g_shadowDataBuf) g_shadowDataBuf = VK_NULL_HANDLE;
+        if (buf == g_gbufDataBuf)   g_gbufDataBuf   = VK_NULL_HANDLE;
         for (std::map<VkDescriptorSet, MvShadowRegion>::iterator sr =
                  g_setShadowRegion.begin(); sr != g_setShadowRegion.end(); )
             if (sr->second.buf == buf) sr = g_setShadowRegion.erase(sr); else ++sr;
@@ -7988,6 +7998,9 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                         g_cbShadowRegion[cb] = r;
                         if (g_cbShadowRegion.size() > 512)
                             g_cbShadowRegion.erase(g_cbShadowRegion.begin());
+                        // Global latest, resolved offset - the resolve reads this.
+                        g_shadowDataBuf = r.buf; g_shadowDataOff = r.off;
+                        g_shadowDataRange = r.range;
                     }
                     static uint64_t lseen = 0;
                     if ((lseen++ % 3000) == 0)
@@ -8010,6 +8023,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                         g_cbGbufRegion[cb] = r;
                         if (g_cbGbufRegion.size() > 512)
                             g_cbGbufRegion.erase(g_cbGbufRegion.begin());
+                        g_gbufDataBuf = r.buf; g_gbufDataOff = r.off;
+                        g_gbufDataRange = r.range;
                     }
                 }
             }

@@ -1635,6 +1635,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         if (it != g_cbGbufRegion.end()) {
             gbBuf = it->second.buf; gbOff = it->second.off;
             gbRange = it->second.range;
+        } else if (g_gbufDataBuf != VK_NULL_HANDLE) {
+            gbBuf = g_gbufDataBuf; gbOff = g_gbufDataOff;
+            gbRange = g_gbufDataRange;
         }
     }
     const bool gbufTap = (gbBuf != VK_NULL_HANDLE);
