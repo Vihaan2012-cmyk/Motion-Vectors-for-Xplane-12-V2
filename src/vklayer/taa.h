@@ -1639,6 +1639,15 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     }
     const bool gbufTap = (gbBuf != VK_NULL_HANDLE);
     const bool sunTap = (sdBuf != VK_NULL_HANDLE) && g_taa.sunValid;
+    // What did the resolve's OWN command buffer actually carry? The taps only
+    // help if the engine bound these sets into the same cb the resolve records
+    // into - this says so, once every ~600 dispatches.
+    {
+        static uint64_t rt = 0;
+        if ((rt++ % 600) == 0)
+            trace("RESOLVE TAP: sun=%d gbuf=%d (this cb's regions)",
+                  sunTap ? 1 : 0, gbufTap ? 1 : 0);
+    }
     VkDescriptorBufferInfo bs;
     bs.buffer = sunTap ? sdBuf : g_taa.uboBuf;
     bs.offset = sunTap ? sdOff : 2048ull * setIdx;
