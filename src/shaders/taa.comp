@@ -110,6 +110,21 @@ layout(binding = 4)          uniform usampler2DArray uFlags;
 // engine drew anything. When the flag is off (or identification has not landed
 // yet) binding 5 holds the velocity target as a dummy and is never sampled.
 layout(binding = 5)          uniform sampler2DArray uEngineDepth;
+// ---- THE REPROJECTION MATRIX, FOR PIXELS THE INJECTION NEVER WROTE.
+//
+// The SAME unjittered camera-relative matrix the injected vertex shaders
+// receive per draw: prevClip = uReproj * currClip. Homogeneous, so a point at
+// infinity (sky) becomes a direction and reprojects by ROTATION - which is
+// exactly what the sky needs when the camera pans, and it falls out of the
+// mathematics rather than being a special case.
+//
+// uReprojParams: x = the viewport Y sign (framebuffer-UV to NDC), y = 1 when
+// the matrix is valid this frame (the plugin could not always invert), zw
+// unused. Read only under FLAG_DEPTH_REPROJECT.
+layout(binding = 6, std140) uniform ReprojData {
+    mat4 uReproj;
+    vec4 uReprojParams;
+};
 
 
 layout(push_constant) uniform Params {
@@ -223,8 +238,28 @@ const int FLAG_CATMULL        = 32;  // sharp history resampling; see the
 const int FLAG_RESET          = 512;  // was the int32 pc.reset
 const int FLAG_CAMERA_MOVED   = 1024; // was the int32 pc.cameraMoved
 const int FLAG_ENGINE_DEPTH   = 2048; // binding 5 holds X-Plane's own depth
+const int FLAG_DEPTH_REPROJECT = 4096; // reconstruct velocity at unwritten px
 // view distance from engine depth; fb is the injected clip-w fallback so a
 // wrong identification degrades to exactly the previous behaviour.
+// Velocity reconstructed from engine depth + camera motion, in EXACTLY the
+// injection's convention: mv = (curr.xy/curr.w - prev.xy/prev.w) * 0.5, NDC
+// units, unscaled (the caller applies pc.velScale like any written vector).
+// Right for everything static, which is precisely the population of pixels
+// that has no written vector: sky, clouds, terrain drawn by unpatched shaders.
+// Moving objects our injection missed still reproject as if static - coarse,
+// but strictly better than the zero they carried before.
+vec2 mvReconstructVel(vec2 u, float lay)
+{
+    float d = texture(uEngineDepth, vec3(u, lay)).r;
+    // Framebuffer UV to NDC. The Y sign comes from the viewport the layer
+    // actually saw, not from an assumption - same rule as the jitter push.
+    vec2 ndc = vec2(u.x * 2.0 - 1.0, uReprojParams.x * (u.y * 2.0 - 1.0));
+    vec4 curr = vec4(ndc, d, 1.0);
+    vec4 prev = uReproj * curr;
+    if (abs(prev.w) < 1e-9) return vec2(0.0);
+    return (curr.xy - prev.xy / prev.w) * 0.5;
+}
+
 float mvViewDepth(vec2 u, float lay, float fb)
 {
     if ((pc.flags & FLAG_ENGINE_DEPTH) == 0) return fb;
@@ -704,6 +739,20 @@ void main()
     // any reachable velocity and well above the sentinel.
     bool unwritten = velS.x < -1000.0 || velS.y < -1000.0;
     vec2 vel  = unwritten ? vec2(0.0) : velS.xy * pc.velScale;
+    // ---- AN UNWRITTEN PIXEL IS NO LONGER AN UNREADABLE ONE.
+    //
+    // vel = 0 at an unwritten pixel was the resolve's oldest dilemma: with the
+    // camera moving, zero is simply WRONG for everything static, and the whole
+    // novec/cameraMoved machinery below exists to manage how wrong. With the
+    // engine's depth bound, the camera-motion component is computable exactly
+    // - so compute it. The pixel keeps its unwritten status for every other
+    // decision (coverage, alpha, AO gates); only the vector stops being a lie.
+    bool reconstructed = false;
+    if (unwritten && (pc.flags & FLAG_DEPTH_REPROJECT) != 0 &&
+        uReprojParams.y > 0.5) {
+        vel = mvReconstructVel(uv + S, float(layer)) * pc.velScale;
+        reconstructed = true;
+    }
     // ---- THE COVERAGE MASK (C13 -> C14).
     //
     // The velocity target is RGBA16F and its alpha carries the transparency
@@ -891,7 +940,12 @@ void main()
         // which the reactive mask hands to the current frame. The prop disc
         // should be a clean yellow circle; yellow over the whole airframe
         // would mean the gate is misreading opaque geometry.
-        vec3 c = noVector    ? vec3(1.0, 0.0, 0.0)
+        // MAGENTA: unwritten, but carrying a depth-reconstructed vector -
+        // the set that used to be red. Red shrinking to magenta under camera
+        // motion IS the feature working; red that stays red is a pixel the
+        // reconstruction could not serve (invalid matrix, or harvest off).
+        vec3 c = reconstructed ? vec3(1.0, 0.0, 1.0)
+               : noVector    ? vec3(1.0, 0.0, 0.0)
                : !valid     ? vec3(0.0, 0.0, 1.0)
                : (covMax < 0.5 && (pc.flags & FLAG_REACTIVE) != 0)
                             ? vec3(1.0, 1.0, 0.0)

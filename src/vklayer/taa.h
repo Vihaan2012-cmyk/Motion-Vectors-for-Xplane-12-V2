@@ -130,6 +130,13 @@ struct TaaState {
     static const uint32_t kSets = 16;
     VkDescriptorSet sets[kSets] = { VK_NULL_HANDLE };
     uint32_t        nextSet = 0;
+    // Per-dispatch uniform data (the reprojection matrix for depth-
+    // reconstructed velocity). A ring of kSets slots aligned to 256 so the
+    // slot written for this dispatch is never one the GPU may still be
+    // reading - the same rotation discipline as the descriptor sets.
+    VkBuffer        uboBuf = VK_NULL_HANDLE;
+    VkDeviceMemory  uboMem = VK_NULL_HANDLE;
+    void           *uboMap = nullptr;
 
     uint32_t w = 0, h = 0;
     // Array layers of the scene target, and therefore of our history. One for a
@@ -272,6 +279,7 @@ enum {
     kTaaFlagReset         = 1 << 9,   // was the int32 TaaPush::reset
     kTaaFlagCameraMoved   = 1 << 10,  // was the int32 TaaPush::cameraMoved
     kTaaFlagEngineDepth   = 1 << 11,  // binding 5 holds X-Plane's gbuf-depth
+    kTaaFlagDepthReproject = 1 << 12, // reconstruct velocity at unwritten px
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -388,6 +396,13 @@ static bool taaDilate() { return live::onoff("taa.dilate", "TAA_DILATE", true); 
 // of the injected clip-w. Off by default until it has been A/B'd - and it can
 // only engage once the name listener has identified the image anyway.
 static bool taaPosHarvest() { return live::onoff("taa.pos_harvest", "TAA_POS_HARVEST", false); }
+// Depth-reconstructed velocity for pixels the injection never wrote (sky,
+// clouds, any unpatched shader). Needs pos_harvest's engine depth AND a valid
+// reprojection matrix; degrades to the old vel=0 per-pixel otherwise. The
+// reconstruction uses the SAME matrix and the SAME (curr - prev) * 0.5 formula
+// as the injected vertex shaders, so both vector populations agree in units,
+// sign and convention by construction.
+static bool taaNovecReproject() { return live::onoff("taa.novec_reproject", "TAA_NOVEC_REPROJECT", true); }
 // ---- AMBIENT OCCLUSION.
 //
 // Computed inside the resolve from the clip w the injector writes into the
@@ -452,6 +467,12 @@ static void taaDestroyState(DeviceData &dd, TaaState &g_taa)
     if (g_taa.pipeLayout)  dd.destroyPipelineLayout(g_taa.device, g_taa.pipeLayout, nullptr);
     if (g_taa.setLayout)   dd.destroyDescriptorSetLayout(g_taa.device, g_taa.setLayout, nullptr);
     if (g_taa.pool)        dd.destroyDescriptorPool(g_taa.device, g_taa.pool, nullptr);
+    if (g_taa.uboBuf) {
+        PFN_vkDestroyBuffer pfnDb =
+            (PFN_vkDestroyBuffer)dd.gdpa(g_taa.device, "vkDestroyBuffer");
+        if (pfnDb) pfnDb(g_taa.device, g_taa.uboBuf, nullptr);
+    }
+    if (g_taa.uboMem)      dd.freeMemory(g_taa.device, g_taa.uboMem, nullptr);
     if (g_taa.sampler)     dd.destroySampler(g_taa.device, g_taa.sampler, nullptr);
     if (g_taa.samplerNearest) dd.destroySampler(g_taa.device, g_taa.samplerNearest, nullptr);
     for (int i = 0; i < 2; ++i)
@@ -755,7 +776,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                   "override stays off");
     }
 
-    VkDescriptorSetLayoutBinding b[6];
+    VkDescriptorSetLayoutBinding b[7];
     memset(b, 0, sizeof(b));
     // Binding 0 is a SAMPLER now, not a storage image: the dispatch only reads
     // the scene. That is what lets the scene target keep X-Plane's own usage
@@ -768,14 +789,17 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     // Binding 5: the engine's depth, sampled. Dummy-bound to the velocity
     // target whenever the real image is unidentified or the harvest is off.
     b[5].binding = 5; b[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    for (int i = 0; i < 6; ++i) {
+    // Binding 6: the per-dispatch uniform slot (reprojection matrix). Always
+    // bound; the shader only reads it under kTaaFlagDepthReproject.
+    b[6].binding = 6; b[6].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    for (int i = 0; i < 7; ++i) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci;
     memset(&dlci, 0, sizeof(dlci));
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 6; dlci.pBindings = b;
+    dlci.bindingCount = 7; dlci.pBindings = b;
     if (dd.createDescriptorSetLayout(dev, &dlci, nullptr, &g_taa.setLayout) != VK_SUCCESS) return false;
 
     VkPushConstantRange pcr;
@@ -826,16 +850,18 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
         return false;
     }
 
-    VkDescriptorPoolSize ps[2];
+    VkDescriptorPoolSize ps[3];
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = 1 * TaaState::kSets;   // history write only
     ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     ps[1].descriptorCount = 5 * TaaState::kSets;   // scene, velocity, history, flags, engine depth
+    ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    ps[2].descriptorCount = 1 * TaaState::kSets;   // reproj slot
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.maxSets = TaaState::kSets;
-    dpci.poolSizeCount = 2; dpci.pPoolSizes = ps;
+    dpci.poolSizeCount = 3; dpci.pPoolSizes = ps;
     if (dd.createDescriptorPool(dev, &dpci, nullptr, &g_taa.pool) != VK_SUCCESS) return false;
 
     VkDescriptorSetLayout layouts[TaaState::kSets];
@@ -847,6 +873,69 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     dsai.descriptorSetCount = TaaState::kSets;
     dsai.pSetLayouts = layouts;
     if (dd.allocateDescriptorSets(dev, &dsai, g_taa.sets) != VK_SUCCESS) return false;
+
+    // ---- THE REPROJECTION SLOT RING.
+    //
+    // 256 bytes per slot (the worst-case minUniformBufferOffsetAlignment),
+    // one slot per descriptor set, HOST_VISIBLE|COHERENT and mapped for the
+    // lifetime of the state. The record path writes the slot belonging to the
+    // set it is about to dispatch with; the ring depth is what makes that
+    // write safe while earlier dispatches may still be reading their slots.
+    //
+    // Failure here IS fatal to init, deliberately. Binding 6 is statically
+    // used by the shader, so a descriptor set with no buffer written there is
+    // invalid Vulkan whatever the runtime flag says - the graceful path would
+    // be undefined behaviour wearing a seatbelt. A 4 KB host-visible buffer
+    // failing to allocate means the device is in far worse trouble than a
+    // missing resolve.
+    {
+        PFN_vkCreateBuffer  pfnCreateBuffer =
+            (PFN_vkCreateBuffer)dd.gdpa(dev, "vkCreateBuffer");
+        PFN_vkGetBufferMemoryRequirements pfnBufReq =
+            (PFN_vkGetBufferMemoryRequirements)dd.gdpa(dev, "vkGetBufferMemoryRequirements");
+        PFN_vkBindBufferMemory pfnBindBuf =
+            (PFN_vkBindBufferMemory)dd.gdpa(dev, "vkBindBufferMemory");
+        PFN_vkMapMemory pfnMap = (PFN_vkMapMemory)dd.gdpa(dev, "vkMapMemory");
+        if (pfnCreateBuffer && pfnBufReq && pfnBindBuf && pfnMap) {
+            VkBufferCreateInfo bci;
+            memset(&bci, 0, sizeof(bci));
+            bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bci.size  = 256ull * TaaState::kSets;
+            bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+            bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            if (pfnCreateBuffer(dev, &bci, nullptr, &g_taa.uboBuf) == VK_SUCCESS) {
+                VkMemoryRequirements mr;
+                pfnBufReq(dev, g_taa.uboBuf, &mr);
+                VkMemoryAllocateInfo mai;
+                memset(&mai, 0, sizeof(mai));
+                mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                mai.allocationSize = mr.size;
+                mai.memoryTypeIndex = taaFindMemory(dd, mr.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                if (mai.memoryTypeIndex != UINT32_MAX &&
+                    dd.allocateMemory(dev, &mai, nullptr, &g_taa.uboMem) == VK_SUCCESS &&
+                    pfnBindBuf(dev, g_taa.uboBuf, g_taa.uboMem, 0) == VK_SUCCESS &&
+                    pfnMap(dev, g_taa.uboMem, 0, VK_WHOLE_SIZE, 0,
+                           &g_taa.uboMap) == VK_SUCCESS) {
+                    // mapped for good
+                } else {
+                    g_taa.uboMap = nullptr;
+                    trace("TAA: reproj UBO memory setup failed - resolve "
+                          "cannot initialise (binding 6 must hold a buffer)");
+                    return false;
+                }
+            } else {
+                trace("TAA: reproj UBO creation failed - resolve cannot "
+                      "initialise");
+                return false;
+            }
+        } else {
+            trace("TAA: buffer entry points unavailable - resolve cannot "
+                  "initialise");
+            return false;
+        }
+    }
 
     g_taa.velView = velView;
     g_taa.ready = true;
@@ -1292,8 +1381,27 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         reset = true;
     }
 
-    VkDescriptorSet set = g_taa.sets[g_taa.nextSet];
-    g_taa.nextSet = (g_taa.nextSet + 1) % TaaState::kSets;
+    const uint32_t setIdx = g_taa.nextSet;
+    VkDescriptorSet set = g_taa.sets[setIdx];
+    g_taa.nextSet = (setIdx + 1) % TaaState::kSets;
+
+    // ---- THIS DISPATCH'S REPROJECTION SLOT.
+    //
+    // Written before the descriptor that points at it, same slot index as the
+    // descriptor set so ring depth covers in-flight reads. Layout mirrors the
+    // shader's std140 block: mat4 (column-major, as published), then a vec4 of
+    // (ySign, valid, 0, 0).
+    const bool reprojOn = g_taa.uboMap && g_taaReprojValid &&
+                          taaPosHarvest() && g_taa.edValid &&
+                          taaNovecReproject();
+    if (g_taa.uboMap) {
+        float *slot = (float *)((char *)g_taa.uboMap + 256u * setIdx);
+        memcpy(slot, g_taaReproj, 16 * sizeof(float));
+        slot[16] = g_taaVpYSign;
+        slot[17] = reprojOn ? 1.0f : 0.0f;
+        slot[18] = 0.0f;
+        slot[19] = 0.0f;
+    }
 
     VkDescriptorImageInfo ii[6];
     memset(ii, 0, sizeof(ii));
@@ -1343,7 +1451,22 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     wr[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wr[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wr[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    // Binding 6: this dispatch's reproj slot. Written even when the feature is
+    // off (the layout demands a valid buffer); the shader gates on the flag.
+    VkDescriptorBufferInfo bi;
+    bi.buffer = g_taa.uboBuf;
+    bi.offset = 256ull * setIdx;
+    bi.range  = 256;
+    VkWriteDescriptorSet wru;
+    memset(&wru, 0, sizeof(wru));
+    wru.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wru.dstSet = set;
+    wru.dstBinding = 6;
+    wru.descriptorCount = 1;
+    wru.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    wru.pBufferInfo = &bi;
     dd.updateDescriptorSets(g_taa.device, 6, wr, 0, nullptr);
+    dd.updateDescriptorSets(g_taa.device, 1, &wru, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -1413,6 +1536,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.flags    = (pcReset             ? kTaaFlagReset         : 0)
                  | (cameraMoved        ? kTaaFlagCameraMoved   : 0)
                  | ((taaPosHarvest() && g_taa.edValid) ? kTaaFlagEngineDepth : 0)
+                 | (reprojOn            ? kTaaFlagDepthReproject : 0)
                  | (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)

@@ -310,6 +310,16 @@ static float g_taaSunView[3] = { 0.0f, 0.0f, 0.0f };
 // only writer - for the same include-order reason as g_taaSunView.
 static float g_taaEdAB[2] = { 0.0f, 0.0f };
 
+// The reprojection matrix and its validity, for depth-reconstructed velocity
+// at pixels the injection never wrote. The SAME unjittered camera-relative
+// matrix the injected vertex shaders receive per draw, so a reconstructed
+// vector and an injected one describe the same motion in the same units.
+// g_taaVpYSign mirrors g_viewportYFlipped (declared far below, at the viewport
+// hook) because snapshot() is defined before it.
+static float g_taaReproj[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+static bool  g_taaReprojValid = false;
+static float g_taaVpYSign = 1.0f;
+
 static bool snapshot(Snapshot *o)
 {
     o->valid = false;
@@ -319,6 +329,8 @@ static bool snapshot(Snapshot *o)
         uint64_t before = g_share->frame;
 
         memcpy(o->reproj,          g_share->reproj,          sizeof(o->reproj));
+        memcpy(g_taaReproj,        g_share->reproj,          sizeof(g_taaReproj));
+        g_taaReprojValid = g_share->reprojValid != 0;
         memcpy(o->invCurrViewProj, g_share->invCurrViewProj, sizeof(o->invCurrViewProj));
         memcpy(o->prevViewProj,    g_share->prevViewProj,    sizeof(o->prevViewProj));
         memcpy(o->world,           g_share->world,           sizeof(o->world));
@@ -4662,6 +4674,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetViewport(
                       flip ? "-1" : "+1");
             }
             g_viewportYFlipped = flip;
+            g_taaVpYSign = flip ? -1.0f : 1.0f;
         }
     }
 
