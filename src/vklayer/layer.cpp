@@ -16448,19 +16448,11 @@ static void mvNoteUboWrite(const char *via, uint32_t binding,
             trace("SHADOW SCAN: UBO push binding=%u range=%llu via %s",
                   binding, (unsigned long long)bi.range, via);
     }
-    if (binding == 14 && bi.range >= 1552) {
-        std::lock_guard<std::mutex> g(g_lock);
-        g_shadowDataBuf   = bi.buffer;
-        g_shadowDataOff   = bi.offset;
-        g_shadowDataRange = bi.range;
-        if ((g_shadowDataSeen++ % 600) == 0)
-            trace("SHADOW TAP (%s): u_shadow_data candidate - buffer=%p "
-                  "offset=%llu range=%llu (%llu sightings)",
-                  via, (void*)g_shadowDataBuf,
-                  (unsigned long long)g_shadowDataOff,
-                  (unsigned long long)g_shadowDataRange,
-                  (unsigned long long)g_shadowDataSeen);
-    }
+    // Capture moved to the QUALIFIED template path: binding+range alone
+    // collides with unrelated 1568-byte blocks across other set layouts, and
+    // the sun dump proved those collisions were what we bound - a different
+    // impostor nearly every frame. Scan telemetry stays; capture does not.
+    (void)binding; (void)bi;
 }
 
 static void mvNoteShadowWrites(uint32_t n, const VkWriteDescriptorSet *w,
@@ -16521,36 +16513,79 @@ static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
         if (it == g_updateTemplates.end()) return;
         entries = it->second;
     }
+    // ---- PASS 1: what does this template write, and which IMAGES?
+    //
+    // Binding+range alone proved worthless: X-Plane has many 1568-byte blocks
+    // at binding 14 across unrelated set layouts, and the sun dump showed we
+    // bound a different impostor nearly every frame. The disambiguator no
+    // impostor can pass: the REAL shadow set also binds tex_smap0 - an image
+    // we know by NAME (csm_shadow_maps) - in the same template write. The
+    // real u_gbuffer_data set likewise binds gbuffer_pos, which is gbuf-depth.
+    // Identity is proven by the images travelling with the block.
+    bool sawCsm = false, sawGbufDepth = false;
+    const VkDescriptorBufferInfo *ubo14 = nullptr, *ubo18 = nullptr;
     for (size_t e = 0; e < entries.size(); ++e) {
         const VkDescriptorUpdateTemplateEntry &en = entries[e];
-        if (en.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
-            en.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
-            continue;
         for (uint32_t j = 0; j < en.descriptorCount; ++j) {
-            const VkDescriptorBufferInfo *bi =
-                (const VkDescriptorBufferInfo *)((const char *)data +
-                                                 en.offset + j * en.stride);
-            mvNoteUboWrite(via, en.dstBinding + j, *bi);
-            // Frame association: this SET now carries this region.
-            if (dstSet != VK_NULL_HANDLE && en.dstBinding + j == 14 &&
-                bi->range >= 1552) {
-                MvShadowRegion r;
-                r.buf = bi->buffer; r.off = bi->offset; r.range = bi->range;
-                std::lock_guard<std::mutex> g(g_lock);
-                g_setShadowRegion[dstSet] = r;
-                if (g_setShadowRegion.size() > 256)
-                    g_setShadowRegion.erase(g_setShadowRegion.begin());
-            }
-            if (dstSet != VK_NULL_HANDLE && en.dstBinding + j == 18 &&
-                bi->range >= 96 && bi->range <= 256) {
-                MvShadowRegion r;
-                r.buf = bi->buffer; r.off = bi->offset; r.range = bi->range;
-                std::lock_guard<std::mutex> g(g_lock);
-                g_setGbufRegion[dstSet] = r;
-                if (g_setGbufRegion.size() > 256)
-                    g_setGbufRegion.erase(g_setGbufRegion.begin());
+            const char *ptr = (const char *)data + en.offset + j * en.stride;
+            if (en.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                en.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+                const VkDescriptorBufferInfo *bi =
+                    (const VkDescriptorBufferInfo *)ptr;
+                mvNoteUboWrite(via, en.dstBinding + j, *bi);
+                if (en.dstBinding + j == 14 && bi->range >= 1552) ubo14 = bi;
+                if (en.dstBinding + j == 18 && bi->range >= 96 &&
+                    bi->range <= 256) ubo18 = bi;
+            } else if (en.descriptorType ==
+                           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                       en.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+                const VkDescriptorImageInfo *ii =
+                    (const VkDescriptorImageInfo *)ptr;
+                if (ii->imageView != VK_NULL_HANDLE) {
+                    std::lock_guard<std::mutex> g(g_lock);
+                    std::map<VkImageView, VkImage>::iterator vi =
+                        g_viewToImage.find(ii->imageView);
+                    if (vi != g_viewToImage.end()) {
+                        if (vi->second == g_sunShadowImage &&
+                            g_sunShadowImage != VK_NULL_HANDLE)
+                            sawCsm = true;
+                        if (vi->second == g_engineDepthImage &&
+                            g_engineDepthImage != VK_NULL_HANDLE)
+                            sawGbufDepth = true;
+                    }
+                }
             }
         }
+    }
+    // ---- PASS 2: tag only what the images proved.
+    if (dstSet != VK_NULL_HANDLE && ubo14 && sawCsm) {
+        MvShadowRegion r;
+        r.buf = ubo14->buffer; r.off = ubo14->offset; r.range = ubo14->range;
+        std::lock_guard<std::mutex> g(g_lock);
+        g_setShadowRegion[dstSet] = r;
+        g_shadowDataBuf = r.buf; g_shadowDataOff = r.off;
+        g_shadowDataRange = r.range;
+        if ((g_shadowDataSeen++ % 600) == 0)
+            trace("SHADOW TAP (qualified): u_shadow_data PROVEN by "
+                  "csm_shadow_maps in the same template - buffer=%p "
+                  "range=%llu (%llu sightings)",
+                  (void*)r.buf, (unsigned long long)r.range,
+                  (unsigned long long)g_shadowDataSeen);
+        if (g_setShadowRegion.size() > 256)
+            g_setShadowRegion.erase(g_setShadowRegion.begin());
+    }
+    if (dstSet != VK_NULL_HANDLE && ubo18 && sawGbufDepth) {
+        MvShadowRegion r;
+        r.buf = ubo18->buffer; r.off = ubo18->offset; r.range = ubo18->range;
+        std::lock_guard<std::mutex> g(g_lock);
+        g_setGbufRegion[dstSet] = r;
+        static uint64_t gseen = 0;
+        if ((gseen++ % 600) == 0)
+            trace("GBUF TAP (qualified): u_gbuffer_data PROVEN by gbuf-depth "
+                  "in the same template - buffer=%p range=%llu",
+                  (void*)r.buf, (unsigned long long)r.range);
+        if (g_setGbufRegion.size() > 256)
+            g_setGbufRegion.erase(g_setGbufRegion.begin());
     }
 }
 
