@@ -16372,37 +16372,156 @@ static bool mvNameInteresting(const std::string &n)
     return false;
 }
 
-// The u_shadow_data signature test, shared by every path that carries a
-// VkWriteDescriptorSet - classic updates AND push descriptors, which is the
-// route X-Plane actually uses (16 push-descriptor sites in the decompiled
-// engine; zero descriptor-set allocations for this block).
-static void mvNoteShadowWrites(uint32_t n, const VkWriteDescriptorSet *w)
+// ---- EVERY UBO WRITE IS SCANNED, AND EVERY NEW SHAPE IS SAID OUT LOUD.
+//
+// Three capture attempts ran dry because each assumed the route (classic
+// writes, descriptor buffers, plain push) instead of measuring it. This scan
+// removes the guessing permanently: the first sighting of each distinct
+// (binding, range) uniform-buffer write is traced with the path it arrived
+// by, so whichever route and signature u_shadow_data actually uses appears in
+// the log by name - and if the binding is not 14 after all, that shows too.
+static void mvNoteUboWrite(const char *via, uint32_t binding,
+                           const VkDescriptorBufferInfo &bi)
 {
-    for (uint32_t i = 0; i < n && w; ++i) {
+    // The scan (outside the capture filter, first 40 distinct shapes).
+    {
+        static std::set<std::pair<uint32_t, uint64_t> > seen;
+        std::lock_guard<std::mutex> g(g_lock);
+        if (seen.size() < 40 &&
+            seen.insert(std::make_pair(binding, (uint64_t)bi.range)).second)
+            trace("SHADOW SCAN: UBO push binding=%u range=%llu via %s",
+                  binding, (unsigned long long)bi.range, via);
+    }
+    if (binding == 14 && bi.range >= 1552) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_shadowDataBuf   = bi.buffer;
+        g_shadowDataOff   = bi.offset;
+        g_shadowDataRange = bi.range;
+        if ((g_shadowDataSeen++ % 600) == 0)
+            trace("SHADOW TAP (%s): u_shadow_data candidate - buffer=%p "
+                  "offset=%llu range=%llu (%llu sightings)",
+                  via, (void*)g_shadowDataBuf,
+                  (unsigned long long)g_shadowDataOff,
+                  (unsigned long long)g_shadowDataRange,
+                  (unsigned long long)g_shadowDataSeen);
+    }
+}
+
+static void mvNoteShadowWrites(uint32_t n, const VkWriteDescriptorSet *w,
+                               const char *via)
+{
+    for (uint32_t i = 0; i < n && w; ++i)
         if ((w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
              w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) &&
-            w[i].dstBinding == 14 && w[i].pBufferInfo &&
-            w[i].pBufferInfo[0].range >= 1552) {
-            std::lock_guard<std::mutex> g(g_lock);
-            g_shadowDataBuf   = w[i].pBufferInfo[0].buffer;
-            g_shadowDataOff   = w[i].pBufferInfo[0].offset;
-            g_shadowDataRange = w[i].pBufferInfo[0].range;
-            if ((g_shadowDataSeen++ % 600) == 0)
-                trace("SHADOW TAP (push descriptor): u_shadow_data candidate - "
-                      "buffer=%p offset=%llu range=%llu (%llu sightings)",
-                      (void*)g_shadowDataBuf,
-                      (unsigned long long)g_shadowDataOff,
-                      (unsigned long long)g_shadowDataRange,
-                      (unsigned long long)g_shadowDataSeen);
+            w[i].pBufferInfo)
+            mvNoteUboWrite(via, w[i].dstBinding, w[i].pBufferInfo[0]);
+}
+
+// ---- UPDATE TEMPLATES: THE BLOB ROUTE.
+//
+// The engine class list (gfx_vk_descriptor_update_template and friends) says
+// templates are in play. A template push hands over a raw void* laid out per
+// entries fixed at template creation - so creation is recorded, and the blob
+// is decoded with the offsets the engine itself declared.
+static std::map<VkDescriptorUpdateTemplate,
+                std::vector<VkDescriptorUpdateTemplateEntry> > g_updateTemplates;
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDescriptorUpdateTemplate(
+    VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *ci,
+    const VkAllocationCallbacks *alloc, VkDescriptorUpdateTemplate *out)
+{
+    PFN_vkCreateDescriptorUpdateTemplate next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkCreateDescriptorUpdateTemplate)
+                it->second.gdpa(device, "vkCreateDescriptorUpdateTemplate");
+    }
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = next(device, ci, alloc, out);
+    if (r == VK_SUCCESS && ci && out && ci->pDescriptorUpdateEntries) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_updateTemplates[*out] = std::vector<VkDescriptorUpdateTemplateEntry>(
+            ci->pDescriptorUpdateEntries,
+            ci->pDescriptorUpdateEntries + ci->descriptorUpdateEntryCount);
+        trace("SHADOW SCAN: update template %p recorded (%u entries)",
+              (void*)*out, ci->descriptorUpdateEntryCount);
+    }
+    return r;
+}
+
+static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
+                               const void *data, const char *via)
+{
+    if (!data) return;
+    std::vector<VkDescriptorUpdateTemplateEntry> entries;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkDescriptorUpdateTemplate,
+                 std::vector<VkDescriptorUpdateTemplateEntry> >::iterator it =
+            g_updateTemplates.find(tpl);
+        if (it == g_updateTemplates.end()) return;
+        entries = it->second;
+    }
+    for (size_t e = 0; e < entries.size(); ++e) {
+        const VkDescriptorUpdateTemplateEntry &en = entries[e];
+        if (en.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+            en.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+            continue;
+        for (uint32_t j = 0; j < en.descriptorCount; ++j) {
+            const VkDescriptorBufferInfo *bi =
+                (const VkDescriptorBufferInfo *)((const char *)data +
+                                                 en.offset + j * en.stride);
+            mvNoteUboWrite(via, en.dstBinding + j, *bi);
         }
     }
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSetWithTemplate(
+    VkCommandBuffer cb, VkDescriptorUpdateTemplate tpl,
+    VkPipelineLayout layout, uint32_t set, const void *data)
+{
+    mvScanTemplateBlob(tpl, data, "push-template");
+    PFN_vkCmdPushDescriptorSetWithTemplateKHR next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator it =
+                g_devices.find(dispatchKey(ci->second));
+            if (it != g_devices.end() && it->second.gdpa)
+                next = (PFN_vkCmdPushDescriptorSetWithTemplateKHR)
+                    it->second.gdpa(ci->second,
+                                    "vkCmdPushDescriptorSetWithTemplateKHR");
+        }
+    }
+    if (next && next != Layer_CmdPushDescriptorSetWithTemplate)
+        next(cb, tpl, layout, set, data);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSetWithTemplate(
+    VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate tpl,
+    const void *data)
+{
+    mvScanTemplateBlob(tpl, data, "set-template");
+    PFN_vkUpdateDescriptorSetWithTemplate next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkUpdateDescriptorSetWithTemplate)
+                it->second.gdpa(device, "vkUpdateDescriptorSetWithTemplate");
+    }
+    if (next && next != Layer_UpdateDescriptorSetWithTemplate)
+        next(device, set, tpl, data);
 }
 
 static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSet(
     VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout,
     uint32_t set, uint32_t n, const VkWriteDescriptorSet *w)
 {
-    mvNoteShadowWrites(n, w);
+    mvNoteShadowWrites(n, w, "push");
     PFN_vkCmdPushDescriptorSetKHR next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -16578,6 +16697,12 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkGetDescriptorEXT",           Layer_GetDescriptorEXT)
     RETURN_IF("vkCmdPushDescriptorSet",       Layer_CmdPushDescriptorSet)
     RETURN_IF("vkCmdPushDescriptorSetKHR",    Layer_CmdPushDescriptorSet)
+    RETURN_IF("vkCmdPushDescriptorSetWithTemplate",    Layer_CmdPushDescriptorSetWithTemplate)
+    RETURN_IF("vkCmdPushDescriptorSetWithTemplateKHR", Layer_CmdPushDescriptorSetWithTemplate)
+    RETURN_IF("vkCreateDescriptorUpdateTemplate",      Layer_CreateDescriptorUpdateTemplate)
+    RETURN_IF("vkCreateDescriptorUpdateTemplateKHR",   Layer_CreateDescriptorUpdateTemplate)
+    RETURN_IF("vkUpdateDescriptorSetWithTemplate",     Layer_UpdateDescriptorSetWithTemplate)
+    RETURN_IF("vkUpdateDescriptorSetWithTemplateKHR",  Layer_UpdateDescriptorSetWithTemplate)
     RETURN_IF("vkGetBufferDeviceAddress",     Layer_GetBufferDeviceAddress)
     RETURN_IF("vkGetBufferDeviceAddressKHR",  Layer_GetBufferDeviceAddress)
     RETURN_IF("vkCreateSwapchainKHR",  Layer_CreateSwapchainKHR)
