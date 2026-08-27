@@ -1986,6 +1986,22 @@ static VkDeviceSize g_shadowDataOff    = 0;
 static VkDeviceSize g_shadowDataRange  = 0;
 static uint64_t     g_shadowDataSeen   = 0;
 
+// ---- FRAME-MATCHED u_shadow_data, BECAUSE "LATEST" WAS A STROBE.
+//
+// The block is double-buffered and the engine records ahead, so "the most
+// recently captured region" is frequently the buffer the CPU is mid-rewriting
+// for a FUTURE frame. Binding it read torn matrices and the sun-visibility
+// classification of the whole frame swung per frame - a literal strobe.
+// X-Plane's own fences protect each buffer exactly for the frame that binds
+// it, so correctness is frame association: remember which DESCRIPTOR SET the
+// template update filled, latch its region onto the COMMAND BUFFER when that
+// set is bound, and let the resolve - recorded into that same command buffer -
+// use its own frame's region. The "latest" globals above remain only as a
+// last-resort fallback.
+struct MvShadowRegion { VkBuffer buf; VkDeviceSize off, range; };
+static std::map<VkDescriptorSet,  MvShadowRegion> g_setShadowRegion;
+static std::map<VkCommandBuffer,  MvShadowRegion> g_cbShadowRegion;
+
 // ---- THE DESCRIPTOR-BUFFER ROUTE, WHICH IS THE ONE THE ENGINE ACTUALLY USES.
 //
 // The classic capture above logged ZERO sightings: X-Plane routes u_shadow_data
@@ -3752,6 +3768,12 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
         g_bufferNames.erase(buf);
         g_allBuffers.erase(buf);
         if (buf == g_shadowDataBuf) g_shadowDataBuf = VK_NULL_HANDLE;
+        for (std::map<VkDescriptorSet, MvShadowRegion>::iterator sr =
+                 g_setShadowRegion.begin(); sr != g_setShadowRegion.end(); )
+            if (sr->second.buf == buf) sr = g_setShadowRegion.erase(sr); else ++sr;
+        for (std::map<VkCommandBuffer, MvShadowRegion>::iterator cr =
+                 g_cbShadowRegion.begin(); cr != g_cbShadowRegion.end(); )
+            if (cr->second.buf == buf) cr = g_cbShadowRegion.erase(cr); else ++cr;
         for (std::map<uint64_t, std::pair<VkBuffer, uint64_t>>::iterator ba =
                  g_bufAddr.begin(); ba != g_bufAddr.end(); )
             if (ba->second.first == buf) ba = g_bufAddr.erase(ba); else ++ba;
@@ -7808,6 +7830,22 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
     // nothing it needs.
     static std::atomic<uint32_t> useSample(0);
     bool sampleUse = (useSample.fetch_add(1) & 63) == 0;
+
+    // Frame-matched u_shadow_data: when a set the template capture has tagged
+    // is bound into this command buffer, THIS frame's region rides along.
+    if (sets) {
+        std::lock_guard<std::mutex> g(g_lock);
+        if (!g_setShadowRegion.empty())
+            for (uint32_t i = 0; i < n; ++i) {
+                std::map<VkDescriptorSet, MvShadowRegion>::iterator it =
+                    g_setShadowRegion.find(sets[i]);
+                if (it != g_setShadowRegion.end()) {
+                    g_cbShadowRegion[cb] = it->second;
+                    if (g_cbShadowRegion.size() > 512)
+                        g_cbShadowRegion.erase(g_cbShadowRegion.begin());
+                }
+            }
+    }
 
     PFN_vkCmdBindDescriptorSets next = nullptr;
     {
@@ -16452,7 +16490,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDescriptorUpdateTemplate(
 }
 
 static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
-                               const void *data, const char *via)
+                               const void *data, const char *via,
+                               VkDescriptorSet dstSet)
 {
     if (!data) return;
     std::vector<VkDescriptorUpdateTemplateEntry> entries;
@@ -16474,6 +16513,16 @@ static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
                 (const VkDescriptorBufferInfo *)((const char *)data +
                                                  en.offset + j * en.stride);
             mvNoteUboWrite(via, en.dstBinding + j, *bi);
+            // Frame association: this SET now carries this region.
+            if (dstSet != VK_NULL_HANDLE && en.dstBinding + j == 14 &&
+                bi->range >= 1552) {
+                MvShadowRegion r;
+                r.buf = bi->buffer; r.off = bi->offset; r.range = bi->range;
+                std::lock_guard<std::mutex> g(g_lock);
+                g_setShadowRegion[dstSet] = r;
+                if (g_setShadowRegion.size() > 256)
+                    g_setShadowRegion.erase(g_setShadowRegion.begin());
+            }
         }
     }
 }
@@ -16482,7 +16531,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSetWithTemplate(
     VkCommandBuffer cb, VkDescriptorUpdateTemplate tpl,
     VkPipelineLayout layout, uint32_t set, const void *data)
 {
-    mvScanTemplateBlob(tpl, data, "push-template");
+    mvScanTemplateBlob(tpl, data, "push-template", VK_NULL_HANDLE);
     PFN_vkCmdPushDescriptorSetWithTemplateKHR next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -16504,7 +16553,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSetWithTemplate(
     VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate tpl,
     const void *data)
 {
-    mvScanTemplateBlob(tpl, data, "set-template");
+    mvScanTemplateBlob(tpl, data, "set-template", set);
     PFN_vkUpdateDescriptorSetWithTemplate next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);

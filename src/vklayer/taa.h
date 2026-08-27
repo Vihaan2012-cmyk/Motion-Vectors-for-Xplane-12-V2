@@ -1577,11 +1577,28 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // slot otherwise. Pointing at THEIR buffer is what makes this a tap
     // rather than a copy: both shaders read the same allocation, so the
     // values cannot be stale and no TRANSFER usage is ever needed.
-    const bool sunTap = (g_shadowDataBuf != VK_NULL_HANDLE) && g_taa.sunValid;
+    // THIS command buffer's region first - the frame-matched one. The
+    // "latest capture" globals are the fallback, and they are the ones that
+    // strobed, so they only serve when the cb has no association at all.
+    VkBuffer     sdBuf = VK_NULL_HANDLE;
+    VkDeviceSize sdOff = 0, sdRange = 0;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, MvShadowRegion>::iterator it =
+            g_cbShadowRegion.find(cb);
+        if (it != g_cbShadowRegion.end()) {
+            sdBuf = it->second.buf; sdOff = it->second.off;
+            sdRange = it->second.range;
+        } else if (g_shadowDataBuf != VK_NULL_HANDLE) {
+            sdBuf = g_shadowDataBuf; sdOff = g_shadowDataOff;
+            sdRange = g_shadowDataRange;
+        }
+    }
+    const bool sunTap = (sdBuf != VK_NULL_HANDLE) && g_taa.sunValid;
     VkDescriptorBufferInfo bs;
-    bs.buffer = sunTap ? g_shadowDataBuf : g_taa.uboBuf;
-    bs.offset = sunTap ? g_shadowDataOff : 2048ull * setIdx;
-    bs.range  = sunTap ? g_shadowDataRange : 2048;
+    bs.buffer = sunTap ? sdBuf : g_taa.uboBuf;
+    bs.offset = sunTap ? sdOff : 2048ull * setIdx;
+    bs.range  = sunTap ? sdRange : 2048;
     VkWriteDescriptorSet wrs = wru;
     wrs.dstBinding = 9;
     wrs.pBufferInfo = &bs;
