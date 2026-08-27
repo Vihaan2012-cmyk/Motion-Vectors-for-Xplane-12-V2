@@ -295,6 +295,7 @@ enum {
     kTaaFlagDepthReproject = 1 << 12, // reconstruct velocity at unwritten px
     kTaaFlagSunTap        = 1 << 13,  // bindings 7+9 carry live cascade data
     kTaaFlagProbeTap      = 1 << 14,  // binding 8 carries the env cubemaps
+    kTaaFlagGbufTap       = 1 << 15,  // binding 10 carries u_gbuffer_data
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -807,7 +808,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                   "override stays off");
     }
 
-    VkDescriptorSetLayoutBinding b[10];
+    VkDescriptorSetLayoutBinding b[11];
     memset(b, 0, sizeof(b));
     // Binding 0 is a SAMPLER now, not a storage image: the dispatch only reads
     // the scene. That is what lets the scene target keep X-Plane's own usage
@@ -831,14 +832,18 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     // buffer region when the descriptor capture has seen it, at our zeroed
     // ring slot otherwise.
     b[9].binding = 9; b[9].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    for (int i = 0; i < 10; ++i) {
+    // Binding 10: the engine's u_gbuffer_data - its own depth-linearization
+    // and screen-to-eye coefficients, so eye reconstruction is a
+    // transcription too, not a reinvention.
+    b[10].binding = 10; b[10].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    for (int i = 0; i < 11; ++i) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci;
     memset(&dlci, 0, sizeof(dlci));
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 10; dlci.pBindings = b;
+    dlci.bindingCount = 11; dlci.pBindings = b;
     if (dd.createDescriptorSetLayout(dev, &dlci, nullptr, &g_taa.setLayout) != VK_SUCCESS) return false;
 
     VkPushConstantRange pcr;
@@ -895,7 +900,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     ps[1].descriptorCount = 7 * TaaState::kSets;   // + sun cascades, env probes
     ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    ps[2].descriptorCount = 2 * TaaState::kSets;   // reproj slot + u_shadow_data
+    ps[2].descriptorCount = 3 * TaaState::kSets;   // reproj + u_shadow_data + u_gbuffer_data
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1621,6 +1626,18 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
             sdRange = g_shadowDataRange;
         }
     }
+    VkBuffer     gbBuf = VK_NULL_HANDLE;
+    VkDeviceSize gbOff = 0, gbRange = 0;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, MvShadowRegion>::iterator it =
+            g_cbGbufRegion.find(cb);
+        if (it != g_cbGbufRegion.end()) {
+            gbBuf = it->second.buf; gbOff = it->second.off;
+            gbRange = it->second.range;
+        }
+    }
+    const bool gbufTap = (gbBuf != VK_NULL_HANDLE);
     const bool sunTap = (sdBuf != VK_NULL_HANDLE) && g_taa.sunValid;
     VkDescriptorBufferInfo bs;
     bs.buffer = sunTap ? sdBuf : g_taa.uboBuf;
@@ -1629,9 +1646,19 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     VkWriteDescriptorSet wrs = wru;
     wrs.dstBinding = 9;
     wrs.pBufferInfo = &bs;
+    // Binding 10: u_gbuffer_data by reference; zeroed ring slot otherwise
+    // (the shader guards on clip.w == 0 and falls back to the legacy path).
+    VkDescriptorBufferInfo bg;
+    bg.buffer = gbufTap ? gbBuf : g_taa.uboBuf;
+    bg.offset = gbufTap ? gbOff : 2048ull * setIdx;
+    bg.range  = gbufTap ? gbRange : 2048;
+    VkWriteDescriptorSet wrg = wru;
+    wrg.dstBinding = 10;
+    wrg.pBufferInfo = &bg;
     dd.updateDescriptorSets(g_taa.device, 8, wr, 0, nullptr);
     dd.updateDescriptorSets(g_taa.device, 1, &wru, 0, nullptr);
     dd.updateDescriptorSets(g_taa.device, 1, &wrs, 0, nullptr);
+    dd.updateDescriptorSets(g_taa.device, 1, &wrg, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -1713,6 +1740,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                  | ((taaPosHarvest() && g_taa.edValid) ? kTaaFlagEngineDepth : 0)
                  | (reprojOn            ? kTaaFlagDepthReproject : 0)
                  | (sunTap              ? kTaaFlagSunTap        : 0)
+                 | (gbufTap             ? kTaaFlagGbufTap       : 0)
                  | (g_taa.probeValid    ? kTaaFlagProbeTap      : 0)
                  | (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
@@ -2043,6 +2071,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // The oracle's content probe rides the same command buffer, after the
     // resolve - scene complete, engine targets in their read layouts.
     oracle::record(dd, g_taa.device, cb);
+    // Numeric dump of the two captured engine blocks - the instrument that
+    // replaced testing sun-tap plumbing on the user's eyes.
+    if (sunTap && gbufTap)
+        oracle::sunDump(dd, g_taa.device, cb, sdBuf, sdOff, sdRange,
+                        gbBuf, gbOff, gbRange);
 
     if ((++g_taa.dispatches % 600) == 1)
         trace("TAA: dispatch %llu - mode %d alpha %.3f reset %d (%ux%u x%u)",

@@ -138,6 +138,18 @@ layout(binding = 6, std140) uniform ReprojData {
 // on screen.
 layout(binding = 7) uniform sampler2DArrayShadow uSunShadow;
 layout(binding = 8) uniform sampler2DArray uEnvProbes;
+// The engine's own screen-to-eye coefficients (u_gbuffer_data, binding 18
+// in its set - captured by reference like the shadow block). With these, eye
+// reconstruction is the engine's exact arithmetic; the edA/edB path below
+// remains only as the fallback when the tap is not armed.
+layout(binding = 10, std140) uniform EngineGbuf {
+    vec4 gViewportSize;        // xy = size, zw = 1/size
+    vec4 gGbufferSize;
+    vec4 gProjCoefficients[2];
+    vec4 gClipInfo[2];
+    vec2 gSampleOffset;
+};
+
 layout(binding = 9, std140) uniform EngineShadow {
     layout(offset = 0)    vec4  eShadowFade;
     layout(offset = 16)   vec4  eShadowS[4];
@@ -263,6 +275,7 @@ const int FLAG_ENGINE_DEPTH   = 2048; // binding 5 holds X-Plane's own depth
 const int FLAG_DEPTH_REPROJECT = 4096; // reconstruct velocity at unwritten px
 const int FLAG_SUN_TAP        = 8192;  // bindings 7+9 carry live cascade data
 const int FLAG_PROBE_TAP      = 16384; // binding 8 carries the env cubemaps
+const int FLAG_GBUF_TAP       = 32768; // binding 10 carries u_gbuffer_data
 // view distance from engine depth; fb is the injected clip-w fallback so a
 // wrong identification degrades to exactly the previous behaviour.
 // Velocity reconstructed from engine depth + camera motion, in EXACTLY the
@@ -299,6 +312,22 @@ float mvViewDepth(vec2 u, float lay, float fb)
 vec3 mvEyePos(vec2 u, float lay)
 {
     float d = texture(uEngineDepth, vec3(u, lay)).r;
+    // ---- THE ENGINE'S OWN RECONSTRUCTION, when its coefficients are bound.
+    // Transcribed from deferred_gbuf_9.spv:
+    //   z  = (d*clip.x + clip.y) / (d*clip.z + clip.w)      (z negative forward)
+    //   xy = ((frag + sampleOff) / viewport) * projCoeff.xy + projCoeff.zw,
+    //        then * (-z)
+    // A rational linearization and an affine screen map - which is why the
+    // hand-rolled two-constant version below produced garbage the moment the
+    // projection carried an offset (cockpit clip scaling, FSR viewport).
+    if ((pc.flags & FLAG_GBUF_TAP) != 0 && gClipInfo[0].w != 0.0) {
+        float z = (d * gClipInfo[0].x + gClipInfo[0].y) /
+                  (d * gClipInfo[0].z + gClipInfo[0].w);
+        vec2 fc = u * gViewportSize.xy + gSampleOffset;
+        vec2 xy = (fc * gViewportSize.zw) * gProjCoefficients[0].xy +
+                  gProjCoefficients[0].zw;
+        return vec3(xy * (-z), z);
+    }
     float den = d + pc.edA;
     float dist = (abs(den) < 1e-7) ? 1e6 : max(-pc.edB / den, 0.0);
     vec2 ndc = vec2(u.x * 2.0 - 1.0, uReprojParams.x * (u.y * 2.0 - 1.0));

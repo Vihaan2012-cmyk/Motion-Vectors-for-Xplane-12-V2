@@ -497,6 +497,171 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb)
     ++P.probes;
 }
 
+
+// ------------------------------------------------------------- the sun dump
+//
+// One-thread compute that reads the two engine blocks the sun tap binds and
+// writes their members to a mapped buffer this side traces. Numbers, not
+// colours: whether the captured 1568-byte block is really u_shadow_data,
+// whether the cascade rows are sane and stable, and whether u_gbuffer_data's
+// clip coefficients look like a projection - all answered from the log.
+struct DState {
+    bool tried = false, ready = false;
+    VkShaderModule        sm   = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl  = VK_NULL_HANDLE;
+    VkPipelineLayout      pl   = VK_NULL_HANDLE;
+    VkPipeline            pipe = VK_NULL_HANDLE;
+    VkDescriptorPool      pool = VK_NULL_HANDLE;
+    VkDescriptorSet       set  = VK_NULL_HANDLE;
+    VkBuffer              ssbo = VK_NULL_HANDLE;
+    VkDeviceMemory        mem  = VK_NULL_HANDLE;
+    void                 *map  = nullptr;
+    uint64_t              calls = 0;
+    bool                  pending = false;
+};
+static DState D;
+
+inline bool initSunDump(DeviceData &dd, VkDevice dev)
+{
+    if (D.tried) return D.ready;
+    D.tried = true;
+    if (!initProbe(dd, dev)) return false;   // shares P's PFNs
+
+    VkShaderModuleCreateInfo smci;
+    memset(&smci, 0, sizeof(smci));
+    smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = sizeof(kOracleSunDumpSpv);
+    smci.pCode = kOracleSunDumpSpv;
+    if (P.createSm(dev, &smci, nullptr, &D.sm) != VK_SUCCESS) return false;
+
+    VkDescriptorSetLayoutBinding b[3];
+    memset(b, 0, sizeof(b));
+    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    for (int k = 0; k < 3; ++k) { b[k].descriptorCount = 1; b[k].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
+    VkDescriptorSetLayoutCreateInfo dl;
+    memset(&dl, 0, sizeof(dl));
+    dl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dl.bindingCount = 3; dl.pBindings = b;
+    if (P.createDsl(dev, &dl, nullptr, &D.dsl) != VK_SUCCESS) return false;
+
+    VkPipelineLayoutCreateInfo pli;
+    memset(&pli, 0, sizeof(pli));
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1; pli.pSetLayouts = &D.dsl;
+    if (P.createPl(dev, &pli, nullptr, &D.pl) != VK_SUCCESS) return false;
+
+    VkComputePipelineCreateInfo cp;
+    memset(&cp, 0, sizeof(cp));
+    cp.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cp.stage.module = D.sm;
+    cp.stage.pName = "main";
+    cp.layout = D.pl;
+    if (P.createPipe(dev, VK_NULL_HANDLE, 1, &cp, nullptr, &D.pipe) != VK_SUCCESS)
+        return false;
+
+    VkDescriptorPoolSize psz[2];
+    psz[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; psz[0].descriptorCount = 2;
+    psz[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; psz[1].descriptorCount = 1;
+    VkDescriptorPoolCreateInfo dp;
+    memset(&dp, 0, sizeof(dp));
+    dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dp.maxSets = 1; dp.poolSizeCount = 2; dp.pPoolSizes = psz;
+    if (P.createPool(dev, &dp, nullptr, &D.pool) != VK_SUCCESS) return false;
+    VkDescriptorSetAllocateInfo da;
+    memset(&da, 0, sizeof(da));
+    da.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    da.descriptorPool = D.pool; da.descriptorSetCount = 1; da.pSetLayouts = &D.dsl;
+    if (P.allocSets(dev, &da, &D.set) != VK_SUCCESS) return false;
+
+    VkBufferCreateInfo bc;
+    memset(&bc, 0, sizeof(bc));
+    bc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bc.size  = 128;
+    bc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (P.createBuf(dev, &bc, nullptr, &D.ssbo) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    P.bufReq(dev, D.ssbo, &mr);
+    uint32_t idx = UINT32_MAX;
+    if (g_getPhysMemProps && dd.phys != VK_NULL_HANDLE) {
+        VkPhysicalDeviceMemoryProperties mp;
+        memset(&mp, 0, sizeof(mp));
+        g_getPhysMemProps(dd.phys, &mp);
+        const VkMemoryPropertyFlags want =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t k = 0; k < mp.memoryTypeCount; ++k)
+            if ((mr.memoryTypeBits & (1u << k)) &&
+                (mp.memoryTypes[k].propertyFlags & want) == want) { idx = k; break; }
+    }
+    VkMemoryAllocateInfo ma;
+    memset(&ma, 0, sizeof(ma));
+    ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ma.allocationSize = mr.size;
+    ma.memoryTypeIndex = idx;
+    if (idx == UINT32_MAX ||
+        P.allocMem(dev, &ma, nullptr, &D.mem) != VK_SUCCESS ||
+        P.bindBuf(dev, D.ssbo, D.mem, 0) != VK_SUCCESS ||
+        P.mapMem(dev, D.mem, 0, VK_WHOLE_SIZE, 0, &D.map) != VK_SUCCESS)
+        return false;
+    D.ready = true;
+    trace("ORACLE: sun-dump ready.");
+    return true;
+}
+
+inline void sunDump(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
+                    VkBuffer sdBuf, VkDeviceSize sdOff, VkDeviceSize sdRange,
+                    VkBuffer gbBuf, VkDeviceSize gbOff, VkDeviceSize gbRange)
+{
+    if ((D.calls++ % 600) != 0) return;
+    if (!initSunDump(dd, dev)) return;
+
+    // Read the PREVIOUS dump (600 frames retired) before overwriting.
+    if (D.pending && D.map) {
+        const float *f = (const float *)D.map;
+        trace("SUN DUMP: fade=(%.4g,%.4g,%.4g,%.4g) count=%.0f smapOff=%.2f "
+              "bias=(%.5f,%.5f)",
+              f[0], f[1], f[2], f[3], f[12], f[13], f[14], f[15]);
+        trace("SUN DUMP: s0=(%.5g,%.5g,%.5g,%.5g) r0=(%.5g,%.5g,%.5g,%.5g)",
+              f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+        trace("SUN DUMP: clip0=(%.6g,%.6g,%.6g,%.6g) proj0=(%.6g,%.6g,%.6g,%.6g)",
+              f[16], f[17], f[18], f[19], f[20], f[21], f[22], f[23]);
+        trace("SUN DUMP: viewport=(%.1f,%.1f,%.6g,%.6g) sampleOff=(%.3f,%.3f)",
+              f[24], f[25], f[26], f[27], f[28], f[29]);
+    }
+
+    VkDescriptorBufferInfo bi[3];
+    bi[0].buffer = sdBuf; bi[0].offset = sdOff; bi[0].range = sdRange;
+    bi[1].buffer = gbBuf; bi[1].offset = gbOff; bi[1].range = gbRange;
+    bi[2].buffer = D.ssbo; bi[2].offset = 0; bi[2].range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet wr[3];
+    memset(wr, 0, sizeof(wr));
+    for (int k = 0; k < 3; ++k) {
+        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[k].dstSet = D.set;
+        wr[k].dstBinding = (uint32_t)k;
+        wr[k].descriptorCount = 1;
+        wr[k].descriptorType = (k == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                        : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        wr[k].pBufferInfo = &bi[k];
+    }
+    P.updSets(dev, 3, wr, 0, nullptr);
+    P.bindPipe(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.pipe);
+    P.bindSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.pl, 0, 1, &D.set, 0, nullptr);
+    P.dispatch(cb, 1, 1, 1);
+    VkMemoryBarrier mb;
+    memset(&mb, 0, sizeof(mb));
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    P.barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+              VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    D.pending = true;
+}
+
 // ------------------------------------------------------------------ the report
 inline void dump()
 {

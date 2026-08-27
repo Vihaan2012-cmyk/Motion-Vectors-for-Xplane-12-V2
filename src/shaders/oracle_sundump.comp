@@ -1,0 +1,53 @@
+#version 450
+// ============================================================== THE SUN DUMP
+//
+// One thread, no pixels, pure numbers: reads the two engine blocks the sun
+// tap binds (u_shadow_data and u_gbuffer_data, by reference) and writes their
+// interesting members to a host-visible buffer the layer traces. Exists
+// because three viz runs burned the user's eyes on what a printout settles:
+// is the captured block really u_shadow_data, are the cascade rows sane, are
+// they stable frame to frame, and do the clip coefficients look like a
+// projection. Colours argue; numbers conclude.
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0, std140) uniform EngineShadow {
+    layout(offset = 0)    vec4  eShadowFade;
+    layout(offset = 16)   vec4  eShadowS[4];
+    layout(offset = 80)   vec4  eShadowT[4];
+    layout(offset = 144)  vec4  eShadowR[4];
+    layout(offset = 1536) float eSmapOffset;
+    layout(offset = 1540) int   eShadowCount;
+    layout(offset = 1544) vec2  eShadowBias;
+};
+
+layout(binding = 1, std140) uniform EngineGbuf {
+    vec4 gViewportSize;
+    vec4 gGbufferSize;
+    vec4 gProjCoefficients[2];
+    vec4 gClipInfo[2];
+    vec2 gSampleOffset;
+};
+
+layout(binding = 2, std430) writeonly buffer OutB { float f[]; } o;
+
+void main()
+{
+    o.f[0]  = eShadowFade.x;  o.f[1]  = eShadowFade.y;
+    o.f[2]  = eShadowFade.z;  o.f[3]  = eShadowFade.w;
+    o.f[4]  = eShadowS[0].x;  o.f[5]  = eShadowS[0].y;
+    o.f[6]  = eShadowS[0].z;  o.f[7]  = eShadowS[0].w;
+    o.f[8]  = eShadowR[0].x;  o.f[9]  = eShadowR[0].y;
+    o.f[10] = eShadowR[0].z;  o.f[11] = eShadowR[0].w;
+    o.f[12] = float(eShadowCount);
+    o.f[13] = eSmapOffset;
+    o.f[14] = eShadowBias.x;  o.f[15] = eShadowBias.y;
+    o.f[16] = gClipInfo[0].x; o.f[17] = gClipInfo[0].y;
+    o.f[18] = gClipInfo[0].z; o.f[19] = gClipInfo[0].w;
+    o.f[20] = gProjCoefficients[0].x; o.f[21] = gProjCoefficients[0].y;
+    o.f[22] = gProjCoefficients[0].z; o.f[23] = gProjCoefficients[0].w;
+    o.f[24] = gViewportSize.x; o.f[25] = gViewportSize.y;
+    o.f[26] = gViewportSize.z; o.f[27] = gViewportSize.w;
+    o.f[28] = gSampleOffset.x; o.f[29] = gSampleOffset.y;
+    o.f[30] = 0.0; o.f[31] = 0.0;
+}

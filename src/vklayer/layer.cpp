@@ -2001,6 +2001,10 @@ static uint64_t     g_shadowDataSeen   = 0;
 struct MvShadowRegion { VkBuffer buf; VkDeviceSize off, range; };
 static std::map<VkDescriptorSet,  MvShadowRegion> g_setShadowRegion;
 static std::map<VkCommandBuffer,  MvShadowRegion> g_cbShadowRegion;
+// u_gbuffer_data (binding 18, ~112 bytes): the engine's depth-linearization
+// and screen-to-eye coefficients - captured and frame-matched identically.
+static std::map<VkDescriptorSet,  MvShadowRegion> g_setGbufRegion;
+static std::map<VkCommandBuffer,  MvShadowRegion> g_cbGbufRegion;
 
 // ---- THE DESCRIPTOR-BUFFER ROUTE, WHICH IS THE ONE THE ENGINE ACTUALLY USES.
 //
@@ -2043,6 +2047,7 @@ static std::map<VkBuffer, std::string>  g_bufferNames;
 static std::map<VkBuffer, uint64_t>     g_allBuffers;   // size in bytes
 
 #include "oracle_probe_spv.h"
+#include "oracle_sundump_spv.h"
 #include "oracle.h"
 
 #include "taa.h"
@@ -3774,6 +3779,12 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
         for (std::map<VkCommandBuffer, MvShadowRegion>::iterator cr =
                  g_cbShadowRegion.begin(); cr != g_cbShadowRegion.end(); )
             if (cr->second.buf == buf) cr = g_cbShadowRegion.erase(cr); else ++cr;
+        for (std::map<VkDescriptorSet, MvShadowRegion>::iterator sg =
+                 g_setGbufRegion.begin(); sg != g_setGbufRegion.end(); )
+            if (sg->second.buf == buf) sg = g_setGbufRegion.erase(sg); else ++sg;
+        for (std::map<VkCommandBuffer, MvShadowRegion>::iterator cg =
+                 g_cbGbufRegion.begin(); cg != g_cbGbufRegion.end(); )
+            if (cg->second.buf == buf) cg = g_cbGbufRegion.erase(cg); else ++cg;
         for (std::map<uint64_t, std::pair<VkBuffer, uint64_t>>::iterator ba =
                  g_bufAddr.begin(); ba != g_bufAddr.end(); )
             if (ba->second.first == buf) ba = g_bufAddr.erase(ba); else ++ba;
@@ -7835,7 +7846,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
     // is bound into this command buffer, THIS frame's region rides along.
     if (sets) {
         std::lock_guard<std::mutex> g(g_lock);
-        if (!g_setShadowRegion.empty())
+        if (!g_setShadowRegion.empty() || !g_setGbufRegion.empty())
             for (uint32_t i = 0; i < n; ++i) {
                 std::map<VkDescriptorSet, MvShadowRegion>::iterator it =
                     g_setShadowRegion.find(sets[i]);
@@ -7843,6 +7854,13 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                     g_cbShadowRegion[cb] = it->second;
                     if (g_cbShadowRegion.size() > 512)
                         g_cbShadowRegion.erase(g_cbShadowRegion.begin());
+                }
+                std::map<VkDescriptorSet, MvShadowRegion>::iterator ig =
+                    g_setGbufRegion.find(sets[i]);
+                if (ig != g_setGbufRegion.end()) {
+                    g_cbGbufRegion[cb] = ig->second;
+                    if (g_cbGbufRegion.size() > 512)
+                        g_cbGbufRegion.erase(g_cbGbufRegion.begin());
                 }
             }
     }
@@ -16522,6 +16540,15 @@ static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
                 g_setShadowRegion[dstSet] = r;
                 if (g_setShadowRegion.size() > 256)
                     g_setShadowRegion.erase(g_setShadowRegion.begin());
+            }
+            if (dstSet != VK_NULL_HANDLE && en.dstBinding + j == 18 &&
+                bi->range >= 96 && bi->range <= 256) {
+                MvShadowRegion r;
+                r.buf = bi->buffer; r.off = bi->offset; r.range = bi->range;
+                std::lock_guard<std::mutex> g(g_lock);
+                g_setGbufRegion[dstSet] = r;
+                if (g_setGbufRegion.size() > 256)
+                    g_setGbufRegion.erase(g_setGbufRegion.begin());
             }
         }
     }
