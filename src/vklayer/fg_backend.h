@@ -74,6 +74,9 @@ struct State {
 
     uint64_t frameID    = 0;
     uint64_t dispatches = 0;
+    // Wall-clock start of the current quiet window: the first unheld frame
+    // after startup or after an aircraft-swap hold. 0 = re-arm on next frame.
+    uint64_t quietStartMs = 0;
 
     std::mutex lock;
 };
@@ -379,12 +382,47 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
         // aircraft in flight. Marking the inputs stale forces interpolation to
         // wait for a genuinely fresh pair.
         fgprep::state().readySlot = -1;
+        // Re-arm the post-hold quiet window: the 12 seconds start counting
+        // from the frame the hold RELEASES, not from when it began.
+        s.quietStartMs = 0;
         static uint64_t held = 0;
         if ((held++ % 300) == 0)
             trace("FG: holding - aircraft swap in progress, presenting real "
                   "frames only and discarding stale interpolation inputs "
                   "(%llu frames held).", (unsigned long long)held);
         return FFX_OK;
+    }
+    // ---- THE QUIET WINDOW: NO INTERPOLATED FRAMES FOR THE FIRST 12 SECONDS.
+    //
+    // The black flicker at the start of a flight is interpolation running
+    // against inputs that are technically written but describe a scene still
+    // assembling - texture paging, the loading blackout, the first unsettled
+    // seconds. Every targeted gate tried so far (readySlot, runs > 0, the
+    // swap hold) closed one hole and left the next; twelve seconds of real
+    // frames closes the class. The cost is invisible: nobody needs generated
+    // frames during a loading transition.
+    //
+    // Wall clock, not frames, deliberately - the whole point is that frame
+    // cadence is chaotic in exactly this window. Counts from startup and
+    // re-arms whenever the aircraft-swap hold releases.
+    {
+        const uint64_t nowMs = (uint64_t)GetTickCount64();
+        if (s.quietStartMs == 0) s.quietStartMs = nowMs;
+        const uint64_t quietMs = (uint64_t)live::f("taa.fg_quiet_ms",
+                                                   "TAA_FG_QUIET_MS", 12000.0f);
+        if (nowMs - s.quietStartMs < quietMs) {
+            // Inputs stay stale too, so the first interpolated frame after the
+            // window blends a genuinely fresh pair rather than one banked
+            // twelve seconds ago.
+            fgprep::state().readySlot = -1;
+            static uint64_t quiet = 0;
+            if ((quiet++ % 300) == 0)
+                trace("FG: quiet window - %llu ms of %llu elapsed, presenting "
+                      "real frames only.",
+                      (unsigned long long)(nowMs - s.quietStartMs),
+                      (unsigned long long)quietMs);
+            return FFX_OK;
+        }
     }
     // ---- READY IS NOT THE SAME AS WRITTEN.
     //
