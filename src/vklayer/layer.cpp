@@ -309,6 +309,8 @@ static float g_taaSunView[3] = { 0.0f, 0.0f, 0.0f };
 // of the live projection, view = -B/(d+A). Defined here above snapshot() - the
 // only writer - for the same include-order reason as g_taaSunView.
 static float g_taaEdAB[2] = { 0.0f, 0.0f };
+// 1/proj[0], 1/proj[5]: eye-position reconstruction for the cascade tap.
+static float g_taaInvProj[2] = { 1.0f, 1.0f };
 
 // The reprojection matrix and its validity, for depth-reconstructed velocity
 // at pixels the injection never wrote. The SAME unjittered camera-relative
@@ -341,6 +343,8 @@ static bool snapshot(Snapshot *o)
         // rather than assumed.
         g_taaEdAB[0] = g_share->proj[10];
         g_taaEdAB[1] = g_share->proj[14];
+        g_taaInvProj[0] = g_share->proj[0] != 0.0f ? 1.0f / g_share->proj[0] : 1.0f;
+        g_taaInvProj[1] = g_share->proj[5] != 0.0f ? 1.0f / g_share->proj[5] : 1.0f;
         memcpy(o->prevProj,        g_share->prevProj,        sizeof(o->prevProj));
         memcpy(o->bodyReproj,      g_share->bodyReproj,      sizeof(o->bodyReproj));
         o->bodyReprojValid = g_share->bodyReprojValid;
@@ -1958,6 +1962,29 @@ static std::map<VkImage, std::string> g_imageNames;
 // The image the engine names "gbuf-depth" - identified by the name listener,
 // consumed by the resolve as its depth source under taa.pos_harvest.
 static VkImage g_engineDepthImage = VK_NULL_HANDLE;
+
+// The engine's sun shadow cascades and environment cubemap probes, identified
+// the same way. The oracle proved both exist and carry live data; these are
+// the taps that let the resolve ASK them questions.
+static VkImage g_sunShadowImage = VK_NULL_HANDLE;   // "csm_shadow_maps"
+static VkImage g_envProbeImage  = VK_NULL_HANDLE;   // "environment_probes"
+
+// ---- THE ENGINE'S u_shadow_data, BY REFERENCE RATHER THAN BY COPY.
+//
+// The oracle read the block's layout out of the shipped SPIR-V (set=2
+// binding=14, ~1.5 KB: cascade rows shadow_s/t/r, count, bias). The VALUES
+// live in a uniform buffer the engine updates; when that update goes through
+// classic vkUpdateDescriptorSets we see (buffer, offset, range) here - and
+// our own descriptor can then point at THE SAME REGION. No copy, no
+// TRANSFER_SRC usage problem, no staleness: both shaders read one allocation.
+//
+// Counted as well as captured, because the engine may route this through
+// descriptor buffers instead - in which case the count stays zero and the
+// trace says so, which is the observable that decides the next move.
+static VkBuffer     g_shadowDataBuf    = VK_NULL_HANDLE;
+static VkDeviceSize g_shadowDataOff    = 0;
+static VkDeviceSize g_shadowDataRange  = 0;
+static uint64_t     g_shadowDataSeen   = 0;
 
 // The engine's name for an image this layer identified by shape, or null.
 // The check that closes the loop: shape-identification says WHICH image,
@@ -3711,6 +3738,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
         }
         g_bufferNames.erase(buf);
         g_allBuffers.erase(buf);
+        if (buf == g_shadowDataBuf) g_shadowDataBuf = VK_NULL_HANDLE;
     }
     if (next) next(device, buf, alloc);
 }
@@ -4084,6 +4112,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
         g_imageNames.erase(img);
         g_allImages.erase(img);
         if (img == g_engineDepthImage) g_engineDepthImage = VK_NULL_HANDLE;
+        if (img == g_sunShadowImage)   g_sunShadowImage   = VK_NULL_HANDLE;
+        if (img == g_envProbeImage)    g_envProbeImage    = VK_NULL_HANDLE;
         g_fgMutableImg.erase(img);
         for (size_t i = 0; i < g_depthCandidates.size(); ++i)
             if (g_depthCandidates[i].image == img) {
@@ -6874,6 +6904,25 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                         }
                         taaBindEngineDepth(tdd, edi, edf, eds);
                     }
+                    // Sun cascades + environment probes, same discipline:
+                    // creation records supply format/layers/samples.
+                    {
+                        VkImage si = g_sunShadowImage, pi = g_envProbeImage;
+                        OracleImgInfo sinfo, pinfo;
+                        {
+                            std::lock_guard<std::mutex> g(g_lock);
+                            if (si != VK_NULL_HANDLE && g_allImages.count(si))
+                                sinfo = g_allImages[si];
+                            else si = VK_NULL_HANDLE;
+                            if (pi != VK_NULL_HANDLE && g_allImages.count(pi))
+                                pinfo = g_allImages[pi];
+                            else pi = VK_NULL_HANDLE;
+                        }
+                        taaBindSunShadow(tdd, si, sinfo.format, sinfo.layers,
+                                         sinfo.samples);
+                        taaBindEnvProbes(tdd, pi, pinfo.format, pinfo.layers,
+                                         pinfo.samples);
+                    }
                     // Lifetime ledger for the deferred-destroy protection:
                     // this engine image is now referenced by a dispatch that
                     // may execute up to a few frames from now.
@@ -7672,6 +7721,28 @@ static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSets(
                     if (w[i].pImageInfo[k].imageView != VK_NULL_HANDLE)
                         sv.push_back(w[i].pImageInfo[k].imageView);
                 if (sv.size() > 64) sv.erase(sv.begin(), sv.begin() + (sv.size() - 64));
+                continue;
+            }
+            if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+                // u_shadow_data's signature: binding 14, ~1.5 KB or larger.
+                // Binding number alone would false-positive; the size makes it
+                // nearly unique, and the viz mode is the final arbiter.
+                if (w[i].dstBinding == 14 && w[i].pBufferInfo &&
+                    w[i].pBufferInfo[0].range >= 1552) {
+                    g_shadowDataBuf   = w[i].pBufferInfo[0].buffer;
+                    g_shadowDataOff   = w[i].pBufferInfo[0].offset;
+                    g_shadowDataRange = w[i].pBufferInfo[0].range;
+                    if ((g_shadowDataSeen++ % 600) == 0)
+                        trace("SHADOW TAP: u_shadow_data candidate seen - "
+                              "buffer=%p offset=%llu range=%llu type=%d "
+                              "(%llu sightings)",
+                              (void*)g_shadowDataBuf,
+                              (unsigned long long)g_shadowDataOff,
+                              (unsigned long long)g_shadowDataRange,
+                              (int)w[i].descriptorType,
+                              (unsigned long long)g_shadowDataSeen);
+                }
                 continue;
             }
             if (w[i].descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
@@ -16309,6 +16380,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_SetDebugUtilsObjectNameEXT(
             trace("IMG NAME: %llu namings, %zu unique so far",
                   (unsigned long long)total, seen.size());
 
+        if (nm == "csm_shadow_maps") {
+            if (g_sunShadowImage != img)
+                trace("IMG NAME: csm_shadow_maps identified = %p", (void*)img);
+            g_sunShadowImage = img;
+        } else if (img == g_sunShadowImage) {
+            g_sunShadowImage = VK_NULL_HANDLE;
+        }
+        if (nm == "environment_probes") {
+            if (g_envProbeImage != img)
+                trace("IMG NAME: environment_probes identified = %p", (void*)img);
+            g_envProbeImage = img;
+        } else if (img == g_envProbeImage) {
+            g_envProbeImage = VK_NULL_HANDLE;
+        }
         if (nm == "gbuf-depth") {
             if (g_engineDepthImage != img)
                 trace("IMG NAME: gbuf-depth identified = %p%s", (void*)img,

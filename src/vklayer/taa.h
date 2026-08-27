@@ -107,6 +107,12 @@ struct TaaState {
     std::map<VkImage, VkImageView> edViews;
     VkImageView     edView  = VK_NULL_HANDLE;
     bool            edValid = false;
+    // Bindings 7/8: the engine's sun cascades and environment probes.
+    std::map<VkImage, VkImageView> sunViews, probeViews;
+    VkImageView     sunView   = VK_NULL_HANDLE;
+    bool            sunValid  = false;
+    VkImageView     probeView = VK_NULL_HANDLE;
+    bool            probeValid = false;
     VkImageView     flagsView   = VK_NULL_HANDLE;   // what binding 4 gets
     bool            flagsValid  = false;            // true only for the real image
     VkImage         flagsFallback     = VK_NULL_HANDLE;
@@ -280,6 +286,8 @@ enum {
     kTaaFlagCameraMoved   = 1 << 10,  // was the int32 TaaPush::cameraMoved
     kTaaFlagEngineDepth   = 1 << 11,  // binding 5 holds X-Plane's gbuf-depth
     kTaaFlagDepthReproject = 1 << 12, // reconstruct velocity at unwritten px
+    kTaaFlagSunTap        = 1 << 13,  // bindings 7+9 carry live cascade data
+    kTaaFlagProbeTap      = 1 << 14,  // binding 8 carries the env cubemaps
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -776,7 +784,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                   "override stays off");
     }
 
-    VkDescriptorSetLayoutBinding b[7];
+    VkDescriptorSetLayoutBinding b[10];
     memset(b, 0, sizeof(b));
     // Binding 0 is a SAMPLER now, not a storage image: the dispatch only reads
     // the scene. That is what lets the scene target keep X-Plane's own usage
@@ -792,14 +800,22 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     // Binding 6: the per-dispatch uniform slot (reprojection matrix). Always
     // bound; the shader only reads it under kTaaFlagDepthReproject.
     b[6].binding = 6; b[6].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    for (int i = 0; i < 7; ++i) {
+    // Bindings 7/8: the engine's sun cascades and environment probes; dummies
+    // (the velocity view) when unidentified, gated by flags like binding 5.
+    b[7].binding = 7; b[7].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[8].binding = 8; b[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    // Binding 9: the engine's u_shadow_data - pointed at the ENGINE'S OWN
+    // buffer region when the descriptor capture has seen it, at our zeroed
+    // ring slot otherwise.
+    b[9].binding = 9; b[9].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    for (int i = 0; i < 10; ++i) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci;
     memset(&dlci, 0, sizeof(dlci));
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 7; dlci.pBindings = b;
+    dlci.bindingCount = 10; dlci.pBindings = b;
     if (dd.createDescriptorSetLayout(dev, &dlci, nullptr, &g_taa.setLayout) != VK_SUCCESS) return false;
 
     VkPushConstantRange pcr;
@@ -854,9 +870,9 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = 1 * TaaState::kSets;   // history write only
     ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    ps[1].descriptorCount = 5 * TaaState::kSets;   // scene, velocity, history, flags, engine depth
+    ps[1].descriptorCount = 7 * TaaState::kSets;   // + sun cascades, env probes
     ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    ps[2].descriptorCount = 1 * TaaState::kSets;   // reproj slot
+    ps[2].descriptorCount = 2 * TaaState::kSets;   // reproj slot + u_shadow_data
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -900,7 +916,11 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
             VkBufferCreateInfo bci;
             memset(&bci, 0, sizeof(bci));
             bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-            bci.size  = 256ull * TaaState::kSets;
+            // 2048 per slot: the first 96 bytes are the reproj block, the
+            // rest stays zero and doubles as the u_shadow_data fallback
+            // region (the shader reads offsets up to ~1548 when the tap flag
+            // is off the values must still be READABLE, just zero).
+            bci.size  = 2048ull * TaaState::kSets;
             bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
             bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             if (pfnCreateBuffer(dev, &bci, nullptr, &g_taa.uboBuf) == VK_SUCCESS) {
@@ -1107,6 +1127,76 @@ static void taaBindEngineDepth(DeviceData &dd, VkImage image, VkFormat fmt,
     g_taa.edViews[image] = view;
     g_taa.edView  = view;
     g_taa.edValid = (view != VK_NULL_HANDLE);
+}
+
+// Bindings 7 and 8: the engine's sun cascades (depth aspect) and environment
+// probe cubemaps (colour), cached-view binders in the gbuf-depth mould.
+static void taaBindSunShadow(DeviceData &dd, VkImage image, VkFormat fmt,
+                             uint32_t layers, VkSampleCountFlagBits samples)
+{
+    if (image == VK_NULL_HANDLE || samples != VK_SAMPLE_COUNT_1_BIT) {
+        g_taa.sunView = VK_NULL_HANDLE; g_taa.sunValid = false; return;
+    }
+    std::map<VkImage, VkImageView>::iterator it = g_taa.sunViews.find(image);
+    if (it != g_taa.sunViews.end()) {
+        g_taa.sunView = it->second;
+        g_taa.sunValid = (it->second != VK_NULL_HANDLE);
+        return;
+    }
+    VkImageViewCreateInfo v;
+    memset(&v, 0, sizeof(v));
+    v.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    v.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    v.format = fmt;
+    v.image = image;
+    v.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    v.subresourceRange.levelCount = 1;
+    v.subresourceRange.layerCount = layers ? layers : 1;
+    VkImageView view = VK_NULL_HANDLE;
+    if (dd.createImageView(g_taa.device, &v, nullptr, &view) != VK_SUCCESS) {
+        trace("TAA: csm_shadow_maps view failed (fmt=%d)", (int)fmt);
+        view = VK_NULL_HANDLE;
+    } else {
+        trace("TAA: engine sun cascades bound (fmt=%d, %u layers) - "
+              "viz 9 shows per-pixel sun visibility.", (int)fmt, layers);
+    }
+    g_taa.sunViews[image] = view;
+    g_taa.sunView  = view;
+    g_taa.sunValid = (view != VK_NULL_HANDLE);
+}
+
+static void taaBindEnvProbes(DeviceData &dd, VkImage image, VkFormat fmt,
+                             uint32_t layers, VkSampleCountFlagBits samples)
+{
+    if (image == VK_NULL_HANDLE || samples != VK_SAMPLE_COUNT_1_BIT) {
+        g_taa.probeView = VK_NULL_HANDLE; g_taa.probeValid = false; return;
+    }
+    std::map<VkImage, VkImageView>::iterator it = g_taa.probeViews.find(image);
+    if (it != g_taa.probeViews.end()) {
+        g_taa.probeView = it->second;
+        g_taa.probeValid = (it->second != VK_NULL_HANDLE);
+        return;
+    }
+    VkImageViewCreateInfo v;
+    memset(&v, 0, sizeof(v));
+    v.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    v.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    v.format = fmt;
+    v.image = image;
+    v.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    v.subresourceRange.levelCount = 1;
+    v.subresourceRange.layerCount = layers ? layers : 1;
+    VkImageView view = VK_NULL_HANDLE;
+    if (dd.createImageView(g_taa.device, &v, nullptr, &view) != VK_SUCCESS) {
+        trace("TAA: environment_probes view failed (fmt=%d)", (int)fmt);
+        view = VK_NULL_HANDLE;
+    } else {
+        trace("TAA: engine environment probes bound (fmt=%d, %u faces) - "
+              "viz 10 shows probe radiance along the view ray.", (int)fmt, layers);
+    }
+    g_taa.probeViews[image] = view;
+    g_taa.probeView  = view;
+    g_taa.probeValid = (view != VK_NULL_HANDLE);
 }
 
 static void taaBindFlags(DeviceData &dd, VkImage image, VkFormat fmt,
@@ -1395,15 +1485,20 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                           taaPosHarvest() && g_taa.edValid &&
                           taaNovecReproject();
     if (g_taa.uboMap) {
-        float *slot = (float *)((char *)g_taa.uboMap + 256u * setIdx);
+        float *slot = (float *)((char *)g_taa.uboMap + 2048u * setIdx);
         memcpy(slot, g_taaReproj, 16 * sizeof(float));
         slot[16] = g_taaVpYSign;
         slot[17] = reprojOn ? 1.0f : 0.0f;
         slot[18] = 0.0f;
         slot[19] = 0.0f;
+        // Second param row: eye-position reconstruction for the cascade tap.
+        slot[20] = g_taaInvProj[0];
+        slot[21] = g_taaInvProj[1];
+        slot[22] = 0.0f;
+        slot[23] = 0.0f;
     }
 
-    VkDescriptorImageInfo ii[6];
+    VkDescriptorImageInfo ii[8];
     memset(ii, 0, sizeof(ii));
     ii[0].imageView = g_taa.sceneView;
     ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1435,10 +1530,19 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     ii[5].imageView = g_taa.edValid ? g_taa.edView : g_taa.velView;
     ii[5].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     ii[5].sampler   = g_taa.samplerNearest;   // depth: no filtering across edges
+    // Bindings 7/8: engine cascades and probes, dummy-bound like binding 5.
+    // The cascades were consumed by the deferred lighting long before the
+    // resolve runs; the probes are sampled by it too - same layout reasoning.
+    ii[6].imageView = g_taa.sunValid ? g_taa.sunView : g_taa.velView;
+    ii[6].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ii[6].sampler   = g_taa.samplerNearest;
+    ii[7].imageView = g_taa.probeValid ? g_taa.probeView : g_taa.velView;
+    ii[7].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ii[7].sampler   = g_taa.sampler;          // radiance: bilinear is right
 
-    VkWriteDescriptorSet wr[6];
+    VkWriteDescriptorSet wr[8];
     memset(wr, 0, sizeof(wr));
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 8; ++i) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[i].dstSet = set;
         wr[i].dstBinding = (uint32_t)i;
@@ -1451,11 +1555,15 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     wr[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wr[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wr[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr[6].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr[6].dstBinding = 7;
+    wr[7].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr[7].dstBinding = 8;
     // Binding 6: this dispatch's reproj slot. Written even when the feature is
     // off (the layout demands a valid buffer); the shader gates on the flag.
     VkDescriptorBufferInfo bi;
     bi.buffer = g_taa.uboBuf;
-    bi.offset = 256ull * setIdx;
+    bi.offset = 2048ull * setIdx;
     bi.range  = 256;
     VkWriteDescriptorSet wru;
     memset(&wru, 0, sizeof(wru));
@@ -1465,8 +1573,21 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     wru.descriptorCount = 1;
     wru.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     wru.pBufferInfo = &bi;
-    dd.updateDescriptorSets(g_taa.device, 6, wr, 0, nullptr);
+    // Binding 9: the engine's u_shadow_data region when captured, our zeroed
+    // slot otherwise. Pointing at THEIR buffer is what makes this a tap
+    // rather than a copy: both shaders read the same allocation, so the
+    // values cannot be stale and no TRANSFER usage is ever needed.
+    const bool sunTap = (g_shadowDataBuf != VK_NULL_HANDLE) && g_taa.sunValid;
+    VkDescriptorBufferInfo bs;
+    bs.buffer = sunTap ? g_shadowDataBuf : g_taa.uboBuf;
+    bs.offset = sunTap ? g_shadowDataOff : 2048ull * setIdx;
+    bs.range  = sunTap ? g_shadowDataRange : 2048;
+    VkWriteDescriptorSet wrs = wru;
+    wrs.dstBinding = 9;
+    wrs.pBufferInfo = &bs;
+    dd.updateDescriptorSets(g_taa.device, 8, wr, 0, nullptr);
     dd.updateDescriptorSets(g_taa.device, 1, &wru, 0, nullptr);
+    dd.updateDescriptorSets(g_taa.device, 1, &wrs, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -1547,6 +1668,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                  | (cameraMoved        ? kTaaFlagCameraMoved   : 0)
                  | ((taaPosHarvest() && g_taa.edValid) ? kTaaFlagEngineDepth : 0)
                  | (reprojOn            ? kTaaFlagDepthReproject : 0)
+                 | (sunTap              ? kTaaFlagSunTap        : 0)
+                 | (g_taa.probeValid    ? kTaaFlagProbeTap      : 0)
                  | (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
