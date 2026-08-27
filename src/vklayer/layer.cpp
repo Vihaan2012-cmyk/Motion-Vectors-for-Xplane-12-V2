@@ -1657,9 +1657,12 @@ static VKAPI_ATTR void VKAPI_CALL Vram_CmdCopyBuffer(
 
 // Descriptor-set allocation counter (SS35) - measurement only; the engine
 // owns its descriptors and the layer's job is to know whether they churn.
-// Dynamic-descriptor counts (layout->count, set->count); see the sun latch.
-static std::map<VkDescriptorSetLayout, uint32_t> g_layoutDynCount;
-static std::map<VkDescriptorSet, uint32_t>       g_setDynCount;
+// Dynamic-descriptor bindings, sorted, per layout and per set. The engine's
+// dyn[] is ordered by ascending binding within each set, so binding B's index
+// in a set is its position in THIS list - the template-unioned list was wrong
+// (it over-counted across partial writes; the layout is the authority).
+static std::map<VkDescriptorSetLayout, std::vector<uint32_t> > g_layoutDynBinds;
+static std::map<VkDescriptorSet, std::vector<uint32_t> >       g_setDynBinds;
 static PFN_vkAllocateDescriptorSets g_nextAllocDescSets = nullptr;
 static VKAPI_ATTR VkResult VKAPI_CALL Vram_AllocateDescriptorSets(
     VkDevice device, const VkDescriptorSetAllocateInfo *ai,
@@ -1671,12 +1674,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Vram_AllocateDescriptorSets(
     if (r == VK_SUCCESS && ai && out && ai->pSetLayouts) {
         std::lock_guard<std::mutex> g(g_lock);
         for (uint32_t i = 0; i < ai->descriptorSetCount; ++i) {
-            std::map<VkDescriptorSetLayout, uint32_t>::iterator li =
-                g_layoutDynCount.find(ai->pSetLayouts[i]);
-            g_setDynCount[out[i]] = (li != g_layoutDynCount.end()) ? li->second : 0;
+            std::map<VkDescriptorSetLayout, std::vector<uint32_t> >::iterator li =
+                g_layoutDynBinds.find(ai->pSetLayouts[i]);
+            if (li != g_layoutDynBinds.end()) g_setDynBinds[out[i]] = li->second;
+            else g_setDynBinds[out[i]].clear();
         }
-        if (g_setDynCount.size() > 16384)
-            g_setDynCount.erase(g_setDynCount.begin());
+        if (g_setDynBinds.size() > 16384)
+            g_setDynBinds.erase(g_setDynBinds.begin());
     }
     return r;
 }
@@ -2068,17 +2072,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDescriptorSetLayout(
     if (!next) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = next(device, ci, alloc, out);
     if (r == VK_SUCCESS && ci && out) {
-        uint32_t dyn = 0;
+        std::vector<uint32_t> dynB;
         for (uint32_t i = 0; i < ci->bindingCount && ci->pBindings; ++i)
             if (ci->pBindings[i].descriptorType ==
                     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
                 ci->pBindings[i].descriptorType ==
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
-                dyn += ci->pBindings[i].descriptorCount;
+                for (uint32_t j = 0; j < ci->pBindings[i].descriptorCount; ++j)
+                    dynB.push_back(ci->pBindings[i].binding + j);
+        std::sort(dynB.begin(), dynB.end());
         std::lock_guard<std::mutex> g(g_lock);
-        g_layoutDynCount[*out] = dyn;
-        if (g_layoutDynCount.size() > 8192)
-            g_layoutDynCount.erase(g_layoutDynCount.begin());
+        g_layoutDynBinds[*out] = dynB;
+        if (g_layoutDynBinds.size() > 8192)
+            g_layoutDynBinds.erase(g_layoutDynBinds.begin());
     }
     return r;
 }
@@ -7945,25 +7951,30 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                 uint32_t dynBase = 0;
                 bool baseKnown = true;
                 for (uint32_t q = 0; q < i; ++q) {
-                    std::map<VkDescriptorSet, uint32_t>::iterator dc =
-                        g_setDynCount.find(sets[q]);
-                    if (dc == g_setDynCount.end()) { baseKnown = false; break; }
-                    dynBase += dc->second;
+                    std::map<VkDescriptorSet, std::vector<uint32_t> >::iterator dc =
+                        g_setDynBinds.find(sets[q]);
+                    if (dc == g_setDynBinds.end()) { baseKnown = false; break; }
+                    dynBase += (uint32_t)dc->second.size();
                 }
-                if (!baseKnown && (m.shadowDynamic || m.gbufDynamic)) {
+                // This set's OWN authoritative dynamic-binding list.
+                std::map<VkDescriptorSet, std::vector<uint32_t> >::iterator mine =
+                    g_setDynBinds.find(sets[i]);
+                const std::vector<uint32_t> *dl =
+                    (mine != g_setDynBinds.end()) ? &mine->second : nullptr;
+                if ((!baseKnown || !dl) && (m.shadowDynamic || m.gbufDynamic)) {
                     static uint64_t skipped = 0;
-                    if ((skipped++ % 600) == 0)
-                        trace("SUN META: set at pos %u/%u, a preceding set's "
-                              "dyn count is unknown - skipped (%llu times)",
+                    if ((skipped++ % 1200) == 0)
+                        trace("SUN META: pos %u/%u, base or layout list "
+                              "unknown - skipped (%llu times)",
                               i, n, (unsigned long long)skipped);
                     continue;
                 }
-                // Index within THIS set, then add the set's base into dyn[].
                 uint32_t idx14 = UINT32_MAX, idx18 = UINT32_MAX;
-                for (uint32_t k = 0; k < (uint32_t)m.dynBindings.size(); ++k) {
-                    if (m.dynBindings[k] == 14) idx14 = dynBase + k;
-                    if (m.dynBindings[k] == 18) idx18 = dynBase + k;
-                }
+                if (dl)
+                    for (uint32_t k = 0; k < (uint32_t)dl->size(); ++k) {
+                        if ((*dl)[k] == 14) idx14 = dynBase + k;
+                        if ((*dl)[k] == 18) idx18 = dynBase + k;
+                    }
                 if (m.provenShadow && m.shadowRange) {
                     VkDeviceSize off = m.shadowBase;
                     bool ok = true;
@@ -16575,6 +16586,31 @@ static bool mvNameInteresting(const std::string &n)
 // (binding, range) uniform-buffer write is traced with the path it arrived
 // by, so whichever route and signature u_shadow_data actually uses appears in
 // the log by name - and if the binding is not 14 after all, that shows too.
+// Clear a command buffer's latched sun/gbuf regions when it BEGINS recording:
+// the regions are per-frame (the dynamic offset changes every frame) and the
+// map is keyed by cb handle, so a reused cb must not serve last frame's offset
+// to this frame's resolve. This kills a stale-offset flicker at the source.
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_BeginCommandBuffer(
+    VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi)
+{
+    PFN_vkBeginCommandBuffer next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator it =
+                g_devices.find(dispatchKey(ci->second));
+            if (it != g_devices.end() && it->second.gdpa)
+                next = (PFN_vkBeginCommandBuffer)
+                    it->second.gdpa(ci->second, "vkBeginCommandBuffer");
+        }
+        g_cbShadowRegion.erase(cb);
+        g_cbGbufRegion.erase(cb);
+    }
+    return next ? next(cb, bi) : VK_SUCCESS;
+}
+
+
 static void mvNoteUboWrite(const char *via, uint32_t binding,
                            const VkDescriptorBufferInfo &bi)
 {
@@ -16988,6 +17024,7 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkCmdPushDescriptorSetWithTemplate",    Layer_CmdPushDescriptorSetWithTemplate)
     RETURN_IF("vkCmdPushDescriptorSetWithTemplateKHR", Layer_CmdPushDescriptorSetWithTemplate)
     RETURN_IF("vkCreateDescriptorSetLayout",           Layer_CreateDescriptorSetLayout)
+    RETURN_IF("vkBeginCommandBuffer",                  Layer_BeginCommandBuffer)
     RETURN_IF("vkCreateDescriptorUpdateTemplate",      Layer_CreateDescriptorUpdateTemplate)
     RETURN_IF("vkCreateDescriptorUpdateTemplateKHR",   Layer_CreateDescriptorUpdateTemplate)
     RETURN_IF("vkUpdateDescriptorSetWithTemplate",     Layer_UpdateDescriptorSetWithTemplate)
