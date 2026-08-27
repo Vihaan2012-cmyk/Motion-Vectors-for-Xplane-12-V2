@@ -94,6 +94,13 @@ struct TaaState {
     VkSampler       sampler     = VK_NULL_HANDLE;
     // NEAREST, for the integer flags image - see the note at its creation.
     VkSampler       samplerNearest = VK_NULL_HANDLE;
+    // Comparison samplers for the engine shadow cascades: the engine samples
+    // tex_smap0 through sampler2DArrayShadow, so the compare runs in hardware
+    // and the only open question is the compare OP - both are created and the
+    // live knob picks per frame, because one screenshot settles it faster
+    // than one relaunch per guess.
+    VkSampler       samplerShadowLE = VK_NULL_HANDLE;
+    VkSampler       samplerShadowGE = VK_NULL_HANDLE;
     // ---- X-PLANE'S gbuffer_vel, AND A FALLBACK FOR WHEN IT IS UNKNOWN.
     //
     // The flags view is over an image X-Plane owns, identified by shape by the
@@ -483,6 +490,8 @@ static void taaDestroyState(DeviceData &dd, TaaState &g_taa)
     if (g_taa.uboMem)      dd.freeMemory(g_taa.device, g_taa.uboMem, nullptr);
     if (g_taa.sampler)     dd.destroySampler(g_taa.device, g_taa.sampler, nullptr);
     if (g_taa.samplerNearest) dd.destroySampler(g_taa.device, g_taa.samplerNearest, nullptr);
+    if (g_taa.samplerShadowLE) dd.destroySampler(g_taa.device, g_taa.samplerShadowLE, nullptr);
+    if (g_taa.samplerShadowGE) dd.destroySampler(g_taa.device, g_taa.samplerShadowGE, nullptr);
     for (int i = 0; i < 2; ++i)
         if (g_taa.historyView[i]) dd.destroyImageView(g_taa.device, g_taa.historyView[i], nullptr);
     for (std::map<VkImage, VkImageView>::iterator it = g_taa.sceneViews.begin();
@@ -694,6 +703,20 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     sci.minFilter = VK_FILTER_NEAREST;
     if (dd.createSampler(dev, &sci, nullptr, &g_taa.samplerNearest) != VK_SUCCESS)
         return false;
+    // The shadow-compare pair. LINEAR + compare = free 2x2 PCF on depth.
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.compareEnable = VK_TRUE;
+    sci.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    if (dd.createSampler(dev, &sci, nullptr, &g_taa.samplerShadowLE) != VK_SUCCESS)
+        return false;
+    sci.compareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+    if (dd.createSampler(dev, &sci, nullptr, &g_taa.samplerShadowGE) != VK_SUCCESS)
+        return false;
+    sci.compareEnable = VK_FALSE;
+    sci.compareOp = VK_COMPARE_OP_NEVER;
+    sci.magFilter = VK_FILTER_NEAREST;
+    sci.minFilter = VK_FILTER_NEAREST;
 
     // ---- THE READBACK BUFFER. See TaaState::readBuf.
     //
@@ -1535,7 +1558,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // resolve runs; the probes are sampled by it too - same layout reasoning.
     ii[6].imageView = g_taa.sunValid ? g_taa.sunView : g_taa.velView;
     ii[6].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ii[6].sampler   = g_taa.samplerNearest;
+    // Comparison sampler, op picked live: taa.smap_ge=1 flips the compare if
+    // the viz shows lit/shadowed inverted. Binding 7 is sampler2DArrayShadow
+    // in the shader, so a comparison sampler here is REQUIRED, not chosen.
+    ii[6].sampler   = live::onoff("taa.smap_ge", "TAA_SMAP_GE", false)
+                        ? g_taa.samplerShadowGE : g_taa.samplerShadowLE;
     ii[7].imageView = g_taa.probeValid ? g_taa.probeView : g_taa.velView;
     ii[7].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     ii[7].sampler   = g_taa.sampler;          // radiance: bilinear is right

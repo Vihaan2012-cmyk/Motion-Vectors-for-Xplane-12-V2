@@ -136,15 +136,16 @@ layout(binding = 6, std140) uniform ReprojData {
 // Together they answer the question a BVH was going to be built for: is this
 // eye-space point reached by the sun - including occluders that are nowhere
 // on screen.
-layout(binding = 7) uniform sampler2DArray uSunShadow;
+layout(binding = 7) uniform sampler2DArrayShadow uSunShadow;
 layout(binding = 8) uniform sampler2DArray uEnvProbes;
 layout(binding = 9, std140) uniform EngineShadow {
+    layout(offset = 0)    vec4  eShadowFade;
     layout(offset = 16)   vec4  eShadowS[4];
     layout(offset = 80)   vec4  eShadowT[4];
     layout(offset = 144)  vec4  eShadowR[4];
     layout(offset = 1536) float eSmapOffset;
     layout(offset = 1540) int   eShadowCount;
-    layout(offset = 1544) float eShadowBias;
+    layout(offset = 1544) vec2  eShadowBias;   // vec2 - the engine slope-biases
 };
 
 
@@ -306,24 +307,48 @@ vec3 mvEyePos(vec2 u, float lay)
                 -dist);
 }
 
-// Sun visibility of an eye-space point, via the engine's own cascades.
-// Returns: 1 lit, 0 shadowed, -1 outside every cascade. The comparison
-// direction is unverified until the viz says otherwise - which is exactly
-// what VIZ_SUNVIS exists to show (it draws BOTH hypotheses).
-float mvSunVisibility(vec3 eye)
+// ---- SUN VISIBILITY, AS A TRANSCRIPTION RATHER THAN A GUESS.
+//
+// The first version invented its own sampling semantics from the member
+// names, and every relaunch was another guess. This one is the engine's own
+// deferred shader (deferred_gbuf_9.spv, spirv-cross'd), line for line:
+//
+//   - every dot product is CENTERED: s,t,r = dot(p4, row) - 0.5
+//   - cascade selection tests all THREE - the depth slab included - as
+//     |s,t,r| <= 0.5, with the LAST cascade's r tested signed
+//   - the sample is a HARDWARE COMPARE (sampler2DArrayShadow) at
+//     uv = (s,t)+0.5, layer = c + tex_smap_offset, reference = r+0.5
+//   - visibility fades to LIT with eye distance via shadow_fade
+//   - outside every cascade IS lit, not unknown
+//
+// The one thing the transcription cannot carry over is the compare OP, which
+// lives in the engine's sampler object - so taa.smap_ge flips ours live if
+// the viz shows the world inverted. The engine also normal-offsets the
+// position by a slope bias before projecting; that needs the surface normal,
+// so it arrives with the SSGI normal work rather than here.
+//
+// out.x = visibility 0..1, out.y = cascade index (or -1 outside, -2 no tap).
+vec2 mvSunVisibility(vec3 eye)
 {
-    if ((pc.flags & FLAG_SUN_TAP) == 0) return -1.0;
+    if ((pc.flags & FLAG_SUN_TAP) == 0) return vec2(1.0, -2.0);
     vec4 e4 = vec4(eye, 1.0);
+    float eyeDist = -eye.z;
     int n = clamp(eShadowCount, 0, 4);
     for (int c = 0; c < n; ++c) {
-        float s = dot(eShadowS[c], e4);
-        float t = dot(eShadowT[c], e4);
-        if (s < 0.0 || s > 1.0 || t < 0.0 || t > 1.0) continue;
-        float r  = dot(eShadowR[c], e4);
-        float sm = texture(uSunShadow, vec3(s, t, float(c))).r;
-        return (r <= sm + eShadowBias) ? 1.0 : 0.0;
+        float s = dot(e4, eShadowS[c]) - 0.5;
+        float t = dot(e4, eShadowT[c]) - 0.5;
+        float r = dot(e4, eShadowR[c]) - 0.5;
+        vec3 a = abs(vec3(s, t, r));
+        if (c == n - 1) a.z = r;             // last slab: signed, engine-exact
+        if (any(greaterThan(a, vec3(0.5)))) continue;
+        float vis = texture(uSunShadow,
+                            vec4(s + 0.5, t + 0.5,
+                                 float(c) + eSmapOffset, r + 0.5));
+        vis = mix(vis, 1.0,
+                  clamp(eyeDist * eShadowFade.x + eShadowFade.y, 0.0, 1.0));
+        return vec2(vis, float(c));
     }
-    return -1.0;
+    return vec2(1.0, -1.0);                   // beyond the cascades: lit
 }
 
 // Radiance from the engine's environment probe cube (cube 0 = layers 0..5),
@@ -917,16 +942,16 @@ void main()
     // because the point of a first run is to SEE whether the plumbing is
     // right, not to trust that it is.
     if (pc.viz == VIZ_SUNVIS) {
-        // GREEN lit, RED shadowed, BLUE outside every cascade, GREY no tap.
-        // If green/red is INVERTED relative to visible shadows, the depth
-        // comparison direction is flipped - that is a sign fix, not a bug in
-        // the tap. Cascade index rides the blue channel faintly.
+        // Continuous: green scaled by visibility, red by shadow, so PCF
+        // penumbras show as blends. BLUE tint marks "beyond all cascades"
+        // (which the engine treats as lit), GREY means no tap. Inverted
+        // green/red against visible shadows = flip taa.smap_ge, live.
         vec3 eye = mvEyePos(uv + S, float(layer));
-        float v = mvSunVisibility(eye);
-        vec3 c = (pc.flags & FLAG_SUN_TAP) == 0 ? vec3(0.3)
-               : v < 0.0 ? vec3(0.0, 0.0, 1.0)
-               : v > 0.5 ? vec3(0.0, 1.0, 0.0)
-                         : vec3(1.0, 0.0, 0.0);
+        vec2 v = mvSunVisibility(eye);
+        vec3 c;
+        if (v.y < -1.5)      c = vec3(0.3);
+        else if (v.y < -0.5) c = vec3(0.0, 0.5, 0.7);
+        else                 c = vec3(1.0 - v.x, v.x, 0.0);
         imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
         return;
     }
