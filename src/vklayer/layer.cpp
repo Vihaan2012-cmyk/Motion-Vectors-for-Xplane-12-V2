@@ -2064,6 +2064,21 @@ static std::vector<DepthCandidate> g_depthCandidates;
 // be tied together to answer "which image does the scene actually render into".
 static std::map<VkImageView, VkImage> g_viewToImage;
 
+// ---- X-PLANE TELLS US WHAT EVERY IMAGE IS. WE JUST NEVER LISTENED.
+//
+// The engine names every VkImage it creates through
+// vkSetDebugUtilsObjectNameEXT, gated only on the loader reporting
+// VK_EXT_debug_utils - which the loader always does, because the loader itself
+// implements it. Confirmed in the decompiled engine: gfx_vk_image.cpp names the
+// image immediately after vkCreateImage, every session, not just under
+// validation.
+//
+// This mod spent weeks identifying images by SHAPE - "five colour attachments",
+// "fmt=97 at swapchain size", census heuristics - while the engine was
+// announcing "gbuffer_pos" through a call our layer simply did not intercept.
+// This map is the correction: handle -> the engine's own name for it.
+static std::map<VkImage, std::string> g_imageNames;
+
 // The frame-generation backbuffers the layer tagged MUTABLE_FORMAT, mapped to
 // the usage they were really created with. Layer_CreateImageView consults this
 // to make X-Plane's sRGB view of one of these UNORM images legal: the format is
@@ -3986,6 +4001,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
              vi != g_viewToImage.end(); ) {
             if (vi->second == img) vi = g_viewToImage.erase(vi); else ++vi;
         }
+        g_imageNames.erase(img);
         g_fgMutableImg.erase(img);
         for (size_t i = 0; i < g_depthCandidates.size(); ++i)
             if (g_depthCandidates[i].image == img) {
@@ -16119,9 +16135,89 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
     return scr;
 }
 
+// ---- THE NAME LISTENER. See the note on g_imageNames.
+//
+// Interception, not invention: the engine already makes this call for every
+// image; returning our hook from GetDeviceProcAddr/GetInstanceProcAddr puts us
+// in the chain. Two rules keep the instrument honest:
+//
+//   - EVERY image name is recorded, but only the first ~300 unique names are
+//     traced verbatim, because X-Plane names its streamed textures too and an
+//     unbounded dump buries the dozen names that matter. G-buffer-family names
+//     are traced ALWAYS, past any cap - those are the ones this exists for.
+//
+//   - Correlation lines fire when a name lands on an image this layer has
+//     already identified by shape (the velocity candidate, the scene colour),
+//     so a wrong identification announces itself instead of lying quietly.
+//
+// Forwarding may find nothing below us - with no validation layer, the driver
+// may not implement the call. That is fine: the loader tolerates it, X-Plane
+// never checks the result, and the information has already been taken.
+static bool mvNameInteresting(const std::string &n)
+{
+    static const char *kWant[] = { "gbuf", "hiz", "hi_z", "vel", "nrm",
+                                   "depth", "pos", "lit", "mat" };
+    std::string lo(n);
+    for (size_t i = 0; i < lo.size(); ++i)
+        lo[i] = (char)tolower((unsigned char)lo[i]);
+    for (size_t i = 0; i < sizeof(kWant)/sizeof(kWant[0]); ++i)
+        if (lo.find(kWant[i]) != std::string::npos) return true;
+    return false;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_SetDebugUtilsObjectNameEXT(
+    VkDevice device, const VkDebugUtilsObjectNameInfoEXT *info)
+{
+    PFN_vkGetDeviceProcAddr gdpa = nullptr;
+    if (info && info->objectType == VK_OBJECT_TYPE_IMAGE && info->pObjectName &&
+        info->objectHandle != 0) {
+        const VkImage img = (VkImage)info->objectHandle;
+        const std::string nm(info->pObjectName);
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) gdpa = it->second.gdpa;
+
+        const bool interesting = mvNameInteresting(nm);
+        static std::set<std::string> seen;
+        static uint64_t total = 0;
+        ++total;
+        const bool fresh = seen.insert(nm).second;
+        if (fresh && (interesting || seen.size() <= 300))
+            trace("IMG NAME%s: %-40s = %p", interesting ? " *" : "",
+                  nm.c_str(), (void*)img);
+        if ((total % 2000) == 0)
+            trace("IMG NAME: %llu namings, %zu unique so far",
+                  (unsigned long long)total, seen.size());
+
+        // The shape-identified handles, checked against the engine's own word.
+        if (interesting) {
+            if (img == g_gbufferVelCandidate)
+                trace("IMG NAME CORRELATE: our gbuffer_vel candidate is the "
+                      "engine's \"%s\"", nm.c_str());
+            if (img == g_sceneColor.image)
+                trace("IMG NAME CORRELATE: our scene colour is the engine's "
+                      "\"%s\"", nm.c_str());
+        }
+        g_imageNames[img] = nm;
+    } else {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) gdpa = it->second.gdpa;
+    }
+    if (gdpa) {
+        PFN_vkSetDebugUtilsObjectNameEXT next =
+            (PFN_vkSetDebugUtilsObjectNameEXT)
+                gdpa(device, "vkSetDebugUtilsObjectNameEXT");
+        if (next && next != Layer_SetDebugUtilsObjectNameEXT)
+            return next(device, info);
+    }
+    return VK_SUCCESS;
+}
+
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 MV_GetDeviceProcAddr(VkDevice device, const char *name)
 {
+    RETURN_IF("vkSetDebugUtilsObjectNameEXT", Layer_SetDebugUtilsObjectNameEXT)
     RETURN_IF("vkCreateSwapchainKHR",  Layer_CreateSwapchainKHR)
     RETURN_IF("vkGetDeviceProcAddr",   MV_GetDeviceProcAddr)
     RETURN_IF("vkDestroyDevice",       Layer_DestroyDevice)
@@ -16311,6 +16407,10 @@ MV_GetInstanceProcAddr(VkInstance inst, const char *name)
 {
     RETURN_IF("vkCreateDebugUtilsMessengerEXT",  TAA_CreateDebugUtilsMessengerEXT)
     RETURN_IF("vkDestroyDebugUtilsMessengerEXT", TAA_DestroyDebugUtilsMessengerEXT)
+    // X-Plane fetches this through the INSTANCE proc addr (decompiled engine,
+    // instance init) and then calls it with a device - so the hook must be
+    // returned from both tables or the engine's copy bypasses the layer.
+    RETURN_IF("vkSetDebugUtilsObjectNameEXT", Layer_SetDebugUtilsObjectNameEXT)
     RETURN_IF("vkGetInstanceProcAddr", MV_GetInstanceProcAddr)
     RETURN_IF("vkCreateInstance",      TAA_CreateInstance)
     RETURN_IF("vkDestroyInstance",     TAA_DestroyInstance)
