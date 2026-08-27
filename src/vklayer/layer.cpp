@@ -1986,6 +1986,19 @@ static VkDeviceSize g_shadowDataOff    = 0;
 static VkDeviceSize g_shadowDataRange  = 0;
 static uint64_t     g_shadowDataSeen   = 0;
 
+// ---- THE DESCRIPTOR-BUFFER ROUTE, WHICH IS THE ONE THE ENGINE ACTUALLY USES.
+//
+// The classic capture above logged ZERO sightings: X-Plane routes u_shadow_data
+// through VK_EXT_descriptor_buffer, where descriptors are memcpy'd bytes and
+// vkUpdateDescriptorSets never runs. But descriptor buffers have their own
+// host-visible choke point: the app must call vkGetDescriptorEXT to encode
+// each descriptor, and for a uniform buffer the INPUT of that call carries the
+// buffer device address and range in the clear. Address -> buffer comes from
+// hooking vkGetBufferDeviceAddress. Two hooks, and the opaque path stops
+// being opaque.
+static std::map<uint64_t, std::pair<VkBuffer, uint64_t>> g_bufAddr; // base -> (buf, size)
+static uint64_t g_descGetSeen = 0;
+
 // The engine's name for an image this layer identified by shape, or null.
 // The check that closes the loop: shape-identification says WHICH image,
 // the listener says WHAT the engine calls it, and disagreement is a bug in
@@ -3739,6 +3752,9 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
         g_bufferNames.erase(buf);
         g_allBuffers.erase(buf);
         if (buf == g_shadowDataBuf) g_shadowDataBuf = VK_NULL_HANDLE;
+        for (std::map<uint64_t, std::pair<VkBuffer, uint64_t>>::iterator ba =
+                 g_bufAddr.begin(); ba != g_bufAddr.end(); )
+            if (ba->second.first == buf) ba = g_bufAddr.erase(ba); else ++ba;
     }
     if (next) next(device, buf, alloc);
 }
@@ -16356,6 +16372,76 @@ static bool mvNameInteresting(const std::string &n)
     return false;
 }
 
+// ---- vkGetBufferDeviceAddress: the address book.
+static VKAPI_ATTR VkDeviceAddress VKAPI_CALL Layer_GetBufferDeviceAddress(
+    VkDevice device, const VkBufferDeviceAddressInfo *info)
+{
+    PFN_vkGetBufferDeviceAddress next = nullptr;
+    uint64_t size = 0;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkGetBufferDeviceAddress)
+                       it->second.gdpa(device, "vkGetBufferDeviceAddress");
+        if (info && g_allBuffers.count(info->buffer))
+            size = g_allBuffers[info->buffer];
+    }
+    if (!next) return 0;
+    VkDeviceAddress a = next(device, info);
+    if (a != 0 && info) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_bufAddr[(uint64_t)a] = std::make_pair(info->buffer, size);
+        // Bounded: buffers die, the book must not grow without limit.
+        if (g_bufAddr.size() > 65536) g_bufAddr.erase(g_bufAddr.begin());
+    }
+    return a;
+}
+
+// ---- vkGetDescriptorEXT: the descriptor-buffer choke point.
+static VKAPI_ATTR void VKAPI_CALL Layer_GetDescriptorEXT(
+    VkDevice device, const VkDescriptorGetInfoEXT *info,
+    size_t dataSize, void *out)
+{
+    if (info && info->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+        info->data.pUniformBuffer && info->data.pUniformBuffer->address != 0 &&
+        info->data.pUniformBuffer->range >= 1552 &&
+        info->data.pUniformBuffer->range <= 4096) {
+        const uint64_t addr  = (uint64_t)info->data.pUniformBuffer->address;
+        const uint64_t range = (uint64_t)info->data.pUniformBuffer->range;
+        std::lock_guard<std::mutex> g(g_lock);
+        // The greatest base address <= addr, checked for containment.
+        std::map<uint64_t, std::pair<VkBuffer, uint64_t>>::iterator it =
+            g_bufAddr.upper_bound(addr);
+        if (it != g_bufAddr.begin()) {
+            --it;
+            const uint64_t base = it->first, bsz = it->second.second;
+            if (addr >= base && (bsz == 0 || addr - base + range <= bsz)) {
+                g_shadowDataBuf   = it->second.first;
+                g_shadowDataOff   = (VkDeviceSize)(addr - base);
+                g_shadowDataRange = (VkDeviceSize)range;
+                if ((g_descGetSeen++ % 600) == 0)
+                    trace("SHADOW TAP (descriptor buffer): u_shadow_data "
+                          "candidate - buffer=%p offset=%llu range=%llu "
+                          "(%llu sightings)",
+                          (void*)g_shadowDataBuf,
+                          (unsigned long long)g_shadowDataOff,
+                          (unsigned long long)range,
+                          (unsigned long long)g_descGetSeen);
+            }
+        }
+    }
+    PFN_vkGetDescriptorEXT next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkGetDescriptorEXT)
+                       it->second.gdpa(device, "vkGetDescriptorEXT");
+    }
+    if (next && next != Layer_GetDescriptorEXT) next(device, info, dataSize, out);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL Layer_SetDebugUtilsObjectNameEXT(
     VkDevice device, const VkDebugUtilsObjectNameInfoEXT *info)
 {
@@ -16442,6 +16528,9 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 MV_GetDeviceProcAddr(VkDevice device, const char *name)
 {
     RETURN_IF("vkSetDebugUtilsObjectNameEXT", Layer_SetDebugUtilsObjectNameEXT)
+    RETURN_IF("vkGetDescriptorEXT",           Layer_GetDescriptorEXT)
+    RETURN_IF("vkGetBufferDeviceAddress",     Layer_GetBufferDeviceAddress)
+    RETURN_IF("vkGetBufferDeviceAddressKHR",  Layer_GetBufferDeviceAddress)
     RETURN_IF("vkCreateSwapchainKHR",  Layer_CreateSwapchainKHR)
     RETURN_IF("vkGetDeviceProcAddr",   MV_GetDeviceProcAddr)
     RETURN_IF("vkDestroyDevice",       Layer_DestroyDevice)
