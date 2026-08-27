@@ -305,6 +305,11 @@ struct Snapshot {
 // horizon, which the resolve reads as "take no taps".
 static float g_taaSunView[3] = { 0.0f, 0.0f, 0.0f };
 
+// Engine-depth linearization constants for the resolve: proj[10] and proj[14]
+// of the live projection, view = -B/(d+A). Defined here above snapshot() - the
+// only writer - for the same include-order reason as g_taaSunView.
+static float g_taaEdAB[2] = { 0.0f, 0.0f };
+
 static bool snapshot(Snapshot *o)
 {
     o->valid = false;
@@ -318,6 +323,12 @@ static bool snapshot(Snapshot *o)
         memcpy(o->prevViewProj,    g_share->prevViewProj,    sizeof(o->prevViewProj));
         memcpy(o->world,           g_share->world,           sizeof(o->world));
         memcpy(o->proj,            g_share->proj,            sizeof(o->proj));
+        // Engine-depth linearization for the resolve: view = -B/(d+A). Taken
+        // from the LIVE projection, so cockpit near-clip scaling (the engine
+        // scales clip planes per view - cockpit/near_clip_ratio) is tracked
+        // rather than assumed.
+        g_taaEdAB[0] = g_share->proj[10];
+        g_taaEdAB[1] = g_share->proj[14];
         memcpy(o->prevProj,        g_share->prevProj,        sizeof(o->prevProj));
         memcpy(o->bodyReproj,      g_share->bodyReproj,      sizeof(o->bodyReproj));
         o->bodyReprojValid = g_share->bodyReprojValid;
@@ -2078,6 +2089,20 @@ static std::map<VkImageView, VkImage> g_viewToImage;
 // announcing "gbuffer_pos" through a call our layer simply did not intercept.
 // This map is the correction: handle -> the engine's own name for it.
 static std::map<VkImage, std::string> g_imageNames;
+
+// The image the engine names "gbuf-depth" - identified by the name listener,
+// consumed by the resolve as its depth source under taa.pos_harvest.
+static VkImage g_engineDepthImage = VK_NULL_HANDLE;
+
+// The engine's name for an image this layer identified by shape, or null.
+// The check that closes the loop: shape-identification says WHICH image,
+// the listener says WHAT the engine calls it, and disagreement is a bug in
+// the shape check, announced instead of silent.
+static const char *mvEngineNameOf(VkImage img)
+{
+    std::map<VkImage, std::string>::iterator it = g_imageNames.find(img);
+    return it == g_imageNames.end() ? nullptr : it->second.c_str();
+}
 
 // The frame-generation backbuffers the layer tagged MUTABLE_FORMAT, mapped to
 // the usage they were really created with. Layer_CreateImageView consults this
@@ -4002,6 +4027,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
             if (vi->second == img) vi = g_viewToImage.erase(vi); else ++vi;
         }
         g_imageNames.erase(img);
+        if (img == g_engineDepthImage) g_engineDepthImage = VK_NULL_HANDLE;
         g_fgMutableImg.erase(img);
         for (size_t i = 0; i < g_depthCandidates.size(); ++i)
             if (g_depthCandidates[i].image == img) {
@@ -6769,6 +6795,28 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                         }
                     }
                     taaBindFlags(tdd, fi, ff, fl, fsm);
+                    // Binding 5: the engine's own depth, identified BY NAME by
+                    // the listener rather than by shape. Format and sample
+                    // count come from our vkCreateImage records - the depth
+                    // candidate list tracks every depth-capable image.
+                    {
+                        VkImage  edi = g_engineDepthImage;
+                        VkFormat edf = VK_FORMAT_UNDEFINED;
+                        VkSampleCountFlagBits eds = VK_SAMPLE_COUNT_1_BIT;
+                        if (edi != VK_NULL_HANDLE) {
+                            std::lock_guard<std::mutex> g(g_lock);
+                            bool found = false;
+                            for (size_t di = 0; di < g_depthCandidates.size(); ++di)
+                                if (g_depthCandidates[di].image == edi) {
+                                    edf = g_depthCandidates[di].format;
+                                    eds = g_depthCandidates[di].samples;
+                                    found = true;
+                                    break;
+                                }
+                            if (!found) edi = VK_NULL_HANDLE;
+                        }
+                        taaBindEngineDepth(tdd, edi, edf, eds);
+                    }
                     // Lifetime ledger for the deferred-destroy protection:
                     // this engine image is now referenced by a dispatch that
                     // may execute up to a few frames from now.
@@ -7205,6 +7253,12 @@ static void noteGbufferVelCandidate(const ColorTarget &c)
     // uint image of some other size is a histogram or a tile buffer.
     if (!g_mv.w || !g_mv.h || c.w != g_mv.w || c.h != g_mv.h) return;
     g_gbufferVelCandidate = c.image;
+    // The engine's own name for this handle, if the listener has one - the
+    // correlation that closes the loop on a shape-based identification.
+    if (const char *en = mvEngineNameOf(c.image))
+        trace("GBUFFER_VEL CORRELATE: the engine calls this image \"%s\"", en);
+    else
+        trace("GBUFFER_VEL CORRELATE: no engine name recorded for this handle");
     trace("GBUFFER_VEL: candidate %p fmt=%s %ux%u layers=%u samples=%u. "
           "ssr_deferred reads a uint flags image at set 0 binding 4 and tests "
           "bit 2 to choose u_local_reproj over u_reproj, so bit 2 is X-Plane's "
@@ -8776,6 +8830,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // knowing before designing around it rather than after.
     if (!g_sceneColorReported && g_sceneColor.image != VK_NULL_HANDLE) {
         g_sceneColorReported = true;
+        if (const char *en = mvEngineNameOf(g_sceneColor.image))
+            trace("SCENE CORRELATE: the engine calls the scene colour \"%s\"", en);
+        else
+            trace("SCENE CORRELATE: no engine name recorded for the scene colour");
         bool sampled = (g_sceneColor.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
         bool storage = (g_sceneColor.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
         bool xfer    = (g_sceneColor.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
@@ -16189,6 +16247,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_SetDebugUtilsObjectNameEXT(
             trace("IMG NAME: %llu namings, %zu unique so far",
                   (unsigned long long)total, seen.size());
 
+        if (nm == "gbuf-depth") {
+            if (g_engineDepthImage != img)
+                trace("IMG NAME: gbuf-depth identified = %p%s", (void*)img,
+                      g_engineDepthImage ? "  (handle changed)" : "");
+            g_engineDepthImage = img;
+        } else if (img == g_engineDepthImage) {
+            // Handle reuse: this handle is now something else entirely.
+            trace("IMG NAME: gbuf-depth handle %p renamed to \"%s\" - "
+                  "identification cleared", (void*)img, nm.c_str());
+            g_engineDepthImage = VK_NULL_HANDLE;
+        }
         // The shape-identified handles, checked against the engine's own word.
         if (interesting) {
             if (img == g_gbufferVelCandidate)

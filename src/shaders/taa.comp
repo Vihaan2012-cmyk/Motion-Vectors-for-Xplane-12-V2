@@ -100,13 +100,39 @@ layout(binding = 3)          uniform sampler2DArray uHistorySampler;
 // binding to be valid even behind a branch - and reads as bit-2-clear, a
 // no-op.
 layout(binding = 4)          uniform usampler2DArray uFlags;
+// ---- X-PLANE'S OWN DEPTH, BOUND STRAIGHT FROM THE ENGINE.
+//
+// The image the engine itself names "gbuf-depth" - the same buffer its clouds,
+// fog, atmosphere and particles all read as gbuffer_pos. Under FLAG_ENGINE_DEPTH
+// the AO and contact-shadow marches take their view distance from here instead
+// of from the injected clip-w in uVelocity's B channel: the injected value only
+// exists where our patched vertex shaders ran, while this exists EVERYWHERE the
+// engine drew anything. When the flag is off (or identification has not landed
+// yet) binding 5 holds the velocity target as a dummy and is never sampled.
+layout(binding = 5)          uniform sampler2DArray uEngineDepth;
+
 
 layout(push_constant) uniform Params {
     vec2  invSize;      // 1 / target size
     vec2  jitter;       // the APPLIED NDC offset this frame - scaled, Y-signed
     float alpha;        // weight of the current frame
     int   mode;         // 0 passthrough, 1 reproject, 2 full
-    int   reset;        // 1 = ignore history this frame
+    // ---- DID THE CAMERA MOVE THIS FRAME? (now FLAG_CAMERA_MOVED in flags)
+    //
+    // Needed to read a zero velocity correctly: our velocity attachment is
+    // CLEARED to zero and written only by the vertex shaders we patched, so an
+    // unwritten pixel and a static pixel are indistinguishable per-pixel and
+    // need opposite treatment. One bit from the camera separates them - with
+    // the camera still, zero means static; moving, zero means unknown.
+    // ---- reset and cameraMoved MOVED INTO pc.flags (FLAG_RESET,
+    // FLAG_CAMERA_MOVED). The push block sits at the 128-byte guaranteed
+    // ceiling, and two int32s that each carried one bit were the only slack.
+    // Their four bytes now carry the engine-depth linearization:
+    //     view_distance = -edB / (ndc_depth + edA)
+    // with edA = proj[10] and edB = proj[14], straight from the projection the
+    // plugin already publishes. Works for either depth convention because the
+    // constants come from the live matrix rather than from an assumption.
+    float edA;
     // ---- DID THE CAMERA MOVE THIS FRAME?
     //
     // Needed to read a zero velocity correctly, and that turns out to matter a
@@ -122,7 +148,7 @@ layout(push_constant) uniform Params {
     // one cannot be reprojected at all. One bit from the camera separates them.
     // With the camera still, zero means static and history is perfect; with the
     // camera moving, zero means unknown.
-    int   cameraMoved;
+    float edB;
     // ---- LOOK AT IT, AND REMOVE ONE INPUT AT A TIME.
     //
     // All live-editable while the sim runs. One picture settled what twenty
@@ -194,6 +220,20 @@ const int FLAG_REACTIVE       = 8;   // consume the coverage mask in .a
 const int FLAG_NO_UNJITTER    = 16;
 const int FLAG_CATMULL        = 32;  // sharp history resampling; see the
                                      // note at sampleHistory
+const int FLAG_RESET          = 512;  // was the int32 pc.reset
+const int FLAG_CAMERA_MOVED   = 1024; // was the int32 pc.cameraMoved
+const int FLAG_ENGINE_DEPTH   = 2048; // binding 5 holds X-Plane's own depth
+// view distance from engine depth; fb is the injected clip-w fallback so a
+// wrong identification degrades to exactly the previous behaviour.
+float mvViewDepth(vec2 u, float lay, float fb)
+{
+    if ((pc.flags & FLAG_ENGINE_DEPTH) == 0) return fb;
+    float d   = texture(uEngineDepth, vec3(u, lay)).r;
+    float den = d + pc.edA;
+    if (abs(den) < 1e-7) return fb;          // at-infinity texel
+    float v = -pc.edB / den;
+    return (v > 0.0) ? v : fb;
+}
 const int FLAG_DILATE         = 256; // borrow the closest neighbour's vector
                                      // at silhouettes; see the search above the
                                      // velocity fetch. Off makes every edge take
@@ -828,7 +868,7 @@ void main()
     // it separates "unwritten" from "written, and stationary" - which a zero
     // vector cannot do.
     bool noVector = (pc.flags & FLAG_NOVEC_BY_VEL) != 0
-                  ? (pc.cameraMoved != 0 && vel == vec2(0.0)
+                  ? ((pc.flags & FLAG_CAMERA_MOVED) != 0 && vel == vec2(0.0)
                      && (pc.flags & FLAG_NO_MOTION) == 0)
                   : (pc.novecCov >= 0.0 && unwritten
                      && (pc.flags & FLAG_NO_MOTION) == 0);
@@ -908,7 +948,7 @@ void main()
     // is a cleared zero, which would read as infinitely near and blacken the
     // horizon.
     if (pc.aoStrength > 0.0 && !unwritten && velS.z > 0.0) {
-        float w0 = velS.z;
+        float w0 = mvViewDepth(uv + S, float(layer), velS.z);
         // Per-pixel rotation (interleaved gradient noise). Without it the eight
         // taps land on the same eight angles everywhere and the occlusion shows
         // its sampling pattern as a visible texture.
@@ -922,7 +962,8 @@ void main()
             // bunching them at the centre.
             float rad = pc.aoRadius * sqrt((float(i) + 0.5) / float(AO_TAPS));
             vec2  o   = vec2(cos(ang), sin(ang)) * rad / vec2(size);
-            float wn  = texture(uVelocity, vec3(uv + S + o, float(layer))).z;
+            float wn  = mvViewDepth(uv + S + o, float(layer),
+                                    texture(uVelocity, vec3(uv + S + o, float(layer))).z);
             if (wn <= 0.0) continue;                 // nothing wrote there
             float d = w0 - wn;                       // >0 => neighbour is nearer
             if (d <= 0.0) continue;                  // behind us, not an occluder
@@ -966,7 +1007,7 @@ void main()
     vec2 sunXY = vec2(pc.sunViewX, pc.sunViewY * pc.velYSign);
     float sunLen = length(sunXY);
     if (pc.csStrength > 0.0 && !unwritten && velS.z > 0.0 && sunLen > 0.05) {
-        float w0 = velS.z;
+        float w0 = mvViewDepth(uv + S, float(layer), velS.z);
         vec2  dir = sunXY / sunLen;
         // Shorter than the AO radius on purpose. Contact shadows are a contact
         // effect; marching them as far as the ambient term turns every silhou-
@@ -980,7 +1021,8 @@ void main()
         for (int i = 0; i < CS_STEPS; ++i) {
             float t = (float(i) + ign) / float(CS_STEPS);
             vec2  o = dir * (csLen * t) / vec2(size);
-            float wn = texture(uVelocity, vec3(uv + S + o, float(layer))).z;
+            float wn = mvViewDepth(uv + S + o, float(layer),
+                                   texture(uVelocity, vec3(uv + S + o, float(layer))).z);
             if (wn <= 0.0) continue;                 // nothing wrote there
             float d = w0 - wn;                       // >0 => sample is nearer
             // A bias that GROWS along the march, standing in for the ray
@@ -1022,7 +1064,7 @@ void main()
         currA *= clamp(1.0 - pc.csStrength * shadow, 0.0, 1.0);
     }
 
-    if (pc.reset != 0 || !valid || noVector) {
+    if ((pc.flags & FLAG_RESET) != 0 || !valid || noVector) {
         imageStore(uHistory, ivec3(px, layer), vec4(currA, 1.0));
         return;
     }
@@ -1078,7 +1120,7 @@ void main()
         h = clamp(h, cmin, cmax);
         // First frame, a reset, or a reprojection that left the screen: take
         // the current frame whole rather than blending against nothing.
-        bool bad = pc.reset != 0 ||
+        bool bad = (pc.flags & FLAG_RESET) != 0 ||
                    hUv.x < 0.0 || hUv.x > 1.0 || hUv.y < 0.0 || hUv.y > 1.0;
         // ---- A PIXEL WITH NO VECTOR CANNOT FOLLOW THE CAMERA.
         //

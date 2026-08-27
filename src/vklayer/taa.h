@@ -102,6 +102,11 @@ struct TaaState {
     // statically-used binding to be valid even behind a branch, and a zero
     // flag word reads as bit-2-clear, which makes the fallback a no-op.
     std::map<VkImage, VkImageView> flagsViews;
+    // Binding 5: the engine's own depth. Views cached per image exactly like
+    // the flags views; edValid says binding 5 holds the real thing.
+    std::map<VkImage, VkImageView> edViews;
+    VkImageView     edView  = VK_NULL_HANDLE;
+    bool            edValid = false;
     VkImageView     flagsView   = VK_NULL_HANDLE;   // what binding 4 gets
     bool            flagsValid  = false;            // true only for the real image
     VkImage         flagsFallback     = VK_NULL_HANDLE;
@@ -166,14 +171,13 @@ struct TaaPush {
     float jitterX, jitterY;
     float alpha;
     int32_t mode;
-    int32_t reset;
-    // Whether the camera moved this frame. The shader needs it to read a ZERO
-    // velocity correctly: our attachment is cleared and written only by the
-    // vertex shaders we patched, so at a sky or cloud pixel zero means "nothing
-    // wrote here", not "this pixel is stationary". With the camera still, zero
-    // means static and history is perfect; with it moving, zero means the pixel
-    // cannot be reprojected at all. Same word, opposite treatment.
-    int32_t cameraMoved;
+    // ---- reset and cameraMoved live in `flags` now (kTaaFlagReset,
+    // kTaaFlagCameraMoved). The block is at the 128-byte ceiling and each of
+    // those int32s carried one bit; their bytes now hold the engine-depth
+    // linearization:  view = -edB / (ndc_depth + edA), edA = proj[10],
+    // edB = proj[14] from the live projection. See g_taaEdAB.
+    float   edA;
+    float   edB;
     // Debug visualisation, and the switches that remove one input at a time.
     // Packed as a bitmask rather than four ints because the block is pushed
     // every frame and 16 bytes of padding is 16 bytes of nothing.
@@ -265,6 +269,9 @@ enum {
     // Default ON - a correctness fix for thin geometry, not an effect. Bit 8
     // because 7 was already taken on the frame-gen branch.
     kTaaFlagDilate        = 1 << 8,
+    kTaaFlagReset         = 1 << 9,   // was the int32 TaaPush::reset
+    kTaaFlagCameraMoved   = 1 << 10,  // was the int32 TaaPush::cameraMoved
+    kTaaFlagEngineDepth   = 1 << 11,  // binding 5 holds X-Plane's gbuf-depth
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -377,6 +384,10 @@ static bool taaReactive() { return live::onoff("taa.reactive", "TAA_REACTIVE", f
 // is why thin geometry - struts, antennas, wires, blade edges - ghosts. Set 0
 // to A/B it; the difference shows on edges under camera motion, nowhere else.
 static bool taaDilate() { return live::onoff("taa.dilate", "TAA_DILATE", true); }
+// Read AO/contact view depth from X-Plane's own gbuf-depth (binding 5) instead
+// of the injected clip-w. Off by default until it has been A/B'd - and it can
+// only engage once the name listener has identified the image anyway.
+static bool taaPosHarvest() { return live::onoff("taa.pos_harvest", "TAA_POS_HARVEST", false); }
 // ---- AMBIENT OCCLUSION.
 //
 // Computed inside the resolve from the clip w the injector writes into the
@@ -744,7 +755,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                   "override stays off");
     }
 
-    VkDescriptorSetLayoutBinding b[5];
+    VkDescriptorSetLayoutBinding b[6];
     memset(b, 0, sizeof(b));
     // Binding 0 is a SAMPLER now, not a storage image: the dispatch only reads
     // the scene. That is what lets the scene target keep X-Plane's own usage
@@ -754,14 +765,17 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     b[3].binding = 3; b[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     b[4].binding = 4; b[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    for (int i = 0; i < 5; ++i) {
+    // Binding 5: the engine's depth, sampled. Dummy-bound to the velocity
+    // target whenever the real image is unidentified or the harvest is off.
+    b[5].binding = 5; b[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    for (int i = 0; i < 6; ++i) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci;
     memset(&dlci, 0, sizeof(dlci));
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 5; dlci.pBindings = b;
+    dlci.bindingCount = 6; dlci.pBindings = b;
     if (dd.createDescriptorSetLayout(dev, &dlci, nullptr, &g_taa.setLayout) != VK_SUCCESS) return false;
 
     VkPushConstantRange pcr;
@@ -816,7 +830,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = 1 * TaaState::kSets;   // history write only
     ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    ps[1].descriptorCount = 4 * TaaState::kSets;   // scene, velocity, history, flags
+    ps[1].descriptorCount = 5 * TaaState::kSets;   // scene, velocity, history, flags, engine depth
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -964,6 +978,48 @@ static DeviceData *g_taaDevice = nullptr;
 // Refuses multisampled or non-uint candidates: the shader declares a
 // single-sample uint array sampler, and a mismatched view is exactly the class
 // of silent wrongness the shape checks exist to prevent.
+// Point binding 5 at X-Plane's own depth image (the one the engine names
+// "gbuf-depth"), creating the view once per image. DEPTH aspect: the format is
+// a depth format and a colour-aspect view of it is invalid. Multisampled
+// candidates are refused for the same reason as the flags binding.
+static void taaBindEngineDepth(DeviceData &dd, VkImage image, VkFormat fmt,
+                               VkSampleCountFlagBits samples)
+{
+    if (image == VK_NULL_HANDLE || samples != VK_SAMPLE_COUNT_1_BIT) {
+        g_taa.edView  = VK_NULL_HANDLE;
+        g_taa.edValid = false;
+        return;
+    }
+    std::map<VkImage, VkImageView>::iterator it = g_taa.edViews.find(image);
+    if (it != g_taa.edViews.end()) {
+        g_taa.edView  = it->second;
+        g_taa.edValid = (it->second != VK_NULL_HANDLE);
+        return;
+    }
+    VkImageViewCreateInfo v;
+    memset(&v, 0, sizeof(v));
+    v.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    v.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    v.format = fmt;
+    v.image = image;
+    v.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    v.subresourceRange.levelCount = 1;
+    v.subresourceRange.layerCount = 1;
+    VkImageView view = VK_NULL_HANDLE;
+    if (dd.createImageView(g_taa.device, &v, nullptr, &view) != VK_SUCCESS) {
+        trace("TAA: gbuf-depth view creation failed (fmt=%d) - pos harvest "
+              "stays on the injected clip-w", (int)fmt);
+        view = VK_NULL_HANDLE;
+    } else {
+        trace("TAA: engine gbuf-depth bound (fmt=%d) - taa.pos_harvest=1 now "
+              "reads the engine's own depth for AO and contact shadows.",
+              (int)fmt);
+    }
+    g_taa.edViews[image] = view;
+    g_taa.edView  = view;
+    g_taa.edValid = (view != VK_NULL_HANDLE);
+}
+
 static void taaBindFlags(DeviceData &dd, VkImage image, VkFormat fmt,
                          uint32_t layers, VkSampleCountFlagBits samples)
 {
@@ -1239,7 +1295,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     VkDescriptorSet set = g_taa.sets[g_taa.nextSet];
     g_taa.nextSet = (g_taa.nextSet + 1) % TaaState::kSets;
 
-    VkDescriptorImageInfo ii[5];
+    VkDescriptorImageInfo ii[6];
     memset(ii, 0, sizeof(ii));
     ii[0].imageView = g_taa.sceneView;
     ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1262,10 +1318,19 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                                                             : g_taa.flagsFallbackView;
     ii[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     ii[4].sampler   = g_taa.samplerNearest;   // integer format: NEAREST only
+    // Binding 5: the engine's depth when identified, the velocity target as a
+    // dummy otherwise (any float array view satisfies the layout; the shader
+    // never samples it unless kTaaFlagEngineDepth is set, and that flag is only
+    // set when edValid). Same no-barrier reasoning as binding 4: by resolve
+    // time the deferred shading, clouds and fog have all sampled this image,
+    // so the engine has already moved it to a shader-readable layout.
+    ii[5].imageView = g_taa.edValid ? g_taa.edView : g_taa.velView;
+    ii[5].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ii[5].sampler   = g_taa.samplerNearest;   // depth: no filtering across edges
 
-    VkWriteDescriptorSet wr[5];
+    VkWriteDescriptorSet wr[6];
     memset(wr, 0, sizeof(wr));
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 6; ++i) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[i].dstSet = set;
         wr[i].dstBinding = (uint32_t)i;
@@ -1277,7 +1342,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     wr[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wr[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wr[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    dd.updateDescriptorSets(g_taa.device, 5, wr, 0, nullptr);
+    wr[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    dd.updateDescriptorSets(g_taa.device, 6, wr, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -1319,8 +1385,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.jitterY = jitterY;
     pcv.alpha = taaAlpha();
     pcv.mode = taaMode();
-    pcv.reset = (reset || taaForceReset()) ? 1 : 0;
-    pcv.cameraMoved = cameraMoved ? 1 : 0;
+    const bool pcReset = (reset || taaForceReset());
+    pcv.edA = g_taaEdAB[0];
+    pcv.edB = g_taaEdAB[1];
     pcv.viz      = taaViz();
     pcv.vizScale = taaVizScale();
     pcv.gain     = taaGain();
@@ -1343,7 +1410,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.sunViewY      = g_taaSunView[1];
     pcv.sunViewZ      = g_taaSunView[2];
     pcv.csStrength    = taaCsStrength();
-    pcv.flags    = (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
+    pcv.flags    = (pcReset             ? kTaaFlagReset         : 0)
+                 | (cameraMoved        ? kTaaFlagCameraMoved   : 0)
+                 | ((taaPosHarvest() && g_taa.edValid) ? kTaaFlagEngineDepth : 0)
+                 | (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
                  | (taaReactive()      ? kTaaFlagReactive      : 0)
@@ -1370,7 +1440,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         static float lastScale = 0.0f, lastSign = 0.0f;
         if (pcv.viz != lastViz || pcv.velScale != lastScale ||
             pcv.velYSign != lastSign) {
-            if (lastViz != -1) pcv.reset = 1;
+            if (lastViz != -1) pcv.flags |= kTaaFlagReset;
             lastViz = pcv.viz; lastScale = pcv.velScale; lastSign = pcv.velYSign;
         }
     }
@@ -1672,7 +1742,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     if ((++g_taa.dispatches % 600) == 1)
         trace("TAA: dispatch %llu - mode %d alpha %.3f reset %d (%ux%u x%u)",
               (unsigned long long)g_taa.dispatches, taaMode(), taaAlpha(),
-              pcv.reset, g_taa.w, g_taa.h, g_taa.layers);
+              (pcv.flags & kTaaFlagReset) ? 1 : 0,
+              g_taa.w, g_taa.h, g_taa.layers);
 }
 
 // The IBackend entry point. Thin on purpose: everything above it is the
