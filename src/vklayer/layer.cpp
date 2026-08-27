@@ -2020,7 +2020,13 @@ struct MvSunSetMeta {
     VkDeviceSize shadowBase = 0, shadowRange = 0;
     VkDeviceSize gbufBase = 0,   gbufRange = 0;
     bool         shadowDynamic = false, gbufDynamic = false;
-    // Ascending dynamic-UBO bindings of this set, from its template.
+    // Proof and payload arrive in SEPARATE template writes - the first run
+    // showed the engine updating the set's images and its UBOs in different
+    // blobs, so identity (the named image seen in ANY write to this set) and
+    // capture (the UBO region from any other write) accumulate independently
+    // and the latch requires both.
+    bool         provenShadow = false, provenGbuf = false;
+    // Ascending dynamic-UBO bindings of this set, unioned across its writes.
     std::vector<uint32_t> dynBindings;
 };
 static std::map<VkDescriptorSet, MvSunSetMeta> g_setSunMeta;
@@ -7878,6 +7884,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                     g_setSunMeta.find(sets[i]);
                 if (it == g_setSunMeta.end()) continue;
                 MvSunSetMeta &m = it->second;
+                if (!m.provenShadow && !m.provenGbuf) continue;
                 if (i != 0 && (m.shadowDynamic || m.gbufDynamic)) {
                     static uint64_t skipped = 0;
                     if ((skipped++ % 600) == 0)
@@ -7892,35 +7899,42 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                     if (m.dynBindings[k] == 14) idx14 = k;
                     if (m.dynBindings[k] == 18) idx18 = k;
                 }
-                if (m.shadowRange) {
+                if (m.provenShadow && m.shadowRange) {
                     VkDeviceSize off = m.shadowBase;
+                    bool ok = true;
                     if (m.shadowDynamic) {
-                        if (idx14 == UINT32_MAX || idx14 >= nd) continue;
-                        off += dyn[idx14];
+                        if (idx14 == UINT32_MAX || idx14 >= nd) ok = false;
+                        else off += dyn[idx14];
                     }
-                    MvShadowRegion r;
-                    r.buf = m.buf; r.off = off; r.range = m.shadowRange;
-                    g_cbShadowRegion[cb] = r;
-                    if (g_cbShadowRegion.size() > 512)
-                        g_cbShadowRegion.erase(g_cbShadowRegion.begin());
+                    if (ok) {
+                        MvShadowRegion r;
+                        r.buf = m.buf; r.off = off; r.range = m.shadowRange;
+                        g_cbShadowRegion[cb] = r;
+                        if (g_cbShadowRegion.size() > 512)
+                            g_cbShadowRegion.erase(g_cbShadowRegion.begin());
+                    }
                     static uint64_t lseen = 0;
                     if ((lseen++ % 3000) == 0)
-                        trace("SUN META: latched shadow off=%llu (dyn %s) "
-                              "gbufIdx=%u nd=%u",
-                              (unsigned long long)off,
-                              m.shadowDynamic ? "yes" : "no", idx18, nd);
+                        trace("SUN LATCH: shadow ok=%d off=%llu idx14=%u "
+                              "dyn14=%u | idx18=%u nd=%u pos=%u/%u dynList=%zu",
+                              ok ? 1 : 0, (unsigned long long)off,
+                              idx14, (idx14 < nd) ? dyn[idx14] : 0,
+                              idx18, nd, i, n, m.dynBindings.size());
                 }
-                if (m.gbufRange) {
+                if (m.provenGbuf && m.gbufRange) {
                     VkDeviceSize off = m.gbufBase;
+                    bool ok = true;
                     if (m.gbufDynamic) {
-                        if (idx18 == UINT32_MAX || idx18 >= nd) continue;
-                        off += dyn[idx18];
+                        if (idx18 == UINT32_MAX || idx18 >= nd) ok = false;
+                        else off += dyn[idx18];
                     }
-                    MvShadowRegion r;
-                    r.buf = m.buf; r.off = off; r.range = m.gbufRange;
-                    g_cbGbufRegion[cb] = r;
-                    if (g_cbGbufRegion.size() > 512)
-                        g_cbGbufRegion.erase(g_cbGbufRegion.begin());
+                    if (ok) {
+                        MvShadowRegion r;
+                        r.buf = m.buf; r.off = off; r.range = m.gbufRange;
+                        g_cbGbufRegion[cb] = r;
+                        if (g_cbGbufRegion.size() > 512)
+                            g_cbGbufRegion.erase(g_cbGbufRegion.begin());
+                    }
                 }
             }
     }
@@ -16617,70 +16631,73 @@ static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
             }
         }
     }
-    // ---- PASS 2: metadata for the sets the images proved. The dynamic-UBO
-    // binding order comes from the SAME template entries, so dyn[] at bind
-    // time indexes straight to the true offsets.
-    if (dstSet != VK_NULL_HANDLE && (ubo14 || ubo18) &&
-        (sawCsm || sawGbufDepth)) {
-        MvSunSetMeta m;
+    // ---- PASS 2: accumulate per-set state. Identity (a named image seen in
+    // ANY write to this set) and payload (UBO regions) arrive in SEPARATE
+    // writes, so everything is stored unconditionally per set and the latch
+    // demands proof + payload together. Dynamic-binding lists are unioned
+    // across writes to approach the set layout's full dynamic order.
+    if (dstSet != VK_NULL_HANDLE &&
+        (ubo14 || ubo18 || sawCsm || sawGbufDepth)) {
+        std::lock_guard<std::mutex> g(g_lock);
+        MvSunSetMeta &dst = g_setSunMeta[dstSet];
+        const size_t hadDyn = dst.dynBindings.size();
         for (size_t e = 0; e < entries.size(); ++e)
             if (entries[e].descriptorType ==
                 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
-                for (uint32_t j = 0; j < entries[e].descriptorCount; ++j)
-                    m.dynBindings.push_back(entries[e].dstBinding + j);
-        std::sort(m.dynBindings.begin(), m.dynBindings.end());
-        bool any = false;
-        if (ubo14 && sawCsm) {
-            m.buf = ubo14->buffer;
-            m.shadowBase = ubo14->offset; m.shadowRange = ubo14->range;
+                for (uint32_t j = 0; j < entries[e].descriptorCount; ++j) {
+                    const uint32_t bnd = entries[e].dstBinding + j;
+                    bool have = false;
+                    for (size_t k = 0; k < dst.dynBindings.size(); ++k)
+                        if (dst.dynBindings[k] == bnd) { have = true; break; }
+                    if (!have) dst.dynBindings.push_back(bnd);
+                }
+        std::sort(dst.dynBindings.begin(), dst.dynBindings.end());
+        const bool wasArmedS = dst.provenShadow && dst.shadowRange != 0;
+        const bool wasArmedG = dst.provenGbuf && dst.gbufRange != 0;
+        if (sawCsm)       dst.provenShadow = true;
+        if (sawGbufDepth) dst.provenGbuf   = true;
+        if (ubo14) {
+            dst.buf = ubo14->buffer;
+            dst.shadowBase = ubo14->offset; dst.shadowRange = ubo14->range;
             for (size_t e = 0; e < entries.size(); ++e)
                 if (entries[e].descriptorType ==
                         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
                     entries[e].dstBinding <= 14 &&
                     14 < entries[e].dstBinding + entries[e].descriptorCount)
-                    m.shadowDynamic = true;
-            any = true;
+                    dst.shadowDynamic = true;
         }
-        if (ubo18 && sawGbufDepth) {
-            m.buf = ubo18->buffer;
-            m.gbufBase = ubo18->offset; m.gbufRange = ubo18->range;
+        if (ubo18) {
+            dst.buf = ubo18->buffer;
+            dst.gbufBase = ubo18->offset; dst.gbufRange = ubo18->range;
             for (size_t e = 0; e < entries.size(); ++e)
                 if (entries[e].descriptorType ==
                         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
                     entries[e].dstBinding <= 18 &&
                     18 < entries[e].dstBinding + entries[e].descriptorCount)
-                    m.gbufDynamic = true;
-            any = true;
+                    dst.gbufDynamic = true;
         }
-        if (any) {
-            std::lock_guard<std::mutex> g(g_lock);
-            // Merge: shadow and gbuf can arrive in separate template writes
-            // to the same set.
-            MvSunSetMeta &dst = g_setSunMeta[dstSet];
-            if (m.shadowRange) {
-                dst.buf = m.buf;
-                dst.shadowBase = m.shadowBase; dst.shadowRange = m.shadowRange;
-                dst.shadowDynamic = m.shadowDynamic;
+        const bool armedS = dst.provenShadow && dst.shadowRange != 0;
+        const bool armedG = dst.provenGbuf && dst.gbufRange != 0;
+        if ((armedS && !wasArmedS) || (armedG && !wasArmedG) ||
+            dst.dynBindings.size() != hadDyn) {
+            std::string dl;
+            char tmp[16];
+            for (size_t k = 0; k < dst.dynBindings.size(); ++k) {
+                snprintf(tmp, sizeof(tmp), "%s%u", k ? "," : "",
+                         dst.dynBindings[k]);
+                dl += tmp;
             }
-            if (m.gbufRange) {
-                dst.buf = m.buf;
-                dst.gbufBase = m.gbufBase; dst.gbufRange = m.gbufRange;
-                dst.gbufDynamic = m.gbufDynamic;
-            }
-            if (!m.dynBindings.empty()) dst.dynBindings = m.dynBindings;
-            if (g_setSunMeta.size() > 256)
-                g_setSunMeta.erase(g_setSunMeta.begin());
-            static uint64_t qseen = 0;
-            if ((qseen++ % 600) == 0)
-                trace("SUN META (qualified): set=%p shadow(base=%llu rng=%llu "
-                      "dyn=%d) gbuf(base=%llu rng=%llu dyn=%d) dynUBOs=%zu",
-                      (void*)dstSet,
-                      (unsigned long long)dst.shadowBase,
-                      (unsigned long long)dst.shadowRange, dst.shadowDynamic ? 1 : 0,
-                      (unsigned long long)dst.gbufBase,
-                      (unsigned long long)dst.gbufRange, dst.gbufDynamic ? 1 : 0,
-                      dst.dynBindings.size());
+            trace("SUN META: set=%p shadow[%s rng=%llu dyn=%d] "
+                  "gbuf[%s rng=%llu dyn=%d] dynUBOs=[%s]",
+                  (void*)dstSet,
+                  armedS ? "ARMED" : (dst.provenShadow ? "proven" : "-"),
+                  (unsigned long long)dst.shadowRange, dst.shadowDynamic ? 1 : 0,
+                  armedG ? "ARMED" : (dst.provenGbuf ? "proven" : "-"),
+                  (unsigned long long)dst.gbufRange, dst.gbufDynamic ? 1 : 0,
+                  dl.c_str());
         }
+        if (g_setSunMeta.size() > 256)
+            g_setSunMeta.erase(g_setSunMeta.begin());
     }
 }
 
