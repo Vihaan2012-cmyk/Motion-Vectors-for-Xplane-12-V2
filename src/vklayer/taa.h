@@ -1472,18 +1472,6 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         g_taa.sunDummyReady = true;
     }
 
-    // ---- THE GATHER RUNS FIRST, IN THIS COMMAND BUFFER.
-    //
-    // Recorded before the resolve's own dispatch so its result is ready to be
-    // composited in the same frame, with the gather's trailing barrier doing
-    // the ordering. Everything it needs is already identified: the engine's
-    // depth and probes by name, our velocity by construction.
-    gi::record(dd, g_taa.device, cb, g_taa.sceneView, g_taa.velView,
-               g_taa.edValid ? g_taa.edView : VK_NULL_HANDLE,
-               g_taa.probeValid ? g_taa.probeView : VK_NULL_HANDLE,
-               g_taa.w, g_taa.h, g_taaEdAB[0], g_taaEdAB[1],
-               g_taaInvProj[0], g_taaInvProj[1]);
-
     VkImageMemoryBarrier bar[3];
     memset(bar, 0, sizeof(bar));
     for (int i = 0; i < 3; ++i) {
@@ -1554,6 +1542,28 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                               0, nullptr, 0, nullptr, 2, hist);
     }
+
+    // ---- THE GATHER, AFTER THE TRANSITIONS AND BEFORE THE RESOLVE.
+    //
+    // It must come after the barriers above, not before them: bar[0] moves the
+    // scene image from COLOR_ATTACHMENT_OPTIMAL to SHADER_READ_ONLY_OPTIMAL,
+    // and the gather samples that image while declaring the latter. Recorded
+    // ahead of the barrier it was originally placed before, it would have been
+    // sampling an image in a layout it does not have - invalid, and the kind
+    // of invalid a driver may honour on one machine and not another.
+    //
+    // Still ahead of the resolve's own dispatch, so the result is composited
+    // in the same frame, with the gather's trailing barrier ordering it.
+    gi::record(dd, g_taa.device, cb, g_taa.sceneView, g_taa.velView,
+               g_taa.edValid ? g_taa.edView : VK_NULL_HANDLE,
+               g_taa.probeValid ? g_taa.probeView : VK_NULL_HANDLE,
+               g_taa.w, g_taa.h, g_taaEdAB[0], g_taaEdAB[1],
+               g_taaInvProj[0], g_taaInvProj[1],
+               // Read directly rather than through the seqlock snapshot below:
+               // this is a single float that changes only when the viewport
+               // orientation does, and the snapshot is taken further down than
+               // the gather now sits.
+               g_taaVpYSign);
 
     // Clear the history once, explicitly. Reading an UNDEFINED image gives
     // undefined contents and on the first frame every output pixel is a blend

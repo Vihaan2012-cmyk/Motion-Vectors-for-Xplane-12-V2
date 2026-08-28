@@ -46,7 +46,7 @@ layout(binding = 5) uniform sampler2DArray uProbes;   // engine cubemaps
 layout(push_constant) uniform P {
     ivec2 halfSize;     // dispatch extent
     ivec2 fullSize;     // render resolution
-    float edA, edB;     // view = -edB / (depth + edA)
+    float edA, edB;     // view = edB / (depth + edA)
     float invProjX;     // 1 / proj[0]
     float invProjY;     // 1 / proj[5]
     float radius;       // ray length ceiling, METRES
@@ -55,6 +55,7 @@ layout(push_constant) uniform P {
     float alpha;        // history blend
     float velScale;
     float velYSign;
+    float ySign;        // viewport Y flip: framebuffer Y vs clip Y
     float intensity;    // scales the gathered radiance
     int   steps;        // march steps per ray
     int   rays;         // rays per pixel per frame
@@ -80,7 +81,10 @@ vec3 eyePos(vec2 uv, float lay, out float dist)
     // write black over the whole frame.
     dist = (abs(den) < 1e-7) ? 1e9 : pc.edB / den;
     if (dist <= 0.0) dist = 1e9;
-    vec2 ndc = uv * 2.0 - 1.0;
+    // ySign carries X-Plane's negative-height viewport. Without it the
+    // reconstruction is mirrored in Y and the depth-derived normal - a cross
+    // product of two mirrored differences - points where nothing faces.
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * pc.ySign);
     return vec3(ndc.x * dist * pc.invProjX, ndc.y * dist * pc.invProjY, -dist);
 }
 
@@ -90,6 +94,7 @@ vec2 eyeToUv(vec3 e)
 {
     float z = max(-e.z, 1e-4);
     vec2 ndc = vec2(e.x / (z * pc.invProjX), e.y / (z * pc.invProjY));
+    ndc.y *= pc.ySign;                       // the inverse of eyePos's flip
     return ndc * 0.5 + 0.5;
 }
 
@@ -213,7 +218,13 @@ void main()
 
         // Start slightly off the surface: a ray that begins exactly on it
         // hits its own origin at the first step and the whole frame goes dark.
-        vec3 origin = P + N * (0.01 + 0.002 * dist);
+        //
+        // Scaled to the RAY, not to the world. An absolute 1 cm is half the
+        // ray's entire length at 0.5 m distance (where the pixel cap leaves
+        // only ~2 cm of reach), so the ray would have started halfway along
+        // itself - the same absolute-versus-relative error as the radius and
+        // the hit tolerance, one line further on again.
+        vec3 origin = P + N * max(0.05 * effRadius, 0.0005 * dist);
         vec3 target = origin + dir * effRadius;
 
         vec2 uv0 = eyeToUv(origin);

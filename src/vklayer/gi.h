@@ -106,6 +106,7 @@ struct Push {
     float   radius, maxScreenPx, thickness;
     float   alpha;
     float   velScale, velYSign;
+    float   ySign;
     float   intensity;
     int32_t steps, rays, frame, flags;
 };
@@ -299,7 +300,8 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
                    VkImageView sceneView, VkImageView velView,
                    VkImageView depthView, VkImageView probeView,
                    uint32_t fullW, uint32_t fullH,
-                   float edA, float edB, float invProjX, float invProjY)
+                   float edA, float edB, float invProjX, float invProjY,
+                   float ySign)
 {
     if (!enabled()) return;
     if (sceneView == VK_NULL_HANDLE || velView == VK_NULL_HANDLE) return;
@@ -409,6 +411,17 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     p.alpha     = live::f("taa.gi_alpha",     "TAA_GI_ALPHA",     0.08f);
     p.velScale  = taaVelScale();
     p.velYSign  = taaVelYSign();
+    // ---- THE VIEWPORT Y FLIP, WHICH THIS PASS WAS IGNORING.
+    //
+    // X-Plane sets a NEGATIVE-height viewport, so framebuffer Y and clip Y
+    // point opposite ways. Every other consumer in this layer respects that -
+    // it is the whole reason smul_y is negative and velYSign exists - but the
+    // eye reconstruction here assumed the Vulkan default. Positions came out
+    // mirrored in Y, and the depth-derived normal is a CROSS PRODUCT of two
+    // such differences, so it did not merely flip: it came out as
+    // (-n.x, n.y, -n.z), pointing somewhere the surface does not face. Every
+    // ray would then be cast into the wrong hemisphere.
+    p.ySign     = ySign;
     p.intensity = 1.0f;   // applied at composite; see the shader's note
     p.steps     = (int32_t)live::i("taa.gi_steps", "TAA_GI_STEPS", 10);
     p.rays      = (int32_t)live::i("taa.gi_rays",  "TAA_GI_RAYS",  4);
