@@ -1661,7 +1661,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         // when the gather has produced nothing, so the composite cannot read
         // a strength for a result that does not exist.
         slot[22] = (gi::resultView() != VK_NULL_HANDLE)
-                 ? live::f("taa.gi_strength", "TAA_GI_STRENGTH", 1.0f) : 0.0f;
+                 ? live::f("taa.gi_strength", "TAA_GI_STRENGTH", 0.5f) : 0.0f;
         slot[22] = 0.0f;
         slot[23] = 0.0f;
     }

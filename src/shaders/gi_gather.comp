@@ -49,7 +49,8 @@ layout(push_constant) uniform P {
     float edA, edB;     // view = -edB / (depth + edA)
     float invProjX;     // 1 / proj[0]
     float invProjY;     // 1 / proj[5]
-    float radius;       // ray length, METRES
+    float radius;       // ray length ceiling, METRES
+    float maxScreenPx;  // and its ceiling in half-res PIXELS - see the note
     float thickness;    // hit tolerance, metres
     float alpha;        // history blend
     float velScale;
@@ -170,6 +171,28 @@ void main()
         return;
     }
 
+    // ---- THE RAY IS CAPPED IN PIXELS, NOT ONLY IN METRES.
+    //
+    // A fixed world-space length is a wildly varying screen-space one. At this
+    // projection (proj[0] = 1/invProjX) a length L subtends
+    //     px = L * proj[0] * width / (2 * dist)
+    // half-resolution pixels. With a 6 m ray and 1477 px of width that is
+    //
+    //     dist 0.5 m -> 13910 px      dist 100 m ->  70 px
+    //     dist   5 m ->  1391 px      dist 300 m ->  23 px
+    //
+    // so a fixed step count would sample every ~1700 px in the cockpit and
+    // every ~3 px in the distance. The near field - the panel, the airframe,
+    // where bounce light matters most - would be marched by rays that leap
+    // over whole objects and hit nothing but coincidence.
+    //
+    // Capping the SCREEN length instead makes the step size roughly constant
+    // in pixels at every distance, which is the only thing the march actually
+    // cares about; the metre ceiling still bounds it far away.
+    const float pxPerM = (1.0 / max(pc.invProjX, 1e-6)) *
+                         (float(pc.halfSize.x) * 0.5) / max(dist, 1e-3);
+    const float effRadius = min(pc.radius, pc.maxScreenPx / max(pxPerM, 1e-6));
+
     const vec3 N = normalFromDepth(uv, P, lay, texel);
     const float n0 = ign(vec2(px), pc.frame);
     const float n1 = ign(vec2(px) + 17.0, pc.frame + 7);
@@ -186,7 +209,7 @@ void main()
         // Start slightly off the surface: a ray that begins exactly on it
         // hits its own origin at the first step and the whole frame goes dark.
         vec3 origin = P + N * (0.01 + 0.002 * dist);
-        vec3 target = origin + dir * pc.radius;
+        vec3 target = origin + dir * effRadius;
 
         vec2 uv0 = eyeToUv(origin);
         vec2 uv1 = eyeToUv(target);
@@ -224,6 +247,28 @@ void main()
         gathered += radiance;
     }
     gathered /= float(nRays);
+
+    // ---- STORE A RATIO, NOT RAW RADIANCE.
+    //
+    // The composite multiplies by (1 + gi * strength), and the radiance
+    // gathered here is the engine's PRE-TONEMAP HDR: the oracle measured
+    // environment_probes at mean 5,625 and max 27,040. Feeding that in raw
+    // means currA *= 5001 on the first accumulated frame - a guaranteed
+    // white-out, and a strength knob whose usable range would be 0.0002.
+    //
+    // Dividing by the surface's own luminance makes the stored quantity
+    // dimensionless: "how much indirect light arrives here, relative to what
+    // this surface already shows". Scale-free, exposure-free, and it keeps
+    // the bounce's COLOUR (the divisor is a scalar), which is the entire
+    // point - a red sign bleeding onto grey concrete.
+    //
+    // Clamped because a surface in deep shadow has a near-zero divisor, and
+    // an unbounded ratio there would light it more brightly than the sun.
+    {
+        vec3  local = max(texture(uScene, vec3(uv, lay)).rgb, vec3(0.0));
+        float lref  = max(dot(local, vec3(0.2126, 0.7152, 0.0722)), 1e-3);
+        gathered = min(gathered / lref, vec3(2.0));
+    }
 
     // ---- ACCUMULATE IN OUR OWN HISTORY.
     //

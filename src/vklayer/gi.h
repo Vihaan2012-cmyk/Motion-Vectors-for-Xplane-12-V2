@@ -103,7 +103,7 @@ struct Push {
     int32_t fullW, fullH;
     float   edA, edB;
     float   invProjX, invProjY;
-    float   radius, thickness;
+    float   radius, maxScreenPx, thickness;
     float   alpha;
     float   velScale, velYSign;
     float   intensity;
@@ -384,13 +384,17 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     p.fullW = (int32_t)fullW; p.fullH = (int32_t)fullH;
     p.edA = edA; p.edB = edB;
     p.invProjX = invProjX; p.invProjY = invProjY;
-    p.radius    = live::f("taa.gi_radius",    "TAA_GI_RADIUS",    6.0f);
+    p.radius      = live::f("taa.gi_radius",  "TAA_GI_RADIUS",  6.0f);
+    // 48 half-res pixels over 10 steps is ~4.8 px per step - the range a
+    // screen-space march can actually resolve. The metre radius alone put
+    // 1,739 px between steps in the cockpit.
+    p.maxScreenPx = live::f("taa.gi_max_px",  "TAA_GI_MAX_PX", 48.0f);
     p.thickness = live::f("taa.gi_thickness", "TAA_GI_THICKNESS", 0.5f);
     p.alpha     = live::f("taa.gi_alpha",     "TAA_GI_ALPHA",     0.08f);
     p.velScale  = taaVelScale();
     p.velYSign  = taaVelYSign();
     p.intensity = 1.0f;   // applied at composite; see the shader's note
-    p.steps     = (int32_t)live::i("taa.gi_steps", "TAA_GI_STEPS", 8);
+    p.steps     = (int32_t)live::i("taa.gi_steps", "TAA_GI_STEPS", 10);
     p.rays      = (int32_t)live::i("taa.gi_rays",  "TAA_GI_RAYS",  4);
     p.frame     = (int32_t)(s.frame & 0x3fffffff);
     p.flags     = (haveProbes ? kGiProbes : 0) | (s.primed ? 0 : kGiReset);
@@ -414,8 +418,11 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     if (!s.announced) {
         s.announced = true;
         trace("GI: gathering at %ux%u (half of %ux%u), %d rays x %d steps, "
-              "probes %s. Escaped rays %s.", hw, hh, fullW, fullH,
-              p.rays, p.steps, haveProbes ? "BOUND" : "absent",
+              "ray <= %.0f m and <= %.0f px, probes %s. Escaped rays %s. "
+              "Stored value is radiance RELATIVE to local surface luminance, "
+              "so gi_strength is O(1) rather than O(1e-4).",
+              hw, hh, fullW, fullH, p.rays, p.steps, p.radius, p.maxScreenPx,
+              haveProbes ? "BOUND" : "absent",
               haveProbes ? "read the engine's environment capture"
                          : "return black - this is plain screen-space GI");
     }
