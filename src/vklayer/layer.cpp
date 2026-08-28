@@ -68,6 +68,7 @@
 #include <string>
 #include <map>
 #include <set>
+#include <memory>
 #include <mutex>
 #include <atomic>
 #include <vector>
@@ -108,13 +109,29 @@ static void trace(const char *fmt, ...)
 
     std::lock_guard<std::mutex> g(g_traceLock);
     static FILE *f = nullptr;
+    static uint64_t bytesOut = 0;
     if (!f) f = fopen(path.c_str(), "a");
     if (!f) return;
+    // ---- ROTATION. One diagnostic session produced a 581 MB trace, which
+    // makes every grep of it cost seconds and eventually fills the disk. At
+    // 256 MB the file is closed, swapped to <name>.old (previous .old
+    // deleted), and restarted - tail history survives one rotation deep.
+    if (bytesOut > 256ull * 1024 * 1024) {
+        fclose(f);
+        std::string old = path + ".old";
+        remove(old.c_str());
+        rename(path.c_str(), old.c_str());
+        f = fopen(path.c_str(), "a");
+        bytesOut = 0;
+        if (!f) return;
+        fprintf(f, "TRACE: rotated (previous 256 MB in %s)\n", old.c_str());
+    }
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
+    int wrote = vfprintf(f, fmt, ap);
     va_end(ap);
     fputc('\n', f);
+    if (wrote > 0) bytesOut += (uint64_t)wrote + 1;
     fflush(f);   // flushed, not closed: durability without an open and close
                  // per line, which cost 63 MB of file I/O and most of the fps.
 }
@@ -303,6 +320,12 @@ struct Snapshot {
 //
 // Unit vector toward the sun in view space. All zero means it is below the
 // horizon, which the resolve reads as "take no taps".
+// Sequence counter guarding the whole block of resolve-facing globals below
+// (sun, edAB, invProj, reproj, ySign, valid). snapshot() runs on X-Plane's
+// frame thread while the resolve records on the render thread; without this
+// a reader could see half of one frame's matrix and half of another's.
+// Writer: ++ (odd) .. write .. ++ (even). Reader: retry until even & stable.
+static std::atomic<uint32_t> g_taaShareSeq{0};
 static float g_taaSunView[3] = { 0.0f, 0.0f, 0.0f };
 
 // Engine-depth linearization constants for the resolve: proj[10] and proj[14]
@@ -331,6 +354,7 @@ static bool snapshot(Snapshot *o)
         uint64_t before = g_share->frame;
 
         memcpy(o->reproj,          g_share->reproj,          sizeof(o->reproj));
+        g_taaShareSeq.fetch_add(1, std::memory_order_release);   // -> odd
         memcpy(g_taaReproj,        g_share->reproj,          sizeof(g_taaReproj));
         g_taaReprojValid = g_share->reprojValid != 0;
         memcpy(o->invCurrViewProj, g_share->invCurrViewProj, sizeof(o->invCurrViewProj));
@@ -345,6 +369,7 @@ static bool snapshot(Snapshot *o)
         g_taaEdAB[1] = g_share->proj[14];
         g_taaInvProj[0] = g_share->proj[0] != 0.0f ? 1.0f / g_share->proj[0] : 1.0f;
         g_taaInvProj[1] = g_share->proj[5] != 0.0f ? 1.0f / g_share->proj[5] : 1.0f;
+        g_taaShareSeq.fetch_add(1, std::memory_order_release);   // -> even
         memcpy(o->prevProj,        g_share->prevProj,        sizeof(o->prevProj));
         memcpy(o->bodyReproj,      g_share->bodyReproj,      sizeof(o->bodyReproj));
         o->bodyReprojValid = g_share->bodyReprojValid;
@@ -1663,6 +1688,44 @@ static VKAPI_ATTR void VKAPI_CALL Vram_CmdCopyBuffer(
 // (it over-counted across partial writes; the layout is the authority).
 static std::map<VkDescriptorSetLayout, std::vector<uint32_t> > g_layoutDynBinds;
 static std::map<VkDescriptorSet, std::vector<uint32_t> >       g_setDynBinds;
+static std::map<VkDescriptorSet, VkDescriptorPool>             g_setPool;
+
+struct MvShadowRegion { VkBuffer buf; VkDeviceSize off, range; };
+static std::map<VkDescriptorSet,  MvShadowRegion> g_setShadowRegion;
+static std::map<VkCommandBuffer,  MvShadowRegion> g_cbShadowRegion;
+// u_gbuffer_data (binding 18, ~112 bytes): the engine's depth-linearization
+// and screen-to-eye coefficients - captured and frame-matched identically.
+static std::map<VkDescriptorSet,  MvShadowRegion> g_setGbufRegion;
+static std::map<VkCommandBuffer,  MvShadowRegion> g_cbGbufRegion;
+
+// ---- DYNAMIC OFFSETS: THE LAST LOCK.
+//
+// The qualified capture proved identity and STILL dumped garbage, because the
+// engine's blocks are UNIFORM_BUFFER_DYNAMIC: one per-frame arena buffer, the
+// descriptor carries only a base, and the real location arrives as a dynamic
+// offset at vkCmdBindDescriptorSets - the dyn[] array this layer received on
+// every call and never read. The template's entry types say which bindings
+// are dynamic and Vulkan orders dyn[] by ascending binding, so the set's
+// metadata below turns dyn[] into the true offsets for bindings 14 and 18.
+struct MvSunSetMeta {
+    VkBuffer     buf = VK_NULL_HANDLE;
+    VkDeviceSize shadowBase = 0, shadowRange = 0;
+    VkDeviceSize gbufBase = 0,   gbufRange = 0;
+    bool         shadowDynamic = false, gbufDynamic = false;
+    // Proof and payload arrive in SEPARATE template writes - the first run
+    // showed the engine updating the set's images and its UBOs in different
+    // blobs, so identity (the named image seen in ANY write to this set) and
+    // capture (the UBO region from any other write) accumulate independently
+    // and the latch requires both.
+    bool         provenShadow = false, provenGbuf = false;
+    // Ascending dynamic-UBO bindings of this set, unioned across its writes.
+    std::vector<uint32_t> dynBindings;
+};
+static std::map<VkDescriptorSet, MvSunSetMeta> g_setSunMeta;
+
+static std::map<VkDescriptorUpdateTemplate,
+                std::shared_ptr<const std::vector<VkDescriptorUpdateTemplateEntry> > > g_updateTemplates;
+
 static PFN_vkAllocateDescriptorSets g_nextAllocDescSets = nullptr;
 static VKAPI_ATTR VkResult VKAPI_CALL Vram_AllocateDescriptorSets(
     VkDevice device, const VkDescriptorSetAllocateInfo *ai,
@@ -1678,9 +1741,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL Vram_AllocateDescriptorSets(
                 g_layoutDynBinds.find(ai->pSetLayouts[i]);
             if (li != g_layoutDynBinds.end()) g_setDynBinds[out[i]] = li->second;
             else g_setDynBinds[out[i]].clear();
+            // A NEW LEASE CLEARS EVERY PER-SET RECORD. Handles recycle, and a
+            // sticky proven flag on a recycled handle was the impostor
+            // re-latch that poisoned the sun tap. Pool membership is recorded
+            // so ResetDescriptorPool can clear its children wholesale.
+            g_setSunMeta.erase(out[i]);
+            g_setShadowRegion.erase(out[i]);
+            g_setGbufRegion.erase(out[i]);
+            g_setPool[out[i]] = ai->descriptorPool;
         }
         if (g_setDynBinds.size() > 16384)
             g_setDynBinds.erase(g_setDynBinds.begin());
+        if (g_setPool.size() > 16384)
+            g_setPool.erase(g_setPool.begin());
     }
     return r;
 }
@@ -1975,6 +2048,9 @@ extern "C" PFN_vkVoidFunction mvNextDeviceProcAddr(VkDevice device, const char *
 // announcing "gbuffer_pos" through a call our layer simply did not intercept.
 // This map is the correction: handle -> the engine's own name for it.
 static std::map<VkImage, std::string> g_imageNames;
+// Bumped on every insert/rename/erase of an image name; the oracle's cached
+// candidate list keys its rebuilds off this instead of rescanning per frame.
+static uint64_t g_imageNamesVersion = 0;
 
 // The image the engine names "gbuf-depth" - identified by the name listener,
 // consumed by the resolve as its depth source under taa.pos_harvest.
@@ -2024,38 +2100,6 @@ static VkDeviceSize g_gbufDataRange    = 0;
 // set is bound, and let the resolve - recorded into that same command buffer -
 // use its own frame's region. The "latest" globals above remain only as a
 // last-resort fallback.
-struct MvShadowRegion { VkBuffer buf; VkDeviceSize off, range; };
-static std::map<VkDescriptorSet,  MvShadowRegion> g_setShadowRegion;
-static std::map<VkCommandBuffer,  MvShadowRegion> g_cbShadowRegion;
-// u_gbuffer_data (binding 18, ~112 bytes): the engine's depth-linearization
-// and screen-to-eye coefficients - captured and frame-matched identically.
-static std::map<VkDescriptorSet,  MvShadowRegion> g_setGbufRegion;
-static std::map<VkCommandBuffer,  MvShadowRegion> g_cbGbufRegion;
-
-// ---- DYNAMIC OFFSETS: THE LAST LOCK.
-//
-// The qualified capture proved identity and STILL dumped garbage, because the
-// engine's blocks are UNIFORM_BUFFER_DYNAMIC: one per-frame arena buffer, the
-// descriptor carries only a base, and the real location arrives as a dynamic
-// offset at vkCmdBindDescriptorSets - the dyn[] array this layer received on
-// every call and never read. The template's entry types say which bindings
-// are dynamic and Vulkan orders dyn[] by ascending binding, so the set's
-// metadata below turns dyn[] into the true offsets for bindings 14 and 18.
-struct MvSunSetMeta {
-    VkBuffer     buf = VK_NULL_HANDLE;
-    VkDeviceSize shadowBase = 0, shadowRange = 0;
-    VkDeviceSize gbufBase = 0,   gbufRange = 0;
-    bool         shadowDynamic = false, gbufDynamic = false;
-    // Proof and payload arrive in SEPARATE template writes - the first run
-    // showed the engine updating the set's images and its UBOs in different
-    // blobs, so identity (the named image seen in ANY write to this set) and
-    // capture (the UBO region from any other write) accumulate independently
-    // and the latch requires both.
-    bool         provenShadow = false, provenGbuf = false;
-    // Ascending dynamic-UBO bindings of this set, unioned across its writes.
-    std::vector<uint32_t> dynBindings;
-};
-static std::map<VkDescriptorSet, MvSunSetMeta> g_setSunMeta;
 
 // ---- DYNAMIC-DESCRIPTOR COUNTS, SO A PROVEN SET AT POSITION >0 IS INDEXABLE.
 //
@@ -2108,8 +2152,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDescriptorSetLayout(
 // buffer device address and range in the clear. Address -> buffer comes from
 // hooking vkGetBufferDeviceAddress. Two hooks, and the opaque path stops
 // being opaque.
-static std::map<uint64_t, std::pair<VkBuffer, uint64_t>> g_bufAddr; // base -> (buf, size)
-static uint64_t g_descGetSeen = 0;
+// (The descriptor-buffer address book that lived here is deleted: the engine
+// is PROVEN to route these blocks through update templates, so the book was
+// per-call bookkeeping for a consumer that never fired. The two hooks below
+// remain as pure forwarders - interception stays correct, the cost is gone.)
 
 // The engine's name for an image this layer identified by shape, or null.
 // The check that closes the loop: shape-identification says WHICH image,
@@ -3884,9 +3930,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyBuffer(
         // g_setDynCount is keyed by set, not buffer - it is not cleaned here;
         // its 16384 cap recycles it, and a stale set handle simply never
         // matches a future bind.
-        for (std::map<uint64_t, std::pair<VkBuffer, uint64_t>>::iterator ba =
-                 g_bufAddr.begin(); ba != g_bufAddr.end(); )
-            if (ba->second.first == buf) ba = g_bufAddr.erase(ba); else ++ba;
+
     }
     if (next) next(device, buf, alloc);
 }
@@ -4259,9 +4303,42 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
         }
         g_imageNames.erase(img);
         g_allImages.erase(img);
+        ++g_imageNamesVersion;
         if (img == g_engineDepthImage) g_engineDepthImage = VK_NULL_HANDLE;
         if (img == g_sunShadowImage)   g_sunShadowImage   = VK_NULL_HANDLE;
         if (img == g_envProbeImage)    g_envProbeImage    = VK_NULL_HANDLE;
+        // ---- THE VIEW CACHES MUST NOT OUTLIVE THE IMAGE. A recycled image
+        // handle finding a cached view of its dead predecessor is a
+        // device-lost with an aircraft-change trigger. The views are ours to
+        // destroy - we created them - and any current pointer that referenced
+        // one is dropped so the per-frame binder re-resolves.
+        {
+            PFN_vkDestroyImageView dview = nullptr;
+            std::map<void*, DeviceData>::iterator di =
+                g_devices.find(dispatchKey(device));
+            if (di != g_devices.end()) dview = di->second.destroyImageView;
+            std::map<VkImage, VkImageView> *vc[4] = {
+                &g_taa.flagsViews, &g_taa.edViews,
+                &g_taa.sunViews,   &g_taa.probeViews };
+            for (int c2 = 0; c2 < 4; ++c2) {
+                std::map<VkImage, VkImageView>::iterator fv = vc[c2]->find(img);
+                if (fv == vc[c2]->end()) continue;
+                if (fv->second == g_taa.flagsView) {
+                    g_taa.flagsView = g_taa.flagsFallbackView;
+                    g_taa.flagsValid = false;
+                }
+                if (fv->second == g_taa.edView)    { g_taa.edView = VK_NULL_HANDLE;    g_taa.edValid = false; }
+                if (fv->second == g_taa.sunView)   { g_taa.sunView = VK_NULL_HANDLE;   g_taa.sunValid = false; }
+                if (fv->second == g_taa.probeView) { g_taa.probeView = VK_NULL_HANDLE; g_taa.probeValid = false; }
+                if (fv->second && dview) dview(device, fv->second, nullptr);
+                vc[c2]->erase(fv);
+            }
+            std::map<VkImage, VkImageView>::iterator ov = oracle::P.views.find(img);
+            if (ov != oracle::P.views.end()) {
+                if (ov->second && dview) dview(device, ov->second, nullptr);
+                oracle::P.views.erase(ov);
+            }
+        }
         g_fgMutableImg.erase(img);
         for (size_t i = 0; i < g_depthCandidates.size(); ++i)
             if (g_depthCandidates[i].image == img) {
@@ -7873,24 +7950,11 @@ static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSets(
             }
             if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
                 w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
-                // u_shadow_data's signature: binding 14, ~1.5 KB or larger.
-                // Binding number alone would false-positive; the size makes it
-                // nearly unique, and the viz mode is the final arbiter.
-                if (w[i].dstBinding == 14 && w[i].pBufferInfo &&
-                    w[i].pBufferInfo[0].range >= 1552) {
-                    g_shadowDataBuf   = w[i].pBufferInfo[0].buffer;
-                    g_shadowDataOff   = w[i].pBufferInfo[0].offset;
-                    g_shadowDataRange = w[i].pBufferInfo[0].range;
-                    if ((g_shadowDataSeen++ % 600) == 0)
-                        trace("SHADOW TAP: u_shadow_data candidate seen - "
-                              "buffer=%p offset=%llu range=%llu type=%d "
-                              "(%llu sightings)",
-                              (void*)g_shadowDataBuf,
-                              (unsigned long long)g_shadowDataOff,
-                              (unsigned long long)g_shadowDataRange,
-                              (int)w[i].descriptorType,
-                              (unsigned long long)g_shadowDataSeen);
-                }
+                // Capture REMOVED: this was the original unqualified
+                // binding+range match, and it survived three rounds of the
+                // qualified capture being built next to it - still writing
+                // g_shadowDataBuf from impostor blocks the whole time. Only
+                // the image-proven template path may feed those globals.
                 continue;
             }
             if (w[i].descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
@@ -7941,6 +8005,9 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
     static std::atomic<uint32_t> useSample(0);
     bool sampleUse = (useSample.fetch_add(1) & 63) == 0;
 
+    bool latchTrace = false; bool ltOk = false;
+    uint64_t ltOff = 0; uint32_t ltBase = 0, lt14 = 0, lt18 = 0, ltNd = 0,
+             ltDyn = 0, ltPos = 0, ltN = 0;
     // Frame-matched u_shadow_data and u_gbuffer_data: when a PROVEN set is
     // bound into this command buffer, resolve its dynamic offsets (dyn[] is
     // ordered by ascending binding within each set) and latch the TRUE
@@ -8003,12 +8070,13 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                         g_shadowDataRange = r.range;
                     }
                     static uint64_t lseen = 0;
-                    if ((lseen++ % 3000) == 0)
-                        trace("SUN LATCH: shadow ok=%d off=%llu base=%u idx14=%u "
-                              "dyn14=%u | idx18=%u nd=%u pos=%u/%u",
-                              ok ? 1 : 0, (unsigned long long)off, dynBase,
-                              idx14, (idx14 < nd) ? dyn[idx14] : 0,
-                              idx18, nd, i, n);
+                    if ((lseen++ % 3000) == 0) {
+                        latchTrace = true;
+                        ltOk = ok; ltOff = off; ltBase = dynBase;
+                        lt14 = idx14; lt18 = idx18; ltNd = nd;
+                        ltDyn = (idx14 < nd) ? dyn[idx14] : 0;
+                        ltPos = i; ltN = n;
+                    }
                 }
                 if (m.provenGbuf && m.gbufRange) {
                     VkDeviceSize off = m.gbufBase;
@@ -8029,6 +8097,11 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                 }
             }
     }
+    if (latchTrace)
+        trace("SUN LATCH: shadow ok=%d off=%llu base=%u idx14=%u dyn14=%u | "
+              "idx18=%u nd=%u pos=%u/%u",
+              ltOk ? 1 : 0, (unsigned long long)ltOff, ltBase, lt14, ltDyn,
+              lt18, ltNd, ltPos, ltN);
 
     PFN_vkCmdBindDescriptorSets next = nullptr;
     {
@@ -10543,6 +10616,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSampler(
                                : VK_ERROR_INITIALIZATION_FAILED;
 }
 
+namespace oracle { inline void shutdown(DeviceData &dd, VkDevice dev); }
+
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
     VkDevice device, const VkAllocationCallbacks *alloc)
 {
@@ -10550,6 +10625,15 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
     // and every pooled block is genuinely freed, while the device and its
     // queues still exist to accept them.
     vram::shutdown();
+
+    // Oracle objects die with the device rather than leaking past it.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it =
+            g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            oracle::shutdown(it->second, device);
+    }
 
     // ---- RELEASE THE VELOCITY TARGET.
     //
@@ -15870,6 +15954,11 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     GD(cmdBindPipeline, CmdBindPipeline);             GD(cmdBindDescriptorSets, CmdBindDescriptorSets);
     GD(cmdPushConstants, CmdPushConstants);            GD(cmdDispatch, CmdDispatch);
     dd.cmdPushDescriptorSet = (PFN_vkCmdPushDescriptorSetKHR)nextGDPA(*out, "vkCmdPushDescriptorSetKHR");
+    // Core-1.4 fallback: a driver exporting only the promoted name must not
+    // silently drop every push descriptor.
+    if (!dd.cmdPushDescriptorSet)
+        dd.cmdPushDescriptorSet =
+            (PFN_vkCmdPushDescriptorSetKHR)nextGDPA(*out, "vkCmdPushDescriptorSet");
     if (!dd.cmdPushDescriptorSet)
         dd.cmdPushDescriptorSet = (PFN_vkCmdPushDescriptorSetKHR)
             nextGDPA(*out, "vkCmdPushDescriptorSet");   // core in 1.4
@@ -16619,12 +16708,146 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_BeginCommandBuffer(
                 next = (PFN_vkBeginCommandBuffer)
                     it->second.gdpa(ci->second, "vkBeginCommandBuffer");
         }
+        if (!next)
+            for (std::map<void*, DeviceData>::iterator d2 = g_devices.begin();
+                 d2 != g_devices.end() && !next; ++d2)
+                if (d2->second.gdpa && d2->second.device != VK_NULL_HANDLE)
+                    next = (PFN_vkBeginCommandBuffer)
+                        d2->second.gdpa(d2->second.device, "vkBeginCommandBuffer");
         g_cbShadowRegion.erase(cb);
         g_cbGbufRegion.erase(cb);
     }
-    return next ? next(cb, bi) : VK_SUCCESS;
+    // VK_SUCCESS-without-forwarding would leave the caller recording into a
+    // never-begun buffer; a hard error is honest and immediately visible.
+    return next ? next(cb, bi) : VK_ERROR_INITIALIZATION_FAILED;
 }
 
+
+// ---- THE TEARDOWN HOOKS THAT WERE NEVER WRITTEN.
+//
+// Every map keyed by a Vulkan handle is a lie waiting to happen unless the
+// handle's death erases the entry: handles recycle, and a recycled handle
+// wearing a dead handle's record was the root of the sun-tap instability
+// (proven flags, stale layouts, stale template entries). These five hooks
+// close the class.
+static void mvEraseSetRecords(VkDescriptorSet setH)
+{
+    g_setSunMeta.erase(setH);
+    g_setDynBinds.erase(setH);
+    g_setShadowRegion.erase(setH);
+    g_setGbufRegion.erase(setH);
+    g_setPool.erase(setH);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_FreeDescriptorSets(
+    VkDevice device, VkDescriptorPool pool, uint32_t n,
+    const VkDescriptorSet *sets)
+{
+    PFN_vkFreeDescriptorSets next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkFreeDescriptorSets)
+                it->second.gdpa(device, "vkFreeDescriptorSets");
+        for (uint32_t i = 0; i < n && sets; ++i) mvEraseSetRecords(sets[i]);
+    }
+    return next ? next(device, pool, n, sets) : VK_SUCCESS;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_ResetDescriptorPool(
+    VkDevice device, VkDescriptorPool pool, VkDescriptorPoolResetFlags flags)
+{
+    PFN_vkResetDescriptorPool next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkResetDescriptorPool)
+                it->second.gdpa(device, "vkResetDescriptorPool");
+        // Reset kills every set of the pool at once; the pool-membership map
+        // recorded at allocation is what makes the sweep possible.
+        for (std::map<VkDescriptorSet, VkDescriptorPool>::iterator sp =
+                 g_setPool.begin(); sp != g_setPool.end(); ) {
+            if (sp->second == pool) {
+                VkDescriptorSet dead = sp->first;
+                ++sp;
+                mvEraseSetRecords(dead);
+            } else ++sp;
+        }
+    }
+    return next ? next(device, pool, flags) : VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDescriptorSetLayout(
+    VkDevice device, VkDescriptorSetLayout layout,
+    const VkAllocationCallbacks *alloc)
+{
+    PFN_vkDestroyDescriptorSetLayout next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkDestroyDescriptorSetLayout)
+                it->second.gdpa(device, "vkDestroyDescriptorSetLayout");
+        g_layoutDynBinds.erase(layout);
+    }
+    if (next) next(device, layout, alloc);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDescriptorUpdateTemplate(
+    VkDevice device, VkDescriptorUpdateTemplate tpl,
+    const VkAllocationCallbacks *alloc)
+{
+    PFN_vkDestroyDescriptorUpdateTemplate next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkDestroyDescriptorUpdateTemplate)
+                it->second.gdpa(device, "vkDestroyDescriptorUpdateTemplate");
+        g_updateTemplates.erase(tpl);
+    }
+    if (next) next(device, tpl, alloc);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImageView(
+    VkDevice device, VkImageView view, const VkAllocationCallbacks *alloc)
+{
+    PFN_vkDestroyImageView next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkDestroyImageView)
+                it->second.gdpa(device, "vkDestroyImageView");
+        // The view->image book must not attribute a recycled view handle to
+        // a dead image - the template image-proof reads this map.
+        g_viewToImage.erase(view);
+    }
+    if (next) next(device, view, alloc);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_FreeCommandBuffers(
+    VkDevice device, VkCommandPool pool, uint32_t n,
+    const VkCommandBuffer *cbs)
+{
+    PFN_vkFreeCommandBuffers next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkFreeCommandBuffers)
+                it->second.gdpa(device, "vkFreeCommandBuffers");
+        for (uint32_t i = 0; i < n && cbs; ++i) {
+            g_cbToDevice.erase(cbs[i]);
+            g_cbFamily.erase(cbs[i]);
+            g_cbShadowRegion.erase(cbs[i]);
+            g_cbGbufRegion.erase(cbs[i]);
+        }
+    }
+    if (next) next(device, pool, n, cbs);
+}
 
 static void mvNoteUboWrite(const char *via, uint32_t binding,
                            const VkDescriptorBufferInfo &bi)
@@ -16661,8 +16884,6 @@ static void mvNoteShadowWrites(uint32_t n, const VkWriteDescriptorSet *w,
 // templates are in play. A template push hands over a raw void* laid out per
 // entries fixed at template creation - so creation is recorded, and the blob
 // is decoded with the offsets the engine itself declared.
-static std::map<VkDescriptorUpdateTemplate,
-                std::vector<VkDescriptorUpdateTemplateEntry> > g_updateTemplates;
 
 static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDescriptorUpdateTemplate(
     VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *ci,
@@ -16680,9 +16901,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDescriptorUpdateTemplate(
     VkResult r = next(device, ci, alloc, out);
     if (r == VK_SUCCESS && ci && out && ci->pDescriptorUpdateEntries) {
         std::lock_guard<std::mutex> g(g_lock);
-        g_updateTemplates[*out] = std::vector<VkDescriptorUpdateTemplateEntry>(
-            ci->pDescriptorUpdateEntries,
-            ci->pDescriptorUpdateEntries + ci->descriptorUpdateEntryCount);
+        g_updateTemplates[*out] =
+            std::make_shared<const std::vector<VkDescriptorUpdateTemplateEntry> >(
+                ci->pDescriptorUpdateEntries,
+                ci->pDescriptorUpdateEntries + ci->descriptorUpdateEntryCount);
+        if (g_updateTemplates.size() > 4096)
+            g_updateTemplates.erase(g_updateTemplates.begin());
         trace("SHADOW SCAN: update template %p recorded (%u entries)",
               (void*)*out, ci->descriptorUpdateEntryCount);
     }
@@ -16694,15 +16918,16 @@ static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
                                VkDescriptorSet dstSet)
 {
     if (!data) return;
-    std::vector<VkDescriptorUpdateTemplateEntry> entries;
+    std::shared_ptr<const std::vector<VkDescriptorUpdateTemplateEntry> > entriesSp;
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<VkDescriptorUpdateTemplate,
-                 std::vector<VkDescriptorUpdateTemplateEntry> >::iterator it =
+                 std::shared_ptr<const std::vector<VkDescriptorUpdateTemplateEntry> > >::iterator it =
             g_updateTemplates.find(tpl);
         if (it == g_updateTemplates.end()) return;
-        entries = it->second;
+        entriesSp = it->second;
     }
+    const std::vector<VkDescriptorUpdateTemplateEntry> &entries = *entriesSp;
     // ---- PASS 1: what does this template write, and which IMAGES?
     //
     // Binding+range alone proved worthless: X-Plane has many 1568-byte blocks
@@ -16752,6 +16977,9 @@ static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
     // writes, so everything is stored unconditionally per set and the latch
     // demands proof + payload together. Dynamic-binding lists are unioned
     // across writes to approach the set layout's full dynamic order.
+    bool traceAfterUnlock = false;
+    bool tuS = false, tuG = false; uint64_t tuSr = 0, tuGr = 0; size_t tuN = 0;
+    void *tuSet = nullptr;
     if (dstSet != VK_NULL_HANDLE &&
         (ubo14 || ubo18 || sawCsm || sawGbufDepth)) {
         std::lock_guard<std::mutex> g(g_lock);
@@ -16794,27 +17022,32 @@ static void mvScanTemplateBlob(VkDescriptorUpdateTemplate tpl,
         }
         const bool armedS = dst.provenShadow && dst.shadowRange != 0;
         const bool armedG = dst.provenGbuf && dst.gbufRange != 0;
-        if ((armedS && !wasArmedS) || (armedG && !wasArmedG) ||
-            dst.dynBindings.size() != hadDyn) {
-            std::string dl;
-            char tmp[16];
-            for (size_t k = 0; k < dst.dynBindings.size(); ++k) {
-                snprintf(tmp, sizeof(tmp), "%s%u", k ? "," : "",
-                         dst.dynBindings[k]);
-                dl += tmp;
-            }
-            trace("SUN META: set=%p shadow[%s rng=%llu dyn=%d] "
-                  "gbuf[%s rng=%llu dyn=%d] dynUBOs=[%s]",
-                  (void*)dstSet,
-                  armedS ? "ARMED" : (dst.provenShadow ? "proven" : "-"),
-                  (unsigned long long)dst.shadowRange, dst.shadowDynamic ? 1 : 0,
-                  armedG ? "ARMED" : (dst.provenGbuf ? "proven" : "-"),
-                  (unsigned long long)dst.gbufRange, dst.gbufDynamic ? 1 : 0,
-                  dl.c_str());
+        // Newly-armed only, THROTTLED, and the I/O happens outside the lock:
+        // the untamed version of this line wrote 302,926 times (581 MB) in
+        // one session, because the engine re-creates these sets every frame.
+        bool sayIt = false;
+        if ((armedS && !wasArmedS) || (armedG && !wasArmedG)) {
+            static uint64_t armEvents = 0;
+            sayIt = (armEvents++ % 3000) == 0;
         }
-        if (g_setSunMeta.size() > 256)
+        const uint64_t sRng = dst.shadowRange, gRng = dst.gbufRange;
+        const bool sArm = armedS, gArm = armedG;
+        const size_t nDyn = dst.dynBindings.size();
+        if (sayIt) {
+            // trace() outside g_lock: fall through with copies.
+            traceAfterUnlock = true;
+            tuS = sArm; tuG = gArm; tuSr = sRng; tuGr = gRng; tuN = nDyn;
+            tuSet = (void*)dstSet;
+        }
+        if (g_setSunMeta.size() > 1024)
             g_setSunMeta.erase(g_setSunMeta.begin());
     }
+    if (traceAfterUnlock)
+        trace("SUN META: set=%p shadow[%s rng=%llu] gbuf[%s rng=%llu] "
+              "dynUBOs=%llu (1 of every 3000 arm events shown)",
+              tuSet, tuS ? "ARMED" : "-", (unsigned long long)tuSr,
+              tuG ? "ARMED" : "-", (unsigned long long)tuGr,
+              (unsigned long long)tuN);
 }
 
 static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSetWithTemplate(
@@ -16829,15 +17062,73 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSetWithTemplate(
         if (ci != g_cbToDevice.end()) {
             std::map<void*, DeviceData>::iterator it =
                 g_devices.find(dispatchKey(ci->second));
-            if (it != g_devices.end() && it->second.gdpa)
+            if (it != g_devices.end() && it->second.gdpa) {
                 next = (PFN_vkCmdPushDescriptorSetWithTemplateKHR)
                     it->second.gdpa(ci->second,
                                     "vkCmdPushDescriptorSetWithTemplateKHR");
+                if (!next)
+                    next = (PFN_vkCmdPushDescriptorSetWithTemplateKHR)
+                        it->second.gdpa(ci->second,
+                                        "vkCmdPushDescriptorSetWithTemplate");
+            }
         }
     }
     if (next && next != Layer_CmdPushDescriptorSetWithTemplate)
         next(cb, tpl, layout, set, data);
 }
+
+#ifdef VK_VERSION_1_4
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSet2(
+    VkCommandBuffer cb, const VkPushDescriptorSetInfo *info)
+{
+    if (info) mvNoteShadowWrites(info->descriptorWriteCount,
+                                 info->pDescriptorWrites, "push2");
+    PFN_vkCmdPushDescriptorSet2 next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator it =
+                g_devices.find(dispatchKey(ci->second));
+            if (it != g_devices.end() && it->second.gdpa) {
+                next = (PFN_vkCmdPushDescriptorSet2)
+                    it->second.gdpa(ci->second, "vkCmdPushDescriptorSet2");
+                if (!next)
+                    next = (PFN_vkCmdPushDescriptorSet2)
+                        it->second.gdpa(ci->second, "vkCmdPushDescriptorSet2KHR");
+            }
+        }
+    }
+    if (next && next != Layer_CmdPushDescriptorSet2) next(cb, info);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSetWithTemplate2(
+    VkCommandBuffer cb, const VkPushDescriptorSetWithTemplateInfo *info)
+{
+    if (info)
+        mvScanTemplateBlob(info->descriptorUpdateTemplate, info->pData,
+                           "push-template2", VK_NULL_HANDLE);
+    PFN_vkCmdPushDescriptorSetWithTemplate2 next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator it =
+                g_devices.find(dispatchKey(ci->second));
+            if (it != g_devices.end() && it->second.gdpa) {
+                next = (PFN_vkCmdPushDescriptorSetWithTemplate2)
+                    it->second.gdpa(ci->second,
+                                    "vkCmdPushDescriptorSetWithTemplate2");
+                if (!next)
+                    next = (PFN_vkCmdPushDescriptorSetWithTemplate2)
+                        it->second.gdpa(ci->second,
+                                        "vkCmdPushDescriptorSetWithTemplate2KHR");
+            }
+        }
+    }
+    if (next && next != Layer_CmdPushDescriptorSetWithTemplate2) next(cb, info);
+}
+#endif
 
 static VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSetWithTemplate(
     VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate tpl,
@@ -16861,6 +17152,16 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSet(
     uint32_t set, uint32_t n, const VkWriteDescriptorSet *w)
 {
     mvNoteShadowWrites(n, w, "push");
+    // One-shot: the plain-push route carries NO set handle, so the qualified
+    // capture can never prove through it. Said out loud once, not silent.
+    {
+        static bool said = false;
+        if (!said) { said = true;
+            trace("SHADOW SCAN: plain-push route active - it can scan but "
+                  "never prove (no destination set in the API)"); }
+    }
+    // Forward via the pointer captured at device creation (KHR name, core
+    // fallback) - no per-call map walk or gdpa on this hot path.
     PFN_vkCmdPushDescriptorSetKHR next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -16868,9 +17169,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSet(
         if (ci != g_cbToDevice.end()) {
             std::map<void*, DeviceData>::iterator it =
                 g_devices.find(dispatchKey(ci->second));
-            if (it != g_devices.end() && it->second.gdpa)
-                next = (PFN_vkCmdPushDescriptorSetKHR)
-                    it->second.gdpa(ci->second, "vkCmdPushDescriptorSetKHR");
+            if (it != g_devices.end()) next = it->second.cmdPushDescriptorSet;
         }
     }
     if (next && next != Layer_CmdPushDescriptorSet)
@@ -16881,26 +17180,23 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdPushDescriptorSet(
 static VKAPI_ATTR VkDeviceAddress VKAPI_CALL Layer_GetBufferDeviceAddress(
     VkDevice device, const VkBufferDeviceAddressInfo *info)
 {
+    // Pure forwarder. Never returns 0 on a mere lookup miss: a zero device
+    // address handed to the engine is a delayed crash with our name on it.
     PFN_vkGetBufferDeviceAddress next = nullptr;
-    uint64_t size = 0;
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
         if (it != g_devices.end() && it->second.gdpa)
             next = (PFN_vkGetBufferDeviceAddress)
-                       it->second.gdpa(device, "vkGetBufferDeviceAddress");
-        if (info && g_allBuffers.count(info->buffer))
-            size = g_allBuffers[info->buffer];
+                it->second.gdpa(device, "vkGetBufferDeviceAddress");
+        if (!next)
+            for (std::map<void*, DeviceData>::iterator d2 = g_devices.begin();
+                 d2 != g_devices.end() && !next; ++d2)
+                if (d2->second.gdpa)
+                    next = (PFN_vkGetBufferDeviceAddress)
+                        d2->second.gdpa(device, "vkGetBufferDeviceAddress");
     }
-    if (!next) return 0;
-    VkDeviceAddress a = next(device, info);
-    if (a != 0 && info) {
-        std::lock_guard<std::mutex> g(g_lock);
-        g_bufAddr[(uint64_t)a] = std::make_pair(info->buffer, size);
-        // Bounded: buffers die, the book must not grow without limit.
-        if (g_bufAddr.size() > 65536) g_bufAddr.erase(g_bufAddr.begin());
-    }
-    return a;
+    return next ? next(device, info) : 0;
 }
 
 // ---- vkGetDescriptorEXT: the descriptor-buffer choke point.
@@ -16908,41 +17204,14 @@ static VKAPI_ATTR void VKAPI_CALL Layer_GetDescriptorEXT(
     VkDevice device, const VkDescriptorGetInfoEXT *info,
     size_t dataSize, void *out)
 {
-    if (info && info->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
-        info->data.pUniformBuffer && info->data.pUniformBuffer->address != 0 &&
-        info->data.pUniformBuffer->range >= 1552 &&
-        info->data.pUniformBuffer->range <= 4096) {
-        const uint64_t addr  = (uint64_t)info->data.pUniformBuffer->address;
-        const uint64_t range = (uint64_t)info->data.pUniformBuffer->range;
-        std::lock_guard<std::mutex> g(g_lock);
-        // The greatest base address <= addr, checked for containment.
-        std::map<uint64_t, std::pair<VkBuffer, uint64_t>>::iterator it =
-            g_bufAddr.upper_bound(addr);
-        if (it != g_bufAddr.begin()) {
-            --it;
-            const uint64_t base = it->first, bsz = it->second.second;
-            if (addr >= base && (bsz == 0 || addr - base + range <= bsz)) {
-                g_shadowDataBuf   = it->second.first;
-                g_shadowDataOff   = (VkDeviceSize)(addr - base);
-                g_shadowDataRange = (VkDeviceSize)range;
-                if ((g_descGetSeen++ % 600) == 0)
-                    trace("SHADOW TAP (descriptor buffer): u_shadow_data "
-                          "candidate - buffer=%p offset=%llu range=%llu "
-                          "(%llu sightings)",
-                          (void*)g_shadowDataBuf,
-                          (unsigned long long)g_shadowDataOff,
-                          (unsigned long long)range,
-                          (unsigned long long)g_descGetSeen);
-            }
-        }
-    }
+    // Pure forwarder - see the note where the address book used to be.
     PFN_vkGetDescriptorEXT next = nullptr;
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
         if (it != g_devices.end() && it->second.gdpa)
             next = (PFN_vkGetDescriptorEXT)
-                       it->second.gdpa(device, "vkGetDescriptorEXT");
+                it->second.gdpa(device, "vkGetDescriptorEXT");
     }
     if (next && next != Layer_GetDescriptorEXT) next(device, info, dataSize, out);
 }
@@ -16963,7 +17232,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_SetDebugUtilsObjectNameEXT(
         static std::set<std::string> seen;
         static uint64_t total = 0;
         ++total;
-        const bool fresh = seen.insert(nm).second;
+        // Bounded: streamed texture paths are unbounded over a long session.
+        // Past the cap nothing new is RECORDED here (the name map itself still
+        // updates); one line says the census went blind rather than nothing.
+        if (seen.size() >= 4096) {
+            static bool said = false;
+            if (!said) { said = true;
+                trace("IMG NAME: unique-name census capped at 4096 - further "
+                      "first-sightings are not individually traced"); }
+        }
+        const bool fresh = seen.size() < 4096 && seen.insert(nm).second;
         if (fresh && (interesting || seen.size() <= 300))
             trace("IMG NAME%s: %-40s = %p", interesting ? " *" : "",
                   nm.c_str(), (void*)img);
@@ -17006,6 +17284,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_SetDebugUtilsObjectNameEXT(
                       "\"%s\"", nm.c_str());
         }
         g_imageNames[img] = nm;
+        ++g_imageNamesVersion;
     } else if (info && info->objectType == VK_OBJECT_TYPE_BUFFER &&
                info->pObjectName && info->objectHandle != 0) {
         // Buffers get names too - and the engine's light list, if it names it,
@@ -17039,11 +17318,24 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkCmdPushDescriptorSetWithTemplate",    Layer_CmdPushDescriptorSetWithTemplate)
     RETURN_IF("vkCmdPushDescriptorSetWithTemplateKHR", Layer_CmdPushDescriptorSetWithTemplate)
     RETURN_IF("vkCreateDescriptorSetLayout",           Layer_CreateDescriptorSetLayout)
+    RETURN_IF("vkDestroyDescriptorSetLayout",          Layer_DestroyDescriptorSetLayout)
+    RETURN_IF("vkDestroyDescriptorUpdateTemplate",     Layer_DestroyDescriptorUpdateTemplate)
+    RETURN_IF("vkDestroyDescriptorUpdateTemplateKHR",  Layer_DestroyDescriptorUpdateTemplate)
+    RETURN_IF("vkFreeDescriptorSets",                  Layer_FreeDescriptorSets)
+    RETURN_IF("vkResetDescriptorPool",                 Layer_ResetDescriptorPool)
+    RETURN_IF("vkDestroyImageView",                    Layer_DestroyImageView)
+    RETURN_IF("vkFreeCommandBuffers",                  Layer_FreeCommandBuffers)
     RETURN_IF("vkBeginCommandBuffer",                  Layer_BeginCommandBuffer)
     RETURN_IF("vkCreateDescriptorUpdateTemplate",      Layer_CreateDescriptorUpdateTemplate)
     RETURN_IF("vkCreateDescriptorUpdateTemplateKHR",   Layer_CreateDescriptorUpdateTemplate)
     RETURN_IF("vkUpdateDescriptorSetWithTemplate",     Layer_UpdateDescriptorSetWithTemplate)
     RETURN_IF("vkUpdateDescriptorSetWithTemplateKHR",  Layer_UpdateDescriptorSetWithTemplate)
+#ifdef VK_VERSION_1_4
+    RETURN_IF("vkCmdPushDescriptorSet2",               Layer_CmdPushDescriptorSet2)
+    RETURN_IF("vkCmdPushDescriptorSet2KHR",            Layer_CmdPushDescriptorSet2)
+    RETURN_IF("vkCmdPushDescriptorSetWithTemplate2",   Layer_CmdPushDescriptorSetWithTemplate2)
+    RETURN_IF("vkCmdPushDescriptorSetWithTemplate2KHR",Layer_CmdPushDescriptorSetWithTemplate2)
+#endif
     RETURN_IF("vkGetBufferDeviceAddress",     Layer_GetBufferDeviceAddress)
     RETURN_IF("vkGetBufferDeviceAddressKHR",  Layer_GetBufferDeviceAddress)
     RETURN_IF("vkCreateSwapchainKHR",  Layer_CreateSwapchainKHR)

@@ -1,4 +1,4 @@
-﻿// Generated from src/shaders/oracle_sundump.comp by build.ps1 - do not edit.
+// Generated from src/shaders/oracle_sundump.comp by build.ps1 - do not edit.
 #pragma once
 #include <stdint.h>
 
@@ -149,4 +149,3 @@ static const uint32_t kOracleSunDumpSpv[] = {
     0x00060041u,0x0000001bu,0x0000009fu,0x0000000au,0x0000000cu,0x0000009eu,0x0003003eu,0x0000009fu,
     0x0000009cu,0x000100fdu,0x00010038u,
 };
-

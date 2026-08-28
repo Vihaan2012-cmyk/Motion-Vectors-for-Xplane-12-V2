@@ -175,7 +175,7 @@ for ($i = 0; $i -lt $gwords.Count; $i += 8) {
 [void]$gsb.AppendLine("};")
 [void]$gsb.AppendLine("")
 [void]$gsb.AppendLine("static const size_t kFgPrepareSpvWords = $($gwords.Count);")
-Set-Content -Path "$src/vklayer/fg_prepare_spv.h" -Value $gsb.ToString() -Encoding utf8 -NoNewline
+[IO.File]::WriteAllText("$src/vklayer/fg_prepare_spv.h", $gsb.ToString())
 Write-Host "  fg_prepare_spv.h: $($gwords.Count) words"
 
 # ---- THE FIDELITYFX OBJECTS.
@@ -213,6 +213,10 @@ if ($haveFfx) {
 $sdTmp = Join-Path $env:TEMP "oracle_sundump.spv"
 & $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/oracle_sundump.comp" -o $sdTmp | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "oracle_sundump.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $sdTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "oracle_sundump.comp failed spirv-val" }
+}
 $sdbytes = [System.IO.File]::ReadAllBytes($sdTmp)
 $sdwords = New-Object System.Collections.Generic.List[string]
 for ($i = 0; $i -lt $sdbytes.Length; $i += 4) {
@@ -229,7 +233,7 @@ for ($i = 0; $i -lt $sdwords.Count; $i += 8) {
     [void]$sdsb.AppendLine("    " + (($sdwords.GetRange($i, $n)) -join ",") + ",")
 }
 [void]$sdsb.AppendLine("};")
-Set-Content -Path "$src/vklayer/oracle_sundump_spv.h" -Value $sdsb.ToString() -Encoding utf8
+[IO.File]::WriteAllText("$src/vklayer/oracle_sundump_spv.h", $sdsb.ToString())
 Write-Host ("  oracle_sundump_spv.h: {0} words" -f $sdwords.Count)
 
 Write-Host "Compiling oracle probe shader..."
@@ -257,7 +261,7 @@ for ($i = 0; $i -lt $owords.Count; $i += 8) {
     [void]$osb.AppendLine("    " + (($owords.GetRange($i, $n)) -join ",") + ",")
 }
 [void]$osb.AppendLine("};")
-Set-Content -Path "$src/vklayer/oracle_probe_spv.h" -Value $osb.ToString() -Encoding utf8
+[IO.File]::WriteAllText("$src/vklayer/oracle_probe_spv.h", $osb.ToString())
 Write-Host ("  oracle_probe_spv.h: {0} words" -f $owords.Count)
 
 Write-Host "Building FidelityFX..."
@@ -461,7 +465,7 @@ if ($haveFfx -and (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
 # first call, with no output at all.
 Write-Host "Building Vulkan layer..."
 & g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
-  -I"$vksdk\Include" -m64 -O2 -std=c++17 `
+  -I"$vksdk\Include" -m64 -O2 -std=c++17 -D__USE_MINGW_ANSI_STDIO=1 `
   @sdkDefines @sdkIncludes $ffxDefine `
   "-I$ffxSdk\sdk\include" @ffxObjs `
   -static -static-libgcc -static-libstdc++

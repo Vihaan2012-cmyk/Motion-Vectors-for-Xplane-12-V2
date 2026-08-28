@@ -116,6 +116,14 @@ struct TaaState {
     bool            edValid = false;
     // Bindings 7/8: the engine's sun cascades and environment probes.
     std::map<VkImage, VkImageView> sunViews, probeViews;
+    // 1x1 D16 dummy for binding 7's fallback. A COMPARISON sampler on the
+    // RGBA16F velocity view was invalid Vulkan for every frame the cascades
+    // were unidentified - i.e. all menus. Comparison sampling demands a depth
+    // format, so the dummy is one.
+    VkImage         sunDummy     = VK_NULL_HANDLE;
+    VkDeviceMemory  sunDummyMem  = VK_NULL_HANDLE;
+    VkImageView     sunDummyView = VK_NULL_HANDLE;
+    bool            sunDummyReady = false;   // one-time layout transition done
     VkImageView     sunView   = VK_NULL_HANDLE;
     bool            sunValid  = false;
     VkImageView     probeView = VK_NULL_HANDLE;
@@ -411,7 +419,13 @@ static bool taaDilate() { return live::onoff("taa.dilate", "TAA_DILATE", true); 
 // Read AO/contact view depth from X-Plane's own gbuf-depth (binding 5) instead
 // of the injected clip-w. Off by default until it has been A/B'd - and it can
 // only engage once the name listener has identified the image anyway.
-static bool taaPosHarvest() { return live::onoff("taa.pos_harvest", "TAA_POS_HARVEST", false); }
+static bool taaPosHarvest() {
+    // taa.engine_depth is the honest name (the harvest source is the engine's
+    // gbuf-depth; "pos" predates learning that gbuffer_pos IS depth). The old
+    // key stays as an alias so existing inis keep working.
+    return live::onoff("taa.engine_depth", "TAA_ENGINE_DEPTH", false) ||
+           live::onoff("taa.pos_harvest",  "TAA_POS_HARVEST",  false);
+}
 // Depth-reconstructed velocity for pixels the injection never wrote (sky,
 // clouds, any unpatched shader). Needs pos_harvest's engine depth AND a valid
 // reprojection matrix; degrades to the old vel=0 per-pixel otherwise. The
@@ -499,6 +513,27 @@ static void taaDestroyState(DeviceData &dd, TaaState &g_taa)
          it != g_taa.sceneViews.end(); ++it)
         if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
     g_taa.sceneViews.clear();
+    // The engine-image view caches added for the taps: leaked on every
+    // re-init (resolution change) until this loop existed.
+    std::map<VkImage, VkImageView> *caches[4] = {
+        &g_taa.flagsViews, &g_taa.edViews, &g_taa.sunViews, &g_taa.probeViews };
+    for (int ci = 0; ci < 4; ++ci) {
+        for (std::map<VkImage, VkImageView>::iterator it = caches[ci]->begin();
+             it != caches[ci]->end(); ++it)
+            if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
+        caches[ci]->clear();
+    }
+    g_taa.flagsView = VK_NULL_HANDLE; g_taa.flagsValid = false;
+    g_taa.edView    = VK_NULL_HANDLE; g_taa.edValid    = false;
+    g_taa.sunView   = VK_NULL_HANDLE; g_taa.sunValid   = false;
+    g_taa.probeView = VK_NULL_HANDLE; g_taa.probeValid = false;
+    if (g_taa.sunDummyView) dd.destroyImageView(g_taa.device, g_taa.sunDummyView, nullptr);
+    if (g_taa.sunDummy)     dd.destroyImage(g_taa.device, g_taa.sunDummy, nullptr);
+    if (g_taa.sunDummyMem)  dd.freeMemory(g_taa.device, g_taa.sunDummyMem, nullptr);
+    g_taa.sunDummyView = VK_NULL_HANDLE;
+    g_taa.sunDummy = VK_NULL_HANDLE;
+    g_taa.sunDummyMem = VK_NULL_HANDLE;
+    g_taa.sunDummyReady = false;
     // velView is g_mv.viewArray - g_mv owns and destroys it; destroying it
     // here too was a latent double-destroy.
     for (std::map<VkImage, VkImageView>::iterator it = g_taa.flagsViews.begin();
@@ -966,7 +1001,10 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                     pfnBindBuf(dev, g_taa.uboBuf, g_taa.uboMem, 0) == VK_SUCCESS &&
                     pfnMap(dev, g_taa.uboMem, 0, VK_WHOLE_SIZE, 0,
                            &g_taa.uboMap) == VK_SUCCESS) {
-                    // mapped for good
+                    // Zeroed ONCE here, which is what makes the fallback
+                    // regions' "readable zeros" true rather than a comment's
+                    // wish over undefined allocation contents.
+                    memset(g_taa.uboMap, 0, (size_t)bci.size);
                 } else {
                     g_taa.uboMap = nullptr;
                     trace("TAA: reproj UBO memory setup failed - resolve "
@@ -983,6 +1021,49 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                   "initialise");
             return false;
         }
+    }
+
+    {
+        VkImageCreateInfo ic;
+        memset(&ic, 0, sizeof(ic));
+        ic.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ic.imageType = VK_IMAGE_TYPE_2D;
+        ic.format = VK_FORMAT_D16_UNORM;
+        ic.extent.width = 1; ic.extent.height = 1; ic.extent.depth = 1;
+        ic.mipLevels = 1; ic.arrayLayers = 1;
+        ic.samples = VK_SAMPLE_COUNT_1_BIT;
+        ic.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ic.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (dd.createImage && dd.createImage(dev, &ic, nullptr,
+                                               &g_taa.sunDummy) == VK_SUCCESS) {
+            VkMemoryRequirements mr;
+            dd.getImageMemReq(dev, g_taa.sunDummy, &mr);
+            VkMemoryAllocateInfo ma;
+            memset(&ma, 0, sizeof(ma));
+            ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            ma.allocationSize = mr.size;
+            ma.memoryTypeIndex = taaFindMemory(dd, mr.memoryTypeBits,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (ma.memoryTypeIndex != UINT32_MAX &&
+                dd.allocateMemory(dev, &ma, nullptr, &g_taa.sunDummyMem) == VK_SUCCESS &&
+                dd.bindImageMemory(dev, g_taa.sunDummy, g_taa.sunDummyMem, 0) == VK_SUCCESS) {
+                VkImageViewCreateInfo vv;
+                memset(&vv, 0, sizeof(vv));
+                vv.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                vv.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+                vv.format = VK_FORMAT_D16_UNORM;
+                vv.image = g_taa.sunDummy;
+                vv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                vv.subresourceRange.levelCount = 1;
+                vv.subresourceRange.layerCount = 1;
+                dd.createImageView(dev, &vv, nullptr, &g_taa.sunDummyView);
+            }
+        }
+        if (g_taa.sunDummyView == VK_NULL_HANDLE)
+            trace("TAA: sun dummy depth creation failed - binding 7 fallback "
+                  "will violate spec until cascades identify");
     }
 
     g_taa.velView = velView;
@@ -1365,6 +1446,28 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
 {
     if (!g_taa.ready || !taaEnabled()) return;
 
+    // One-time: the 1x1 comparison-sampler dummy leaves UNDEFINED layout the
+    // first time any resolve records - sampling an UNDEFINED image is itself
+    // the class of invalid use the dummy exists to prevent.
+    if (g_taa.sunDummy != VK_NULL_HANDLE && !g_taa.sunDummyReady) {
+        VkImageMemoryBarrier db;
+        memset(&db, 0, sizeof(db));
+        db.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        db.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        db.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        db.image = g_taa.sunDummy;
+        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        db.subresourceRange.levelCount = 1;
+        db.subresourceRange.layerCount = 1;
+        db.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              0, 0, nullptr, 0, nullptr, 1, &db);
+        g_taa.sunDummyReady = true;
+    }
+
     VkImageMemoryBarrier bar[3];
     memset(bar, 0, sizeof(bar));
     for (int i = 0; i < 3; ++i) {
@@ -1499,6 +1602,22 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         reset = true;
     }
 
+    // Coherent copy of the frame-thread globals: retry while the writer is
+    // mid-update (odd) or moved between our reads.
+    float snapSun[3], snapEd[2], snapIp[2], snapReproj[16], snapYSign;
+    bool  snapReprojValid;
+    for (;;) {
+        const uint32_t s1 = g_taaShareSeq.load(std::memory_order_acquire);
+        if (s1 & 1u) continue;
+        memcpy(snapSun,    g_taaSunView, sizeof(snapSun));
+        memcpy(snapEd,     g_taaEdAB,    sizeof(snapEd));
+        memcpy(snapIp,     g_taaInvProj, sizeof(snapIp));
+        memcpy(snapReproj, g_taaReproj,  sizeof(snapReproj));
+        snapYSign = g_taaVpYSign;
+        snapReprojValid = g_taaReprojValid;
+        if (g_taaShareSeq.load(std::memory_order_acquire) == s1) break;
+    }
+
     const uint32_t setIdx = g_taa.nextSet;
     VkDescriptorSet set = g_taa.sets[setIdx];
     g_taa.nextSet = (setIdx + 1) % TaaState::kSets;
@@ -1509,19 +1628,19 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // descriptor set so ring depth covers in-flight reads. Layout mirrors the
     // shader's std140 block: mat4 (column-major, as published), then a vec4 of
     // (ySign, valid, 0, 0).
-    const bool reprojOn = g_taa.uboMap && g_taaReprojValid &&
+    const bool reprojOn = g_taa.uboMap && snapReprojValid &&
                           taaPosHarvest() && g_taa.edValid &&
                           taaNovecReproject();
     if (g_taa.uboMap) {
         float *slot = (float *)((char *)g_taa.uboMap + 2048u * setIdx);
-        memcpy(slot, g_taaReproj, 16 * sizeof(float));
-        slot[16] = g_taaVpYSign;
+        memcpy(slot, snapReproj, 16 * sizeof(float));
+        slot[16] = snapYSign;
         slot[17] = reprojOn ? 1.0f : 0.0f;
         slot[18] = 0.0f;
         slot[19] = 0.0f;
         // Second param row: eye-position reconstruction for the cascade tap.
-        slot[20] = g_taaInvProj[0];
-        slot[21] = g_taaInvProj[1];
+        slot[20] = snapIp[0];
+        slot[21] = snapIp[1];
         slot[22] = 0.0f;
         slot[23] = 0.0f;
     }
@@ -1561,7 +1680,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // Bindings 7/8: engine cascades and probes, dummy-bound like binding 5.
     // The cascades were consumed by the deferred lighting long before the
     // resolve runs; the probes are sampled by it too - same layout reasoning.
-    ii[6].imageView = g_taa.sunValid ? g_taa.sunView : g_taa.velView;
+    ii[6].imageView = g_taa.sunValid ? g_taa.sunView
+                     : (g_taa.sunDummyView ? g_taa.sunDummyView : g_taa.velView);
     ii[6].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     // Comparison sampler, op picked live: taa.smap_ge=1 flips the compare if
     // the viz shows lit/shadowed inverted. Binding 7 is sampler2DArrayShadow
@@ -1667,10 +1787,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     VkWriteDescriptorSet wrg = wru;
     wrg.dstBinding = 10;
     wrg.pBufferInfo = &bg;
-    dd.updateDescriptorSets(g_taa.device, 8, wr, 0, nullptr);
-    dd.updateDescriptorSets(g_taa.device, 1, &wru, 0, nullptr);
-    dd.updateDescriptorSets(g_taa.device, 1, &wrs, 0, nullptr);
-    dd.updateDescriptorSets(g_taa.device, 1, &wrg, 0, nullptr);
+    VkWriteDescriptorSet wrAll[11];
+    for (int k = 0; k < 8; ++k) wrAll[k] = wr[k];
+    wrAll[8] = wru; wrAll[9] = wrs; wrAll[10] = wrg;
+    dd.updateDescriptorSets(g_taa.device, 11, wrAll, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -1713,8 +1833,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.alpha = taaAlpha();
     pcv.mode = taaMode();
     const bool pcReset = (reset || taaForceReset());
-    pcv.edA = g_taaEdAB[0];
-    pcv.edB = g_taaEdAB[1];
+    pcv.edA = snapEd[0];
+    pcv.edB = snapEd[1];
     pcv.viz      = taaViz();
     pcv.vizScale = taaVizScale();
     pcv.gain     = taaGain();
@@ -1733,9 +1853,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.aoRadius      = taaAoRadius();
     // The sun, straight through from the plugin. Zeroed when it is below the
     // horizon, which the shader reads as "do not march".
-    pcv.sunViewX      = g_taaSunView[0];
-    pcv.sunViewY      = g_taaSunView[1];
-    pcv.sunViewZ      = g_taaSunView[2];
+    pcv.sunViewX      = snapSun[0];
+    pcv.sunViewY      = snapSun[1];
+    pcv.sunViewZ      = snapSun[2];
     pcv.csStrength    = taaCsStrength();
     // ---- ORACLE MEASUREMENT MODE: our own effects OFF while measuring.
     //

@@ -1,4 +1,4 @@
-﻿// Generated from src/shaders/oracle_probe.comp by build.ps1 - do not edit.
+// Generated from src/shaders/oracle_probe.comp by build.ps1 - do not edit.
 #pragma once
 #include <stdint.h>
 
@@ -130,4 +130,3 @@ static const uint32_t kOracleProbeSpv[] = {
     0x0000009eu,0x0003003eu,0x000000a5u,0x000000a4u,0x000200f9u,0x0000007du,0x000200f8u,0x0000007du,
     0x000100fdu,0x00010038u,
 };
-

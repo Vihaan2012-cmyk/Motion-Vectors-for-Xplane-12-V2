@@ -297,6 +297,15 @@ vec2 mvReconstructVel(vec2 u, float lay)
     return (curr.xy - prev.xy / prev.w) * 0.5;
 }
 
+// Interleaved gradient noise, shared by AO and contact shadows. ONE
+// definition on purpose: when the temporal re-seed lands (the camera-motion
+// aliasing fix), editing a single copy re-seeds both consumers together
+// instead of silently decorrelating them.
+float mvIgn(vec2 p)
+{
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
 float mvViewDepth(vec2 u, float lay, float fb)
 {
     if ((pc.flags & FLAG_ENGINE_DEPTH) == 0) return fb;
@@ -320,9 +329,9 @@ vec3 mvEyePos(vec2 u, float lay)
     // A rational linearization and an affine screen map - which is why the
     // hand-rolled two-constant version below produced garbage the moment the
     // projection carried an offset (cockpit clip scaling, FSR viewport).
-    if ((pc.flags & FLAG_GBUF_TAP) != 0 && gClipInfo[0].w != 0.0) {
-        float z = (d * gClipInfo[0].x + gClipInfo[0].y) /
-                  (d * gClipInfo[0].z + gClipInfo[0].w);
+    float gden = d * gClipInfo[0].z + gClipInfo[0].w;
+    if ((pc.flags & FLAG_GBUF_TAP) != 0 && abs(gden) > 1e-12) {
+        float z = (d * gClipInfo[0].x + gClipInfo[0].y) / gden;
         vec2 fc = u * gViewportSize.xy + gSampleOffset;
         vec2 xy = (fc * gViewportSize.zw) * gProjCoefficients[0].xy +
                   gProjCoefficients[0].zw;
@@ -975,13 +984,15 @@ void main()
         // penumbras show as blends. BLUE tint marks "beyond all cascades"
         // (which the engine treats as lit), GREY means no tap. Inverted
         // green/red against visible shadows = flip taa.smap_ge, live.
-        vec3 eye = mvEyePos(uv + S, float(layer));
+        // Plain uv: the engine path adds ITS sample offset; stacking our
+        // unjitter shift on top double-applied the subpixel correction.
+        vec3 eye = mvEyePos(uv, float(layer));
         vec2 v = mvSunVisibility(eye);
         vec3 c;
         if (v.y < -1.5)      c = vec3(0.3);
         else if (v.y < -0.5) c = vec3(0.0, 0.5, 0.7);
         else                 c = vec3(1.0 - v.x, v.x, 0.0);
-        imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
+        imageStore(uHistory, ivec3(px, layer), vec4(c, 0.0));
         return;
     }
     if (pc.viz == VIZ_PROBE) {
@@ -989,9 +1000,9 @@ void main()
         // by vizScale (the probe holds HDR values in the thousands). A
         // recognisable blurry world = the tap is right; garbage = face
         // mapping or layer order is wrong.
-        vec3 eye = normalize(mvEyePos(uv + S, float(layer)));
+        vec3 eye = normalize(mvEyePos(uv, float(layer)));
         vec3 r = mvProbeRadiance(eye) * pc.vizScale * 1e-3;
-        imageStore(uHistory, ivec3(px, layer), vec4(r, 1.0));
+        imageStore(uHistory, ivec3(px, layer), vec4(r, 0.0));
         return;
     }
     if (pc.viz == VIZ_MOTION) {
@@ -1003,7 +1014,7 @@ void main()
         // consumed, not what is stored.
         vec2 px2 = vec2(vel.x, pc.velYSign * vel.y) * vec2(size);
         vec3 c = vec3(0.5) + vec3(px2.x, px2.y, 0.0) * 0.02 * pc.vizScale;
-        imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
+        imageStore(uHistory, ivec3(px, layer), vec4(c, 0.0));
         return;
     }
     if (pc.viz == VIZ_WRITTEN) {
@@ -1114,7 +1125,7 @@ void main()
                : (covMax < 0.5 && (pc.flags & FLAG_REACTIVE) != 0)
                             ? vec3(1.0, 1.0, 0.0)
                             : vec3(0.0, 1.0, 0.0);
-        imageStore(uHistory, ivec3(px, layer), vec4(c, 1.0));
+        imageStore(uHistory, ivec3(px, layer), vec4(c, 0.0));
         return;
     }
 
@@ -1170,7 +1181,7 @@ void main()
         // Per-pixel rotation (interleaved gradient noise). Without it the eight
         // taps land on the same eight angles everywhere and the occlusion shows
         // its sampling pattern as a visible texture.
-        float ign = fract(52.9829189 * fract(dot(vec2(px), vec2(0.06711056, 0.00583715))));
+        float ign = mvIgn(vec2(px));
         float rot = ign * 6.2831853;
         const int   AO_TAPS = 8;
         float occ = 0.0;
@@ -1233,7 +1244,7 @@ void main()
         float csLen = pc.aoRadius * 0.5;
         // Same interleaved-gradient offset the AO uses, so the eight steps do
         // not land on the same eight depths across a flat surface and band it.
-        float ign = fract(52.9829189 * fract(dot(vec2(px), vec2(0.06711056, 0.00583715))));
+        float ign = mvIgn(vec2(px));
         const int CS_STEPS = 8;
         float shadow = 0.0;
         for (int i = 0; i < CS_STEPS; ++i) {
@@ -1607,7 +1618,7 @@ void main()
     // This is the view that says whether alpha is doing what the number says.
     if (pc.viz == VIZ_WEIGHT) {
         imageStore(uHistory, ivec3(px, layer),
-                   vec4(heat(a * pc.vizScale), 1.0));
+                   vec4(heat(a * pc.vizScale), 0.0));
         return;
     }
 

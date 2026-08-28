@@ -243,6 +243,23 @@ inline void loadNow()
             trace("LIVE: %s removed - falling back to the environment or the "
                   "built-in default", it->first.c_str());
 
+    // The shipped lock silently overrides 31 keys; its state changing is
+    // exactly the kind of thing the trace exists to record.
+    {
+        std::map<std::string, std::string>::iterator ul = kv.find("taa.unlock");
+        const bool nowUnlocked =
+            ul != kv.end() && !(ul->second == "0" || ul->second == "off" ||
+                                ul->second == "false" || ul->second == "no");
+        static int last = -1;
+        if ((int)nowUnlocked != last) {
+            last = (int)nowUnlocked;
+            trace(nowUnlocked
+                ? "LIVE: taa.unlock=1 - the ini and environment now override "
+                  "the shipped tuning table"
+                : "LIVE: shipped tuning table IN FORCE - 31 keys locked "
+                  "(ini and environment ignored for them; taa.unlock=1 frees)");
+        }
+    }
     g_kv = kv;
     g_stamp = stamp;
     g_everSeen = true;
@@ -328,6 +345,9 @@ inline void clearOneShot(const char *key)
 //
 // taa.unlock=1 releases all of it, for when tuning is the point.
 struct Shipped { const char *k; const char *v; };
+// The Lua panel hand-mirrors this table as LOCKED{}; the two drift silently
+// unless both sides count. C side asserts here; Lua asserts at load.
+#define MV_SHIPPED_COUNT 31
 static const Shipped kShipped[] = {
     // Accumulation and clipping.
     { "taa.mode",              "2"      },
@@ -372,9 +392,23 @@ static const Shipped kShipped[] = {
     // VRAM. It stays at 0 unless someone deliberately unlocks and retunes it.
     { "taa.lod_bias",          "0.0"    },
 };
+static_assert(sizeof(kShipped) / sizeof(kShipped[0]) == MV_SHIPPED_COUNT,
+              "kShipped changed size - update MV_SHIPPED_COUNT and the Lua "
+              "LOCKED table together");
 
 // Reads g_kv directly and does NOT take the lock - it is called from inside
 // lookup(), which already holds it, and std::mutex is not recursive.
+// O(1) membership for the shipped table. The 31-strcmp linear scan ran on
+// EVERY knob read - dozens per frame - and this map is built once.
+inline const std::map<std::string, const char *> &shippedMap()
+{
+    static std::map<std::string, const char *> m;
+    if (m.empty())
+        for (size_t n = 0; n < sizeof(kShipped) / sizeof(kShipped[0]); ++n)
+            m[kShipped[n].k] = kShipped[n].v;
+    return m;
+}
+
 inline bool unlockedLocked()
 {
     std::map<std::string, std::string>::iterator it = g_kv.find("taa.unlock");
@@ -387,9 +421,12 @@ inline bool lookup(const char *key, std::string &out)
 {
     std::lock_guard<std::mutex> g(g_mtx);
     // The shipped table wins, unless the user has explicitly unlocked it.
+    // NOTE the lock overrides the ENVIRONMENT as well as the ini - TAA_* vars
+    // for locked keys are ignored while locked, by design.
     if (!unlockedLocked()) {
-        for (size_t n = 0; n < sizeof(kShipped) / sizeof(kShipped[0]); ++n)
-            if (strcmp(kShipped[n].k, key) == 0) { out = kShipped[n].v; return true; }
+        std::map<std::string, const char *>::const_iterator sh =
+            shippedMap().find(key);
+        if (sh != shippedMap().end()) { out = sh->second; return true; }
     }
     std::map<std::string, std::string>::iterator it = g_kv.find(key);
     if (it == g_kv.end()) return false;

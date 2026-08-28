@@ -233,7 +233,10 @@ local function ini_set(key, value)
     local pat = key:gsub("%.", "%%.")
     local line = key .. "=" .. tostring(value)
     if s:match("\n" .. pat .. "=[^\r\n]*") or s:match("^" .. pat .. "=[^\r\n]*") then
-        s = s:gsub("([\r\n]" .. pat .. ")=[^\r\n]*", "%1=" .. tostring(value), 1)
+        -- ALL occurrences, deliberately: the C parser lets the LAST duplicate
+        -- win while this function used to rewrite only the FIRST - a duplicate
+        -- key made a control that looked live and did nothing.
+        s = s:gsub("([\r\n]" .. pat .. ")=[^\r\n]*", "%1=" .. tostring(value))
         s = s:gsub("^(" .. pat .. ")=[^\r\n]*", "%1=" .. tostring(value), 1)
     else
         if s:sub(-1) ~= "\n" then s = s .. "\n" end
@@ -488,6 +491,10 @@ local g_effect_last = {}
 --
 -- taa.unlock=1 releases them; the button for that is at the top of the
 -- advanced section.
+-- Mirrors kShipped[] in mv_live.h. MV_SHIPPED_COUNT there asserts 31 at
+-- compile time; the loop below asserts the same here at load, so the two
+-- tables cannot drift silently.
+local LOCKED_EXPECTED = 31
 local LOCKED = {
     ["taa.mode"] = true,
     ["taa.alpha"] = true,
@@ -521,6 +528,16 @@ local LOCKED = {
     ["taa.ao_radius"] = true,
     ["taa.lod_bias"] = true,
 }
+do
+    local nLocked = 0
+    for _ in pairs(LOCKED) do nLocked = nLocked + 1 end
+    if nLocked ~= LOCKED_EXPECTED then
+        logMsg(string.format(
+            "MotionVectors: LOCKED table has %d keys, expected %d - it has "
+            .. "drifted from kShipped[] in mv_live.h", nLocked, LOCKED_EXPECTED))
+    end
+end
+
 
 -- BEGIN GENERATED SETTINGS -- produced by gen_lua.py from the layer
 -- source; every live:: key in src/vklayer is listed here. Do not edit
@@ -542,7 +559,7 @@ local SETTINGS = {
     group = "TAA", help = "Speed, in px/frame, at which alpha_moving is fully applied." },
   { key = "taa.clear_after_resolve", label = "clear_after_resolve", kind = "bool", def = false, lo = nil, hi = nil,
     group = "TAA", help = "" },
-  { key = "taa.contact", label = "contact", kind = "float", def = 0.6, lo = 0.0, hi = 1.0,
+  { key = "taa.contact", label = "contact", kind = "float", def = 0.0, lo = 0.0, hi = 1.0,
     group = "TAA", help = "Contact shadows: the short, hard, SUN-DIRECTIONAL shadowing a shadow map is too coarse to draw - gear and struts on a sunlit ramp, panel seams, a wing edge on tarmac. Not a second helping of ao: ao is omnidirectional and always on, this only appears where the sun actually reaches. Costs nothing at night; the sun vector is zeroed below the horizon." },
   { key = "taa.enable", label = "enable", kind = "bool", def = false, lo = nil, hi = nil,
     group = "TAA", help = "---- EVERY KNOB IS LIVE." },
@@ -1366,7 +1383,7 @@ local function build(w, x, y)
     local EFFECTS = {
         { key = "taa.ao",      label = "AO",       def = "0.5",
           tip = "Ambient occlusion - omnidirectional creases, always on." },
-        { key = "taa.contact", label = "CONTACT",  def = "0.6",
+        { key = "taa.contact", label = "CONTACT",  def = "0.0",
           tip = "Contact shadows - sun-directional, outdoors in daylight only." },
         { key = "taa.sharpen", label = "SHARPEN",  def = "0.35",
           tip = "Post-resolve sharpen, gated on how converged each pixel is." },
@@ -1383,13 +1400,14 @@ local function build(w, x, y)
         if styled_button(e.label, 76, 22, on and C_GREEN or C_GREY_ED,
                          on and C_GREEN_BG or C_GREY_BG, true) then
             if on then
-                -- Remember what it was before zeroing it, so switching back on
-                -- restores a tuned value rather than stamping the default over
-                -- it.
-                if not e.bool then g_effect_last[e.key] = cur end
+                -- The pre-toggle value persists IN THE INI (companion key),
+                -- so it survives script reloads and restarts - the session
+                -- table it replaced forgot on every reload.
+                if not e.bool then ini_set(e.key .. "_saved", cur) end
                 ini_set(e.key, "0")
             else
-                ini_set(e.key, e.bool and "1" or (g_effect_last[e.key] or e.def))
+                local back = e.bool and "1" or ini_get(e.key .. "_saved", e.def)
+                ini_set(e.key, back)
             end
             logf(C_AMBER, e.label .. (on and " off." or " on."))
         end

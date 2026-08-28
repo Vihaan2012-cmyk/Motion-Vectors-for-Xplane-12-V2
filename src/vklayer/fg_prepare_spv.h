@@ -1,4 +1,4 @@
-﻿// Generated from src/shaders/fg_prepare.comp by build.ps1 - do not edit.
+// Generated from src/shaders/fg_prepare.comp by build.ps1 - do not edit.
 #pragma once
 #include <stdint.h>
 

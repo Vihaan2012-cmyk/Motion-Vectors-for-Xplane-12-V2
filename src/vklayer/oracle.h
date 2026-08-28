@@ -33,6 +33,11 @@
 
 namespace oracle {
 
+inline bool armed()
+{
+    return live::onoff("taa.oracle", "TAA_ORACLE", false);
+}
+
 // ------------------------------------------------------------- the watch lists
 static const char *kBlockWatch[] = {
     "u_shadow_data", "ssbo_light_list", "light_tile_data", "u_gbuffer_data",
@@ -40,7 +45,9 @@ static const char *kBlockWatch[] = {
     "u_new_sky_data", "deferred_metering_data", "u_immediate_data",
 };
 static const char *kShaderResWatch[] = {
-    "tex_smap", "tex_hiZ", "tex_cubemap", "gbuffer_", "tex_ssr", "tex_brdf",
+    // NOTE deliberately no "gbuffer_" here: it appears in half the corpus and
+    // turned the cheap byte-gate into a full parse of most modules.
+    "tex_smap", "tex_hiZ", "tex_cubemap", "gbuffer_vel", "tex_ssr", "tex_brdf",
     "u_tex_cloud_shadow", "u_tex_in_scatter",
 };
 // Image-name fragments worth probing. Lower-case compared.
@@ -73,6 +80,11 @@ inline bool bytesContain(const uint8_t *d, size_t n, const char *needle)
 inline void reflect(const uint32_t *w, size_t nWords)
 {
     if (!w || nWords < 5 || w[0] != 0x07230203u) return;
+    // Load-time guard: ~1,500 modules x 14 substring passes is seconds of
+    // startup for a report nobody asked for. Armed sessions pay it; the
+    // consequence is that arming MID-session reflects only modules created
+    // after arming - the report says so.
+    if (!armed()) return;
     {
         std::lock_guard<std::mutex> g(g_omx);
         ++g_modScanned;
@@ -180,10 +192,6 @@ inline void reflect(const uint32_t *w, size_t nWords)
 }
 
 // -------------------------------------------------------------- the probe pass
-inline bool armed()
-{
-    return live::onoff("taa.oracle", "TAA_ORACLE", false);
-}
 
 static const uint32_t kSlots = 24;
 
@@ -389,7 +397,19 @@ inline bool initProbe(DeviceData &dd, VkDevice dev)
 // records - scene finished, engine targets in their read layouts.
 inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb)
 {
-    if (!armed()) return;
+    // A pending result outlives disarming: report it rather than swallow it.
+    if (!armed()) {
+        if (P.ready && P.map) {
+            PState::Pending &lp = P.pend[P.slot];
+            if (lp.used) {
+                const float *v = (const float *)P.map + P.slot * 16;
+                trace("ORACLE CONTENT (final): %-28s | mean(%.4g,%.4g,%.4g,%.4g)",
+                      lp.name.c_str(), v[8], v[9], v[10], v[11]);
+                lp.used = false;
+            }
+        }
+        return;
+    }
     if (!initProbe(dd, dev)) return;
 
     // Report the result this slot carried from a full lap ago.
@@ -405,23 +425,40 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb)
         pd.used = false;
     }
 
-    // Choose the next watch image, rotating. Snapshot under the lock.
+    // Choose the next watch image, rotating. The candidate list is CACHED
+    // and rebuilt only when the name census changes: the per-frame rebuild
+    // walked every named image with a tolower allocation each, under the
+    // global lock the bind hooks contend for.
     VkImage      img = VK_NULL_HANDLE;
     std::string  name;
     OracleImgInfo info;
     {
+        static std::vector<std::pair<VkImage, std::string> > cand;
+        static uint64_t candVersion = ~0ull;
         std::lock_guard<std::mutex> g(g_lock);
-        std::vector<std::pair<VkImage, std::string> > cand;
-        for (std::map<VkImage, std::string>::iterator it = g_imageNames.begin();
-             it != g_imageNames.end(); ++it)
-            if (nameOnImgWatch(it->second) && g_allImages.count(it->first))
-                cand.push_back(std::make_pair(it->first, it->second));
-        if (cand.empty()) return;
-        const uint32_t pick = P.cursor % (uint32_t)cand.size();
-        ++P.cursor;
-        img  = cand[pick].first;
-        name = cand[pick].second;
-        info = g_allImages[img];
+        if (candVersion != g_imageNamesVersion) {
+            candVersion = g_imageNamesVersion;
+            cand.clear();
+            for (std::map<VkImage, std::string>::iterator it = g_imageNames.begin();
+                 it != g_imageNames.end(); ++it)
+                if (nameOnImgWatch(it->second) && g_allImages.count(it->first))
+                    cand.push_back(std::make_pair(it->first, it->second));
+        }
+        bool picked = false;
+        for (uint32_t tries = 0; tries < 4 && !cand.empty() && !picked; ++tries) {
+            const uint32_t pick = P.cursor % (uint32_t)cand.size();
+            ++P.cursor;
+            std::map<VkImage, OracleImgInfo>::iterator ai =
+                g_allImages.find(cand[pick].first);
+            if (ai == g_allImages.end()) continue;   // died since caching
+            // item 44-of-the-register: sampling requires SAMPLED usage.
+            if ((ai->second.usage & VK_IMAGE_USAGE_SAMPLED_BIT) == 0) continue;
+            img = cand[pick].first;
+            name = cand[pick].second;
+            info = ai->second;
+            picked = true;
+        }
+        if (!picked) return;
     }
     if (info.samples != VK_SAMPLE_COUNT_1_BIT) return;   // cannot sample MS
     if (info.type != VK_IMAGE_TYPE_2D) return;           // probe is 2D-array only
@@ -521,11 +558,42 @@ struct DState {
 };
 static DState D;
 
+// PFN capture shared by probe and sundump WITHOUT constructing either's
+// objects - initSunDump used to drag the whole 24-slot probe fleet into
+// existence just to borrow function pointers.
+inline bool initPfns(DeviceData &dd, VkDevice dev)
+{
+    if (P.createSm) return true;
+    #define ORC_GET2(field, name) \
+        P.field = (decltype(P.field))dd.gdpa(dev, name); if (!P.field) return false
+    ORC_GET2(createSm,   "vkCreateShaderModule");
+    ORC_GET2(createDsl,  "vkCreateDescriptorSetLayout");
+    ORC_GET2(createPl,   "vkCreatePipelineLayout");
+    ORC_GET2(createPipe, "vkCreateComputePipelines");
+    ORC_GET2(createPool, "vkCreateDescriptorPool");
+    ORC_GET2(allocSets,  "vkAllocateDescriptorSets");
+    ORC_GET2(updSets,    "vkUpdateDescriptorSets");
+    ORC_GET2(createSamp, "vkCreateSampler");
+    ORC_GET2(createView, "vkCreateImageView");
+    ORC_GET2(createBuf,  "vkCreateBuffer");
+    ORC_GET2(bufReq,     "vkGetBufferMemoryRequirements");
+    ORC_GET2(allocMem,   "vkAllocateMemory");
+    ORC_GET2(bindBuf,    "vkBindBufferMemory");
+    ORC_GET2(mapMem,     "vkMapMemory");
+    ORC_GET2(bindPipe,   "vkCmdBindPipeline");
+    ORC_GET2(bindSets,   "vkCmdBindDescriptorSets");
+    ORC_GET2(pushConst,  "vkCmdPushConstants");
+    ORC_GET2(dispatch,   "vkCmdDispatch");
+    ORC_GET2(barrier,    "vkCmdPipelineBarrier");
+    #undef ORC_GET2
+    return true;
+}
+
 inline bool initSunDump(DeviceData &dd, VkDevice dev)
 {
     if (D.tried) return D.ready;
     D.tried = true;
-    if (!initProbe(dd, dev)) return false;   // shares P's PFNs
+    if (!initPfns(dd, dev)) return false;
 
     VkShaderModuleCreateInfo smci;
     memset(&smci, 0, sizeof(smci));
@@ -667,7 +735,10 @@ inline void dump()
 {
     const char *t = getenv("TEMP");
     std::string path = std::string(t ? t : ".") + "\\mv_oracle.txt";
-    FILE *f = fopen(path.c_str(), "w");
+    std::string tmp  = path + ".tmp";
+    // Written to a sidecar and swapped in whole: a crash mid-dump must not
+    // leave a plausible-looking half report.
+    FILE *f = fopen(tmp.c_str(), "w");
     if (!f) return;
 
     fprintf(f, "==================== MV ORACLE REPORT ====================\n\n");
@@ -732,8 +803,9 @@ inline void dump()
                         it->second.c_str(), (void *)it->first);
             }
         }
-        fprintf(f, "(%zu watch images of %zu named total)\n",
-                nImg, g_imageNames.size());
+        fprintf(f, "(%llu watch images of %llu named total)\n",
+                (unsigned long long)nImg,
+                (unsigned long long)g_imageNames.size());
 
         fprintf(f, "\n---- NAMED BUFFERS (engine names; the light list lives "
                    "here if anywhere)\n");
@@ -743,7 +815,7 @@ inline void dump()
             fprintf(f, "%-48s %p  %llu bytes\n", it->second.c_str(),
                     (void *)it->first, (unsigned long long)sz);
         }
-        fprintf(f, "(%zu named buffers)\n", g_bufferNames.size());
+        fprintf(f, "(%llu named buffers)\n", (unsigned long long)g_bufferNames.size());
     }
 
     bool lightsReflected, shadowReflected;
@@ -768,7 +840,54 @@ inline void dump()
     fprintf(f, "content probes dispatched ........ %llu (stats in taa_layer trace, "
             "'ORACLE CONTENT')\n", (unsigned long long)P.probes);
     fclose(f);
+    remove(path.c_str());
+    rename(tmp.c_str(), path.c_str());
     trace("ORACLE: report written to %s", path.c_str());
+}
+
+// Device teardown: everything the probe and sundump created dies with the
+// device instead of leaking past it. Called from Layer_DestroyDevice.
+inline void shutdown(DeviceData &dd, VkDevice dev)
+{
+    PFN_vkDestroyShaderModule dsm =
+        (PFN_vkDestroyShaderModule)dd.gdpa(dev, "vkDestroyShaderModule");
+    PFN_vkDestroyDescriptorSetLayout ddl =
+        (PFN_vkDestroyDescriptorSetLayout)dd.gdpa(dev, "vkDestroyDescriptorSetLayout");
+    PFN_vkDestroyPipelineLayout dpl =
+        (PFN_vkDestroyPipelineLayout)dd.gdpa(dev, "vkDestroyPipelineLayout");
+    PFN_vkDestroyPipeline dpp =
+        (PFN_vkDestroyPipeline)dd.gdpa(dev, "vkDestroyPipeline");
+    PFN_vkDestroyDescriptorPool dpo =
+        (PFN_vkDestroyDescriptorPool)dd.gdpa(dev, "vkDestroyDescriptorPool");
+    PFN_vkDestroySampler dsa =
+        (PFN_vkDestroySampler)dd.gdpa(dev, "vkDestroySampler");
+    PFN_vkDestroyBuffer dbu =
+        (PFN_vkDestroyBuffer)dd.gdpa(dev, "vkDestroyBuffer");
+    PFN_vkFreeMemory dfm =
+        (PFN_vkFreeMemory)dd.gdpa(dev, "vkFreeMemory");
+    PFN_vkDestroyImageView div =
+        (PFN_vkDestroyImageView)dd.gdpa(dev, "vkDestroyImageView");
+    for (std::map<VkImage, VkImageView>::iterator it = P.views.begin();
+         it != P.views.end(); ++it)
+        if (it->second && div) div(dev, it->second, nullptr);
+    P.views.clear();
+    if (P.pipe && dpp)  dpp(dev, P.pipe, nullptr);
+    if (P.pl && dpl)    dpl(dev, P.pl, nullptr);
+    if (P.dsl && ddl)   ddl(dev, P.dsl, nullptr);
+    if (P.pool && dpo)  dpo(dev, P.pool, nullptr);
+    if (P.sm && dsm)    dsm(dev, P.sm, nullptr);
+    if (P.samp && dsa)  dsa(dev, P.samp, nullptr);
+    if (P.ssbo && dbu)  dbu(dev, P.ssbo, nullptr);
+    if (P.mem && dfm)   dfm(dev, P.mem, nullptr);
+    if (D.pipe && dpp)  dpp(dev, D.pipe, nullptr);
+    if (D.pl && dpl)    dpl(dev, D.pl, nullptr);
+    if (D.dsl && ddl)   ddl(dev, D.dsl, nullptr);
+    if (D.pool && dpo)  dpo(dev, D.pool, nullptr);
+    if (D.sm && dsm)    dsm(dev, D.sm, nullptr);
+    if (D.ssbo && dbu)  dbu(dev, D.ssbo, nullptr);
+    if (D.mem && dfm)   dfm(dev, D.mem, nullptr);
+    P = PState();
+    D = DState();
 }
 
 // Called from the present hook. Owns its own cadence.
