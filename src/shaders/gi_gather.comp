@@ -51,7 +51,7 @@ layout(push_constant) uniform P {
     float invProjY;     // 1 / proj[5]
     float radius;       // ray length ceiling, METRES
     float maxScreenPx;  // and its ceiling in half-res PIXELS - see the note
-    float thickness;    // hit tolerance, metres
+    float thickness;    // hit tolerance, as a FRACTION of ray length
     float alpha;        // history blend
     float velScale;
     float velYSign;
@@ -239,7 +239,17 @@ void main()
             // In FRONT of the ray, and by less than the surface could be
             // thick. Without the thickness bound a distant silhouette counts
             // as an occluder and paints the frame with foreground colour.
-            if (diff > 0.0 && diff < pc.thickness + 0.02 * sceneDist) {
+            // ---- TOLERANCE SCALES WITH THE RAY, NOT WITH THE WORLD.
+            //
+            // An absolute 0.5 m was 24.6x the ray length at 0.5 m distance
+            // and 0.6x at 100 m: up close every surface within half a metre
+            // counted as a hit, so the ray gathered radiance from unrelated
+            // foreground geometry and the near field would have been lit by
+            // whatever happened to be in front of it. A ray can only
+            // plausibly hit something within its OWN length, so the tolerance
+            // is a fraction of that, with a floor for depth precision.
+            float hitTol = max(pc.thickness * effRadius, 0.001 * sceneDist);
+            if (diff > 0.0 && diff < hitTol) {
                 radiance = max(texture(uScene, vec3(suv, lay)).rgb, vec3(0.0));
                 hit = true;
             }
