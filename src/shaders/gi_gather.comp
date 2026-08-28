@@ -74,7 +74,12 @@ vec3 eyePos(vec2 uv, float lay, out float dist)
 {
     float d = texture(uDepth, vec3(uv, lay)).r;
     float den = d + pc.edA;
-    dist = (abs(den) < 1e-7) ? 1e9 : -pc.edB / den;
+    // edB / den - see the derivation over mvViewDepth in taa.comp. The
+    // negated form yields a negative distance for every valid depth, which
+    // here would have made the sky test reject EVERY pixel and the gather
+    // write black over the whole frame.
+    dist = (abs(den) < 1e-7) ? 1e9 : pc.edB / den;
+    if (dist <= 0.0) dist = 1e9;
     vec2 ndc = uv * 2.0 - 1.0;
     return vec3(ndc.x * dist * pc.invProjX, ndc.y * dist * pc.invProjY, -dist);
 }

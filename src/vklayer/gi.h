@@ -345,7 +345,23 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     s.nextSet = (si + 1) % State::kSets;
     VkDescriptorSet set = s.sets[si];
 
-    const bool haveProbes = (probeView != VK_NULL_HANDLE);
+    // ---- PROBES ARE OFF UNTIL THEY ARE DONE PROPERLY.
+    //
+    // The decompiled deferred shader shows how the engine actually samples
+    // these, and it is not what this pass does:
+    //
+    //   samplerCubeArray, indexed by u_probe_layer[i].x  (up to 8 probes)
+    //   direction transformed by u_eye_to_probe[i]       (not eye space)
+    //   box-parallax corrected against u_probe_data[i]
+    //   scaled by u_exposure_scale
+    //
+    // Feeding a raw eye-space direction into faces 0..5 of the array is wrong
+    // in four independent ways, so escaped rays would return plausible-looking
+    // radiance from the wrong direction - the worst failure shape there is.
+    // Off by default: escaped rays return black and this degrades to ordinary
+    // screen-space GI, which is correct as far as it goes.
+    const bool haveProbes = (probeView != VK_NULL_HANDLE) &&
+                            live::onoff("taa.gi_probes", "TAA_GI_PROBES", false);
 
     VkDescriptorImageInfo ii[6];
     memset(ii, 0, sizeof(ii));

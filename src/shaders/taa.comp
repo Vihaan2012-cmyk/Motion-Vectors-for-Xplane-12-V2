@@ -323,7 +323,16 @@ float mvViewDepth(vec2 u, float lay, float fb)
     float d   = texture(uEngineDepth, vec3(u, lay)).r;
     float den = d + pc.edA;
     if (abs(den) < 1e-7) return fb;          // at-infinity texel
-    float v = -pc.edB / den;
+    // ---- edB / den, NOT -edB / den. Derived, not guessed:
+    //   clip.z = proj[10]*z + proj[14],  clip.w = proj[11]*z = -z
+    //   ndc.z  = 1 + proj[14]/z, and with z = -dist:
+    //   dist   = proj[14] / (ndc.z + proj[10]) = edB / (d + edA)
+    // Measured against this engine (proj[10]=-1, proj[14]=-0.05924,
+    // infinity at ndcZ=1, near plane 5.9 cm) the negated form returns a
+    // NEGATIVE distance for every d in [0,1) - so the guard below rejected
+    // it every single time and this function silently returned the fallback
+    // always. The engine-depth tap has never once been used.
+    float v = pc.edB / den;
     return (v > 0.0) ? v : fb;
 }
 
