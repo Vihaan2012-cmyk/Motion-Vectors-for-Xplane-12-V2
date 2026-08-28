@@ -209,7 +209,34 @@ $haveFfx = Test-Path (Join-Path $ffxSdk "sdk\src\backends\vk\ffx_vk.cpp")
 # skips anything whose object is already newer than its source - so adding
 # a source compiles it, and an unchanged tree costs nothing.
 if ($haveFfx) {
-    Write-Host "Compiling TAAU shader..."
+    Write-Host "Compiling GI gather shader..."
+$giTmp = Join-Path $env:TEMP "gi_gather.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/gi_gather.comp" -o $giTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "gi_gather.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $giTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "gi_gather.comp failed spirv-val" }
+}
+$gibytes = [System.IO.File]::ReadAllBytes($giTmp)
+$giwords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $gibytes.Length; $i += 4) {
+    $giwords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($gibytes, $i)))
+}
+$gisb = New-Object System.Text.StringBuilder
+[void]$gisb.AppendLine("// Generated from src/shaders/gi_gather.comp by build.ps1 - do not edit.")
+[void]$gisb.AppendLine("#pragma once")
+[void]$gisb.AppendLine("#include <stdint.h>")
+[void]$gisb.AppendLine("")
+[void]$gisb.AppendLine("static const uint32_t kGiGatherSpv[] = {")
+for ($i = 0; $i -lt $giwords.Count; $i += 8) {
+    $n = [Math]::Min(8, $giwords.Count - $i)
+    [void]$gisb.AppendLine("    " + (($giwords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$gisb.AppendLine("};")
+[IO.File]::WriteAllText("$src/vklayer/gi_gather_spv.h", $gisb.ToString())
+Write-Host ("  gi_gather_spv.h: {0} words" -f $giwords.Count)
+
+Write-Host "Compiling TAAU shader..."
 $tuTmp = Join-Path $env:TEMP "taau.spv"
 & $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/taau.comp" -o $tuTmp | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "taau.comp failed to compile" }

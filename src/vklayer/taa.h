@@ -304,6 +304,7 @@ enum {
     kTaaFlagSunTap        = 1 << 13,  // bindings 7+9 carry live cascade data
     kTaaFlagProbeTap      = 1 << 14,  // binding 8 carries the env cubemaps
     kTaaFlagGbufTap       = 1 << 15,  // binding 10 carries u_gbuffer_data
+    kTaaFlagGi            = 1 << 16,  // binding 11 carries gathered bounce
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -843,7 +844,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                   "override stays off");
     }
 
-    VkDescriptorSetLayoutBinding b[11];
+    VkDescriptorSetLayoutBinding b[12];
     memset(b, 0, sizeof(b));
     // Binding 0 is a SAMPLER now, not a storage image: the dispatch only reads
     // the scene. That is what lets the scene target keep X-Plane's own usage
@@ -871,14 +872,17 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     // and screen-to-eye coefficients, so eye reconstruction is a
     // transcription too, not a reinvention.
     b[10].binding = 10; b[10].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    for (int i = 0; i < 11; ++i) {
+    // Binding 11: the GI gather's half-res result. Dummy-bound to the velocity
+    // view when the gather is off, gated by kTaaFlagGi like every other tap.
+    b[11].binding = 11; b[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    for (int i = 0; i < 12; ++i) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci;
     memset(&dlci, 0, sizeof(dlci));
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 11; dlci.pBindings = b;
+    dlci.bindingCount = 12; dlci.pBindings = b;
     if (dd.createDescriptorSetLayout(dev, &dlci, nullptr, &g_taa.setLayout) != VK_SUCCESS) return false;
 
     VkPushConstantRange pcr;
@@ -933,7 +937,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = 1 * TaaState::kSets;   // history write only
     ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    ps[1].descriptorCount = 7 * TaaState::kSets;   // + sun cascades, env probes
+    ps[1].descriptorCount = 8 * TaaState::kSets;   // + sun cascades, env probes, GI
     ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ps[2].descriptorCount = 3 * TaaState::kSets;   // reproj + u_shadow_data + u_gbuffer_data
     VkDescriptorPoolCreateInfo dpci;
@@ -1468,6 +1472,18 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         g_taa.sunDummyReady = true;
     }
 
+    // ---- THE GATHER RUNS FIRST, IN THIS COMMAND BUFFER.
+    //
+    // Recorded before the resolve's own dispatch so its result is ready to be
+    // composited in the same frame, with the gather's trailing barrier doing
+    // the ordering. Everything it needs is already identified: the engine's
+    // depth and probes by name, our velocity by construction.
+    gi::record(dd, g_taa.device, cb, g_taa.sceneView, g_taa.velView,
+               g_taa.edValid ? g_taa.edView : VK_NULL_HANDLE,
+               g_taa.probeValid ? g_taa.probeView : VK_NULL_HANDLE,
+               g_taa.w, g_taa.h, g_taaEdAB[0], g_taaEdAB[1],
+               g_taaInvProj[0], g_taaInvProj[1]);
+
     VkImageMemoryBarrier bar[3];
     memset(bar, 0, sizeof(bar));
     for (int i = 0; i < 3; ++i) {
@@ -1641,6 +1657,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         // Second param row: eye-position reconstruction for the cascade tap.
         slot[20] = snapIp[0];
         slot[21] = snapIp[1];
+        // GI strength: see the note on uReprojParams2 in the shader. Zeroed
+        // when the gather has produced nothing, so the composite cannot read
+        // a strength for a result that does not exist.
+        slot[22] = (gi::resultView() != VK_NULL_HANDLE)
+                 ? live::f("taa.gi_strength", "TAA_GI_STRENGTH", 1.0f) : 0.0f;
         slot[22] = 0.0f;
         slot[23] = 0.0f;
     }
@@ -1787,10 +1808,26 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     VkWriteDescriptorSet wrg = wru;
     wrg.dstBinding = 10;
     wrg.pBufferInfo = &bg;
-    VkWriteDescriptorSet wrAll[11];
+    VkDescriptorImageInfo gii;
+    memset(&gii, 0, sizeof(gii));
+    const VkImageView giView = gi::resultView();
+    gii.sampler = g_taa.sampler;
+    gii.imageView = (giView != VK_NULL_HANDLE) ? giView : g_taa.velView;
+    gii.imageLayout = (giView != VK_NULL_HANDLE)
+        ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wrgi;
+    memset(&wrgi, 0, sizeof(wrgi));
+    wrgi.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wrgi.dstSet = set;
+    wrgi.dstBinding = 11;
+    wrgi.descriptorCount = 1;
+    wrgi.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wrgi.pImageInfo = &gii;
+
+    VkWriteDescriptorSet wrAll[12];
     for (int k = 0; k < 8; ++k) wrAll[k] = wr[k];
-    wrAll[8] = wru; wrAll[9] = wrs; wrAll[10] = wrg;
-    dd.updateDescriptorSets(g_taa.device, 11, wrAll, 0, nullptr);
+    wrAll[8] = wru; wrAll[9] = wrs; wrAll[10] = wrg; wrAll[11] = wrgi;
+    dd.updateDescriptorSets(g_taa.device, 12, wrAll, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -1866,6 +1903,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         pcv.aoStrength = 0.0f;
         pcv.csStrength = 0.0f;
         pcv.sharpen    = 0.0f;
+        pcv.flags     &= ~kTaaFlagGi;   // GI strength lives in the UBO slot
     }
     pcv.flags    = (pcReset             ? kTaaFlagReset         : 0)
                  | (cameraMoved        ? kTaaFlagCameraMoved   : 0)
@@ -1873,6 +1911,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                  | (reprojOn            ? kTaaFlagDepthReproject : 0)
                  | (sunTap              ? kTaaFlagSunTap        : 0)
                  | (gbufTap             ? kTaaFlagGbufTap       : 0)
+                 | ((gi::resultView() != VK_NULL_HANDLE)
+                                        ? kTaaFlagGi            : 0)
                  | (g_taa.probeValid    ? kTaaFlagProbeTap      : 0)
                  | (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)

@@ -2192,6 +2192,8 @@ static std::map<VkBuffer, uint64_t>     g_allBuffers;   // size in bytes
 #include "oracle_sundump_spv.h"
 #include "oracle.h"
 
+#include "gi_gather_spv.h"
+#include "gi.h"
 #include "taa.h"
 #include "taau_spv.h"
 #include "taau.h"
@@ -10643,6 +10645,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
             oracle::shutdown(it->second, device);
     }
     taau::shutdown();
+    gi::shutdown();
 
     // ---- RELEASE THE VELOCITY TARGET.
     //

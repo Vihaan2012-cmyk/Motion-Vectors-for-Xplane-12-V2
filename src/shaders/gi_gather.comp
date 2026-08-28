@@ -1,0 +1,252 @@
+#version 450
+// ============================================================== SSGI GATHER
+//
+// Screen-space global illumination: the bounce light X-Plane does not compute.
+//
+// For every half-resolution pixel this marches a few rays through the engine's
+// OWN depth buffer. A ray that hits something reads the HDR scene colour there
+// - that surface's light, arriving here. A ray that escapes the screen reads
+// the engine's environment probe cube in that direction, which is why the
+// picture does not fall apart at the frame edge the way a pure screen-space
+// method does.
+//
+// ---- WHY THIS IS NOT "JUST SSGI".
+//
+// The usual screen-space GI has two structural holes: rays that leave the
+// screen return black, and radiance is read post-tonemap so a sunlit wall and
+// white paint look identical. Neither applies here.
+//
+//   * Escaped rays fall back to environment_probes - the engine's own
+//     omnidirectional capture, which contains what is BEHIND the camera.
+//   * The scene colour is the pre-tonemap HDR target, so a sunlit surface
+//     carries the energy that makes bounce light look like light rather than
+//     like a grey wash. The probe content measured in the thousands; white
+//     paint does not.
+//
+// ---- HALF RESOLUTION, ITS OWN HISTORY.
+//
+// Indirect light is low-frequency, so half resolution costs nothing visible
+// and quarters the ray budget. The accumulator is SEPARATE from the colour
+// history on purpose: a noisy term inside the colour history widens the
+// variance clamp and collapses accumulation - the contact-shadow lesson, paid
+// for once already.
+//
+// Copyright (C) 2026 MotionVectors contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2DArray uScene;    // render res, HDR
+layout(binding = 1) uniform sampler2DArray uVel;      // render res, ours
+layout(binding = 2) uniform sampler2DArray uDepth;    // render res, engine
+layout(binding = 3) uniform sampler2DArray uHistRead; // half res
+layout(binding = 4, rgba16f) uniform image2DArray uHistWrite;
+layout(binding = 5) uniform sampler2DArray uProbes;   // engine cubemaps
+
+layout(push_constant) uniform P {
+    ivec2 halfSize;     // dispatch extent
+    ivec2 fullSize;     // render resolution
+    float edA, edB;     // view = -edB / (depth + edA)
+    float invProjX;     // 1 / proj[0]
+    float invProjY;     // 1 / proj[5]
+    float radius;       // ray length, METRES
+    float thickness;    // hit tolerance, metres
+    float alpha;        // history blend
+    float velScale;
+    float velYSign;
+    float intensity;    // scales the gathered radiance
+    int   steps;        // march steps per ray
+    int   rays;         // rays per pixel per frame
+    int   frame;        // rotates the noise
+    int   flags;
+} pc;
+
+const int GI_PROBES   = 1;   // binding 5 holds real probe data
+const int GI_RESET    = 2;   // no usable history
+
+// ---- EYE-SPACE POSITION FROM THE ENGINE'S DEPTH.
+//
+// The same linearization the resolve uses for AO and contact shadows, so all
+// three agree about where a pixel is. A cleared or sky texel yields a distance
+// at the far plane and is rejected by the caller rather than marched from.
+vec3 eyePos(vec2 uv, float lay, out float dist)
+{
+    float d = texture(uDepth, vec3(uv, lay)).r;
+    float den = d + pc.edA;
+    dist = (abs(den) < 1e-7) ? 1e9 : -pc.edB / den;
+    vec2 ndc = uv * 2.0 - 1.0;
+    return vec3(ndc.x * dist * pc.invProjX, ndc.y * dist * pc.invProjY, -dist);
+}
+
+// Eye space back to UV. The inverse of the above, which is what makes a ray
+// traced in three dimensions marchable in two.
+vec2 eyeToUv(vec3 e)
+{
+    float z = max(-e.z, 1e-4);
+    vec2 ndc = vec2(e.x / (z * pc.invProjX), e.y / (z * pc.invProjY));
+    return ndc * 0.5 + 0.5;
+}
+
+// ---- NORMALS FROM DEPTH, BEST-OF-FOUR.
+//
+// No G-buffer normal is bound: reconstructing from depth costs no new binding
+// and no identification risk, and the engine's own normal buffer can replace
+// this later without changing anything else. The four-triangle pick is what
+// stops silhouettes producing normals that face nowhere - taking the naive
+// central difference across a depth discontinuity halos every edge.
+vec3 normalFromDepth(vec2 uv, vec3 c, float lay, vec2 texel)
+{
+    float dl, dr, du, dd;
+    vec3 l = eyePos(uv - vec2(texel.x, 0.0), lay, dl);
+    vec3 r = eyePos(uv + vec2(texel.x, 0.0), lay, dr);
+    vec3 u = eyePos(uv - vec2(0.0, texel.y), lay, du);
+    vec3 d = eyePos(uv + vec2(0.0, texel.y), lay, dd);
+    float cz = -c.z;
+    vec3 dx = (abs(dl - cz) < abs(dr - cz)) ? (c - l) : (r - c);
+    vec3 dy = (abs(du - cz) < abs(dd - cz)) ? (c - u) : (d - c);
+    vec3 n = cross(dx, dy);
+    float len = length(n);
+    return (len > 1e-8) ? n / len : vec3(0.0, 0.0, 1.0);
+}
+
+float ign(vec2 p, int frame)
+{
+    // Frame-rotated by the golden ratio: the pattern must MOVE, or the
+    // accumulator sees a fixed screen-anchored texture instead of samples of
+    // one integral. That distinction is the whole reason temporal denoising
+    // works, and getting it wrong reads as crawling grain.
+    p += 5.588238 * float(frame & 63);
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+// Cosine-weighted hemisphere direction around n.
+vec3 cosineDir(vec3 n, float u1, float u2)
+{
+    float r = sqrt(u1);
+    float phi = 6.2831853 * u2;
+    vec3 t = abs(n.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tx = normalize(cross(t, n));
+    vec3 ty = cross(n, tx);
+    return normalize(tx * (r * cos(phi)) + ty * (r * sin(phi)) +
+                     n * sqrt(max(1.0 - u1, 0.0)));
+}
+
+// The engine's probe cube, sampled as a 2D array with manual face selection -
+// the image is bound as an array, not a cube view.
+vec3 probe(vec3 dir)
+{
+    if ((pc.flags & GI_PROBES) == 0) return vec3(0.0);
+    vec3 a = abs(dir);
+    float face; vec2 uv; float ma;
+    if (a.x >= a.y && a.x >= a.z) {
+        ma = a.x; face = dir.x > 0.0 ? 0.0 : 1.0;
+        uv = vec2(dir.x > 0.0 ? -dir.z : dir.z, -dir.y);
+    } else if (a.y >= a.z) {
+        ma = a.y; face = dir.y > 0.0 ? 2.0 : 3.0;
+        uv = vec2(dir.x, dir.y > 0.0 ? dir.z : -dir.z);
+    } else {
+        ma = a.z; face = dir.z > 0.0 ? 4.0 : 5.0;
+        uv = vec2(dir.z > 0.0 ? dir.x : -dir.x, -dir.y);
+    }
+    uv = uv / max(ma, 1e-6) * 0.5 + 0.5;
+    return max(texture(uProbes, vec3(uv, face)).rgb, vec3(0.0));
+}
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= pc.halfSize.x || px.y >= pc.halfSize.y) return;
+
+    const float lay = 0.0;
+    const vec2 uv = (vec2(px) + 0.5) / vec2(pc.halfSize);
+    const vec2 texel = 1.0 / vec2(pc.fullSize);
+
+    float dist;
+    vec3 P = eyePos(uv, lay, dist);
+
+    // Sky and anything at the far plane has no surface to gather onto.
+    if (dist > 1e8 || dist <= 0.0) {
+        imageStore(uHistWrite, ivec3(px, 0), vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    const vec3 N = normalFromDepth(uv, P, lay, texel);
+    const float n0 = ign(vec2(px), pc.frame);
+    const float n1 = ign(vec2(px) + 17.0, pc.frame + 7);
+
+    vec3 gathered = vec3(0.0);
+    const int nRays = clamp(pc.rays, 1, 8);
+    const int nSteps = clamp(pc.steps, 2, 32);
+
+    for (int r = 0; r < nRays; ++r) {
+        float u1 = fract(n0 + float(r) * 0.618034);
+        float u2 = fract(n1 + float(r) * 0.381966);
+        vec3 dir = cosineDir(N, u1, u2);
+
+        // Start slightly off the surface: a ray that begins exactly on it
+        // hits its own origin at the first step and the whole frame goes dark.
+        vec3 origin = P + N * (0.01 + 0.002 * dist);
+        vec3 target = origin + dir * pc.radius;
+
+        vec2 uv0 = eyeToUv(origin);
+        vec2 uv1 = eyeToUv(target);
+        float z0 = -origin.z, z1 = -target.z;
+
+        bool hit = false;
+        vec3 radiance = vec3(0.0);
+        // Jittered start so the step pattern does not band across flat ground.
+        float jitter = fract(n0 + float(r) * 0.7548777);
+        for (int s = 1; s <= nSteps && !hit; ++s) {
+            float t = (float(s) - jitter) / float(nSteps);
+            vec2 suv = mix(uv0, uv1, t);
+            if (any(lessThan(suv, vec2(0.0))) ||
+                any(greaterThan(suv, vec2(1.0)))) break;   // left the screen
+
+            float rayZ = mix(z0, z1, t);            // where the ray is
+            float sceneDist;
+            eyePos(suv, lay, sceneDist);            // what the screen has there
+            if (sceneDist >= 1e8) continue;         // sky: nothing to hit
+
+            float diff = rayZ - sceneDist;
+            // In FRONT of the ray, and by less than the surface could be
+            // thick. Without the thickness bound a distant silhouette counts
+            // as an occluder and paints the frame with foreground colour.
+            if (diff > 0.0 && diff < pc.thickness + 0.02 * sceneDist) {
+                radiance = max(texture(uScene, vec3(suv, lay)).rgb, vec3(0.0));
+                hit = true;
+            }
+        }
+
+        // The escape hatch that makes this more than screen space: the
+        // engine's own environment capture, which contains what is off-screen
+        // and behind the camera.
+        if (!hit) radiance = probe(dir);
+        gathered += radiance;
+    }
+    gathered /= float(nRays);
+
+    // ---- ACCUMULATE IN OUR OWN HISTORY.
+    //
+    // Reprojected by the same velocity the resolve uses; four rays a frame is
+    // far too noisy to show directly, and this is where that noise becomes an
+    // integral instead of grain.
+    vec2 fullUv = uv;
+    vec4 vs = texture(uVel, vec3(fullUv, lay));
+    bool unwritten = (vs.x < -1000.0 || vs.y < -1000.0);
+    vec2 vel = unwritten ? vec2(0.0) : vs.xy * pc.velScale;
+    vec2 huv = uv + vec2(vel.x, pc.velYSign * vel.y);
+
+    float a = pc.alpha;
+    if ((pc.flags & GI_RESET) != 0 ||
+        any(lessThan(huv, vec2(0.0))) || any(greaterThan(huv, vec2(1.0))))
+        a = 1.0;
+
+    vec3 hist = texture(uHistRead, vec3(huv, lay)).rgb;
+    vec3 outc = max(mix(hist, gathered, a), vec3(0.0));
+
+    // RAW radiance, never pre-scaled: intensity is applied where the result is
+    // consumed. Baking it in here would compound it every frame - the history
+    // would be multiplied again on each pass through, and the knob would ramp
+    // instead of scale.
+    imageStore(uHistWrite, ivec3(px, 0), vec4(outc, 1.0));
+}

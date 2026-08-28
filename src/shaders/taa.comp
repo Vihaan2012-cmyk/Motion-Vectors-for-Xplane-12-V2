@@ -124,7 +124,11 @@ layout(binding = 5)          uniform sampler2DArray uEngineDepth;
 layout(binding = 6, std140) uniform ReprojData {
     mat4 uReproj;
     vec4 uReprojParams;    // x: viewport Y sign, y: matrix valid
-    vec4 uReprojParams2;   // x: 1/proj[0], y: 1/proj[5] - eye reconstruction
+    // x: 1/proj[0], y: 1/proj[5] - eye reconstruction
+    // z: GI strength. It lives HERE and not in the push block because that
+    //    block is full to its 128-byte guaranteed ceiling, with a
+    //    static_assert standing over it; this slot uses 96 of 2048.
+    vec4 uReprojParams2;
 };
 
 // ---- THE ENGINE'S SUN, ASKED DIRECTLY.
@@ -142,6 +146,12 @@ layout(binding = 8) uniform sampler2DArray uEnvProbes;
 // in its set - captured by reference like the shadow block). With these, eye
 // reconstruction is the engine's exact arithmetic; the edA/edB path below
 // remains only as the fallback when the tap is not armed.
+// The GI gather's result, half render resolution. Sampled bilinearly: indirect
+// light is low-frequency, so the upsample costs nothing visible. A depth-aware
+// joint-bilateral upsample is the obvious later refinement, and would matter
+// most at silhouettes where a half-res tap can straddle a depth discontinuity.
+layout(binding = 11) uniform sampler2DArray uGi;
+
 layout(binding = 10, std140) uniform EngineGbuf {
     vec4 gViewportSize;        // xy = size, zw = 1/size
     vec4 gGbufferSize;
@@ -276,6 +286,7 @@ const int FLAG_DEPTH_REPROJECT = 4096; // reconstruct velocity at unwritten px
 const int FLAG_SUN_TAP        = 8192;  // bindings 7+9 carry live cascade data
 const int FLAG_PROBE_TAP      = 16384; // binding 8 carries the env cubemaps
 const int FLAG_GBUF_TAP       = 32768; // binding 10 carries u_gbuffer_data
+const int FLAG_GI             = 65536; // binding 11 carries gathered bounce
 // view distance from engine depth; fb is the injected clip-w fallback so a
 // wrong identification degrades to exactly the previous behaviour.
 // Velocity reconstructed from engine depth + camera motion, in EXACTLY the
@@ -1206,6 +1217,24 @@ void main()
         }
         float ao = 1.0 - pc.aoStrength * (occ / float(AO_TAPS));
         currA *= clamp(ao, 0.0, 1.0);
+    }
+
+    // ---- INDIRECT LIGHT, ADDED WHERE AO SUBTRACTS IT.
+    //
+    // Modulation rather than addition: gi is radiance gathered from the scene,
+    // and scaling the surface by it means a surface only brightens in
+    // proportion to what it already reflects - a black surface stays black,
+    // which is what keeps bounce light from turning into a grey fog over
+    // everything. Albedo would be the principled multiplier and the engine has
+    // one in gbuf-albedo; this is the version that needs no further tap.
+    //
+    // Applied to currA, alongside AO, and for the same reason it is safe here:
+    // the gather has its OWN accumulator, so what arrives is already smooth.
+    // A raw four-ray gather in this position would widen the variance clamp
+    // and collapse accumulation - the contact-shadow lesson.
+    if ((pc.flags & FLAG_GI) != 0 && !unwritten) {
+        vec3 gi = texture(uGi, vec3(uv + S, float(layer))).rgb;
+        currA *= (vec3(1.0) + max(gi, vec3(0.0)) * uReprojParams2.z);
     }
 
     // ---- CONTACT SHADOWS: THE SHADOW THE SHADOW MAP IS TOO COARSE TO DRAW.
