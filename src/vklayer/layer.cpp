@@ -2193,6 +2193,8 @@ static std::map<VkBuffer, uint64_t>     g_allBuffers;   // size in bytes
 #include "oracle.h"
 
 #include "taa.h"
+#include "taau_spv.h"
+#include "taau.h"
 
 
 // FSR2 is optional at BUILD time as well as run time. Its static library takes
@@ -4337,6 +4339,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
                 if (fv->second && dview) dview(device, fv->second, nullptr);
                 vc[c2]->erase(fv);
             }
+            taau::noteImageGone(img);
             std::map<VkImage, VkImageView>::iterator ov = oracle::P.views.find(img);
             if (ov != oracle::P.views.end()) {
                 if (ov->second && dview) dview(device, ov->second, nullptr);
@@ -14312,6 +14315,37 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
             if (fsrBound2 && firstThisFrame && (gx * 16) > 64) {
                 lastProbeFrame = g_frameCount;
                 fsrProbeRecord(*dd, cb, gx * 16, gy * 16);
+
+                // ---- TAAU STAGE 0. Same moment, same command buffer: EASU
+                // has just produced the upscaled image, so ours lands on top
+                // of it and RCAS - which reads that image next - sharpens our
+                // pixels along with X-Plane's. Ordering is the whole
+                // synchronisation story.
+                //
+                // Only once the probe has NAMED the image. Before that we have
+                // no destination and guessing one would write over something
+                // else at the same extent.
+                if (taau::enabled() && fsrprobe::state().resolved &&
+                    g_taa.ready && g_taa.sceneView != VK_NULL_HANDLE) {
+                    VkImage dstImg = fsrprobe::state().output;
+                    OracleImgInfo di;
+                    bool haveInfo = false;
+                    if (g_allImages.count(dstImg)) {
+                        di = g_allImages[dstImg];
+                        haveInfo = true;
+                    }
+                    if (haveInfo && di.samples == VK_SAMPLE_COUNT_1_BIT)
+                        taau::record(*dd, dd->device, cb, dstImg, di.format,
+                                     di.w, di.h, di.layers,
+                                     g_taa.sceneView, g_taa.w, g_taa.h);
+                    else if (!haveInfo) {
+                        static bool said = false;
+                        if (!said) { said = true;
+                            trace("TAAU: probe named %p but there is no "
+                                  "creation record for it - cannot build a "
+                                  "view without its format", (void*)dstImg); }
+                    }
+                }
             }
         }
     }

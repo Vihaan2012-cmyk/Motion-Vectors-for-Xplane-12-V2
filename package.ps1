@@ -88,6 +88,7 @@ foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path $d | Out-Null 
 Copy-Item "$root\build\vklayer\VkLayer_mv.dll"  "$stage\MotionVectors\"
 Copy-Item "$root\build\vklayer\VkLayer_mv.json" "$stage\MotionVectors\"
 Copy-Item "$root\build\MotionVectorsLauncher.exe" "$stage\MotionVectors\"
+Copy-Item "$root\dist_readme.txt" "$stage\README.txt"
 # ---- THE QT APP SHIPS AS A DIRECTORY, NOT AS A LONE EXE.
 #
 # This looked for build\qt\MotionVectors.exe, which the build has never

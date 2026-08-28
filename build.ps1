@@ -209,7 +209,34 @@ $haveFfx = Test-Path (Join-Path $ffxSdk "sdk\src\backends\vk\ffx_vk.cpp")
 # skips anything whose object is already newer than its source - so adding
 # a source compiles it, and an unchanged tree costs nothing.
 if ($haveFfx) {
-    Write-Host "Compiling oracle sun-dump shader..."
+    Write-Host "Compiling TAAU shader..."
+$tuTmp = Join-Path $env:TEMP "taau.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/taau.comp" -o $tuTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "taau.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $tuTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "taau.comp failed spirv-val" }
+}
+$tubytes = [System.IO.File]::ReadAllBytes($tuTmp)
+$tuwords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $tubytes.Length; $i += 4) {
+    $tuwords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($tubytes, $i)))
+}
+$tusb = New-Object System.Text.StringBuilder
+[void]$tusb.AppendLine("// Generated from src/shaders/taau.comp by build.ps1 - do not edit.")
+[void]$tusb.AppendLine("#pragma once")
+[void]$tusb.AppendLine("#include <stdint.h>")
+[void]$tusb.AppendLine("")
+[void]$tusb.AppendLine("static const uint32_t kTaauSpv[] = {")
+for ($i = 0; $i -lt $tuwords.Count; $i += 8) {
+    $n = [Math]::Min(8, $tuwords.Count - $i)
+    [void]$tusb.AppendLine("    " + (($tuwords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$tusb.AppendLine("};")
+[IO.File]::WriteAllText("$src/vklayer/taau_spv.h", $tusb.ToString())
+Write-Host ("  taau_spv.h: {0} words" -f $tuwords.Count)
+
+Write-Host "Compiling oracle sun-dump shader..."
 $sdTmp = Join-Path $env:TEMP "oracle_sundump.spv"
 & $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/oracle_sundump.comp" -o $sdTmp | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "oracle_sundump.comp failed to compile" }

@@ -1,0 +1,110 @@
+#version 450
+// ============================================================== TAAU, STAGE 0
+//
+// The PLUMBING PROOF. No temporal logic yet - this exists to establish that we
+// can write X-Plane's final upscaled image ourselves, from our own dispatch,
+// with our own descriptors. Everything after this is shader work in a file we
+// control; this is the part that could turn out to be impossible.
+//
+// ---- WHY OUR OWN DISPATCH RATHER THAN THE SHADER SUBSTITUTION.
+//
+// X-Plane's FSR is FSR1/EASU: purely SPATIAL. Its descriptor set is
+// {sampler, input texture, output image, u_fsr_data} and there is no velocity
+// in it - nor can we add a binding to a set X-Plane owns. Substitution can
+// therefore never do temporal upsampling, however convenient it is otherwise.
+//
+// Our own dispatch has no such limit: it is our descriptor set, so the
+// velocity we inject ourselves, the engine depth we tap, and an output-
+// resolution history are all just bindings we choose. That is the whole
+// argument for this file existing.
+//
+// ---- THE SPLIT IS THE PROOF.
+//
+// taa.taau_split is the fraction of screen width we write. At 0.5 the left
+// half is ours and the right half is X-Plane's own upscale, on the same frame,
+// with the seam down the middle - so "did our write reach the screen" and "is
+// ours better or worse" are answered by looking once, not by trusting a log.
+//
+// Copyright (C) 2026 MotionVectors contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2DArray uSrc;              // low res, resolved
+layout(binding = 1, rgba16f) uniform image2DArray uDst;       // X-Plane's 4K output
+
+layout(push_constant) uniform P {
+    ivec2 outSize;      // 3840x2160
+    ivec2 inSize;       // 2953x1661
+    float split;        // fraction of width we own; 1.0 = all of it
+    float sharpness;    // Catmull-Rom blend vs bilinear, 0..1
+    int   layer;        // array layer this dispatch covers
+    int   debugTint;    // 1 = tint our half, to make the seam unmistakable
+} pc;
+
+// Catmull-Rom in the 9-tap bilinear form. Sharper than the bilinear an EASU
+// pass falls back to at low ratios, and it is the same resampling family the
+// resolve already uses for history - so v1 can reuse the reasoning.
+vec3 sampleCatmullRom(vec2 uv, vec2 texSize)
+{
+    vec2 samplePos = uv * texSize;
+    vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    vec2 f = samplePos - texPos1;
+
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / max(w12, vec2(1e-5));
+
+    vec2 texPos0  = (texPos1 - 1.0) / texSize;
+    vec2 texPos3  = (texPos1 + 2.0) / texSize;
+    vec2 texPos12 = (texPos1 + offset12) / texSize;
+
+    float l = float(pc.layer);
+    vec3 r = vec3(0.0);
+    r += texture(uSrc, vec3(texPos0.x,  texPos0.y,  l)).rgb * w0.x  * w0.y;
+    r += texture(uSrc, vec3(texPos12.x, texPos0.y,  l)).rgb * w12.x * w0.y;
+    r += texture(uSrc, vec3(texPos3.x,  texPos0.y,  l)).rgb * w3.x  * w0.y;
+
+    r += texture(uSrc, vec3(texPos0.x,  texPos12.y, l)).rgb * w0.x  * w12.y;
+    r += texture(uSrc, vec3(texPos12.x, texPos12.y, l)).rgb * w12.x * w12.y;
+    r += texture(uSrc, vec3(texPos3.x,  texPos12.y, l)).rgb * w3.x  * w12.y;
+
+    r += texture(uSrc, vec3(texPos0.x,  texPos3.y,  l)).rgb * w0.x  * w3.y;
+    r += texture(uSrc, vec3(texPos12.x, texPos3.y,  l)).rgb * w12.x * w3.y;
+    r += texture(uSrc, vec3(texPos3.x,  texPos3.y,  l)).rgb * w3.x  * w3.y;
+    return r;
+}
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= pc.outSize.x || px.y >= pc.outSize.y) return;
+
+    // Our half only. Everything to the right is left exactly as X-Plane's own
+    // upscale produced it, which is what makes the seam a comparison.
+    if (float(px.x) >= float(pc.outSize.x) * pc.split) return;
+
+    vec2 uv = (vec2(px) + 0.5) / vec2(pc.outSize);
+
+    vec3 c;
+    if (pc.sharpness > 0.0) {
+        vec3 cr = sampleCatmullRom(uv, vec2(pc.inSize));
+        vec3 bl = texture(uSrc, vec3(uv, float(pc.layer))).rgb;
+        c = mix(bl, cr, clamp(pc.sharpness, 0.0, 1.0));
+    } else {
+        c = texture(uSrc, vec3(uv, float(pc.layer))).rgb;
+    }
+
+    // Negative-component floor: Catmull-Rom undershoots at high-contrast edges
+    // and a negative in an HDR target turns into a black speck downstream. The
+    // resolve learned this the hard way; inheriting the lesson is free.
+    c = max(c, vec3(0.0));
+
+    if (pc.debugTint != 0) c.b = min(c.b * 1.6 + 0.02, 65000.0);
+
+    imageStore(uDst, ivec3(px, pc.layer), vec4(c, 1.0));
+}
