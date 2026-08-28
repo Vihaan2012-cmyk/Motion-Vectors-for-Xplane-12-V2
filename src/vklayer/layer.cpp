@@ -69,6 +69,10 @@
 #include <map>
 #include <set>
 #include <memory>
+
+#ifndef MV_LAYER_VERSION_STRING
+#define MV_LAYER_VERSION_STRING "dev"
+#endif
 #include <mutex>
 #include <atomic>
 #include <vector>
@@ -9235,6 +9239,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // One store per frame is free next to everything else here, and it cannot
     // be lost by anyone else clearing the block.
     if (g_share) g_share->layerAttached = 1;
+    if (g_share) g_share->layerHeartbeat++;
 
     if (g_share && !g_availReported) {
         g_availReported = true;
@@ -10711,9 +10716,32 @@ static VkLayerDeviceCreateInfo *findDeviceLink(const VkDeviceCreateInfo *ci)
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 MV_GetDeviceProcAddr(VkDevice device, const char *name);
 
+// ---- THE ATTACH BEACON.
+//
+// Written the moment the loader hands us vkCreateInstance - before the share
+// block, before the plugin, before anything else can fail. Its existence
+// separates two failures the panel used to conflate: "the layer never loaded"
+// (no beacon: wrong launch method, AV ate the DLL, loader skipped the
+// manifest) and "the layer loaded but the handshake failed" (beacon present:
+// share block, version mismatch, plugin missing). The launcher reads it too.
+static void mvWriteAttachBeacon()
+{
+    const char *t = getenv("TEMP");
+    if (!t) return;
+    std::string p = std::string(t) + "\\mv_attach.txt";
+    FILE *f = fopen(p.c_str(), "w");
+    if (!f) return;
+    fprintf(f, "pid=%lu\nversion=%s\n",
+            (unsigned long)GetCurrentProcessId(),
+            MV_LAYER_VERSION_STRING);
+    fclose(f);
+}
+
 extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
     const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *alloc, VkInstance *out)
 {
+    mvWriteAttachBeacon();
+
     // ---- ONLY X-PLANE. THIS IS AN IMPLICIT LAYER.
     //
     // Shipped through the loader's ImplicitLayers key, this is offered to every

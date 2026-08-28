@@ -1681,7 +1681,31 @@ static int   getVramFails(void*)        { return g_share ? (int)g_share->vramAll
 // a panel that reports the wrong one is worse than one that reports nothing.
 static float getTexFloor(void*)         { return g_floorValue; }
 static float getTexStep(void*)          { return g_scaleStep; }
-static int   getAttached(void*)         { return (g_share && g_share->layerAttached) ? 1 : 0; }
+// "Attached" now means ALIVE: the heartbeat advanced within the last two
+// seconds of wall clock. The one-shot flag alone reported a layer that had
+// died mid-session - or a stale share block from a previous run - as healthy.
+static int getAttached(void*)
+{
+    if (!g_share || !g_share->layerAttached) return 0;
+    static uint64_t lastHb = 0;
+    static double   lastAdvance = -1.0;
+    const double now = XPLMGetElapsedTime();
+    const uint64_t hb = g_share->layerHeartbeat;
+    if (hb != lastHb) { lastHb = hb; lastAdvance = now; }
+    if (lastAdvance < 0.0) { lastAdvance = now; return 0; }   // never seen it move
+    return (now - lastAdvance) < 2.0 ? 1 : 0;
+}
+
+// Which link of the attach chain broke, for the panel's diagnosis line:
+// 0 healthy, 1 no share block, 2 share but layer never said hello (wrong
+// launch method / DLL blocked), 3 said hello but heartbeat stalled (layer
+// loaded and died, or a stale share from a previous session).
+static int getAttachStage(void*)
+{
+    if (!g_share) return 1;
+    if (!g_share->layerAttached) return 2;
+    return getAttached(nullptr) ? 0 : 3;
+}
 
 // ---- diagnostics the panel had no way to show.
 //
@@ -1769,6 +1793,8 @@ static void registerDatarefs()
                      getEnabled, setEnabled, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
     g_myAttached = XPLMRegisterDataAccessor("taaimpl/layer_attached", xplmType_Int, 0,
                      getAttached, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
+    XPLMRegisterDataAccessor("taaimpl/attach_stage", xplmType_Int, 0,
+                     getAttachStage, nullptr, 0,0,0,0,0,0,0,0,0,0, nullptr, nullptr);
 
     g_myLodBias  = XPLMRegisterDataAccessor("taaimpl/lod_bias", xplmType_Float, 1,
                      0,0, getLodBias, setLodBias, 0,0,0,0,0,0,0,0, nullptr, nullptr);

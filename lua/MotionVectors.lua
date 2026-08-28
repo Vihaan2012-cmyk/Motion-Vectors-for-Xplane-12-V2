@@ -391,8 +391,22 @@ local function verify_integrity()
     -- So say "waiting" rather than "PROBLEM", do not count it against the
     -- verdict, and let the deferred re-check below settle it once the answer
     -- exists.
+    local stage = get("taaimpl/attach_stage", -1)
     if get("taaimpl/layer_attached", 0) == 1 then
-        logf(C_GREEN, "  OK      Vulkan layer is attached to this process")
+        logf(C_GREEN, "  OK      Vulkan layer is attached and alive")
+    elseif stage == 2 then
+        logf(C_RED,   "  FAIL    Layer never loaded. Start X-Plane through")
+        logf(C_RED,   "          MotionVectorsLauncher.exe - launching from the")
+        logf(C_RED,   "          Steam menu does not load the mod. (Steam users:")
+        logf(C_RED,   "          add the launch-option line from the README.)")
+        logf(C_RED,   "          If you DID use the launcher: antivirus or")
+        logf(C_RED,   "          SmartScreen may have blocked VkLayer_mv.dll.")
+    elseif stage == 3 then
+        logf(C_RED,   "  FAIL    Layer loaded but stopped responding - restart")
+        logf(C_RED,   "          X-Plane; if it repeats, send %TEMP%%\\taa_layer_*.txt")
+    elseif stage == 1 then
+        logf(C_RED,   "  FAIL    Plugin running but no shared-memory block -")
+        logf(C_RED,   "          plugin/layer version mismatch? Reinstall both.")
     elseif not have["taaimpl/layer_attached"] then
         logf(C_RED,   "  PROBLEM Plugin dataref missing - the plugin is not loaded")
         bad = bad + 1

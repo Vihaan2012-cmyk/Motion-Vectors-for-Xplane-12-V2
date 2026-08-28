@@ -35,6 +35,7 @@
 // nothing loaded.
 
 #include <windows.h>
+#include <string>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>   // getenv, for the TEMP path the layer reads its config from
@@ -97,7 +98,19 @@ int main(int argc, char **argv)
         MessageBoxA(nullptr, msg, "Motion Vectors", MB_ICONWARNING | MB_OK);
     }
 
-    SetEnvironmentVariableA("VK_LAYER_PATH", layerDir);
+    // APPEND, never clobber: a machine with RenderDoc or another explicit
+    // layer path set would otherwise lose it - or lose US if theirs wins.
+    {
+        char existing[4096] = {0};
+        DWORD n = GetEnvironmentVariableA("VK_LAYER_PATH", existing,
+                                          sizeof(existing));
+        std::string merged = layerDir;
+        if (n > 0 && n < sizeof(existing)) {
+            merged += ";";
+            merged += existing;
+        }
+        SetEnvironmentVariableA("VK_LAYER_PATH", merged.c_str());
+    }
     SetEnvironmentVariableA("VK_LOADER_LAYERS_ENABLE", kLayerName);
 
     // ---- ACTUALLY TURN THE MOD ON.  (v1.1.0 shipped without this.)
@@ -109,6 +122,20 @@ int main(int argc, char **argv)
     // layer loaded but ZERO velocity, hence no TAA at all. Set both here so the
     // mod works out of the box even if the taa_live.ini seed below is skipped.
     SetEnvironmentVariableA("TAA_VELOCITY", "1");
+
+    // ---- STRIP MARK-OF-THE-WEB from our own binaries. A zip downloaded in a
+    // browser tags every extracted file; SmartScreen then blocks the DLL and
+    // the Vulkan loader SILENTLY skips the layer - the classic "installed but
+    // not attached" report from other people's machines. Deleting the
+    // Zone.Identifier stream is exactly what Explorer's "Unblock" does.
+    {
+        const char *unblock[2] = { "VkLayer_mv.dll", "VkLayer_mv.json" };
+        for (int u = 0; u < 2; ++u) {
+            std::string ads = std::string(layerDir) + "\\" + unblock[u] +
+                              ":Zone.Identifier";
+            DeleteFileA(ads.c_str());
+        }
+    }
     SetEnvironmentVariableA("TAA_RESOLVE",  "1");
 
     // ---- SEED THE TUNED SETTINGS ON FIRST RUN.
@@ -131,15 +158,43 @@ int main(int argc, char **argv)
         }
     }
 
-    // Rebuild the command line: our own path first, then anything the user
-    // passed, quoted so paths with spaces survive.
+    // ---- PASSTHROUGH MODE: the Steam integration.
+    //
+    // Steam's launch options support wrapping the game command:
+    //
+    //     "...\MotionVectors\MotionVectorsLauncher.exe" %command%
+    //
+    // Steam then calls US with the full game command as arguments, we set the
+    // environment above, and exec THAT command - so the layer environment is
+    // established inside Steam's own launch chain, inherits perfectly, and is
+    // scoped to X-Plane alone. No registry, nothing system-wide, and Steam-
+    // menu launches finally load the mod. Detection: the first argument names
+    // an executable that exists.
+    bool passthrough = false;
+    if (argc > 1) {
+        const char *a1 = argv[1];
+        DWORD attr = GetFileAttributesA(a1);
+        if (attr != INVALID_FILE_ATTRIBUTES &&
+            !(attr & FILE_ATTRIBUTE_DIRECTORY))
+            passthrough = true;
+    }
+
+    // Rebuild the command line: the target first, then remaining arguments,
+    // quoted so paths with spaces survive.
     char cmd[8192];
-    int n = snprintf(cmd, sizeof(cmd), "\"%s\"", xplane);
-    for (int i = 1; i < argc && n < (int)sizeof(cmd) - 4; ++i)
-        n += snprintf(cmd + n, sizeof(cmd) - n, " %s", argv[i]);
+    int n;
+    if (passthrough) {
+        n = snprintf(cmd, sizeof(cmd), "\"%s\"", argv[1]);
+        for (int i = 2; i < argc && n < (int)sizeof(cmd) - 4; ++i)
+            n += snprintf(cmd + n, sizeof(cmd) - n, " %s", argv[i]);
+    } else {
+        n = snprintf(cmd, sizeof(cmd), "\"%s\"", xplane);
+        for (int i = 1; i < argc && n < (int)sizeof(cmd) - 4; ++i)
+            n += snprintf(cmd + n, sizeof(cmd) - n, " %s", argv[i]);
+    }
 
     char workdir[MAX_PATH];
-    dirOf(xplane, workdir, sizeof(workdir));
+    dirOf(passthrough ? argv[1] : xplane, workdir, sizeof(workdir));
 
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;

@@ -631,6 +631,15 @@ struct TaaShare {
     // toward" - below the horizon - and the shader skips the work entirely.
     float sunViewX, sunViewY, sunViewZ;
 
+    // ---- PROOF OF LIFE, NOT PROOF OF HELLO.
+    //
+    // layerAttached is a one-shot flag: set once, true forever, even if the
+    // layer dies mid-session or the session it describes ended an hour ago.
+    // This counter increments on every present, so the plugin can answer the
+    // question users actually have - "is the layer running RIGHT NOW" - by
+    // watching it advance. Stalls are visible within a couple of seconds.
+    uint64_t layerHeartbeat;
+
     int32_t valid;            // 0 until two frames of history exist
 };
 
