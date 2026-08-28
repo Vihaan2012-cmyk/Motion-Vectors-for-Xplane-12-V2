@@ -10642,6 +10642,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
         if (it != g_devices.end() && it->second.gdpa)
             oracle::shutdown(it->second, device);
     }
+    taau::shutdown();
 
     // ---- RELEASE THE VELOCITY TARGET.
     //
@@ -14337,7 +14338,8 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
                     if (haveInfo && di.samples == VK_SAMPLE_COUNT_1_BIT)
                         taau::record(*dd, dd->device, cb, dstImg, di.format,
                                      di.w, di.h, di.layers,
-                                     g_taa.sceneView, g_taa.w, g_taa.h);
+                                     g_taa.sceneView, g_taa.w, g_taa.h,
+                                     g_taa.velView, g_jitLastX, g_jitLastY);
                     else if (!haveInfo) {
                         static bool said = false;
                         if (!said) { said = true;
