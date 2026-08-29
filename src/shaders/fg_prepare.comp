@@ -100,7 +100,24 @@ void main()
     // Under standard Z the comparison is inverted by storing the complement, so
     // the same atomicMax still selects the nearest.
     if (!unwritten) {
-        const vec2 prevUv = uv + v.xy;
+        // ---- DERIVED FROM mvPix, NOT FROM v.xy. THE Y SIGN WAS MISSING HERE.
+        //
+        // X-Plane draws with a NEGATIVE-HEIGHT viewport, so framebuffer Y and
+        // clip Y run opposite ways - which is why mvScale.y is handed in as
+        // velScale * velYSign * height and comes through negative. The dilated
+        // motion vector above therefore had the flip; this scatter did not. It
+        // added the raw UV velocity, so every pixel recorded its previous depth
+        // at a texel MIRRORED IN Y about its own position.
+        //
+        // reconstructedPrevNearestDepth is one of the three resources frame
+        // interpolation consumes, and it is the one that drives disocclusion.
+        // Feeding it a vertically mirrored scatter does not fail loudly - it
+        // makes FFX believe things were revealed where they were not.
+        //
+        // Written as mvPix / size rather than by reapplying the sign, so the
+        // scatter and the dilated vector are the same quantity by construction
+        // and cannot drift apart the way they just did.
+        const vec2 prevUv = uv + mvPix / vec2(pc.size);
         if (prevUv.x >= 0.0 && prevUv.x < 1.0 && prevUv.y >= 0.0 && prevUv.y < 1.0) {
             const ivec2 dst = ivec2(prevUv * vec2(pc.size));
             const uint bits = floatBitsToUint(clamp(bestDepth, 0.0, 1.0));

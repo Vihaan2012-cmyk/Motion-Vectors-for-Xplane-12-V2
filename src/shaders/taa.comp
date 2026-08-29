@@ -151,12 +151,35 @@ layout(binding = 8) uniform sampler2DArray uEnvProbes;
 // joint-bilateral upsample is the obvious later refinement, and would matter
 // most at silhouettes where a half-res tap can straddle a depth discontinuity.
 layout(binding = 11) uniform sampler2DArray uGi;
+// The engine's own eye-space normals, spheremap-encoded in .xy. Dummy-bound to
+// the velocity view when unidentified; read only under FLAG_NORMAL_TAP.
+layout(binding = 12) uniform sampler2DArray uNormal;
 
 layout(binding = 10, std140) uniform EngineGbuf {
     vec4 gViewportSize;        // xy = size, zw = 1/size
     vec4 gGbufferSize;
     vec4 gProjCoefficients[2];
     vec4 gClipInfo[2];
+    // ---- STATIC. X-PLANE DOES NOT TEMPORALLY JITTER. ESTABLISHED, NOT ASSUMED.
+    //
+    // The engine adds this to gl_FragCoord once, in its deferred shader, before
+    // reconstructing eye position - the shape of a raster-displacement
+    // correction, which is why it was long suspected of carrying a per-frame
+    // TAA jitter we were not accounting for. It does not, and the binary says
+    // so three ways:
+    //
+    //   - Its FSR is FSR *1*: the passes are "FSR Upscale" then "FSR Sharpen",
+    //     and RCAS ("robust contrast") is present. FSR 1 is purely spatial and
+    //     does not jitter. There is no reconstruct-and-dilate, no accumulation
+    //     pass, none of the FSR2/3 machinery.
+    //   - There is no jitter SEQUENCE anywhere in the executable: no Halton,
+    //     no Sobol, no Hammersley, no phase count, no sample index. Nothing
+    //     exists that could drive a per-frame offset.
+    //   - The only TAA in the whole binary is "cloud/taa/freeze" - volumetric
+    //     cloud reprojection, not whole-frame antialiasing.
+    //
+    // So this is an alignment constant, and OUR injected jitter is the entire
+    // sub-pixel story. The unjitter shift S is complete as it stands.
     vec2 gSampleOffset;
 };
 
@@ -287,6 +310,7 @@ const int FLAG_SUN_TAP        = 8192;  // bindings 7+9 carry live cascade data
 const int FLAG_PROBE_TAP      = 16384; // binding 8 carries the env cubemaps
 const int FLAG_GBUF_TAP       = 32768; // binding 10 carries u_gbuffer_data
 const int FLAG_GI             = 65536; // binding 11 carries gathered bounce
+const int FLAG_NORMAL_TAP     = 131072; // binding 12 carries gbuf-normal
 // view distance from engine depth; fb is the injected clip-w fallback so a
 // wrong identification degrades to exactly the previous behaviour.
 // Velocity reconstructed from engine depth + camera motion, in EXACTLY the
@@ -321,6 +345,26 @@ float mvViewDepth(vec2 u, float lay, float fb)
 {
     if ((pc.flags & FLAG_ENGINE_DEPTH) == 0) return fb;
     float d   = texture(uEngineDepth, vec3(u, lay)).r;
+
+    // ---- THE ENGINE'S OWN LINEARIZATION WHEN WE HAVE ITS COEFFICIENTS.
+    //
+    // gClipInfo is already bound and already used by the eye-position helper
+    // below; this function was the last place still approximating it with two
+    // constants pulled from the projection matrix. The rational form
+    //     z = (d*clip.x + clip.y) / (d*clip.z + clip.w)
+    // is what the engine's deferred shader actually evaluates, and unlike the
+    // two-constant special case it stays exact for a reversed-Z or infinite
+    // far plane rather than happening to agree with one.
+    //
+    // Distance is -z: the engine's z is negative down the view direction.
+    if ((pc.flags & FLAG_GBUF_TAP) != 0) {
+        float gden = d * gClipInfo[0].z + gClipInfo[0].w;
+        if (abs(gden) > 1e-12) {
+            float z = (d * gClipInfo[0].x + gClipInfo[0].y) / gden;
+            return (-z > 0.0) ? -z : fb;
+        }
+    }
+
     float den = d + pc.edA;
     if (abs(den) < 1e-7) return fb;          // at-infinity texel
     // ---- edB / den, NOT -edB / den. Derived, not guessed:
@@ -357,12 +401,56 @@ vec3 mvEyePos(vec2 u, float lay)
                   gProjCoefficients[0].zw;
         return vec3(xy * (-z), z);
     }
+    // ---- edB / den, NOT -edB / den. THE SAME SIGN ERROR AS mvViewDepth,
+    // which was found and fixed there while this copy was left behind.
+    //
+    // It is worse here than it was there. mvViewDepth guards with (v > 0.0)
+    // and returns a fallback, so the bug made the engine-depth tap a silent
+    // no-op. This line clamps with max(..., 0.0) instead - and since the
+    // negated form is negative for EVERY d in [0,1), the clamp returned 0.0
+    // at every pixel. The fallback eye position was not merely wrong, it
+    // collapsed the entire frame onto the camera origin.
+    //
+    // Masked whenever FLAG_GBUF_TAP is set, because the engine path above
+    // returns first. So this only ever showed itself on the machines that
+    // could not find the tap - which is exactly where it is hardest to see.
     float den = d + pc.edA;
-    float dist = (abs(den) < 1e-7) ? 1e6 : max(-pc.edB / den, 0.0);
+    float dist = (abs(den) < 1e-7) ? 1e6 : pc.edB / den;
+    if (dist <= 0.0) dist = 1e6;
     vec2 ndc = vec2(u.x * 2.0 - 1.0, uReprojParams.x * (u.y * 2.0 - 1.0));
     return vec3(ndc.x * dist * uReprojParams2.x,
                 ndc.y * dist * uReprojParams2.y,
                 -dist);
+}
+
+// ---- THE ENGINE'S NORMAL, DECODED THE WAY ITS OWN SHADER DECODES IT.
+//
+// gbuf-normal is R16G16_SFLOAT carrying a Lambert azimuthal (spheremap)
+// encoding. Exact at every pixel including silhouettes, where reconstructing
+// from depth derivatives has to choose between two triangles and is wrong
+// either way. Eye space, and z comes out positive for anything facing the
+// camera - which is the same space and sign convention as mvEyePos.
+vec3 engineNormal(vec2 u, float lay)
+{
+    vec2 e = texture(uNormal, vec3(u, lay)).xy;
+    float f = dot(e, e);
+    return vec3(e * sqrt(max(0.0, 1.0 - f * 0.25)), 1.0 - f * 0.5);
+}
+
+// Eye position from a distance we ALREADY have, without re-sampling depth.
+// Mirrors both of mvEyePos's paths exactly; it exists so the AO can test its
+// taps against the surface plane without doubling its texture fetches.
+vec3 mvEyeFromDist(vec2 u, float dist)
+{
+    if ((pc.flags & FLAG_GBUF_TAP) != 0) {
+        vec2 fc = u * gViewportSize.xy + gSampleOffset;
+        vec2 xy = (fc * gViewportSize.zw) * gProjCoefficients[0].xy
+                + gProjCoefficients[0].zw;
+        return vec3(xy * dist, -dist);
+    }
+    vec2 ndc = vec2(u.x * 2.0 - 1.0, uReprojParams.x * (u.y * 2.0 - 1.0));
+    return vec3(ndc.x * dist * uReprojParams2.x,
+                ndc.y * dist * uReprojParams2.y, -dist);
 }
 
 // ---- SUN VISIBILITY, AS A TRANSCRIPTION RATHER THAN A GUESS.
@@ -386,9 +474,24 @@ vec3 mvEyePos(vec2 u, float lay)
 // so it arrives with the SSGI normal work rather than here.
 //
 // out.x = visibility 0..1, out.y = cascade index (or -1 outside, -2 no tap).
-vec2 mvSunVisibility(vec3 eye)
+vec2 mvSunVisibility(vec3 eye, vec3 N)
 {
     if ((pc.flags & FLAG_SUN_TAP) == 0) return vec2(1.0, -2.0);
+    // ---- THE NORMAL OFFSET, WHICH THIS TRANSCRIPTION WAS MISSING.
+    //
+    // The note above says the engine normal-offsets before projecting and that
+    // it "arrives with the SSGI normal work". It has arrived. The engine's own
+    // line is
+    //     P += N * (bias.x + bias.y * (1 - clamp(dot(sun, N), 0, 1)))
+    // - a constant offset plus a slope term that grows as the surface turns
+    // away from the sun, which is where a shadow map's texel footprint is
+    // longest and acne appears. eShadowBias was already tapped at offset 1544
+    // and had no reader until now.
+    if ((pc.flags & FLAG_NORMAL_TAP) != 0) {
+        vec3 L = vec3(pc.sunViewX, pc.sunViewY, pc.sunViewZ);
+        eye += N * (eShadowBias.x +
+                    eShadowBias.y * (1.0 - clamp(dot(L, N), 0.0, 1.0)));
+    }
     vec4 e4 = vec4(eye, 1.0);
     float eyeDist = -eye.z;
     int n = clamp(eShadowCount, 0, 4);
@@ -1004,10 +1107,21 @@ void main()
         // penumbras show as blends. BLUE tint marks "beyond all cascades"
         // (which the engine treats as lit), GREY means no tap. Inverted
         // green/red against visible shadows = flip taa.smap_ge, live.
-        // Plain uv: the engine path adds ITS sample offset; stacking our
-        // unjitter shift on top double-applied the subpixel correction.
+        // Plain uv. The original reason given here was that "the engine path
+        // adds ITS sample offset", so adding S too would double-apply the
+        // sub-pixel correction. That premise is false - see the note over
+        // gSampleOffset: X-Plane does not jitter, so there is no engine
+        // correction to double up on.
+        //
+        // The line stays as it is anyway. The depth this samples WAS rendered
+        // through our jittered projection, so strictly the reconstruction here
+        // is off by one sub-pixel - and this is VIZ_SUNVIS, a debug view whose
+        // job is to show which cascade lit a pixel. Changing it would alter a
+        // reference view for less than a pixel of accuracy. The render path
+        // does not share the problem: AO reconstructs at uv + S, which is where
+        // the geometry was actually rasterised.
         vec3 eye = mvEyePos(uv, float(layer));
-        vec2 v = mvSunVisibility(eye);
+        vec2 v = mvSunVisibility(eye, engineNormal(uv, float(layer)));
         vec3 c;
         if (v.y < -1.5)      c = vec3(0.3);
         else if (v.y < -0.5) c = vec3(0.0, 0.5, 0.7);
@@ -1205,6 +1319,20 @@ void main()
         float rot = ign * 6.2831853;
         const int   AO_TAPS = 8;
         float occ = 0.0;
+        // ---- THE SURFACE PLANE, SO A SLOPE IS NOT MISTAKEN FOR AN OCCLUDER.
+        //
+        // This march compared depths and nothing else, so a surface tilted away
+        // from the camera occluded ITSELF: its neighbours genuinely are nearer,
+        // d comes out positive, and occlusion accumulated on flat ground. With
+        // maxD = 0.05*w0 + 0.02 that tolerance is over five metres at 100 m, so
+        // distant terrain darkened for no reason other than being sloped.
+        //
+        // The engine has had the normal all along. Taps below the tangent plane
+        // are now rejected, which is the difference between ambient occlusion
+        // and a depth-difference filter.
+        const bool aoN = (pc.flags & FLAG_NORMAL_TAP) != 0;
+        vec3 aoNrm = aoN ? engineNormal(uv + S, float(layer)) : vec3(0.0);
+        vec3 aoP   = aoN ? mvEyeFromDist(uv + S, w0) : vec3(0.0);
         for (int i = 0; i < AO_TAPS; ++i) {
             float ang = rot + float(i) * (6.2831853 / float(AO_TAPS));
             // sqrt spacing spreads the taps evenly over the DISC rather than
@@ -1216,6 +1344,12 @@ void main()
             if (wn <= 0.0) continue;                 // nothing wrote there
             float d = w0 - wn;                       // >0 => neighbour is nearer
             if (d <= 0.0) continue;                  // behind us, not an occluder
+            if (aoN) {
+                // Above the tangent plane, or it is the surface itself sloping.
+                vec3  v3 = mvEyeFromDist(uv + S + o, wn) - aoP;
+                float vl = length(v3);
+                if (vl < 1e-5 || dot(v3 / vl, aoNrm) < 0.1) continue;
+            }
             // Range limit, scaled with distance so the effect stays the same
             // size on screen as geometry recedes. Without it a distant
             // background silhouetted against near geometry occludes the whole
@@ -1242,9 +1376,12 @@ void main()
     // surface therefore takes more bounce than it should, bounded by the
     // gather's clamp at 2. That is a deliberate trade: the ratio form needs
     // no albedo tap, no exposure matching and no absolute scale, and it
-    // cannot blow up. gbuf-albedo IS identified by name if the exact form is
-    // ever wanted; the difference is then a constant near albedo/PI, which is
-    // to say it lives inside gi_strength.
+    // cannot blow up. An earlier version of this note claimed gbuf-albedo was
+    // "identified by name if the exact form is ever wanted" - it is not. The
+    // name listener captures gbuf-depth and gbuf-normal only, so taking the
+    // principled form means adding that tap first, not just using it. The
+    // difference is then a constant near albedo/PI, which is to say it lives
+    // inside gi_strength.
     //
     // Modulation rather than addition: gi is radiance gathered from the scene,
     // and scaling the surface by it means a surface only brightens in
@@ -1289,7 +1426,24 @@ void main()
     // Sun below the horizon arrives as an all-zero vector and costs nothing.
     vec2 sunXY = vec2(pc.sunViewX, pc.sunViewY * pc.velYSign);
     float sunLen = length(sunXY);
-    if (pc.csStrength > 0.0 && !unwritten && velS.z > 0.0 && sunLen > 0.05) {
+    // ---- A SURFACE FACING AWAY FROM THE SUN IS ALREADY DARK. DO NOT DARKEN
+    // IT AGAIN.
+    //
+    // The engine composes direct light as E * NdotL * albedo / PI, so where
+    // N.L <= 0 it contributes nothing and the surface is lit by ambient alone.
+    // Marching a contact shadow there and multiplying the result in is the same
+    // double-counting the GI gather avoids by refusing to read probes for
+    // escaped rays: darkness applied twice for one physical cause.
+    //
+    // sunView is a unit vector toward the sun in view space and the engine
+    // normal is eye space, so this dot needs no flip - velYSign belongs to the
+    // SCREEN-space march direction below, not here.
+    bool csFacing = true;
+    if ((pc.flags & FLAG_NORMAL_TAP) != 0)
+        csFacing = dot(engineNormal(uv + S, float(layer)),
+                       vec3(pc.sunViewX, pc.sunViewY, pc.sunViewZ)) > 0.0;
+    if (pc.csStrength > 0.0 && !unwritten && velS.z > 0.0 && sunLen > 0.05 &&
+        csFacing) {
         float w0 = mvViewDepth(uv + S, float(layer), velS.z);
         vec2  dir = sunXY / sunLen;
         // Shorter than the AO radius on purpose. Contact shadows are a contact

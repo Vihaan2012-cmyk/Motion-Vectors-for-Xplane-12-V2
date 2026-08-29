@@ -49,6 +49,17 @@ struct State {
     PFN_vkCreateSampler             createSamp = nullptr;
     PFN_vkCreateImageView           createView = nullptr;
     PFN_vkDestroyImageView          destroyView = nullptr;
+    // ---- WITHOUT THESE, shutdown() COULD NOT FREE WHAT ensure() BUILT.
+    //
+    // Only the create entry points were ever resolved, so the pipeline, its
+    // layouts, the descriptor pool, both samplers and the shader module had no
+    // way to be destroyed at all - see the note over shutdown().
+    PFN_vkDestroyPipeline           destroyPipe = nullptr;
+    PFN_vkDestroyPipelineLayout     destroyPl   = nullptr;
+    PFN_vkDestroyDescriptorSetLayout destroyDsl = nullptr;
+    PFN_vkDestroyDescriptorPool     destroyPool = nullptr;
+    PFN_vkDestroySampler            destroySamp = nullptr;
+    PFN_vkDestroyShaderModule       destroySm   = nullptr;
     PFN_vkCmdBindPipeline           bindPipe   = nullptr;
     PFN_vkCmdBindDescriptorSets     bindSets   = nullptr;
     PFN_vkCmdPushConstants          pushConst  = nullptr;
@@ -114,6 +125,10 @@ struct Push {
     int32_t layer;
     int32_t flags;
 };
+static_assert(sizeof(Push) <= 128,
+              "taau::Push exceeds the guaranteed 128-byte push constant limit");
+static_assert(sizeof(Push) == 56,
+              "taau::Push changed size - update taau.comp's block to match");
 enum {
     kTaauReset     = 1,
     kTaauTint      = 2,
@@ -139,6 +154,12 @@ inline bool init(DeviceData &dd, VkDevice dev)
     TAAU_GET(createSamp,  "vkCreateSampler");
     TAAU_GET(createView,  "vkCreateImageView");
     TAAU_GET(destroyView, "vkDestroyImageView");
+    TAAU_GET(destroyPipe, "vkDestroyPipeline");
+    TAAU_GET(destroyPl,   "vkDestroyPipelineLayout");
+    TAAU_GET(destroyDsl,  "vkDestroyDescriptorSetLayout");
+    TAAU_GET(destroyPool, "vkDestroyDescriptorPool");
+    TAAU_GET(destroySamp, "vkDestroySampler");
+    TAAU_GET(destroySm,   "vkDestroyShaderModule");
     TAAU_GET(bindPipe,    "vkCmdBindPipeline");
     TAAU_GET(bindSets,    "vkCmdBindDescriptorSets");
     TAAU_GET(pushConst,   "vkCmdPushConstants");
@@ -563,6 +584,44 @@ inline void shutdown()
          it != s.dstViews.end(); ++it)
         if (it->second && s.destroyView) s.destroyView(s.dev, it->second, nullptr);
     s.dstViews.clear();
+
+    // ---- EVERYTHING ensure() BUILT, AND THE LATCH THAT SAID IT WAS BUILT.
+    //
+    // This used to free the history images and stop. Two consequences, and the
+    // second is fatal rather than untidy:
+    //
+    // 1. The pipeline, pipeline layout, descriptor set layout, descriptor pool,
+    //    both samplers and the shader module leaked on every device teardown.
+    //    X-Plane recreates its device on some settings changes, so that is not
+    //    only a shutdown concern.
+    //
+    // 2. ensure() begins "if (s.tried) return s.ready;" - a one-shot latch -
+    //    and neither tried, ready nor dev was reset here. So after the device
+    //    went away this module still reported READY, still held s.dev pointing
+    //    at the destroyed device, and still held a pipeline, layouts and a
+    //    descriptor pool belonging to it. The next ensure() returned true
+    //    without rebuilding anything and record() bound objects from a dead
+    //    device into a live command buffer.
+    //
+    // Destroyed in dependency order: pipeline, then the layouts it was built
+    // from, then the pool (which frees its sets), then the set layout, the
+    // samplers and the module.
+    if (s.pipe && s.destroyPipe) s.destroyPipe(s.dev, s.pipe, nullptr);
+    if (s.pl   && s.destroyPl)   s.destroyPl(s.dev, s.pl, nullptr);
+    if (s.pool && s.destroyPool) s.destroyPool(s.dev, s.pool, nullptr);
+    if (s.dsl  && s.destroyDsl)  s.destroyDsl(s.dev, s.dsl, nullptr);
+    if (s.samp     && s.destroySamp) s.destroySamp(s.dev, s.samp, nullptr);
+    if (s.sampNear && s.destroySamp) s.destroySamp(s.dev, s.sampNear, nullptr);
+    if (s.sm   && s.destroySm)   s.destroySm(s.dev, s.sm, nullptr);
+    s.pipe = VK_NULL_HANDLE; s.pl = VK_NULL_HANDLE; s.pool = VK_NULL_HANDLE;
+    s.dsl  = VK_NULL_HANDLE; s.samp = VK_NULL_HANDLE;
+    s.sampNear = VK_NULL_HANDLE; s.sm = VK_NULL_HANDLE;
+    for (int i = 0; i < State::kSets; ++i) s.sets[i] = VK_NULL_HANDLE;
+
+    // The latch last, so a rebuild on a new device starts from nothing.
+    s.dev = VK_NULL_HANDLE;
+    s.ready = false;
+    s.tried = false;
 }
 
 inline void noteImageGone(VkImage img)

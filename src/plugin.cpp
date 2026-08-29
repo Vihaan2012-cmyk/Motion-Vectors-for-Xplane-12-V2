@@ -1588,6 +1588,18 @@ static float g_lodBias      = -0.5f;
 static float g_renderScale  = 1.0f;
 static int   g_jitterPhases = 8;
 static bool  g_objectsOn    = true;
+// ---- THE PER-FRAME DIAGNOSTICS, OFF BY DEFAULT.
+//
+// MV OWN / MV STATE / MV PROJFULL / MV CAMCHECK are development instrumentation
+// that shipped enabled. Measured on a real user's 21-minute session: 12,584 of
+// 13,617 lines, 92% of the file. That is not merely untidy - it is why a log a
+// user sends is mostly noise, and it costs a formatted write plus a flush
+// several times a second forever.
+//
+// Kept, not deleted: they answer real questions (is the camera the one the
+// reprojection is built from, is the world actually translating). They just
+// have to be asked for - diag_log = 1 in taa.ini, or TAA_DIAG_LOG=1.
+static bool  g_diagLog      = false;
 static float g_trafficRadius = 35.0f;
 static int   g_jitterIndex   = 0;
 // 2.5 m covers the panel and glareshield of an airliner without reaching the
@@ -2971,7 +2983,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
         const double ox = g_drOwnX ? XPLMGetDatad(g_drOwnX) : 0.0;
         const double oz = g_drOwnZ ? XPLMGetDatad(g_drOwnZ) : 0.0;
         static int every = 0;
-        if (haveOwn && (++every % 20) == 0)
+        if (haveOwn && (++every % 20) == 0 && g_diagLog)
             xlog("MV OWN: aircraft moved (%+.4f, %+.4f, %+.4f) m this frame, "
                    "%.4f m total, altitude %.2f m - compare against the camera "
                    "delta the layer prints",
@@ -2985,7 +2997,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
         // is in force - and those need completely different fixes. The whole
         // acceptance suite has been running in this state, so every number it
         // produced covers rotation and near-zero translation only.
-        if (haveOwn && (every % 20) == 0) {
+        if (haveOwn && (every % 20) == 0 && g_diagLog) {
             static XPLMDataRef drGS  = taaFind("sim/flightmodel/position/groundspeed");
             static XPLMDataRef drThr = taaFind("sim/cockpit2/engine/actuators/throttle_ratio_all");
             static XPLMDataRef drPbk = taaFind("sim/flightmodel/controls/parkbrake");
@@ -3149,7 +3161,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // straight ahead would use.
     {
         static int said = 0;
-        if ((++said % 60) == 1)
+        if ((++said % 60) == 1 && g_diagLog)
             xlog("MV PROJFULL: view=%d | [0]=%.5f [4]=%.5f [8]=%.5f [12]=%.5f | "
                  "[1]=%.5f [5]=%.5f [9]=%.5f [13]=%.5f | [2]=%.5f [6]=%.5f "
                  "[10]=%.5f [14]=%.5f | [3]=%.5f [7]=%.5f [11]=%.5f [15]=%.5f",
@@ -3184,7 +3196,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
         const double ry = -((double)s->world[4] * t0 + (double)s->world[5] * t1 + (double)s->world[6]  * t2);
         const double rz = -((double)s->world[8] * t0 + (double)s->world[9] * t1 + (double)s->world[10] * t2);
         static int every = 0;
-        if ((++every % 20) == 0) {
+        if ((++every % 20) == 0 && g_diagLog) {
             const double dx = rx - (double)cp.x, dy = ry - (double)cp.y, dz = rz - (double)cp.z;
             xlog("MV CAMCHECK: view=%d | from world_matrix (-R^T t) = (%.3f, "
                  "%.3f, %.3f) | XPLMReadCameraPosition = (%.3f, %.3f, %.3f) | "
@@ -4301,10 +4313,10 @@ static void createMenu()
 // Retuning LOD bias and jitter length is the bulk of the tuning work and both
 // are pure numbers, so they live in a file rather than needing a rebuild and a
 // sim restart for every experiment.
-static void loadConfig(const std::string &path)
+static bool loadConfig(const std::string &path)
 {
     FILE *f = fopen(path.c_str(), "r");
-    if (!f) { xlog("no config at %s - using defaults", path.c_str()); return; }
+    if (!f) return false;
 
     char line[512];
     while (fgets(line, sizeof(line), f)) {
@@ -4322,6 +4334,7 @@ static void loadConfig(const std::string &path)
         else if (!strcmp(key, "jitter_phases"))  g_jitterPhases = (int)val;
         else if (!strcmp(key, "moving_objects")) g_objectsOn    = (val != 0);
         else if (!strcmp(key, "traffic_radius")) g_trafficRadius= (float)val;
+        else if (!strcmp(key, "diag_log"))       g_diagLog      = (val != 0);
         // The upscaler selection, which this file claimed to carry and did not.
         //
         // The default stays Off, deliberately - something that changes what the
@@ -4337,19 +4350,68 @@ static void loadConfig(const std::string &path)
     if (g_lodBias < -3.0f)    g_lodBias = -3.0f;
     if (g_lodBias >  1.0f)    g_lodBias =  1.0f;
 
-    xlog("config: lodBias=%.2f renderScale=%.2f jitterPhases=%d objects=%d",
-         g_lodBias, g_renderScale, g_jitterPhases, g_objectsOn ? 1 : 0);
+    xlog("config: lodBias=%.2f renderScale=%.2f jitterPhases=%d objects=%d "
+         "diagLog=%d", g_lodBias, g_renderScale, g_jitterPhases,
+         g_objectsOn ? 1 : 0, g_diagLog ? 1 : 0);
+    return true;
 }
 
 PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
 {
-    strcpy(outName, "TAAImplementation");
-    strcpy(outSig,  "com.nitin.taaimplementation");
-    strcpy(outDesc, "Publishes camera matrices for the TAA Vulkan layer.");
+    strcpy(outName, "MotionVectors");
+    strcpy(outSig,  "com.vihaan2012.motionvectors");
+    strcpy(outDesc, "Publishes camera matrices for the MotionVectors Vulkan layer.");
 
     char root[1024] = {0};
     XPLMGetSystemPath(root);
-    g_configPath = std::string(root) + "Resources/plugins/TAAImplementation/taa.ini";
+
+    // ---- DERIVED FROM WHERE THIS PLUGIN ACTUALLY IS, NOT A GUESSED FOLDER.
+    //
+    // This was hard-coded to "Resources/plugins/TAAImplementation/taa.ini". No
+    // shipped install has ever had that folder - the plugin ships as
+    // Resources/plugins/MotionVectors - so loadConfig missed every time and
+    // silently fell back to defaults. Both user logs collected for the 1.1.5
+    // reports carry the proof verbatim:
+    //
+    //   no config at C:\X-Plane 12\Resources/plugins/TAAImplementation/taa.ini
+    //       - using defaults
+    //
+    // It only ever affected the INI. The panel and launcher set the same values
+    // through the shared control block (TAA_CTL_LOD_BIAS and friends), which is
+    // why nobody noticed: the knobs worked, the file behind them did not.
+    //
+    // XPLMGetPluginInfo hands back this .xpl's own path, so the folder name can
+    // change again without this breaking a third time.
+    char me[1024] = {0};
+    XPLMGetPluginInfo(XPLMGetMyID(), nullptr, me, nullptr, nullptr);
+    std::string pdir(me);
+    size_t sl = pdir.find_last_of("/\\");
+    pdir = (sl == std::string::npos) ? std::string() : pdir.substr(0, sl);
+    // The .xpl sits in an ABI subfolder (MotionVectors/64/win.xpl); the ini
+    // belongs beside the plugin folder, not inside 64/.
+    size_t sl2 = pdir.find_last_of("/\\");
+    if (sl2 != std::string::npos) {
+        std::string leaf = pdir.substr(sl2 + 1);
+        if (leaf == "64" || leaf == "win_x64" || leaf == "mac_x64" ||
+            leaf == "lin_x64")
+            pdir = pdir.substr(0, sl2);
+    }
+
+    // Tried in order. The legacy locations stay in the list so an existing
+    // tuning file keeps working instead of being silently ignored a second time.
+    std::string tried[3];
+    tried[0] = pdir.empty() ? std::string() : pdir + "/taa.ini";
+    tried[1] = std::string(root) + "Resources/plugins/MotionVectors/taa.ini";
+    tried[2] = std::string(root) + "TAAImplementation/taa.ini";
+    g_configPath = tried[1];
+    for (int t = 0; t < 3; ++t) {
+        if (tried[t].empty()) continue;
+        FILE *probe = fopen(tried[t].c_str(), "r");
+        if (!probe) continue;
+        fclose(probe);
+        g_configPath = tried[t];
+        break;
+    }
 
     xlog("v%s starting", TAA_PLUGIN_VERSION);
 
@@ -4393,7 +4455,15 @@ PLUGIN_API int XPluginEnable(void)
 {
     // Config parsing only - no dataref access of any kind here. See the header
     // comment: reading dataref values before the sim has started is unstable.
-    loadConfig(g_configPath);
+    // Environment wins over the file, like every other override here.
+    if (const char *dl = getenv("TAA_DIAG_LOG")) g_diagLog = (atoi(dl) != 0);
+
+    if (!loadConfig(g_configPath))
+        xlog("no config at %s - using defaults (looked beside the plugin, in "
+             "Resources/plugins/MotionVectors, and in the legacy "
+             "TAAImplementation folder)", g_configPath.c_str());
+    else
+        xlog("config loaded from %s", g_configPath.c_str());
 
     registerDatarefs();
     createMenu();

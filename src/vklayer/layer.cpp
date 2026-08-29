@@ -91,6 +91,42 @@
 
 static std::mutex g_traceLock;
 
+// ---- PER-CALL-SITE BACKOFF, SO NO ONE LINE CAN OWN THE FILE.
+//
+// Individual sites get throttled by hand when they are caught - SUN META now
+// prints 1 in 3000 because the untamed version wrote 581 MB in a session, and
+// the same lesson has been learned separately at a dozen call sites. Doing it
+// per site means it is only ever fixed AFTER a trace has already been ruined,
+// and every new trace() is a fresh chance to do it again.
+//
+// Keyed on the format string's ADDRESS. Every trace() call passes a literal, so
+// the pointer identifies the site with no hashing of the text and no
+// allocation. A site prints its first 64 lines unrestricted - enough that
+// one-shot and rare messages are completely unaffected - and then only on
+// powers of two, which turns a runaway from linear into logarithmic while
+// still showing that it is still happening, and how often.
+//
+// Deliberately not a global rate cap: that would suppress a rare, important
+// line because an unrelated site was noisy.
+static bool traceSiteAllow(const char *fmt, uint64_t *nth)
+{
+    enum { kSlots = 1024 };
+    static const char *keys[kSlots] = { nullptr };
+    static uint64_t    hits[kSlots] = { 0 };
+    size_t h = (size_t)(((uintptr_t)fmt >> 4) % kSlots);
+    for (size_t probe = 0; probe < kSlots; ++probe) {
+        size_t i = (h + probe) % kSlots;
+        if (keys[i] == nullptr) { keys[i] = fmt; hits[i] = 1; *nth = 1; return true; }
+        if (keys[i] != fmt) continue;
+        const uint64_t n = ++hits[i];
+        *nth = n;
+        if (n <= 64) return true;
+        return (n & (n - 1)) == 0;          // powers of two only
+    }
+    *nth = 0;
+    return true;   // table full: print rather than silently drop
+}
+
 static void trace(const char *fmt, ...)
 {
     static const bool on = getenv("TAA_LAYER_TRACE") != nullptr;
@@ -113,6 +149,10 @@ static void trace(const char *fmt, ...)
     }
 
     std::lock_guard<std::mutex> g(g_traceLock);
+    // Checked under the lock, before the file is touched: the counters are
+    // plain statics and this is the only thing serialising them.
+    uint64_t nth = 0;
+    if (!traceSiteAllow(fmt, &nth)) return;
     static FILE *f = nullptr;
     static uint64_t bytesOut = 0;
     if (!f) {
@@ -175,6 +215,11 @@ static void trace(const char *fmt, ...)
     va_start(ap, fmt);
     int wrote = vfprintf(f, fmt, ap);
     va_end(ap);
+    // Past the unrestricted window this line stands in for many, so say how
+    // many - a backed-off trace that hid its own rate would be worse than a
+    // noisy one, because the count is usually the evidence.
+    if (nth > 64) wrote += fprintf(f, "   [occurrence %llu]",
+                                   (unsigned long long)nth);
     fputc('\n', f);
     if (wrote > 0) bytesOut += (uint64_t)wrote + 1;
     fflush(f);   // flushed, not closed: durability without an open and close
@@ -414,6 +459,24 @@ static bool snapshot(Snapshot *o)
         g_taaEdAB[1] = g_share->proj[14];
         g_taaInvProj[0] = g_share->proj[0] != 0.0f ? 1.0f / g_share->proj[0] : 1.0f;
         g_taaInvProj[1] = g_share->proj[5] != 0.0f ? 1.0f / g_share->proj[5] : 1.0f;
+        // ---- THE SUN BELONGS INSIDE THE CRITICAL SECTION. IT WAS OUTSIDE IT.
+        //
+        // The resolve reads g_taaSunView inside its seqlock retry loop, so it
+        // believes it is getting a coherent vector. This writer set it AFTER
+        // the closing increment below, which means the section was never odd
+        // while these three floats were changing and the reader's retry could
+        // not detect a thing. Three separate stores against a concurrent
+        // three-load read: the render thread could take x from one frame and
+        // y,z from the next.
+        //
+        // The sun moves slowly, so most tears are between near-identical
+        // vectors and invisible - which is exactly why this survived. It bites
+        // on a TRANSITION: the frame the plugin first publishes a real vector
+        // over zeros, or a view change, where half the components are still 0
+        // and the direction points somewhere the sun is not.
+        g_taaSunView[0]  = g_share->sunViewX;
+        g_taaSunView[1]  = g_share->sunViewY;
+        g_taaSunView[2]  = g_share->sunViewZ;
         g_taaShareSeq.fetch_add(1, std::memory_order_release);   // -> even
         memcpy(o->prevProj,        g_share->prevProj,        sizeof(o->prevProj));
         memcpy(o->bodyReproj,      g_share->bodyReproj,      sizeof(o->bodyReproj));
@@ -450,10 +513,6 @@ static bool snapshot(Snapshot *o)
         o->jitterIndex   = g_share->jitterIndex;
         o->jitterPhases  = g_share->jitterPhases;
         o->lodBias       = g_share->lodBias;
-        // Straight to the resolve's global - see the note on g_taaSunView.
-        g_taaSunView[0]  = g_share->sunViewX;
-        g_taaSunView[1]  = g_share->sunViewY;
-        g_taaSunView[2]  = g_share->sunViewZ;
         // ---- SAY WHAT THE SUN IS DOING, PERIODICALLY.
         //
         // Contact shadows were built with no way to see this value at all. If
@@ -1991,6 +2050,62 @@ struct FgSwap {
     bool                             have    = false;
 };
 static FgSwap            g_fgSwap;
+
+// ---- PROXY HANDLES WE HAVE ALREADY DESTROYED, THAT X-PLANE WILL DESTROY AGAIN.
+//
+// vkCreateSwapchainKHR's oldSwapchain does NOT destroy anything - the app still
+// owns the old handle and must free it itself. X-Plane's recreate() does
+// exactly that, in this order:
+//
+//     vkCreateSwapchainKHR(dev, &info, ...)      // info.oldSwapchain = current
+//     if (old) { vkDeviceWaitIdle(); vkDestroySwapchainKHR(dev, old, 0); }
+//
+// We have to tear our proxy down inside the CREATE, before building the next
+// one, because the proxy owns a real driver swapchain on that surface and a
+// second one cannot be created while it lives. So by the time X-Plane's own
+// destroy arrives, the handle is already gone - and it is not a driver object
+// to begin with, it is a C++ object allocated inside this module (see the note
+// at the creation site). Forwarding it to the driver hands a freed pointer to
+// code that will dereference it.
+//
+// Worse is the collision case: we free one FFX object and immediately allocate
+// another of the same size, so the allocator handing back the SAME address is
+// likely, not exotic. Then the old handle compares equal to the new proxy and
+// the destroy hook tears down the swapchain X-Plane is about to render with.
+//
+// Both are fatal, and both fire on every swapchain recreation with frame
+// generation on. X-Plane rebuilds offscreens as part of loading an aircraft,
+// so this is reachable on the FIRST load, not only on an aircraft change - the
+// 900-frame hold gates GENERATION, never proxy lifetime, so it walks straight
+// past that guard.
+//
+// Recording the handle here and swallowing exactly one destroy for it is
+// correct under address reuse as well: X-Plane destroys each handle once, so
+// the swallow consumes the retired one and the live proxy keeps its own.
+static std::vector<VkSwapchainKHR> g_fgRetired;
+
+// Bounded on purpose. If a handle were ever recorded and never destroyed, an
+// unrelated driver swapchain landing on that address later would have its
+// destroy swallowed and leak. In practice the list holds at most one entry.
+static void fgRetire(VkSwapchainKHR h)
+{
+    if (h == VK_NULL_HANDLE) return;
+    g_fgRetired.push_back(h);
+    if (g_fgRetired.size() > 4)
+        g_fgRetired.erase(g_fgRetired.begin());
+}
+
+// Consumes the handle if it is retired. One destroy per record.
+static bool fgClaimRetired(VkSwapchainKHR h)
+{
+    for (size_t i = 0; i < g_fgRetired.size(); ++i) {
+        if (g_fgRetired[i] != h) continue;
+        g_fgRetired.erase(g_fgRetired.begin() + (ptrdiff_t)i);
+        return true;
+    }
+    return false;
+}
+
 static std::atomic<bool> g_fgActive(false);
 // Which proxy image FSR3 writes this frame; advanced once per present.
 static uint32_t          g_fgOutIndex = 0;
@@ -2009,6 +2124,44 @@ static bool              g_fgGenEnabled = false;
 // path that fills it, because the synchronization2 barrier hook above reads it
 // to find the backbuffer whose PRESENT_SRC transition must be rewritten.
 static std::map<VkSwapchainKHR, std::vector<VkImage> > g_swapImages;
+
+// ---- THE PROXY'S BACKBUFFERS, READABLE WITHOUT TAKING A LOCK.
+//
+// The backbuffer layout rewrite needs this list on EVERY vkCmdPipelineBarrier2,
+// and X-Plane issues those by the hundred per frame - it is the busiest hook in
+// the layer. Reaching into g_swapImages there meant taking g_lock, the layer's
+// single global mutex, on every one of them, then walking a red-black tree.
+//
+// That cost only appears with frame generation ON, which is what made it look
+// like an FG problem rather than a TAA one: with FG off the whole block is a
+// single relaxed atomic load. And g_lock is exactly the lock every other thread
+// in the layer contends for - including FFX's presenter thread, which only
+// exists while FG is running. An uncontended mutex is cheap; this one is not
+// uncontended, and a futex round trip per barrier per frame is a frame-rate
+// halving, not a rounding error.
+//
+// The list is fixed for the lifetime of a proxy - assigned once when its images
+// are enumerated, never mutated after - so it can be published once and read
+// with an acquire load. Eight is above any swapchain image count in practice;
+// a longer one simply falls back to rewriting nothing, which is the behaviour
+// before this feature existed.
+static VkImage               g_fgProxyImg[8];
+static std::atomic<uint32_t> g_fgProxyImgN(0);
+
+static void fgPublishProxyImages(const VkImage *imgs, uint32_t n)
+{
+    if (n > 8) n = 8;
+    for (uint32_t i = 0; i < n; ++i) g_fgProxyImg[i] = imgs[i];
+    g_fgProxyImgN.store(n, std::memory_order_release);
+}
+
+static inline bool fgIsProxyImage(VkImage im)
+{
+    const uint32_t n = g_fgProxyImgN.load(std::memory_order_acquire);
+    for (uint32_t k = 0; k < n; ++k)
+        if (g_fgProxyImg[k] == im) return true;
+    return false;
+}
 
 
 // Defined with the probe below; called from the present path, which comes
@@ -3211,21 +3364,19 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdPipelineBarrier2(
     // destination is PRESENT_SRC_KHR. Every other barrier in the frame is
     // untouched, and with FG off this whole block is skipped on a single
     // relaxed atomic load.
+    // Cheapest test first, and it is the one that almost always fails: only a
+    // handful of barriers in a frame target PRESENT_SRC_KHR, and the rest now
+    // cost a compare instead of a lock. See the note over g_fgProxyImg.
     const bool fgRewrite = g_fgActive.load(std::memory_order_relaxed) &&
                            g_fgSwap.have && info &&
                            info->imageMemoryBarrierCount;
     bool needRewrite = false;
     if (fgRewrite) {
-        std::lock_guard<std::mutex> g(g_lock);
-        std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator si =
-            g_swapImages.find(g_fgSwap.handle);
-        if (si != g_swapImages.end())
-            for (uint32_t i = 0; i < info->imageMemoryBarrierCount && !needRewrite; ++i)
-                if (info->pImageMemoryBarriers[i].newLayout ==
-                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR &&
-                    std::find(si->second.begin(), si->second.end(),
-                              info->pImageMemoryBarriers[i].image) != si->second.end())
-                    needRewrite = true;
+        for (uint32_t i = 0; i < info->imageMemoryBarrierCount && !needRewrite; ++i)
+            if (info->pImageMemoryBarriers[i].newLayout ==
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR &&
+                fgIsProxyImage(info->pImageMemoryBarriers[i].image))
+                needRewrite = true;
     }
 
     if (!needRewrite && (!g_pagerDropAbove || !info || !info->imageMemoryBarrierCount)) {
@@ -3239,13 +3390,11 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdPipelineBarrier2(
         for (size_t i = 0; i < fixed.size(); ++i)
             pagerClampRange(fixed[i].image, &fixed[i].subresourceRange);
     if (needRewrite) {
-        std::lock_guard<std::mutex> g(g_lock);
-        std::map<VkSwapchainKHR, std::vector<VkImage> >::iterator si =
-            g_swapImages.find(g_fgSwap.handle);
-        for (size_t i = 0; i < fixed.size() && si != g_swapImages.end(); ++i) {
+        // Same snapshot, still no lock. This pass runs only on the few barriers
+        // that actually carry a present transition for a proxy backbuffer.
+        for (size_t i = 0; i < fixed.size(); ++i) {
             if (fixed[i].newLayout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) continue;
-            if (std::find(si->second.begin(), si->second.end(), fixed[i].image)
-                    == si->second.end()) continue;
+            if (!fgIsProxyImage(fixed[i].image)) continue;
             fixed[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             // The access mask has to follow the layout or the barrier promises
             // a visibility it does not make: FFX samples this image.
@@ -3847,6 +3996,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
 // A command buffer's family is fixed by the pool it came from, so this is known
 // while recording, long before anyone submits it.
 static std::map<VkCommandPool, uint32_t>   g_poolFamily;
+// Which pool a command buffer came from. vkResetCommandPool and
+// vkDestroyCommandPool act on every buffer in a pool at once and name none of
+// them, so without this there is no way to answer "whose state just became
+// invalid" - which is why neither was hooked at all.
+static std::map<VkCommandBuffer, VkCommandPool> g_cbToPool;
 static std::map<VkCommandBuffer, uint32_t> g_cbFamily;
 
 static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateCommandPool(
@@ -3886,6 +4040,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_AllocateCommandBuffers(
             g_poolFamily.find(ai->commandPool);
         for (uint32_t i = 0; i < ai->commandBufferCount; ++i) {
             g_cbToDevice[out[i]] = device;
+            g_cbToPool[out[i]] = ai->commandPool;
             if (pf != g_poolFamily.end()) g_cbFamily[out[i]] = pf->second;
         }
     }
@@ -4145,6 +4300,12 @@ struct DeferredImgKill {
     uint64_t due;
 };
 static std::vector<DeferredImgKill> g_deferredImgKills;
+
+// Every image that has ever been a render-pass colour attachment. Declared
+// here rather than beside its only writer because Layer_DestroyImage below
+// prunes it - it is keyed by VkImage, and a handle the driver recycles must
+// not keep answering "yes, this was an attachment" for its previous owner.
+static std::set<VkImage> g_seenAsAttachment;
 
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
     VkDevice device, VkImage img, const VkAllocationCallbacks *alloc)
@@ -4429,6 +4590,19 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
             }
         }
     }
+    // Keyed by VkImage and never pruned before now, so it both grew for the
+    // life of the process and answered "yes, seen as an attachment" for a
+    // handle that had been recycled into something else entirely.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_seenAsAttachment.erase(img);
+    }
+    // The cached views of this image die with it - see taaForgetImageViews.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(device));
+        if (di != g_devices.end()) taaForgetImageViews(di->second, img);
+    }
     if (next) next(device, img, alloc);
 }
 
@@ -4598,7 +4772,6 @@ static int g_cockpitPassIndex = -1;
 // closed, so a reused buffer starts clean rather than inheriting a decision
 // from whatever it was last used for.
 static std::map<VkCommandBuffer, bool> g_cbSawScenePass;
-static std::map<VkCommandBuffer, bool> g_cbResolvedThisCb;
 
 // How many full-viewport depth passes this command buffer has recorded, and how
 // many it recorded last time round.
@@ -5155,8 +5328,6 @@ static std::map<VkDescriptorSet, std::vector<VkImageView> > g_setViews;
 static std::map<VkDescriptorSet, std::vector<VkImageView> > g_setStorageViews;
 static std::map<VkCommandBuffer, bool> g_cbInSwapPass;
 
-// Every image that has ever been a render-pass colour attachment.
-static std::set<VkImage> g_seenAsAttachment;
 
 // ---- THE COMPUTE COMPOSITE, WHICH NO ATTACHMENT SEARCH COULD EVER FIND.
 //
@@ -6696,8 +6867,11 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
         resolvesThisPresent = 0;
         resolvePresentTag = g_frameCount;
     }
-    const uint32_t maxResolves =
-        (uint32_t)live::i("taa.max_resolves", "TAA_MAX_RESOLVES", 1);
+    // Cached: once per vkCmdEndRendering, and X-Plane ends a lot of passes.
+    static uint64_t mrGen = ~(uint64_t)0;
+    static int      mrVal = 1;
+    const uint32_t maxResolves = (uint32_t)live::iCached(
+        "taa.max_resolves", "TAA_MAX_RESOLVES", 1, mrGen, mrVal);
     // ---- A FRAME WITH NO VALID REPROJECTION MUST NOT BE RESOLVED.
     //
     // The plugin sets reprojValid = 0 when it cannot invert the current
@@ -7393,7 +7567,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_EndCommandBuffer(VkCommandBuffer cb)
             }
 
             g_cbSawScenePass[cb]   = false;
-            g_cbResolvedThisCb[cb] = false;
             g_cbInScenePass[cb]    = false;
         }
         if (wants) {
@@ -8343,6 +8516,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_AcquireNextImageKHR(
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroySwapchainKHR(
     VkDevice device, VkSwapchainKHR sc, const VkAllocationCallbacks *alloc)
 {
+    // ---- CHECKED FIRST, AND DELIBERATELY SO.
+    //
+    // A handle we already destroyed inside vkCreateSwapchainKHR. It must not
+    // reach the driver (it was never a driver object) and it must not be
+    // matched against the LIVE proxy below, which may well have been allocated
+    // at the same address. Retired wins; the live proxy gets its own destroy
+    // later. See the note over g_fgRetired.
+    if (fgClaimRetired(sc)) {
+        trace("FG: X-Plane destroyed the proxy handle %p it handed back as "
+              "oldSwapchain - already torn down during the recreate, so this "
+              "destroy is swallowed rather than forwarded to the driver.",
+              (void*)sc);
+        return;
+    }
+
     if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
         sc == g_fgSwap.handle && g_fgSwap.fn.destroySwapchainKHR) {
         g_fgSwap.fn.destroySwapchainKHR(device, sc, alloc);
@@ -8352,6 +8540,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroySwapchainKHR(
         g_fgSwap.handle = VK_NULL_HANDLE;
         g_fgSwap.proxy  = nullptr;
         g_fgActive.store(false, std::memory_order_relaxed);
+        g_fgProxyImgN.store(0, std::memory_order_release);
         trace("FG: proxy swapchain destroyed - routing returns to the driver.");
         return;
     }
@@ -8380,6 +8569,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_GetSwapchainImagesKHR(
         // nothing. A feature that quietly does nothing is worse than one that
         // fails.
         if (pr == VK_SUCCESS && images && count && *count) {
+            // Published before the map is touched: this is the copy the barrier
+            // hook reads, and it must not need g_lock to do it.
+            fgPublishProxyImages(images, *count);
             std::lock_guard<std::mutex> g(g_lock);
             std::vector<VkImage> &v = g_swapImages[sc];
             v.assign(images, images + *count);
@@ -9546,13 +9738,41 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                       "lastCount=%zu stable=%u",
                       (unsigned long long)nb, g_hdrTargets.size(),
                       lastCount, g_sceneColorStable); }
-        if (g_hdrTargets.size() != lastCount) {
+        // ---- THE SET, NOT ITS CARDINALITY.
+        //
+        // The note above says stability is measured on the SET of HDR targets.
+        // It was measured on how MANY there were. An offscreen rebuild destroys
+        // the old targets and creates the same number of new ones, so the count
+        // returns to where it started and this test never fired - the counter
+        // sailed straight through a rebuild in which every scene target had
+        // been replaced.
+        //
+        // That counter is not cosmetic. g_sceneColorStable >= 120 is what gates
+        // frame-generation activation and the velocity target's settle, so a
+        // rebuild that went unnoticed meant FG arming immediately against
+        // brand-new targets instead of waiting out the window that exists
+        // precisely for this. X-Plane rebuilds offscreens as part of loading an
+        // aircraft.
+        //
+        // XOR of the handles alongside the count: order-independent, so the
+        // census pushing targets in a different order is not a false reset,
+        // while any actual substitution changes it.
+        uintptr_t fp = 0;
+        for (size_t q = 0; q < g_hdrTargets.size(); ++q)
+            fp ^= (uintptr_t)g_hdrTargets[q] * 0x9E3779B97F4A7C15ull;
+        static uintptr_t lastFp = 0;
+        if (g_hdrTargets.size() != lastCount || fp != lastFp) {
             {   static uint64_t ns = 0;
                 if ((ns++ % 120) == 0)
-                    trace("STABLE RESET [set-size]: HDR target count %zu -> %zu "
-                          "(reset #%llu)", lastCount, g_hdrTargets.size(),
+                    trace("STABLE RESET [set]: HDR targets %zu -> %zu, "
+                          "fingerprint %s (reset #%llu)",
+                          lastCount, g_hdrTargets.size(),
+                          (g_hdrTargets.size() == lastCount) ? "CHANGED (same "
+                          "count, different images - the case this missed)"
+                                                             : "n/a",
                           (unsigned long long)ns); }
             lastCount = g_hdrTargets.size();
+            lastFp    = fp;
             g_sceneColorStable = 0;
         } else if (g_sceneColorStable < 100000) {
             ++g_sceneColorStable;
@@ -9900,6 +10120,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 std::map<void*, DeviceData>::iterator it =
                     g_devices.find(dispatchKey(due[i].dev));
                 if (it != g_devices.end()) nd = it->second.destroyImage;
+            }
+            // Same purge on the deferred path: this is the destroy that
+            // actually happens for an image the resolve had bound, so the view
+            // has to go here rather than four presents ago.
+            {
+                std::lock_guard<std::mutex> g(g_lock);
+                std::map<void*, DeviceData>::iterator dv =
+                    g_devices.find(dispatchKey(due[i].dev));
+                if (dv != g_devices.end())
+                    taaForgetImageViews(dv->second, due[i].img);
             }
             if (nd) nd(due[i].dev, due[i].img, due[i].alloc);
         }
@@ -10706,6 +10936,32 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
     }
     taau::shutdown();
     gi::shutdown();
+
+    // ---- THE FRAME-GENERATION PROXY DIES WITH ITS DEVICE.
+    //
+    // Nothing here touched it before, so a live proxy outlived the device that
+    // owned it: its FFX object was never destroyed, the module reference taken
+    // to pin this DLL was never released, and g_fgSwap.have stayed TRUE with a
+    // dangling device handle. The create hook has a guard that notices a proxy
+    // belonging to a dead device and drops it, but that is a lazy repair on the
+    // next swapchain creation - it does not run if the process is shutting
+    // down, and it drops the object without ever freeing it.
+    //
+    // Done while the device and its queues still exist, like vram::shutdown()
+    // above, because FFX's teardown waits on the queue it was built against.
+    if (g_fgSwap.have && g_fgSwap.device == device) {
+        trace("FG: the device owning the proxy is being destroyed - tearing "
+              "the proxy down here rather than leaking it past its device.");
+        if (g_fgSwap.fn.destroySwapchainKHR)
+            g_fgSwap.fn.destroySwapchainKHR(device, g_fgSwap.handle, alloc);
+        g_fgSwap = FgSwap();
+        g_fgActive.store(false, std::memory_order_relaxed);
+        g_fgConfigApplied = false;
+    }
+    // Retired handles are already destroyed, so there is nothing to free - but
+    // a stale entry must not outlive the device and swallow the destroy of an
+    // unrelated swapchain that later lands on the same address.
+    g_fgRetired.clear();
 
     // ---- RELEASE THE VELOCITY TARGET.
     //
@@ -14207,10 +14463,34 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
         // running here as well would both reintroduce the crash and do the work
         // twice. The side-car wins; this path remains for the no-frame-gen case
         // and as the A/B.
+        // ---- THE CONFIG READ IS CACHED. IT WAS RUNNING PER DISPATCH.
+        //
+        // live::onoff is not a cheap accessor. Each call takes live's own mutex,
+        // builds temporary std::strings from the char* key, and does three
+        // string-keyed map lookups (taa.unlock, the shipped table, then g_kv);
+        // "taa.fg_dilate" is not in the shipped table, so it misses and falls
+        // through to getenv() as well - a scan of the environment block.
+        //
+        // X-Plane issues compute dispatches by the hundred per frame, and the
+        // && above means this only ever ran with FRAME GENERATION ON: with FG
+        // off, g_fgActive short-circuits the whole expression away on one
+        // relaxed load. So the cost appeared as "frame generation is slow"
+        // while TAA measured clean - which is exactly how it was reported.
+        //
+        // live::reloads() is the generation counter that exists for this: the
+        // value is re-read only when the ini is actually reloaded. A race here
+        // costs one dispatch a stale bool for one frame, which is why plain
+        // statics are enough.
+        static uint64_t sDilGen = ~(uint64_t)0;
+        static bool     sDilCfg = true;
+        const uint64_t dilGen = live::reloads();
+        if (dilGen != sDilGen) {
+            sDilGen = dilGen;
+            sDilCfg = live::onoff("taa.fg_dilate", "TAA_FG_DILATE", true);
+        }
         const bool sideCarOwnsDilation =
             g_fgActive.load(std::memory_order_relaxed) &&
-            fgdilate::state().ready &&
-            live::onoff("taa.fg_dilate", "TAA_FG_DILATE", true);
+            fgdilate::state().ready && sDilCfg;
         if (ours && fsr3Wanted() && !sideCarOwnsDilation &&
             live::onoff("taa.fsr_run", "TAA_FSR_RUN", true) &&
             out != VK_NULL_HANDLE && colour != VK_NULL_HANDLE &&
@@ -15075,7 +15355,12 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     //   taa.nearfield_view = -1  AUTO: any airframe-mounted view (default)
     //                         0  never arm provisionally (calibration only)
     //                     >1000  arm only in exactly this view id
-    const int nfView = live::i("taa.nearfield_view", "TAA_NEARFIELD_VIEW", -1);
+    // Cached: this runs on every graphics pipeline bind that carries our push
+    // constants, which is most of the scene. See live::iCached.
+    static uint64_t nfGen = ~(uint64_t)0;
+    static int      nfVal = -1;
+    const int nfView = live::iCached("taa.nearfield_view", "TAA_NEARFIELD_VIEW",
+                                     -1, nfGen, nfVal);
     const int vt     = g_velSnap.viewType;
     const bool ridesAirframe = (vt == 1000 || vt == 1017 ||
                                 vt == 1018 || vt == 1026);
@@ -16458,15 +16743,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
               "proxy as oldSwapchain - tearing it down first.");
         if (g_fgSwap.fn.destroySwapchainKHR)
             g_fgSwap.fn.destroySwapchainKHR(device, g_fgSwap.handle, alloc);
+        // X-Plane still owns this handle and will destroy it itself once this
+        // create returns. Record it so that destroy is swallowed instead of
+        // reaching the driver (or, on address reuse, tearing down the proxy we
+        // are about to build). See the note over g_fgRetired.
+        fgRetire(g_fgSwap.handle);
+        g_fgProxyImgN.store(0, std::memory_order_release);
         g_fgSwap.have   = false;
         g_fgSwap.handle = VK_NULL_HANDLE;
         g_fgSwap.proxy  = nullptr;
         g_fgActive.store(false, std::memory_order_relaxed);
         mod.oldSwapchain = VK_NULL_HANDLE;
     }
-    // Any other recreation while a proxy is live: refuse rather than orphan the
-    // first one. One proxy, one config - the second FG: ACTIVE in that log was
-    // already a bug before anything dereferenced anything.
+    // Any other recreation while a proxy is live is left to the driver: the
+    // creation block further down requires !g_fgSwap.have, so no second proxy
+    // is built and the first is not orphaned. One proxy, one config - the
+    // second FG: ACTIVE in that log was already a bug before anything
+    // dereferenced anything. This block only says so once; the refusal itself
+    // is that !have, not anything here.
     if (g_fgSwap.have && live::onoff("taa.fg", "TAA_FG", false)) {
         static bool said = false;
         if (!said) {
@@ -16938,6 +17232,63 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDescriptorUpdateTemplate(
     if (next) next(device, tpl, alloc);
 }
 
+// ---- PIPELINE AND LAYOUT STATE HAS TO DIE WITH ITS OBJECT.
+//
+// vkDestroyPipeline and vkDestroyPipelineLayout were resolved into the dispatch
+// table and never hooked, so four maps keyed by those handles were only ever
+// inserted into:
+//
+//   g_pipelineMvPatched   VkPipeline       -> did we splice velocity into it
+//   g_pipelineIsGeometry  VkPipeline       -> is it scene geometry
+//   g_pipelineLayoutOf    VkPipeline       -> its layout
+//   g_layoutHasOurPC      VkPipelineLayout -> does it carry our push range
+//
+// Unbounded growth is the mild half. Vulkan REUSES handle values, and X-Plane
+// creates and destroys pipelines constantly while an aircraft loads. A new,
+// unpatched pipeline landing on a retired handle inherits "patched = true" and
+// its layout inherits "has our push constants = true" - so TAA_CmdBindPipeline
+// pushes our 128-byte block into a layout that never declared the range. That
+// is undefined behaviour the driver is entitled to turn into a crash, and it
+// happens precisely during a load.
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroyPipeline(
+    VkDevice device, VkPipeline pipe, const VkAllocationCallbacks *alloc)
+{
+    PFN_vkDestroyPipeline next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.destroyPipeline;
+        // A null handle is a legal no-op; do not let it erase entry zero.
+        if (pipe != VK_NULL_HANDLE) {
+            g_pipelineMvPatched.erase(pipe);
+            g_pipelineIsGeometry.erase(pipe);
+            g_pipelineLayoutOf.erase(pipe);
+        }
+    }
+    if (next) next(device, pipe, alloc);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroyPipelineLayout(
+    VkDevice device, VkPipelineLayout layout, const VkAllocationCallbacks *alloc)
+{
+    PFN_vkDestroyPipelineLayout next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end()) next = it->second.destroyPipelineLayout;
+        if (layout != VK_NULL_HANDLE) {
+            g_layoutHasOurPC.erase(layout);
+            // Any pipeline still claiming this layout is claiming a dead one.
+            for (std::map<VkPipeline, VkPipelineLayout>::iterator pi =
+                     g_pipelineLayoutOf.begin(); pi != g_pipelineLayoutOf.end();) {
+                if (pi->second == layout) g_pipelineLayoutOf.erase(pi++);
+                else ++pi;
+            }
+        }
+    }
+    if (next) next(device, layout, alloc);
+}
+
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImageView(
     VkDevice device, VkImageView view, const VkAllocationCallbacks *alloc)
 {
@@ -16955,6 +17306,120 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImageView(
     if (next) next(device, view, alloc);
 }
 
+// ---- WHAT BECOMES INVALID WHEN A COMMAND BUFFER IS RESET, FREED OR ITS POOL
+// GOES AWAY.
+//
+// Split in two on purpose. A RESET keeps the buffer - only what a recording
+// established is stale - while a free or a pool destruction takes the handle
+// itself, so the maps that describe the buffer rather than the recording have
+// to go too. Erasing g_cbToDevice on a mere reset would lose the device
+// binding that vkAllocateCommandBuffers established and that nothing re-earns.
+//
+// Callers hold g_lock.
+static void cbForgetRecording(VkCommandBuffer c)
+{
+    g_cbShadowRegion.erase(c);
+    g_cbGbufRegion.erase(c);
+    g_cbDepthUse.erase(c);
+    g_cbFsrBound.erase(c);
+    g_cbFsrOurs.erase(c);
+    g_cbInCockpitPass.erase(c);
+    g_cbInScenePass.erase(c);
+    g_cbInSwapPass.erase(c);
+    g_cbMvBoundPass.erase(c);
+    g_cbPassInfo.erase(c);
+    g_cbPassLog.erase(c);
+    g_cbSawScenePass.erase(c);
+    g_cbScenePassCount.erase(c);
+    g_cbScenePassHigh.erase(c);
+    g_cbScenePassPrev.erase(c);
+    g_cbSwapTarget.erase(c);
+}
+
+static void cbForgetAll(VkCommandBuffer c)
+{
+    cbForgetRecording(c);
+    g_cbToDevice.erase(c);
+    g_cbFamily.erase(c);
+    g_cbToPool.erase(c);
+}
+
+// Every buffer allocated from this pool. Used by both pool entry points.
+static void cbForgetPool(VkCommandPool pool, bool freeing)
+{
+    for (std::map<VkCommandBuffer, VkCommandPool>::iterator it = g_cbToPool.begin();
+         it != g_cbToPool.end();) {
+        if (it->second != pool) { ++it; continue; }
+        if (freeing) {
+            const VkCommandBuffer c = it->first;
+            g_cbToPool.erase(it++);
+            cbForgetRecording(c);
+            g_cbToDevice.erase(c);
+            g_cbFamily.erase(c);
+        } else {
+            cbForgetRecording(it->first);
+            ++it;
+        }
+    }
+}
+
+// vkResetCommandBuffer puts one buffer back to the initial state. Everything a
+// previous recording proved about it is void from here.
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_ResetCommandBuffer(
+    VkCommandBuffer cb, VkCommandBufferResetFlags flags)
+{
+    PFN_vkResetCommandBuffer next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator it =
+                g_devices.find(dispatchKey(ci->second));
+            if (it != g_devices.end() && it->second.gdpa)
+                next = (PFN_vkResetCommandBuffer)
+                    it->second.gdpa(ci->second, "vkResetCommandBuffer");
+        }
+        cbForgetRecording(cb);
+    }
+    return next ? next(cb, flags) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+// vkResetCommandPool resets EVERY buffer in the pool and names none of them.
+static VKAPI_ATTR VkResult VKAPI_CALL Layer_ResetCommandPool(
+    VkDevice device, VkCommandPool pool, VkCommandPoolResetFlags flags)
+{
+    PFN_vkResetCommandPool next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkResetCommandPool)
+                it->second.gdpa(device, "vkResetCommandPool");
+        cbForgetPool(pool, false);
+    }
+    return next ? next(device, pool, flags) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+// Destroying a pool implicitly frees every buffer in it, so those handles are
+// gone and may be handed back out for something else.
+static VKAPI_ATTR void VKAPI_CALL Layer_DestroyCommandPool(
+    VkDevice device, VkCommandPool pool, const VkAllocationCallbacks *alloc)
+{
+    PFN_vkDestroyCommandPool next = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(device));
+        if (it != g_devices.end() && it->second.gdpa)
+            next = (PFN_vkDestroyCommandPool)
+                it->second.gdpa(device, "vkDestroyCommandPool");
+        if (pool != VK_NULL_HANDLE) {
+            cbForgetPool(pool, true);
+            g_poolFamily.erase(pool);
+        }
+    }
+    if (next) next(device, pool, alloc);
+}
+
 static VKAPI_ATTR void VKAPI_CALL Layer_FreeCommandBuffers(
     VkDevice device, VkCommandPool pool, uint32_t n,
     const VkCommandBuffer *cbs)
@@ -16966,12 +17431,18 @@ static VKAPI_ATTR void VKAPI_CALL Layer_FreeCommandBuffers(
         if (it != g_devices.end() && it->second.gdpa)
             next = (PFN_vkFreeCommandBuffers)
                 it->second.gdpa(device, "vkFreeCommandBuffers");
-        for (uint32_t i = 0; i < n && cbs; ++i) {
-            g_cbToDevice.erase(cbs[i]);
-            g_cbFamily.erase(cbs[i]);
-            g_cbShadowRegion.erase(cbs[i]);
-            g_cbGbufRegion.erase(cbs[i]);
-        }
+        for (uint32_t i = 0; i < n && cbs; ++i) cbForgetAll(cbs[i]);
+        // ---- ALL OF IT, NOT FOUR OF SIXTEEN.
+        //
+        // Sixteen maps are keyed by VkCommandBuffer; this freed four. The other
+        // twelve grew for the life of the process, one entry per command buffer
+        // ever allocated, and X-Plane allocates and frees them continuously.
+        //
+        // Correctness is mostly saved by vkEndCommandBuffer, which re-earns the
+        // per-recording state so a REUSED handle starts from a clean slate. The
+        // cost was the growth itself - and a freed buffer's entries lingering
+        // under a handle the driver may hand to something else.
+
     }
     if (next) next(device, pool, n, cbs);
 }
@@ -17460,6 +17931,11 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkFreeDescriptorSets",                  Layer_FreeDescriptorSets)
     RETURN_IF("vkResetDescriptorPool",                 Layer_ResetDescriptorPool)
     RETURN_IF("vkDestroyImageView",                    Layer_DestroyImageView)
+    RETURN_IF("vkDestroyPipeline",                     Layer_DestroyPipeline)
+    RETURN_IF("vkResetCommandBuffer",                  Layer_ResetCommandBuffer)
+    RETURN_IF("vkResetCommandPool",                    Layer_ResetCommandPool)
+    RETURN_IF("vkDestroyCommandPool",                  Layer_DestroyCommandPool)
+    RETURN_IF("vkDestroyPipelineLayout",               Layer_DestroyPipelineLayout)
     RETURN_IF("vkFreeCommandBuffers",                  Layer_FreeCommandBuffers)
     RETURN_IF("vkBeginCommandBuffer",                  Layer_BeginCommandBuffer)
     RETURN_IF("vkCreateDescriptorUpdateTemplate",      Layer_CreateDescriptorUpdateTemplate)

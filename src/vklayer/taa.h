@@ -307,6 +307,7 @@ enum {
     kTaaFlagProbeTap      = 1 << 14,  // binding 8 carries the env cubemaps
     kTaaFlagGbufTap       = 1 << 15,  // binding 10 carries u_gbuffer_data
     kTaaFlagGi            = 1 << 16,  // binding 11 carries gathered bounce
+    kTaaFlagNormalTap     = 1 << 17,  // binding 12 carries gbuf-normal
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -848,7 +849,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                   "override stays off");
     }
 
-    VkDescriptorSetLayoutBinding b[12];
+    VkDescriptorSetLayoutBinding b[13];
     memset(b, 0, sizeof(b));
     // Binding 0 is a SAMPLER now, not a storage image: the dispatch only reads
     // the scene. That is what lets the scene target keep X-Plane's own usage
@@ -879,14 +880,21 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     // Binding 11: the GI gather's half-res result. Dummy-bound to the velocity
     // view when the gather is off, gated by kTaaFlagGi like every other tap.
     b[11].binding = 11; b[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    for (int i = 0; i < 12; ++i) {
+    // Binding 12: the engine's gbuf-normal, spheremap-encoded in two channels.
+    // AO and contact shadows both had to work from depth alone until now - AO
+    // could not tell a sloped surface from an occluder, and contact shadows
+    // could not tell a surface the sun never reached from one it did. Dummy-
+    // bound to the velocity view when unidentified, gated by kTaaFlagNormalTap
+    // exactly like every other engine tap.
+    b[12].binding = 12; b[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    for (int i = 0; i < 13; ++i) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci;
     memset(&dlci, 0, sizeof(dlci));
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 12; dlci.pBindings = b;
+    dlci.bindingCount = 13; dlci.pBindings = b;
     if (dd.createDescriptorSetLayout(dev, &dlci, nullptr, &g_taa.setLayout) != VK_SUCCESS) return false;
 
     VkPushConstantRange pcr;
@@ -941,7 +949,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = 1 * TaaState::kSets;   // history write only
     ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    ps[1].descriptorCount = 8 * TaaState::kSets;   // + sun cascades, env probes, GI
+    ps[1].descriptorCount = 9 * TaaState::kSets;   // + sun cascades, env probes, GI, normals
     ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ps[2].descriptorCount = 3 * TaaState::kSets;   // reproj + u_shadow_data + u_gbuffer_data
     VkDescriptorPoolCreateInfo dpci;
@@ -1244,6 +1252,54 @@ static void taaBindEngineDepth(DeviceData &dd, VkImage image, VkFormat fmt,
     g_taa.edViews[image] = view;
     g_taa.edView  = view;
     g_taa.edValid = (view != VK_NULL_HANDLE);
+}
+
+// ---- A CACHED VIEW MUST NOT OUTLIVE THE IMAGE IT VIEWS.
+//
+// The engine-image binders cache one VkImageView per VkImage so a view is
+// created once rather than every frame. Nothing purged those caches when the
+// image itself was destroyed - only the full re-init teardown did - and
+// X-Plane destroys these images on every "Rebuilding offscreens", which is
+// part of loading an aircraft.
+//
+// Three separate faults, from one omission:
+//
+//   - The view was never destroyed. One leaked VkImageView per engine image
+//     per rebuild, for the whole session.
+//   - Destroying a VkImage while views of it still exist is itself invalid
+//     (VUID-vkDestroyImage-image-04882), so we were making X-Plane's own
+//     destroy call illegal.
+//   - Worst: the map stayed keyed by a DEAD VkImage handle, and Vulkan reuses
+//     handle values. A new image landing on the same handle hit the cache and
+//     the binder handed a descriptor set a view of an image that no longer
+//     exists - a use-after-free the GPU discovers, which is exactly the
+//     "virtual address 0x0, Type: Compute" signature.
+//
+// Called immediately before the real vkDestroyImage on BOTH paths - the direct
+// one and the four-present deferred one - so the view dies with its image and
+// never before it, which is the ordering the in-flight protection exists for.
+static void taaForgetImageViews(DeviceData &dd, VkImage image)
+{
+    if (image == VK_NULL_HANDLE || g_taa.device == VK_NULL_HANDLE) return;
+    std::map<VkImage, VkImageView> *caches[6] = {
+        &g_taa.sceneViews, &g_taa.flagsViews, &g_taa.edViews,
+        &g_taa.sunViews,   &g_taa.probeViews, &g_taa.normViews };
+    for (int ci = 0; ci < 6; ++ci) {
+        std::map<VkImage, VkImageView>::iterator it = caches[ci]->find(image);
+        if (it == caches[ci]->end()) continue;
+        const VkImageView v = it->second;
+        caches[ci]->erase(it);
+        if (v == VK_NULL_HANDLE) continue;
+        // Clear the LIVE selection too, or the next resolve binds the handle we
+        // are about to destroy.
+        if (g_taa.edView    == v) { g_taa.edView    = VK_NULL_HANDLE; g_taa.edValid    = false; }
+        if (g_taa.sunView   == v) { g_taa.sunView   = VK_NULL_HANDLE; g_taa.sunValid   = false; }
+        if (g_taa.probeView == v) { g_taa.probeView = VK_NULL_HANDLE; g_taa.probeValid = false; }
+        if (g_taa.normView  == v) { g_taa.normView  = VK_NULL_HANDLE; g_taa.normValid  = false; }
+        if (g_taa.flagsView == v) { g_taa.flagsView = VK_NULL_HANDLE; g_taa.flagsValid = false; }
+        if (g_taa.sceneView == v)   g_taa.sceneView = VK_NULL_HANDLE;
+        if (dd.destroyImageView) dd.destroyImageView(g_taa.device, v, nullptr);
+    }
 }
 
 // Bindings 7 and 8: the engine's sun cascades (depth aspect) and environment
@@ -1897,10 +1953,29 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     wrgi.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wrgi.pImageInfo = &gii;
 
-    VkWriteDescriptorSet wrAll[12];
+    // Binding 12: gbuf-normal, or the velocity view as a legal dummy. The
+    // shader only reads it under FLAG_NORMAL_TAP, so the dummy is never
+    // sampled - it exists because a descriptor set must be complete.
+    VkDescriptorImageInfo nii;
+    memset(&nii, 0, sizeof(nii));
+    const bool normTap = g_taa.normValid && g_taa.normView != VK_NULL_HANDLE;
+    nii.sampler = g_taa.sampler;
+    nii.imageView = normTap ? g_taa.normView : g_taa.velView;
+    nii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wrn;
+    memset(&wrn, 0, sizeof(wrn));
+    wrn.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wrn.dstSet = set;
+    wrn.dstBinding = 12;
+    wrn.descriptorCount = 1;
+    wrn.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wrn.pImageInfo = &nii;
+
+    VkWriteDescriptorSet wrAll[13];
     for (int k = 0; k < 8; ++k) wrAll[k] = wr[k];
     wrAll[8] = wru; wrAll[9] = wrs; wrAll[10] = wrg; wrAll[11] = wrgi;
-    dd.updateDescriptorSets(g_taa.device, 12, wrAll, 0, nullptr);
+    wrAll[12] = wrn;
+    dd.updateDescriptorSets(g_taa.device, 13, wrAll, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -1960,7 +2035,20 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.sharpen       = sharpAmt;
     pcv.reactiveAlpha = taaReactiveAlpha();
     pcv.aoStrength    = taaAoStrength();
-    pcv.aoRadius      = taaAoRadius();
+    // ---- THE RADIUS IS IN PIXELS, SO IT HAS TO BE SCALED TO THE FRAME.
+    //
+    // taa.ao_radius is a pixel count, fed straight through until now. That
+    // makes the shipped default mean a DIFFERENT amount of occlusion on every
+    // display: 12 px is 1.11% of screen height at 1080p, 0.83% at 1440p and
+    // 0.56% at 2160p - so a 4K user got half the AO a 1080p user got from the
+    // identical setting, and contact shadows (csLen = aoRadius * 0.5) shrank
+    // with it until a 6 px march at 4K reached almost nothing.
+    //
+    // Normalised against 1080p: the setting keeps its existing meaning there
+    // and now means the same thing everywhere else. Costs nothing - the tap
+    // count is fixed, only their spread changes.
+    pcv.aoRadius      = taaAoRadius() *
+                        (g_taa.h > 0 ? (float)g_taa.h / 1080.0f : 1.0f);
     // The sun, straight through from the plugin. Zeroed when it is below the
     // horizon, which the shader reads as "do not march".
     pcv.sunViewX      = snapSun[0];
@@ -1987,6 +2075,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                  | ((gi::resultView() != VK_NULL_HANDLE)
                                         ? kTaaFlagGi            : 0)
                  | (g_taa.probeValid    ? kTaaFlagProbeTap      : 0)
+                 | (normTap             ? kTaaFlagNormalTap     : 0)
                  | (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)

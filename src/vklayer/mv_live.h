@@ -465,4 +465,25 @@ inline bool onoff(const char *key, const char *env, bool dflt)
 
 inline uint64_t reloads() { return g_reloads; }
 
+// ---- FOR PER-COMMAND HOOKS, WHERE THE PLAIN ACCESSORS ARE TOO EXPENSIVE.
+//
+// i()/f()/onoff() each take g_mtx, build temporary std::strings from the char*
+// key and do up to three string-keyed map lookups (taa.unlock, the shipped
+// table, then g_kv); a key absent from the shipped table also falls through to
+// getenv(), a scan of the environment block. That is fine once a frame and
+// wrong once a draw - and X-Plane binds pipelines and issues dispatches by the
+// hundred per frame.
+//
+// g_reloads only changes when the ini is actually re-read, so a value stamped
+// with it is exactly as fresh as the file. Callers own the two statics, which
+// keeps this allocation-free and leaves the "how stale may this be" decision at
+// the call site. A race costs one call a one-frame-old value.
+inline int iCached(const char *key, const char *env, int dflt,
+                   uint64_t &gen, int &slot)
+{
+    const uint64_t g = reloads();
+    if (g != gen) { gen = g; slot = i(key, env, dflt); }
+    return slot;
+}
+
 } // namespace live
