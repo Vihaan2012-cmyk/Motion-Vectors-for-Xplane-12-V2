@@ -1230,6 +1230,22 @@ void main()
 
     // ---- INDIRECT LIGHT, ADDED WHERE AO SUBTRACTS IT.
     //
+    // ---- HOW THIS DIFFERS FROM THE ENGINE'S OWN ENERGY, EXACTLY.
+    //
+    // Its deferred shader composes, for the ambient and direct terms:
+    //     ambient = irradiance * albedo            (gbuffer_tex)
+    //     direct  = E_sun * NdotL * albedo * (1/PI)   (0.31830987 in the code)
+    // so a physically matched bounce term would be albedo * E / PI.
+    //
+    // What this does instead is L * (E / lum(L)), which keeps the receiving
+    // surface's albedo HUE (L carries it) but not its MAGNITUDE - a dark
+    // surface therefore takes more bounce than it should, bounded by the
+    // gather's clamp at 2. That is a deliberate trade: the ratio form needs
+    // no albedo tap, no exposure matching and no absolute scale, and it
+    // cannot blow up. gbuf-albedo IS identified by name if the exact form is
+    // ever wanted; the difference is then a constant near albedo/PI, which is
+    // to say it lives inside gi_strength.
+    //
     // Modulation rather than addition: gi is radiance gathered from the scene,
     // and scaling the surface by it means a surface only brightens in
     // proportion to what it already reflects - a black surface stays black,
