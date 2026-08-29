@@ -10,18 +10,24 @@
 // picture does not fall apart at the frame edge the way a pure screen-space
 // method does.
 //
-// ---- WHY THIS IS NOT "JUST SSGI".
+// ---- WHAT THIS ADDS, AND WHAT IT DELIBERATELY DOES NOT.
 //
-// The usual screen-space GI has two structural holes: rays that leave the
-// screen return black, and radiance is read post-tonemap so a sunlit wall and
-// white paint look identical. Neither applies here.
+// The engine already applies environment irradiance to every surface: its
+// deferred shader walks u_ibl_probes_count_diffuse probes, samples the cube
+// array along the NORMAL at mip 6, and alpha-blends the result. Ambient light
+// is therefore already present in the colour this pass reads.
 //
-//   * Escaped rays fall back to environment_probes - the engine's own
-//     omnidirectional capture, which contains what is BEHIND the camera.
-//   * The scene colour is the pre-tonemap HDR target, so a sunlit surface
-//     carries the energy that makes bounce light look like light rather than
-//     like a grey wash. The probe content measured in the thousands; white
-//     paint does not.
+// What no irradiance lookup can express is LOCAL COLOURED BOUNCE - a red sign
+// tinting the concrete beneath it, a sunlit wing throwing light into the gear
+// bay. That delta is this pass's entire job, and it is why a ray that escapes
+// the screen contributes ZERO rather than falling back to the probes: the
+// probes' light is already counted, and adding it again would simply brighten
+// the frame twice.
+//
+// The one advantage that does survive: radiance is read PRE-TONEMAP, so a
+// sunlit surface carries the energy that makes bounce read as light rather
+// than as a grey wash - a post-tonemap gather cannot tell a lit wall from
+// white paint.
 //
 // ---- HALF RESOLUTION, ITS OWN HISTORY.
 //

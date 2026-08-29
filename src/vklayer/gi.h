@@ -355,21 +355,34 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     s.nextSet = (si + 1) % State::kSets;
     VkDescriptorSet set = s.sets[si];
 
-    // ---- PROBES ARE OFF UNTIL THEY ARE DONE PROPERLY.
+    // ---- PROBES ARE OFF, AND BLACK IS THE CORRECT ANSWER.
     //
-    // The decompiled deferred shader shows how the engine actually samples
-    // these, and it is not what this pass does:
+    // Not a limitation - a correction. The engine's own deferred shader
+    // ALREADY applies environment irradiance to every surface:
     //
-    //   samplerCubeArray, indexed by u_probe_layer[i].x  (up to 8 probes)
-    //   direction transformed by u_eye_to_probe[i]       (not eye space)
-    //   box-parallax corrected against u_probe_data[i]
-    //   scaled by u_exposure_scale
+    //   for (i < u_ibl_probes_count_diffuse && accum < 1)
+    //       dir = probe_data[i].x == 1 ? boxParallax(eye_to_probe[i], P, N,
+    //                                                probe_data[i].yzw)
+    //                                  : mat3(modelview_inverse_3d) * N;
+    //       s = textureLod(cube, vec4(dir, probe_layer[i].x), 6.0)
+    //           * exposure_scale;
+    //       irradiance += s.rgb * (1-accum);  accum += s.a * (1-accum);
     //
-    // Feeding a raw eye-space direction into faces 0..5 of the array is wrong
-    // in four independent ways, so escaped rays would return plausible-looking
-    // radiance from the wrong direction - the worst failure shape there is.
-    // Off by default: escaped rays return black and this degrades to ordinary
-    // screen-space GI, which is correct as far as it goes.
+    // Sampled along the NORMAL at mip 6 - an irradiance lookup - and alpha-
+    // blended across up to eight probes. That light is therefore already in
+    // the scene colour this pass reads and the resolve composites onto.
+    //
+    // So adding probe radiance for escaped rays would apply the ambient a
+    // SECOND time. What this pass exists to contribute is the delta the
+    // engine cannot produce: local coloured bounce between on-screen
+    // surfaces, which an unoccluded irradiance lookup has no way to express.
+    // A ray that escapes has left the region we can say anything new about,
+    // and zero is the honest value for it.
+    //
+    // The knob remains for experiment. If it is ever turned on properly it
+    // needs all four of the things above - cube ARRAY layer, the per-probe
+    // eye_to_probe matrix, box parallax, and exposure_scale - plus a way to
+    // avoid the double count.
     // ---- THE ENGINE'S OWN GEOMETRY, WHEN BOTH HALVES ARE PRESENT.
     //
     // Its normals AND its screen-to-eye coefficients, or neither: the
