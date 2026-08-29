@@ -115,7 +115,9 @@ struct TaaState {
     VkImageView     edView  = VK_NULL_HANDLE;
     bool            edValid = false;
     // Bindings 7/8: the engine's sun cascades and environment probes.
-    std::map<VkImage, VkImageView> sunViews, probeViews;
+    std::map<VkImage, VkImageView> sunViews, probeViews, normViews;
+    VkImageView     normView  = VK_NULL_HANDLE;
+    bool            normValid = false;
     // 1x1 D16 dummy for binding 7's fallback. A COMPARISON sampler on the
     // RGBA16F velocity view was invalid Vulkan for every frame the cascades
     // were unidentified - i.e. all menus. Comparison sampling demands a depth
@@ -516,9 +518,10 @@ static void taaDestroyState(DeviceData &dd, TaaState &g_taa)
     g_taa.sceneViews.clear();
     // The engine-image view caches added for the taps: leaked on every
     // re-init (resolution change) until this loop existed.
-    std::map<VkImage, VkImageView> *caches[4] = {
-        &g_taa.flagsViews, &g_taa.edViews, &g_taa.sunViews, &g_taa.probeViews };
-    for (int ci = 0; ci < 4; ++ci) {
+    std::map<VkImage, VkImageView> *caches[5] = {
+        &g_taa.flagsViews, &g_taa.edViews, &g_taa.sunViews, &g_taa.probeViews,
+        &g_taa.normViews };
+    for (int ci = 0; ci < 5; ++ci) {
         for (std::map<VkImage, VkImageView>::iterator it = caches[ci]->begin();
              it != caches[ci]->end(); ++it)
             if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
@@ -528,6 +531,7 @@ static void taaDestroyState(DeviceData &dd, TaaState &g_taa)
     g_taa.edView    = VK_NULL_HANDLE; g_taa.edValid    = false;
     g_taa.sunView   = VK_NULL_HANDLE; g_taa.sunValid   = false;
     g_taa.probeView = VK_NULL_HANDLE; g_taa.probeValid = false;
+    g_taa.normView  = VK_NULL_HANDLE; g_taa.normValid  = false;
     if (g_taa.sunDummyView) dd.destroyImageView(g_taa.device, g_taa.sunDummyView, nullptr);
     if (g_taa.sunDummy)     dd.destroyImage(g_taa.device, g_taa.sunDummy, nullptr);
     if (g_taa.sunDummyMem)  dd.freeMemory(g_taa.device, g_taa.sunDummyMem, nullptr);
@@ -1244,6 +1248,44 @@ static void taaBindEngineDepth(DeviceData &dd, VkImage image, VkFormat fmt,
 
 // Bindings 7 and 8: the engine's sun cascades (depth aspect) and environment
 // probe cubemaps (colour), cached-view binders in the gbuf-depth mould.
+// Binding for the engine's own eye-space normals (gbuf-normal, R16G16_SFLOAT,
+// spheremap-encoded). Colour aspect, single sample - the same discipline as
+// the other engine-image binders.
+static void taaBindNormals(DeviceData &dd, VkImage image, VkFormat fmt,
+                           uint32_t layers, VkSampleCountFlagBits samples)
+{
+    if (image == VK_NULL_HANDLE || samples != VK_SAMPLE_COUNT_1_BIT) {
+        g_taa.normView = VK_NULL_HANDLE; g_taa.normValid = false; return;
+    }
+    std::map<VkImage, VkImageView>::iterator it = g_taa.normViews.find(image);
+    if (it != g_taa.normViews.end()) {
+        g_taa.normView = it->second;
+        g_taa.normValid = (it->second != VK_NULL_HANDLE);
+        return;
+    }
+    VkImageViewCreateInfo v;
+    memset(&v, 0, sizeof(v));
+    v.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    v.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    v.format = fmt;
+    v.image = image;
+    v.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    v.subresourceRange.levelCount = 1;
+    v.subresourceRange.layerCount = layers ? layers : 1;
+    VkImageView view = VK_NULL_HANDLE;
+    if (dd.createImageView(g_taa.device, &v, nullptr, &view) != VK_SUCCESS) {
+        trace("TAA: gbuf-normal view failed (fmt=%d)", (int)fmt);
+        view = VK_NULL_HANDLE;
+    } else {
+        trace("TAA: engine gbuf-normal bound (fmt=%d) - the GI gather uses "
+              "the engine's own normals instead of depth derivatives.",
+              (int)fmt);
+    }
+    g_taa.normViews[image] = view;
+    g_taa.normView  = view;
+    g_taa.normValid = (view != VK_NULL_HANDLE);
+}
+
 static void taaBindSunShadow(DeviceData &dd, VkImage image, VkFormat fmt,
                              uint32_t layers, VkSampleCountFlagBits samples)
 {
@@ -1282,7 +1324,8 @@ static void taaBindEnvProbes(DeviceData &dd, VkImage image, VkFormat fmt,
                              uint32_t layers, VkSampleCountFlagBits samples)
 {
     if (image == VK_NULL_HANDLE || samples != VK_SAMPLE_COUNT_1_BIT) {
-        g_taa.probeView = VK_NULL_HANDLE; g_taa.probeValid = false; return;
+        g_taa.probeView = VK_NULL_HANDLE; g_taa.probeValid = false;
+    g_taa.normView  = VK_NULL_HANDLE; g_taa.normValid  = false; return;
     }
     std::map<VkImage, VkImageView>::iterator it = g_taa.probeViews.find(image);
     if (it != g_taa.probeViews.end()) {
@@ -1472,6 +1515,24 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         g_taa.sunDummyReady = true;
     }
 
+    // The engine's u_gbuffer_data region for the gather: the same frame-
+    // matched lookup the resolve's own binding 10 uses, hoisted here because
+    // the gather is recorded before that code runs.
+    VkBuffer     giGbufBuf = VK_NULL_HANDLE;
+    VkDeviceSize giGbufOff = 0, giGbufRange = 0;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, MvShadowRegion>::iterator it =
+            g_cbGbufRegion.find(cb);
+        if (it != g_cbGbufRegion.end()) {
+            giGbufBuf = it->second.buf; giGbufOff = it->second.off;
+            giGbufRange = it->second.range;
+        } else if (g_gbufDataBuf != VK_NULL_HANDLE) {
+            giGbufBuf = g_gbufDataBuf; giGbufOff = g_gbufDataOff;
+            giGbufRange = g_gbufDataRange;
+        }
+    }
+
     VkImageMemoryBarrier bar[3];
     memset(bar, 0, sizeof(bar));
     for (int i = 0; i < 3; ++i) {
@@ -1563,7 +1624,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                // this is a single float that changes only when the viewport
                // orientation does, and the snapshot is taken further down than
                // the gather now sits.
-               g_taaVpYSign);
+               g_taaVpYSign,
+               g_taa.normValid ? g_taa.normView : VK_NULL_HANDLE,
+               giGbufBuf, giGbufOff, giGbufRange);
 
     // Clear the history once, explicitly. Reading an UNDEFINED image gives
     // undefined contents and on the first frame every output pixel is a blend

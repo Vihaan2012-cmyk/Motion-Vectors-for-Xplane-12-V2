@@ -42,6 +42,16 @@ layout(binding = 2) uniform sampler2DArray uDepth;    // render res, engine
 layout(binding = 3) uniform sampler2DArray uHistRead; // half res
 layout(binding = 4, rgba16f) uniform image2DArray uHistWrite;
 layout(binding = 5) uniform sampler2DArray uProbes;   // engine cubemaps
+layout(binding = 6) uniform sampler2DArray uNormal;   // engine, spheremap .xy
+// The engine's own screen-to-eye coefficients, bound BY REFERENCE to the very
+// buffer its deferred shader reads. See the note over eyePosEngine.
+layout(binding = 7, std140) uniform EngineGbuf {
+    vec4 gViewportSize;        // xy = pixels, zw = 1/pixels
+    vec4 gGbufferSize;
+    vec4 gProjCoefficients[2];
+    vec4 gClipInfo[2];
+    vec2 gSampleOffset;
+};
 
 layout(push_constant) uniform P {
     ivec2 halfSize;     // dispatch extent
@@ -65,25 +75,49 @@ layout(push_constant) uniform P {
 
 const int GI_PROBES   = 1;   // binding 5 holds real probe data
 const int GI_RESET    = 2;   // no usable history
+const int GI_ENGINE   = 4;   // bindings 6+7 hold the engine's normals/coeffs
 
 // ---- EYE-SPACE POSITION FROM THE ENGINE'S DEPTH.
 //
 // The same linearization the resolve uses for AO and contact shadows, so all
 // three agree about where a pixel is. A cleared or sky texel yields a distance
 // at the far plane and is rejected by the caller rather than marched from.
+// ---- THE ENGINE'S OWN RECONSTRUCTION, TRANSCRIBED FROM ITS DEFERRED SHADER.
+//
+//   z  = (d*clip.x + clip.y) / (d*clip.z + clip.w)
+//   xy = ((fragCoord + sampleOffset) * (1/viewport)) * projCoeff.xy
+//        + projCoeff.zw,  then * (-z)
+//
+// Three things this gets right that the hand-rolled version below cannot:
+// the depth linearization is RATIONAL rather than a two-constant special
+// case; projCoeff.zw is an OFFSET, so an asymmetric frustum works instead of
+// being silently mis-projected; and the Y flip and jitter are carried by the
+// engine's own coefficients rather than by a sign we deduced.
 vec3 eyePos(vec2 uv, float lay, out float dist)
 {
     float d = texture(uDepth, vec3(uv, lay)).r;
+
+    if ((pc.flags & GI_ENGINE) != 0) {
+        float den = d * gClipInfo[0].z + gClipInfo[0].w;
+        if (abs(den) < 1e-12) { dist = 1e9; return vec3(0.0, 0.0, -1e9); }
+        float z = (d * gClipInfo[0].x + gClipInfo[0].y) / den;   // negative fwd
+        vec2  fc = uv * gViewportSize.xy + gSampleOffset;
+        vec2  xy = (fc * gViewportSize.zw) * gProjCoefficients[0].xy
+                 + gProjCoefficients[0].zw;
+        dist = -z;
+        if (dist <= 0.0) dist = 1e9;
+        return vec3(xy * (-z), z);
+    }
+
+    // Fallback: two constants and a symmetric frustum. edB / den, not
+    // -edB / den - see the derivation over mvViewDepth in taa.comp; the
+    // negated form returns a negative distance for every valid depth, which
+    // here would make the sky test reject every pixel.
     float den = d + pc.edA;
-    // edB / den - see the derivation over mvViewDepth in taa.comp. The
-    // negated form yields a negative distance for every valid depth, which
-    // here would have made the sky test reject EVERY pixel and the gather
-    // write black over the whole frame.
     dist = (abs(den) < 1e-7) ? 1e9 : pc.edB / den;
     if (dist <= 0.0) dist = 1e9;
-    // ySign carries X-Plane's negative-height viewport. Without it the
-    // reconstruction is mirrored in Y and the depth-derived normal - a cross
-    // product of two mirrored differences - points where nothing faces.
+    // ySign carries X-Plane's negative-height viewport, which the engine's
+    // own coefficients carry for us on the path above.
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * pc.ySign);
     return vec3(ndc.x * dist * pc.invProjX, ndc.y * dist * pc.invProjY, -dist);
 }
@@ -93,6 +127,15 @@ vec3 eyePos(vec2 uv, float lay, out float dist)
 vec2 eyeToUv(vec3 e)
 {
     float z = max(-e.z, 1e-4);
+    if ((pc.flags & GI_ENGINE) != 0) {
+        // Exact inverse of the engine path: undo the (-z) scale, the affine
+        // offset, and the sample offset, in that order.
+        vec2 xy = e.xy / (-e.z);
+        vec2 t  = (xy - gProjCoefficients[0].zw) /
+                  max(abs(gProjCoefficients[0].xy), vec2(1e-9)) *
+                  sign(gProjCoefficients[0].xy);
+        return t - gSampleOffset * gViewportSize.zw;
+    }
     vec2 ndc = vec2(e.x / (z * pc.invProjX), e.y / (z * pc.invProjY));
     ndc.y *= pc.ySign;                       // the inverse of eyePos's flip
     return ndc * 0.5 + 0.5;
@@ -105,6 +148,19 @@ vec2 eyeToUv(vec3 e)
 // this later without changing anything else. The four-triangle pick is what
 // stops silhouettes producing normals that face nowhere - taking the naive
 // central difference across a depth discontinuity halos every edge.
+// ---- THE ENGINE'S OWN NORMAL, WHICH IT HAS AND WE WERE GUESSING AT.
+//
+// gbuf-normal is R16G16_SFLOAT carrying a Lambert azimuthal (spheremap)
+// encoding; its deferred shader decodes exactly this way. Exact at every
+// pixel, including the silhouettes where reconstructing from depth
+// derivatives has to pick between two triangles and is wrong either way.
+vec3 engineNormal(vec2 uv, float lay)
+{
+    vec2 e = texture(uNormal, vec3(uv, lay)).xy;
+    float f = dot(e, e);
+    return vec3(e * sqrt(max(0.0, 1.0 - f * 0.25)), 1.0 - f * 0.5);
+}
+
 vec3 normalFromDepth(vec2 uv, vec3 c, float lay, vec2 texel)
 {
     float dl, dr, du, dd;
@@ -203,7 +259,9 @@ void main()
                          (float(pc.halfSize.x) * 0.5) / max(dist, 1e-3);
     const float effRadius = min(pc.radius, pc.maxScreenPx / max(pxPerM, 1e-6));
 
-    const vec3 N = normalFromDepth(uv, P, lay, texel);
+    const vec3 N = ((pc.flags & GI_ENGINE) != 0)
+                 ? engineNormal(uv, lay)
+                 : normalFromDepth(uv, P, lay, texel);
     const float n0 = ign(vec2(px), pc.frame);
     const float n1 = ign(vec2(px) + 17.0, pc.frame + 7);
 

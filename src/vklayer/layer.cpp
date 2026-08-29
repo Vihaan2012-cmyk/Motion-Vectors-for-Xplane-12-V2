@@ -2064,6 +2064,13 @@ static VkImage g_engineDepthImage = VK_NULL_HANDLE;
 // the same way. The oracle proved both exist and carry live data; these are
 // the taps that let the resolve ASK them questions.
 static VkImage g_sunShadowImage = VK_NULL_HANDLE;   // "csm_shadow_maps"
+// The engine's own eye-space normals, spheremap-encoded in two channels. The
+// decompiled deferred shader decodes them as
+//     d = dot(n.xy, n.xy);
+//     N = vec3(n.xy * sqrt(max(0, 1 - d*0.25)), 1 - d*0.5)
+// which is exact everywhere - unlike reconstructing from depth derivatives,
+// which has to guess at every silhouette.
+static VkImage g_gbufNormalImage = VK_NULL_HANDLE;  // "gbuf-normal"
 static VkImage g_envProbeImage  = VK_NULL_HANDLE;   // "environment_probes"
 
 // ---- THE ENGINE'S u_shadow_data, BY REFERENCE RATHER THAN BY COPY.
@@ -4314,6 +4321,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
         ++g_imageNamesVersion;
         if (img == g_engineDepthImage) g_engineDepthImage = VK_NULL_HANDLE;
         if (img == g_sunShadowImage)   g_sunShadowImage   = VK_NULL_HANDLE;
+        if (img == g_gbufNormalImage)  g_gbufNormalImage  = VK_NULL_HANDLE;
         if (img == g_envProbeImage)    g_envProbeImage    = VK_NULL_HANDLE;
         // ---- THE VIEW CACHES MUST NOT OUTLIVE THE IMAGE. A recycled image
         // handle finding a cached view of its dead predecessor is a
@@ -4325,10 +4333,10 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
             std::map<void*, DeviceData>::iterator di =
                 g_devices.find(dispatchKey(device));
             if (di != g_devices.end()) dview = di->second.destroyImageView;
-            std::map<VkImage, VkImageView> *vc[4] = {
+            std::map<VkImage, VkImageView> *vc[5] = {
                 &g_taa.flagsViews, &g_taa.edViews,
-                &g_taa.sunViews,   &g_taa.probeViews };
-            for (int c2 = 0; c2 < 4; ++c2) {
+                &g_taa.sunViews,   &g_taa.probeViews, &g_taa.normViews };
+            for (int c2 = 0; c2 < 5; ++c2) {
                 std::map<VkImage, VkImageView>::iterator fv = vc[c2]->find(img);
                 if (fv == vc[c2]->end()) continue;
                 if (fv->second == g_taa.flagsView) {
@@ -4338,6 +4346,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
                 if (fv->second == g_taa.edView)    { g_taa.edView = VK_NULL_HANDLE;    g_taa.edValid = false; }
                 if (fv->second == g_taa.sunView)   { g_taa.sunView = VK_NULL_HANDLE;   g_taa.sunValid = false; }
                 if (fv->second == g_taa.probeView) { g_taa.probeView = VK_NULL_HANDLE; g_taa.probeValid = false; }
+                if (fv->second == g_taa.normView)  { g_taa.normView = VK_NULL_HANDLE;  g_taa.normValid = false; }
                 if (fv->second && dview) dview(device, fv->second, nullptr);
                 vc[c2]->erase(fv);
             }
@@ -7156,6 +7165,16 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                                          sinfo.samples);
                         taaBindEnvProbes(tdd, pi, pinfo.format, pinfo.layers,
                                          pinfo.samples);
+                        VkImage ni = g_gbufNormalImage;
+                        OracleImgInfo ninfo;
+                        {
+                            std::lock_guard<std::mutex> g(g_lock);
+                            if (ni != VK_NULL_HANDLE && g_allImages.count(ni))
+                                ninfo = g_allImages[ni];
+                            else ni = VK_NULL_HANDLE;
+                        }
+                        taaBindNormals(tdd, ni, ninfo.format, ninfo.layers,
+                                       ninfo.samples);
                     }
                     // Lifetime ledger for the deferred-destroy protection:
                     // this engine image is now referenced by a dispatch that
@@ -17316,6 +17335,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_SetDebugUtilsObjectNameEXT(
             trace("IMG NAME: %llu namings, %zu unique so far",
                   (unsigned long long)total, seen.size());
 
+        if (nm == "gbuf-normal") {
+            if (g_gbufNormalImage != img)
+                trace("IMG NAME: gbuf-normal identified = %p - the GI gather "
+                      "can use the engine's own normals instead of "
+                      "reconstructing them from depth", (void*)img);
+            g_gbufNormalImage = img;
+        } else if (img == g_gbufNormalImage) {
+            g_gbufNormalImage = VK_NULL_HANDLE;
+        }
         if (nm == "csm_shadow_maps") {
             if (g_sunShadowImage != img)
                 trace("IMG NAME: csm_shadow_maps identified = %p", (void*)img);

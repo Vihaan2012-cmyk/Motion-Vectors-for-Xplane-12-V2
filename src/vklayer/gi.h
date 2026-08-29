@@ -85,6 +85,7 @@ struct State {
     uint32_t frame   = 0;
     uint64_t dispatches = 0;
     bool     announced  = false;
+    bool     announced2 = false;
 };
 
 inline State &state() { static State s; return s; }
@@ -110,7 +111,7 @@ struct Push {
     float   intensity;
     int32_t steps, rays, frame, flags;
 };
-enum { kGiProbes = 1, kGiReset = 2 };
+enum { kGiProbes = 1, kGiReset = 2, kGiEngine = 4 };
 
 inline void freeHistory(State &s)
 {
@@ -217,19 +218,23 @@ inline bool init(DeviceData &dd, VkDevice dev)
     smci.pCode = kGiGatherSpv;
     if (s.createSm(dev, &smci, nullptr, &s.sm) != VK_SUCCESS) return false;
 
-    VkDescriptorSetLayoutBinding b[6];
+    // 0 scene | 1 velocity | 2 depth | 3 hist read | 4 hist write |
+    // 5 probes | 6 engine normals | 7 engine u_gbuffer_data (by reference)
+    VkDescriptorSetLayoutBinding b[8];
     memset(b, 0, sizeof(b));
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 8; ++i) {
         b[i].binding = (uint32_t)i;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        b[i].descriptorType = (i == 4) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                       : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[i].descriptorType =
+            (i == 4) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE :
+            (i == 7) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                     : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     }
     VkDescriptorSetLayoutCreateInfo dl;
     memset(&dl, 0, sizeof(dl));
     dl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dl.bindingCount = 6; dl.pBindings = b;
+    dl.bindingCount = 8; dl.pBindings = b;
     if (s.createDsl(dev, &dl, nullptr, &s.dsl) != VK_SUCCESS) return false;
 
     VkPushConstantRange pr;
@@ -253,15 +258,17 @@ inline bool init(DeviceData &dd, VkDevice dev)
     if (s.createPipe(dev, VK_NULL_HANDLE, 1, &cp, nullptr, &s.pipe) != VK_SUCCESS)
         return false;
 
-    VkDescriptorPoolSize psz[2];
+    VkDescriptorPoolSize psz[3];
     psz[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    psz[0].descriptorCount = 5 * State::kSets;
+    psz[0].descriptorCount = 6 * State::kSets;
     psz[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     psz[1].descriptorCount = 1 * State::kSets;
+    psz[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    psz[2].descriptorCount = 1 * State::kSets;
     VkDescriptorPoolCreateInfo dp;
     memset(&dp, 0, sizeof(dp));
     dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dp.maxSets = State::kSets; dp.poolSizeCount = 2; dp.pPoolSizes = psz;
+    dp.maxSets = State::kSets; dp.poolSizeCount = 3; dp.pPoolSizes = psz;
     if (s.createPool(dev, &dp, nullptr, &s.pool) != VK_SUCCESS) return false;
     VkDescriptorSetLayout lays[State::kSets];
     for (uint32_t i = 0; i < State::kSets; ++i) lays[i] = s.dsl;
@@ -301,7 +308,8 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
                    VkImageView depthView, VkImageView probeView,
                    uint32_t fullW, uint32_t fullH,
                    float edA, float edB, float invProjX, float invProjY,
-                   float ySign)
+                   float ySign, VkImageView normalView,
+                   VkBuffer gbufBuf, VkDeviceSize gbufOff, VkDeviceSize gbufRange)
 {
     if (!enabled()) return;
     if (sceneView == VK_NULL_HANDLE || velView == VK_NULL_HANDLE) return;
@@ -362,10 +370,19 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     // radiance from the wrong direction - the worst failure shape there is.
     // Off by default: escaped rays return black and this degrades to ordinary
     // screen-space GI, which is correct as far as it goes.
+    // ---- THE ENGINE'S OWN GEOMETRY, WHEN BOTH HALVES ARE PRESENT.
+    //
+    // Its normals AND its screen-to-eye coefficients, or neither: the
+    // reconstruction and the normal have to describe the same space, and
+    // mixing an engine normal with our hand-rolled position would put the
+    // hemisphere and the ray in different frames.
+    const bool haveEngine = (normalView != VK_NULL_HANDLE) &&
+                            (gbufBuf != VK_NULL_HANDLE) && gbufRange >= 96;
+
     const bool haveProbes = (probeView != VK_NULL_HANDLE) &&
                             live::onoff("taa.gi_probes", "TAA_GI_PROBES", false);
 
-    VkDescriptorImageInfo ii[6];
+    VkDescriptorImageInfo ii[8];
     memset(ii, 0, sizeof(ii));
     ii[0].sampler = s.samp;     ii[0].imageView = sceneView;
     ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -384,18 +401,40 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     ii[5].imageLayout = haveProbes ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                    : VK_IMAGE_LAYOUT_GENERAL;
 
-    VkWriteDescriptorSet wr[6];
+    // Binding 6: the engine's normals, or the depth image as a legal dummy
+    // (the shader only reads it under GI_ENGINE).
+    ii[6].sampler = s.sampNear;
+    ii[6].imageView = haveEngine ? normalView : depthView;
+    ii[6].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    // Binding 7: u_gbuffer_data BY REFERENCE - the very region the engine's
+    // deferred shader reads, captured by the template scanner and frame-
+    // matched at bind time. Our own zeroed ring is not an option here because
+    // we have none; when the tap is absent the shader takes the fallback path
+    // and never touches this binding, so a dummy of the right TYPE is all it
+    // needs. There is no spare uniform buffer, so the engine's own region is
+    // bound either way and the flag decides whether it is read.
+    VkDescriptorBufferInfo gbi;
+    gbi.buffer = gbufBuf;
+    gbi.offset = gbufOff;
+    gbi.range  = gbufRange;
+
+    VkWriteDescriptorSet wr[8];
     memset(wr, 0, sizeof(wr));
-    for (int k = 0; k < 6; ++k) {
+    const int nWrites = haveEngine ? 8 : 7;
+    for (int k = 0; k < nWrites; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[k].dstSet = set;
         wr[k].dstBinding = (uint32_t)k;
         wr[k].descriptorCount = 1;
-        wr[k].pImageInfo = &ii[k];
-        wr[k].descriptorType = (k == 4) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                        : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[k].descriptorType =
+            (k == 4) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE :
+            (k == 7) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                     : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        if (k == 7) wr[k].pBufferInfo = &gbi;
+        else        wr[k].pImageInfo  = &ii[k];
     }
-    s.updSets(dev, 6, wr, 0, nullptr);
+    s.updSets(dev, (uint32_t)nWrites, wr, 0, nullptr);
 
     Push p;
     p.halfW = (int32_t)hw;   p.halfH = (int32_t)hh;
@@ -426,7 +465,8 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     p.steps     = (int32_t)live::i("taa.gi_steps", "TAA_GI_STEPS", 10);
     p.rays      = (int32_t)live::i("taa.gi_rays",  "TAA_GI_RAYS",  4);
     p.frame     = (int32_t)(s.frame & 0x3fffffff);
-    p.flags     = (haveProbes ? kGiProbes : 0) | (s.primed ? 0 : kGiReset);
+    p.flags     = (haveProbes ? kGiProbes : 0) | (s.primed ? 0 : kGiReset)
+                | (haveEngine ? kGiEngine : 0);
 
     s.bindPipe(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipe);
     s.bindSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pl, 0, 1, &set, 0, nullptr);
@@ -454,6 +494,15 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
               haveProbes ? "BOUND" : "absent",
               haveProbes ? "read the engine's environment capture"
                          : "return black - this is plain screen-space GI");
+    if (!s.announced2) {
+        s.announced2 = true;
+        trace("GI: geometry from %s.", haveEngine
+              ? "the ENGINE - gbuf-normal (spheremap) and u_gbuffer_data's own "
+                "rational reconstruction, so asymmetric frusta, the viewport "
+                "flip and jitter are all carried by its coefficients"
+              : "our fallback - depth-derivative normals and a symmetric-"
+                "frustum reconstruction; gbuf-normal or u_gbuffer_data absent");
+    }
     }
     if ((s.dispatches++ % 600) == 0)
         trace("GI: %llu dispatches", (unsigned long long)s.dispatches);
