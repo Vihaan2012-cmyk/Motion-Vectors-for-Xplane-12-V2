@@ -69,6 +69,7 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <algorithm>   // std::sort, used by the trace pruner at first open
 
 #ifndef MV_LAYER_VERSION_STRING
 #define MV_LAYER_VERSION_STRING "dev"
@@ -114,7 +115,47 @@ static void trace(const char *fmt, ...)
     std::lock_guard<std::mutex> g(g_traceLock);
     static FILE *f = nullptr;
     static uint64_t bytesOut = 0;
-    if (!f) f = fopen(path.c_str(), "a");
+    if (!f) {
+        // ---- PRUNE THE PREVIOUS SESSIONS' TRACES, ONCE, BEFORE OPENING.
+        //
+        // The per-PID filename that stops the crash reporter interleaving its
+        // output also means every launch leaves a new file behind, and
+        // rotation only bounds the CURRENT one. A user reported 31 GB of
+        // %TEMP%, 21 GB of which was a single pre-rotation trace with the
+        // other 3 GB spread across a dozen dead sessions. Rotation alone
+        // would not have prevented the accumulation.
+        //
+        // Keeps the four newest by write time - enough to compare a crash
+        // against the runs around it - and deletes the rest.
+        const char *td = getenv("TEMP");
+        if (td) {
+            // Escaped twice on purpose. Written once as "\taa_layer_*.txt" this
+            // compiles to a TAB followed by "aa_layer_*.txt", so
+            // FindFirstFile matched nothing and the pruner silently did
+            // nothing - indistinguishable from working. Found only
+            // because a %TEMP% had grown to 31 GB.
+            std::string pat = std::string(td) + "\\taa_layer_*.txt";
+            std::vector<std::pair<uint64_t, std::string> > found;
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    const uint64_t t =
+                        ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) |
+                         fd.ftLastWriteTime.dwLowDateTime;
+                    found.push_back(std::make_pair(
+                        t, std::string(td) + "\\" + fd.cFileName));
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+            std::sort(found.begin(), found.end());
+            for (size_t i = 0; i + 4 < found.size(); ++i) {
+                remove(found[i].second.c_str());
+                remove((found[i].second + ".old").c_str());
+            }
+        }
+        f = fopen(path.c_str(), "a");
+    }
     if (!f) return;
     // ---- ROTATION. One diagnostic session produced a 581 MB trace, which
     // makes every grep of it cost seconds and eventually fills the disk. At
