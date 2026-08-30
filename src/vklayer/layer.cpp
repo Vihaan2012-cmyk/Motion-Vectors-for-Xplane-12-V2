@@ -2898,8 +2898,15 @@ static uint32_t g_sceneEndsLastFrame   = 0;
 // Candidate HDR passes seen so far this frame, and how many the LAST frame had.
 // The resolve has to run on the final one - see the block that increments this
 // - and the final one is only identifiable in arrears.
-static uint32_t g_hdrPassesThisFrame   = 0;
-static uint32_t g_hdrPassesLastFrame   = 0;
+// Atomic: the ++ lives in Layer_CmdEndRendering, which X-Plane calls from
+// several recording threads, and hdrIdx - the value that decides WHICH pass
+// the resolve runs on - is derived from it. As a plain int, two threads
+// recording qualifying passes concurrently could take the same index or skip
+// one, and "the resolve picked a different pass this frame" is precisely the
+// alternation this file has spent a week hunting. LastFrame is written once
+// per present and read from the hook, so it rides along.
+static std::atomic<uint32_t> g_hdrPassesThisFrame(0);
+static std::atomic<uint32_t> g_hdrPassesLastFrame(0);
 // How far down the resolve gate chain the frame got, as a high-water mark:
 //   0 no candidate lit pass matched at all (pass identification is the fault)
 //   1 candidate lit pass seen        2 entered resolve body (fresh bind, no dump)
@@ -7405,7 +7412,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // onward does. That is one frame without TAA at startup, which
                 // is invisible and strictly better than a frame resolved into
                 // the wrong pass.
-                const uint32_t hdrIdx = ++g_hdrPassesThisFrame;
+                const uint32_t hdrIdx =
+                    g_hdrPassesThisFrame.fetch_add(1, std::memory_order_relaxed) + 1;
                 // MODULO, not equality: X-Plane records ahead, so one present
                 // interval often carries TWO frames' passes (hdr=6 then hdr=0
                 // the next interval - the TAA MISS census measured it). With
@@ -7452,7 +7460,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 } else {
                     // ---- A FALLING HDR-PASS COUNT MUST NOT DROP THE FRAME.
                     //
-                    // The gate was hdrIdx % g_hdrPassesLastFrame == 0: resolve at
+                    // The gate was hdrIdx % g_hdrPassesLastFrame.load(std::memory_order_relaxed) == 0: resolve at
                     // a multiple of the PREVIOUS frame's count. That is exact, and
                     // the count is not stable - changing aircraft or location adds
                     // and removes cockpit-display passes, so the HDR count swings
@@ -7469,10 +7477,10 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     // composites miss AA for a frame or two while the floor rises,
                     // which is invisible next to losing AA outright.
                     static uint32_t hdrFloor = 0;
-                    if (g_hdrPassesLastFrame == 0) break;
-                    if (hdrFloor == 0 || g_hdrPassesLastFrame < hdrFloor)
-                        hdrFloor = g_hdrPassesLastFrame;
-                    else if (g_hdrPassesLastFrame > hdrFloor)
+                    if (g_hdrPassesLastFrame.load(std::memory_order_relaxed) == 0) break;
+                    if (hdrFloor == 0 || g_hdrPassesLastFrame.load(std::memory_order_relaxed) < hdrFloor)
+                        hdrFloor = g_hdrPassesLastFrame.load(std::memory_order_relaxed);
+                    else if (g_hdrPassesLastFrame.load(std::memory_order_relaxed) > hdrFloor)
                         ++hdrFloor;
                     if (hdrIdx < hdrFloor)
                         break;
@@ -7482,7 +7490,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                               "every frame split history between two images - "
                               "the whole-scene wobble.",
                               (void*)passInfo.color0, hdrIdx,
-                              g_hdrPassesLastFrame);
+                              g_hdrPassesLastFrame.load(std::memory_order_relaxed));
                     latchTarget = passInfo.color0;
                     latchSeen   = g_frameCount;
                 }
@@ -7498,7 +7506,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                               "target (benign, history still carries) or the "
                               "pick is drifting between two different passes",
                               (void*)passInfo.color0, hdrIdx,
-                              g_hdrPassesLastFrame, g_sceneEndsThisFrame,
+                              g_hdrPassesLastFrame.load(std::memory_order_relaxed), g_sceneEndsThisFrame,
                               (int)g_mvBindsThisFrame);
                     }
                 }
@@ -8318,7 +8326,7 @@ static void mvFullReport(const char *why, uint64_t frames)
           (unsigned long long)g_taa.dispatches,
           (unsigned long long)g_taa.sceneViews.size());
     trace("   HDR candidate passes: %u this frame, %u last frame (the resolve "
-          "runs on the LAST one)", g_hdrPassesThisFrame, g_hdrPassesLastFrame);
+          "runs on the LAST one)", g_hdrPassesThisFrame.load(std::memory_order_relaxed), g_hdrPassesLastFrame.load(std::memory_order_relaxed));
     trace("   wrote into %p this frame", (void*)g_taaWroteImageThisFrame);
     {
         temporal::BackendInfo bi = g_taaBackend.info();
@@ -10823,17 +10831,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // frames' worth of recording: an empty interval keeps the known count, a
     // clean multiple of it (two frames batched) keeps the PER-FRAME value,
     // and only a genuinely new structure replaces it.
-    if (g_hdrPassesThisFrame) {
-        if (g_hdrPassesLastFrame == 0 ||
-            (g_hdrPassesThisFrame % g_hdrPassesLastFrame) != 0) {
-            if (g_hdrPassesLastFrame)
+    const uint32_t hdrThis = g_hdrPassesThisFrame.load(std::memory_order_relaxed);
+    const uint32_t hdrLast = g_hdrPassesLastFrame.load(std::memory_order_relaxed);
+    if (hdrThis) {
+        if (hdrLast == 0 || (hdrThis % hdrLast) != 0) {
+            if (hdrLast)
                 trace("TAA: HDR candidate passes %u -> %u per interval - pass "
                       "structure changed; the modulo boundary follows it.",
-                      g_hdrPassesLastFrame, g_hdrPassesThisFrame);
-            g_hdrPassesLastFrame = g_hdrPassesThisFrame;
+                      hdrLast, hdrThis);
+            g_hdrPassesLastFrame.store(hdrThis, std::memory_order_relaxed);
         }
     }
-    g_hdrPassesThisFrame   = 0;
+    g_hdrPassesThisFrame.store(0, std::memory_order_relaxed);
     // Name the stage every MISSED frame died at - the 54% duty question.
     if (taaEnabled() && g_mv.ready && !g_taaResolvedThisFrame) {
         static uint64_t missLog = 0;
@@ -10841,7 +10850,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             trace("TAA MISS: frame ended unresolved at gateDepth=%u "
                   "(hdr=%u/%u ends=%u/%u)",
                   g_gateDepthThisFrame.load(),
-                  g_hdrPassesThisFrame, g_hdrPassesLastFrame,
+                  g_hdrPassesThisFrame.load(std::memory_order_relaxed), g_hdrPassesLastFrame.load(std::memory_order_relaxed),
                   g_sceneEndsThisFrame, g_sceneEndsLastFrame);
     }
     g_gateDepthLastFrame.store(g_gateDepthThisFrame.load());
@@ -11292,7 +11301,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             // --- resolve: how far the gate got, and how many ran
             trace("SUITE RESOLVE: gateDepthLast=%u hdrPassesLast=%u "
                   "mvBindsMax=%u resolvedThisFrame=%d",
-                  g_gateDepthLastFrame.load(), g_hdrPassesLastFrame,
+                  g_gateDepthLastFrame.load(), g_hdrPassesLastFrame.load(std::memory_order_relaxed),
                   g_mvBindsMax, g_taaResolvedThisFrame ? 1 : 0);
             // --- injection: what fraction of geometry carries vectors
             trace("SUITE INJECT: pipeBinds=%llu redundant=%llu dsBinds=%llu "
@@ -13787,12 +13796,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 // and knowing WHICH module defeats the injector is the whole
                 // difference between "895 failures" and a fixable list.
                 if (!vertPatched && !fragPatched) {
+                    // X-Plane creates pipelines from many threads at once,
+                    // and every other novelty set in this function mutates
+                    // under g_lock; this one did not. A concurrent insert into
+                    // a std::set is tree corruption, not a stale log line. The
+                    // membership test moves under the lock; the trace stays
+                    // outside it, per the convention.
                     static std::set<VkShaderModule> named;
                     for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
                         VkShaderModule m = ci[i].pStages[s].module;
-                        if (m == VK_NULL_HANDLE || named.count(m)) continue;
-                        if (named.size() >= 64) break;
-                        named.insert(m);
+                        if (m == VK_NULL_HANDLE) continue;
+                        bool isNew = false;
+                        {
+                            std::lock_guard<std::mutex> lg(g_lock);
+                            if (named.size() < 64 && !named.count(m)) {
+                                named.insert(m);
+                                isNew = true;
+                            }
+                        }
+                        if (!isNew) continue;
                         trace("MV UNPATCHABLE MODULE %p stage 0x%x - this "
                               "pipeline draws geometry with neither jitter nor "
                               "velocity; the shader idiom here is what the "
