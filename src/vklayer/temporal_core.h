@@ -137,6 +137,21 @@ inline bool usable(const Frame &f, const char **whyNot = 0)
     else if (!f.renderW || !f.renderH) why = "render size is zero";
     else if (!f.outW || !f.outH)      why = "output size is zero";
     else if (f.frameTimeMs <= 0.0f)   why = "frame time is not positive";
+    // ---- THE CAMERA, WHICH THE FIRST VERSION DID NOT CHECK.
+    //
+    // fovYRad, nearPlane and farPlane come from the share block. If the plugin
+    // has not published yet they are all zero, and a zero FOV is worse than a
+    // missing one: every field an upscaler needs is present and plausible, so
+    // it dispatches and reconstructs its history against a camera with no
+    // aperture. That is wrong output rather than no output, which is the
+    // harder of the two to notice and the harder to attribute.
+    //
+    // farPlane is deliberately NOT required - an infinite-far projection makes
+    // it meaningless, which is why depthInfiniteFar is a flag.
+    else if (f.fovYRad <= 0.0f)       why = "field of view is zero - the share block has not published";
+    else if (f.nearPlane <= 0.0f)     why = "near plane is zero";
+    else if (!f.depthInfiniteFar && f.farPlane <= f.nearPlane)
+                                      why = "far plane is not beyond the near plane";
     if (whyNot) *whyNot = why;
     return why == 0;
 }
