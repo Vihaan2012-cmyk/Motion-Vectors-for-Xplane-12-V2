@@ -18,9 +18,28 @@ sim's own vertex and fragment shaders as they compile, so every drawn pixel
 reports where it was in the previous frame. A compute pass then accumulates
 detail across frames using that field.
 
-Also included is a VRAM manager — budget shaping, memory priorities, upload
-pacing and a recycle pool — which exists because X-Plane has those mechanisms
-and does not use them well under pressure.
+The velocity field, once it exists, pays for itself several times over. Built
+on top of it, all optional and all tunable live:
+
+- **TAA** — the resolve itself: jittered accumulation, variance clamp,
+  per-pixel motion-scaled blend, sharpening.
+- **SSGI** — screen-space bounce light, gathered half-res with its own
+  temporal history, using the engine's own G-buffer normals and depth
+  coefficients rather than reconstructions of them.
+- **Ambient occlusion and contact shadows** — near-field shading the sim's
+  cascades cannot resolve, cosine-weighted and ramped so thresholds never
+  show as speckle.
+- **TAAU** — temporal upsampling: render low, accumulate detail at output
+  resolution.
+- **FSR3 upscaling and frame generation** — through a temporal core that
+  hands every backend the same frame description in its own units, so a sign
+  convention exists in exactly one file.
+- **A VRAM manager** — budget shaping, memory priorities and upload pacing,
+  because X-Plane has those mechanisms and does not use them well under
+  pressure.
+
+The per-feature switchboard is `isolate.ps1`: one preset per feature, applied
+live (~15 frames), each stating what a pass and a failure look like.
 
 Correctness is measured, not judged by eye. The velocity field is checked
 against real image flow by normalised cross-correlation, which shares no

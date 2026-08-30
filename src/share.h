@@ -79,7 +79,13 @@
 #include <math.h>
 
 #define TAA_MAGIC       0x4D414154u            // 'TAAM'
-#define TAA_VERSION     7      // 7: VRAM system state (zone, shaped budget, ...)
+#define TAA_VERSION     8      // 8: writeSeq - the two-phase publish seqlock.
+                                 //    A version-7 reader would still map this
+                                 //    block (the field is appended), but it
+                                 //    would not honour odd-means-mid-write; the
+                                 //    bump is what makes that mismatch visible
+                                 //    in a log instead of a mystery.
+                                 // 7: VRAM system state (zone, shaped budget, ...)
 
 // Which temporal backend to run. All of them consume the SAME inputs - velocity
 // buffer, jitter sequence, insertion point - which is the whole reason the

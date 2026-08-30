@@ -64,7 +64,12 @@
 #include <vector>
 #include <cmath>
 
-#define TAA_PLUGIN_VERSION "0.2.0"
+// The build stamps MV_VERSION from the VERSION file; this alias exists only
+// for the handful of old call sites. It said "0.2.0" for about a year.
+#ifndef MV_VERSION
+#define MV_VERSION "0.0.0-unversioned"
+#endif
+#define TAA_PLUGIN_VERSION MV_VERSION
 
 static std::string g_configPath;
 

@@ -81,7 +81,10 @@ local C_LOG       = 0x6A101010   -- log box, translucent like the panel
 
 -- Version the panel reports, and the newest X-Plane this build has been tested
 -- against. No network check: bump this constant per release.
-local MOD_VERSION      = "1.1.5"
+-- Stamped by build.ps1 at install time from the VERSION file - the same
+-- source the plugin, the layer banner and the Qt launcher use. The literal
+-- below is only what ships if someone copies this file by hand.
+local MOD_VERSION      = "@MV_VERSION@"
 
 -- ---- BUG REPORT DISCORD WEBHOOK.
 --

@@ -45,8 +45,8 @@ $presets = [ordered]@{
                   look = "Dark fringing beside bright edges = unsharp ringing, not an occlusion march." }
 
   "gi"       = @{ v = @{ "taa.enable"="1"; "taa.ao"="0.0"; "taa.contact"="0.0"; "taa.sharpen"="0.0"; "taa.gi"="1" }
-                  why = "SSGI. HAS NEVER RUN - first launch of this code path."
-                  look = "Expect wrong before pretty. Trace says 'GI: geometry from the ENGINE' or the fallback; the fallback is a worse image and says so." }
+                  why = "SSGI. First flight 2026-08-30: looks good. Still the newest path here."
+                  look = "Trace must say 'GI: geometry from the ENGINE' - the fallback is a visibly worse image and says so. Watch disocclusions for popping (the history reject ramp is tuned by taa.gi_reject)." }
 
   "taau"     = @{ v = @{ "taa.enable"="1"; "taa.taau"="1"; "taa.ao"="0.0"; "taa.contact"="0.0"; "taa.gi"="0" }
                   why = "Temporal upsampling. ALSO NEVER RUN."

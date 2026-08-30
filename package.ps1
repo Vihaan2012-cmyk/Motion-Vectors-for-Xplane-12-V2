@@ -117,7 +117,12 @@ Copy-Item "$root\build\MotionVectors.xpl" "$stage\Resources\plugins\MotionVector
 # The panel is a FlyWithLua script. Shipped, but optional - the mod runs without
 # it; it only provides the in-sim controls.
 if (Test-Path "$root\lua\MotionVectors.lua") {
-    Copy-Item "$root\lua\MotionVectors.lua" "$stage\Resources\plugins\FlyWithLua\Scripts\"
+    # Stamped, not copied. The source carries the @MV_VERSION@ placeholder that
+    # build.ps1 fills at install; a raw copy here would SHIP the placeholder,
+    # which is the same packaging-list class of fault that once shipped a zip
+    # without the Qt app. Same VERSION file as everything else.
+    (Get-Content "$root\lua\MotionVectors.lua" -Raw).Replace("@MV_VERSION@", $ver) |
+        Set-Content "$stage\Resources\plugins\FlyWithLua\Scripts\MotionVectors.lua" -Encoding utf8 -NoNewline
 }
 
 # The tuned settings, shipped as the live file. It sits beside the launcher,

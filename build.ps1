@@ -715,8 +715,12 @@ Copy-Item "$out\MotionVectors.xpl" (Join-Path $dst "win.xpl") -Force
 # "installed" cannot drift apart again.
 $luaDst = Join-Path $xp "Resources\plugins\FlyWithLua\Scripts"
 if (Test-Path $luaDst) {
-    Copy-Item "$root\lua\MotionVectors.lua" (Join-Path $luaDst "MotionVectors.lua") -Force
-    Write-Host "  panel -> FlyWithLua\Scripts\MotionVectors.lua"
+    # The panel shows its version in the UI and in bug-report dumps; it was a
+    # hardcoded literal and read "1.1.5" for the whole of 1.2.0-dev. Stamp it
+    # from the same VERSION file as every other component.
+    (Get-Content "$root\lua\MotionVectors.lua" -Raw).Replace("@MV_VERSION@", $mvVersion) |
+        Set-Content (Join-Path $luaDst "MotionVectors.lua") -Encoding utf8 -NoNewline
+    Write-Host "  panel -> FlyWithLua\Scripts\MotionVectors.lua ($mvVersion)"
 } else {
     Write-Host "  FlyWithLua Scripts folder not found - panel NOT installed" -ForegroundColor Yellow
 }

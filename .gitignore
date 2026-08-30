@@ -38,3 +38,6 @@ third_party/
 third_party/FidelityFX-SDK/
 build/
 dist/
+# Validation-run droppings, but NOT the settings file the val launcher needs.
+gpuav_lite/loader.txt*
+gpuav_lite/val_log.txt*
