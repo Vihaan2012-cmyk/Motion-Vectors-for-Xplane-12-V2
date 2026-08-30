@@ -1278,7 +1278,23 @@ static void taaBindEngineDepth(DeviceData &dd, VkImage image, VkFormat fmt,
 // Called immediately before the real vkDestroyImage on BOTH paths - the direct
 // one and the four-present deferred one - so the view dies with its image and
 // never before it, which is the ordering the in-flight protection exists for.
-static void taaForgetImageViews(DeviceData &dd, VkImage image)
+// ---- DETACH ONLY. THE DESTROY HAPPENS ELSEWHERE, LATER, AND UNLOCKED.
+//
+// The first version of this destroyed each view the moment its image was
+// destroyed, inline, while holding g_lock. Two faults, and a resolution change
+// hits both at once because it destroys many images in one burst:
+//
+//   - A view still referenced by an in-flight descriptor set was freed out
+//     from under the GPU. The four-present deferral protects the IMAGE for
+//     exactly this reason; the view had no such guard on the immediate path.
+//   - It called down the dispatch chain (dd.destroyImageView) with g_lock
+//     held, which the stability sweep established this lock must never do.
+//
+// So this now only unhooks the bookkeeping and HANDS BACK the views. The
+// caller is responsible for destroying them at a safe point - which, because
+// Vulkan requires a view to die BEFORE its image, means the image has to be
+// deferred alongside them rather than the view deferred alone.
+static void taaDetachImageViews(VkImage image, std::vector<VkImageView> &out)
 {
     if (image == VK_NULL_HANDLE || g_taa.device == VK_NULL_HANDLE) return;
     std::map<VkImage, VkImageView> *caches[6] = {
@@ -1290,6 +1306,7 @@ static void taaForgetImageViews(DeviceData &dd, VkImage image)
         const VkImageView v = it->second;
         caches[ci]->erase(it);
         if (v == VK_NULL_HANDLE) continue;
+        out.push_back(v);
         // Clear the LIVE selection too, or the next resolve binds the handle we
         // are about to destroy.
         if (g_taa.edView    == v) { g_taa.edView    = VK_NULL_HANDLE; g_taa.edValid    = false; }
@@ -1298,7 +1315,6 @@ static void taaForgetImageViews(DeviceData &dd, VkImage image)
         if (g_taa.normView  == v) { g_taa.normView  = VK_NULL_HANDLE; g_taa.normValid  = false; }
         if (g_taa.flagsView == v) { g_taa.flagsView = VK_NULL_HANDLE; g_taa.flagsValid = false; }
         if (g_taa.sceneView == v)   g_taa.sceneView = VK_NULL_HANDLE;
-        if (dd.destroyImageView) dd.destroyImageView(g_taa.device, v, nullptr);
     }
 }
 
@@ -1971,6 +1987,14 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     wrn.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wrn.pImageInfo = &nii;
 
+    // Ledger: these are the views a submitted command buffer will reference
+    // until it drains. Recorded here, at the only place they enter a
+    // descriptor set, so "last bound" means what it says.
+    viewLedgerNoteBind(ii[0].imageView,  g_taa.sceneImage);
+    viewLedgerNoteBind(ii[5].imageView,  VK_NULL_HANDLE);
+    viewLedgerNoteBind(ii[7].imageView,  VK_NULL_HANDLE);
+    viewLedgerNoteBind(nii.imageView,    VK_NULL_HANDLE);
+
     VkWriteDescriptorSet wrAll[13];
     for (int k = 0; k < 8; ++k) wrAll[k] = wr[k];
     wrAll[8] = wru; wrAll[9] = wrs; wrAll[10] = wrg; wrAll[11] = wrgi;
@@ -2284,7 +2308,25 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         rb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         rb.subresourceRange.levelCount = 1;
         rb.subresourceRange.layerCount = g_taa.layers;
-        rb.image = g_taa.history[hw_];
+        // ---- THE IMAGE THAT WAS ACTUALLY DELIVERED, NOT THE HISTORY.
+        //
+        // This probe compares "what we sent" against "what is in the scene
+        // target" and reports a mismatch as delivery failing. It read
+        // history[hw_] - but with sharpening on, the copy-back sends
+        // g_taa.sharpImage instead, exactly as the note at copySrc says it
+        // does. So the comparison was unsharpened-history against a
+        // sharpened-scene, and the two differ BY THE SHARPENING.
+        //
+        // Sharpening is on by default, so this instrument has been reporting a
+        // delivery failure that never happened - measured at 1839/2048 halves
+        // differing, mean delta 1113. It cost real debugging time: the message
+        // states outright that a difference means the copy is not reaching the
+        // display, and that conclusion was false every time it was read.
+        //
+        // Same expression as copySrc so the two cannot drift apart again.
+        const VkImage probeSrc = doSharpen ? g_taa.sharpImage
+                                           : g_taa.history[hw_];
+        rb.image = probeSrc;
         rb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         rb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         rb.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2304,7 +2346,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         bic.imageExtent.width  = g_taa.w < 512 ? g_taa.w : 512;
         bic.imageExtent.height = 1;
         bic.imageExtent.depth  = 1;
-        dd.cmdCopyImageToBuffer(cb, g_taa.history[hw_],
+        dd.cmdCopyImageToBuffer(cb, probeSrc,
                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 g_taa.readBuf, 1, &bic);
         // ---- AND THE SAME STRIP OF THE SCENE TARGET, RIGHT AFTER THE COPY.

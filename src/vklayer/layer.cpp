@@ -1048,6 +1048,222 @@ static void armSpirvInject()
 // Frames presented. Incremented in vkQueuePresentKHR and read wherever "how
 // long has this been true" is the question - currently the FSR2 idle timeout.
 static uint64_t g_frameCount = 0;
+
+// ============================================================================
+// ---- THE VIEW LIFETIME LEDGER.
+//
+// Built to answer one question with evidence instead of suspicion: when we
+// destroy a VkImageView, was anything still using it?
+//
+// A use-after-free on a view is invisible from inside the layer. There is no
+// Vulkan error - the driver reads a freed descriptor and the process dies
+// somewhere unrelated, with no VK_ERROR and nothing in the trace, which is
+// exactly the shape of the crash this was written for. So the layer has to
+// record enough to convict or acquit itself.
+//
+// Three facts per view: when the resolve last put it in a descriptor set,
+// when it was detached from our caches, and when it was actually destroyed.
+// The verdict is the gap between the first and the last. Anything destroyed
+// within kDangerFrames of its last bind was potentially still referenced by a
+// submitted command buffer, and that is reported LOUDLY with the numbers
+// rather than as a judgement.
+// ============================================================================
+struct ViewLife {
+    VkImage  img       = VK_NULL_HANDLE;
+    uint64_t firstSeen = 0;
+    uint64_t lastBound = 0;    // frame it was last written into a descriptor set
+    uint64_t binds     = 0;
+    uint64_t retired   = 0;    // frame it left our caches
+    uint64_t due       = 0;    // frame it was scheduled to die
+};
+static std::map<VkImageView, ViewLife> g_viewLedger;
+static std::mutex                      g_viewLedgerLock;
+static uint64_t g_viewDestroys   = 0;
+static uint64_t g_viewUnsafe     = 0;   // destroyed inside the danger window
+static uint64_t g_viewNeverBound = 0;
+
+// Four presents is the same window the image deferral uses, for the same
+// reason: it is how long a submitted command buffer may still be executing.
+static const uint64_t kViewDangerFrames = 4;
+
+static void viewLedgerNoteBind(VkImageView v, VkImage img)
+{
+    if (v == VK_NULL_HANDLE) return;
+    std::lock_guard<std::mutex> g(g_viewLedgerLock);
+    ViewLife &L = g_viewLedger[v];
+    if (!L.firstSeen) { L.firstSeen = g_frameCount; L.img = img; }
+    L.lastBound = g_frameCount;
+    ++L.binds;
+}
+
+static void viewLedgerRetire(const std::vector<VkImageView> &vs, VkImage img,
+                             uint64_t due)
+{
+    std::lock_guard<std::mutex> g(g_viewLedgerLock);
+    for (size_t i = 0; i < vs.size(); ++i) {
+        if (vs[i] == VK_NULL_HANDLE) continue;
+        ViewLife &L = g_viewLedger[vs[i]];
+        if (!L.firstSeen) { L.firstSeen = g_frameCount; L.img = img; }
+        L.retired = g_frameCount;
+        L.due     = due;
+    }
+}
+
+// Called immediately before vkDestroyImageView, with the lock NOT held.
+static void viewLedgerNoteDestroy(VkImageView v, VkImage img)
+{
+    if (v == VK_NULL_HANDLE) return;
+    ViewLife L;
+    bool known = false;
+    {
+        std::lock_guard<std::mutex> g(g_viewLedgerLock);
+        std::map<VkImageView, ViewLife>::iterator it = g_viewLedger.find(v);
+        if (it != g_viewLedger.end()) { L = it->second; known = true;
+                                        g_viewLedger.erase(it); }
+        ++g_viewDestroys;
+        if (!known || !L.binds) ++g_viewNeverBound;
+    }
+    if (!known || !L.binds) return;          // never in a descriptor set: safe
+
+    const uint64_t since = g_frameCount - L.lastBound;
+    if (since <= kViewDangerFrames) {
+        std::lock_guard<std::mutex> g(g_viewLedgerLock);
+        ++g_viewUnsafe;
+    }
+    // Reported for every destroy of a view that was ever bound, because the
+    // safe ones are the control group - "0 unsafe out of 40" is the acquittal
+    // and it is worth as much as the conviction.
+    trace("VIEW KILL: %p (of image %p) destroyed on frame %llu. Last bound "
+          "frame %llu (%llu ago, %llu binds), retired %llu, due %llu. %s",
+          (void*)v, (void*)img, (unsigned long long)g_frameCount,
+          (unsigned long long)L.lastBound, (unsigned long long)since,
+          (unsigned long long)L.binds, (unsigned long long)L.retired,
+          (unsigned long long)L.due,
+          since <= kViewDangerFrames
+            ? "*** INSIDE THE DANGER WINDOW - a submitted command buffer may "
+              "still reference this view. THIS is the use-after-free. ***"
+            : "outside the danger window - drained, safe");
+}
+
+// ---- HOW OFTEN IS THE RESOLVE ACTUALLY SKIPPED?
+//
+// g_taaQuiesce is armed with 3 whenever an image the resolve had bound is
+// destroyed, and while it is set the dispatch is skipped and stale history
+// shipped instead. The code that does it says plainly what that looks like:
+// "a raw frame between resolved ones is the alternation the history/composited
+// split measured".
+//
+// So the mechanism for a resolved/raw alternation is present BY DESIGN, and
+// nothing has ever counted how often it fires. Frames skipped versus frames
+// resolved is the whole question - an occasional quiesce is the safety it was
+// built to be, and a quiesce on a third of frames is a flicker with a
+// respectable name.
+static uint64_t g_quiesceArmed   = 0;   // times it was set
+static uint64_t g_quiesceSkips   = 0;   // frames the resolve was skipped
+static uint64_t g_resolveFrames  = 0;   // frames it actually ran
+
+// ---- IS THE RESOLVE LEARNING ANYTHING THIS FRAME?
+//
+// Temporal accumulation only gains information when the frame differs from the
+// last one in a way the resolve can use. Two inputs decide that:
+//
+//   the reprojection matrix - where last frame's pixel is now
+//   the jitter offset       - where inside the pixel we are sampling
+//
+// If BOTH are bit-identical to the previous frame, the resolve is handed the
+// same problem it just solved. It re-derives the same answer, history does not
+// move, and the frame contributes nothing - the pixel is no better antialiased
+// for having been rendered. A run of those is indistinguishable from TAA being
+// switched off, which is what "shimmering and aliased" looks like.
+//
+// Two existing instruments already hint at this from opposite ends - the
+// plugin counts 189/3000 presents with no flight loop, and the history
+// readback counts 326/4201 frames whose history did not change - but nothing
+// has ever joined them. These counters are exact and taken at the present
+// tick, so there is no readback delay to reason around.
+//
+// The number that matters is the JOINT one: frames where nothing could have
+// been learned. An occasional one is scheduling noise; a steady few percent is
+// accumulation quietly running at less than the frame rate.
+static uint64_t g_accFrames      = 0;
+static uint64_t g_accReprojSame  = 0;
+static uint64_t g_accJitterSame  = 0;
+static uint64_t g_accBothSame    = 0;   // could not have learned anything
+static uint64_t g_accRunNow      = 0;
+static uint64_t g_accRunWorst    = 0;
+
+static void accumTick(float jx, float jy)
+{
+    static float    lastReproj[16] = { 0 };
+    static float    lastJx = 0.0f, lastJy = 0.0f;
+    static bool     have = false;
+
+    const bool rSame = have && memcmp(lastReproj, g_taaReproj,
+                                      sizeof(lastReproj)) == 0;
+    const bool jSame = have && lastJx == jx && lastJy == jy;
+    if (have) {
+        ++g_accFrames;
+        if (rSame) ++g_accReprojSame;
+        if (jSame) ++g_accJitterSame;
+        if (rSame && jSame) {
+            ++g_accBothSame;
+            if (++g_accRunNow > g_accRunWorst) g_accRunWorst = g_accRunNow;
+        } else {
+            g_accRunNow = 0;
+        }
+    }
+    memcpy(lastReproj, g_taaReproj, sizeof(lastReproj));
+    lastJx = jx;
+    lastJy = jy;
+    have = true;
+}
+
+static void accumReport()
+{
+    if (!g_accFrames) return;
+    const double pc = 100.0 / (double)g_accFrames;
+    trace("ACCUM LEDGER: %llu frames | reprojection unchanged %llu (%.1f%%) | "
+          "jitter unchanged %llu (%.1f%%) | BOTH unchanged %llu (%.1f%%) - "
+          "those frames could not have accumulated anything, longest "
+          "consecutive run %llu. Jitter unchanged alone is the more damning "
+          "of the two: the sequence is supposed to advance every frame, and a "
+          "repeated offset means the same sub-pixel position was sampled "
+          "twice, which is the one thing temporal antialiasing cannot afford.",
+          (unsigned long long)g_accFrames,
+          (unsigned long long)g_accReprojSame, g_accReprojSame * pc,
+          (unsigned long long)g_accJitterSame, g_accJitterSame * pc,
+          (unsigned long long)g_accBothSame,   g_accBothSame * pc,
+          (unsigned long long)g_accRunWorst);
+}
+
+static void quiesceReport()
+{
+    const uint64_t tot = g_quiesceSkips + g_resolveFrames;
+    trace("QUIESCE LEDGER: armed %llu time(s) | resolve SKIPPED on %llu frame(s)"
+          " | resolve RAN on %llu | %.1f%% of frames shipped raw history. Each "
+          "arming costs 3 frames, so armed*3 should account for the skips; a "
+          "skip rate above a few percent IS the resolved/raw alternation, not "
+          "a safety margin.",
+          (unsigned long long)g_quiesceArmed,
+          (unsigned long long)g_quiesceSkips,
+          (unsigned long long)g_resolveFrames,
+          tot ? (100.0 * (double)g_quiesceSkips / (double)tot) : 0.0);
+}
+
+static void viewLedgerReport()
+{
+    std::lock_guard<std::mutex> g(g_viewLedgerLock);
+    trace("VIEW LEDGER: %llu view destroys so far - %llu were never bound "
+          "(always safe), %llu were destroyed INSIDE the %llu-frame danger "
+          "window. %llu views currently live in the ledger. A non-zero unsafe "
+          "count is the crash; a zero one clears the view path and the fault "
+          "is elsewhere.",
+          (unsigned long long)g_viewDestroys,
+          (unsigned long long)g_viewNeverBound,
+          (unsigned long long)g_viewUnsafe,
+          (unsigned long long)kViewDangerFrames,
+          (unsigned long long)g_viewLedger.size());
+}
 // Which frame FSR2 last wrote its output on. The present blit needs to know
 // the image it is about to copy was produced now, not several seconds ago.
 static uint64_t g_fsr2LastDispatchFrame = 0;
@@ -2087,12 +2303,57 @@ static std::vector<VkSwapchainKHR> g_fgRetired;
 // Bounded on purpose. If a handle were ever recorded and never destroyed, an
 // unrelated driver swapchain landing on that address later would have its
 // destroy swallowed and leak. In practice the list holds at most one entry.
+// ---- THE PROXY LIFECYCLE LEDGER.
+//
+// The CTD fix rests on a claim that has never been observed running: that
+// X-Plane destroys the proxy handle it handed back as oldSwapchain, and that
+// swallowing exactly one destroy per retired handle is correct even when the
+// allocator hands the next proxy the SAME address.
+//
+// That second half is the part worth proving. It was reasoned about, not
+// measured - "we free one FFX object and immediately allocate another of the
+// same size, so the same address back is likely, not exotic". If it never
+// actually collides, the fix is still correct but for a simpler reason; if it
+// does collide, this is the only instrument that would ever say so, because a
+// collision looks like a perfectly ordinary destroy from every other angle.
+static uint64_t g_fgProxiesBuilt   = 0;
+static uint64_t g_fgRetiredCount   = 0;
+static uint64_t g_fgSwallowed      = 0;   // destroys correctly absorbed
+static uint64_t g_fgForwarded      = 0;   // proxy destroys sent to FFX
+static uint64_t g_fgAddrCollisions = 0;   // a new proxy reusing a retired address
+static uint64_t g_fgUnclaimed      = 0;   // retired handles X-Plane never destroyed
+
 static void fgRetire(VkSwapchainKHR h)
 {
     if (h == VK_NULL_HANDLE) return;
+    ++g_fgRetiredCount;
     g_fgRetired.push_back(h);
-    if (g_fgRetired.size() > 4)
+    if (g_fgRetired.size() > 4) {
+        // Evicted without ever being claimed: X-Plane did not destroy it, so
+        // the premise of the whole fix does not hold for this handle.
+        ++g_fgUnclaimed;
+        trace("FG LEDGER: retired handle %p evicted UNCLAIMED - X-Plane never "
+              "destroyed it. The swallow only works if every retired handle is "
+              "eventually handed back; this one was not.",
+              (void*)g_fgRetired.front());
         g_fgRetired.erase(g_fgRetired.begin());
+    }
+}
+
+static void fgLedgerReport()
+{
+    trace("FG LEDGER: proxies built %llu | handles retired %llu | destroys "
+          "swallowed %llu | destroys forwarded to FFX %llu | ADDRESS "
+          "COLLISIONS %llu | retired-but-never-destroyed %llu | live retired "
+          "%u. Collisions > 0 proves the reuse the fix was written for; 0 "
+          "means the fix is right for a simpler reason than assumed.",
+          (unsigned long long)g_fgProxiesBuilt,
+          (unsigned long long)g_fgRetiredCount,
+          (unsigned long long)g_fgSwallowed,
+          (unsigned long long)g_fgForwarded,
+          (unsigned long long)g_fgAddrCollisions,
+          (unsigned long long)g_fgUnclaimed,
+          (unsigned)g_fgRetired.size());
 }
 
 // Consumes the handle if it is retired. One destroy per record.
@@ -2101,6 +2362,18 @@ static bool fgClaimRetired(VkSwapchainKHR h)
     for (size_t i = 0; i < g_fgRetired.size(); ++i) {
         if (g_fgRetired[i] != h) continue;
         g_fgRetired.erase(g_fgRetired.begin() + (ptrdiff_t)i);
+        ++g_fgSwallowed;
+        // The case the ordering was designed for: this handle is ALSO the live
+        // proxy's, so the allocator reused the address. Checking retired first
+        // is what makes that safe - the swallow consumes the dead one and the
+        // live proxy keeps its own destroy for later.
+        if (g_fgSwap.have && g_fgSwap.handle == h) {
+            ++g_fgAddrCollisions;
+            trace("FG LEDGER: ADDRESS COLLISION - retired handle %p is also "
+                  "the LIVE proxy's handle. Retired wins, as designed; had the "
+                  "live-proxy branch been checked first this destroy would "
+                  "have torn down the swapchain in use.", (void*)h);
+        }
         return true;
     }
     return false;
@@ -2396,6 +2669,13 @@ static std::map<VkBuffer, uint64_t>     g_allBuffers;   // size in bytes
 #include "gi_gather_spv.h"
 #include "gi.h"
 #include "taa.h"
+
+// The neutral frame description and the per-backend adapters. Included after
+// taa.h because tcoreDescribe below reads g_taa; the headers themselves depend
+// on nothing but <stdint.h>, deliberately, so the conventions they document can
+// be reasoned about without a device.
+#include "temporal_core.h"
+#include "temporal_adapt.h"
 #include "taau_spv.h"
 #include "taau.h"
 
@@ -4298,6 +4578,10 @@ static std::map<VkImage, uint64_t> g_taaBoundImgs;          // img -> frame
 struct DeferredImgKill {
     VkDevice dev; VkImage img; const VkAllocationCallbacks *alloc;
     uint64_t due;
+    // Views OF this image, destroyed just before it at the due point. Vulkan
+    // requires a view to be destroyed before its image, so these cannot be
+    // deferred independently - they travel with it.
+    std::vector<VkImageView> views;
 };
 static std::vector<DeferredImgKill> g_deferredImgKills;
 
@@ -4351,9 +4635,19 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
     // destroyed image is one the resolve actually bound (the lifetime
     // ledger), which is the only destruction that ever threatened it.
     {
+        // ---- THE QUIESCE DECISION MOVED. It used to be armed HERE, on the
+        // bare fact that the resolve had bound this image - before anything
+        // knew whether the destruction was going to be deferred.
+        //
+        // That armed it for the deferred case too, which is the case that
+        // cannot hurt us: a deferred destroy keeps the image AND its views
+        // alive for four more presents, which is exactly long enough for the
+        // in-flight work to drain. Skipping three resolves on top of that
+        // buys nothing and costs three raw frames.
+        //
+        // See the arming site further down, in the branch that knows.
         std::lock_guard<std::mutex> g(g_lock);
-        if (g_taaBoundImgs.count(img))
-            g_taaQuiesce.store(3);
+        (void)0;
     }
     vram::noteImageDestroy(img);
     PFN_vkDestroyImage next = nullptr;
@@ -4575,9 +4869,30 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
             uint64_t boundAt = bi->second;
             bool recent = g_frameCount - boundAt <= 4;
             g_taaBoundImgs.erase(bi);
+            // ---- ARMED ONLY WHEN THE OBJECT IS NOT PROTECTED.
+            //
+            // recent && next  -> deferred: image and views outlive the work by
+            //                    four presents. The resolve is safe; do not
+            //                    skip it.
+            // otherwise       -> destroyed now. Either it was bound long enough
+            //                    ago that the work has drained, or we cannot
+            //                    forward at all - and the blunt instrument is
+            //                    still the honest answer there.
+            //
+            // taa.quiesce_always=1 restores the old unconditional behaviour
+            // live, without a rebuild, if this turns out to have been holding
+            // something up. It is the escape hatch for a change whose whole
+            // argument is "the deferral already covers this".
+            if (!(recent && next) || live::onoff("taa.quiesce_always",
+                                                 "TAA_QUIESCE_ALWAYS", false)) {
+                g_taaQuiesce.store(3);
+                ++g_quiesceArmed;
+            }
             if (recent && next) {
                 DeferredImgKill k;
                 k.dev = device; k.img = img; k.alloc = alloc;
+                // Views are detached later, at the due point, by the same call
+                // the forced path uses - see the note over taaDetachImageViews.
                 k.due = g_frameCount + 4;
                 g_deferredImgKills.push_back(k);
                 static uint64_t said = 0;
@@ -4597,11 +4912,29 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImage(
         std::lock_guard<std::mutex> g(g_lock);
         g_seenAsAttachment.erase(img);
     }
-    // The cached views of this image die with it - see taaForgetImageViews.
+    // ---- VIEWS COME OFF THE BOOKS HERE; NOTHING IS FREED HERE.
+    //
+    // If this image had cached views, its destruction is FORCED onto the
+    // deferred path even when the resolve ledger did not ask for it. That is
+    // the whole correction: a view cannot outlive its image, so it cannot be
+    // deferred on its own, so the image has to wait with it. Freeing the view
+    // inline instead - which is what this did - hands the driver a dangling
+    // descriptor whenever a set still references it, and a resolution change
+    // destroys a burst of images at once.
+    std::vector<VkImageView> deadViews;
     {
         std::lock_guard<std::mutex> g(g_lock);
-        std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(device));
-        if (di != g_devices.end()) taaForgetImageViews(di->second, img);
+        taaDetachImageViews(img, deadViews);
+    }
+    if (!deadViews.empty() && next) {
+        std::lock_guard<std::mutex> g(g_lock);
+        DeferredImgKill k;
+        k.dev = device; k.img = img; k.alloc = alloc;
+        k.due = g_frameCount + 4;
+        k.views.swap(deadViews);
+        viewLedgerRetire(k.views, img, k.due);
+        g_deferredImgKills.push_back(k);
+        return;                       // the image goes with them, not now
     }
     if (next) next(device, img, alloc);
 }
@@ -5327,6 +5660,29 @@ static std::map<VkDescriptorSet, std::vector<VkImageView> > g_setViews;
 // composite search depends on g_setViews meaning exactly what it means today.
 static std::map<VkDescriptorSet, std::vector<VkImageView> > g_setStorageViews;
 static std::map<VkCommandBuffer, bool> g_cbInSwapPass;
+
+// ---- WHICH HDR TARGET IS ACTUALLY SAMPLED INTO THE SWAPCHAIN.
+//
+// notePresentSource already answers this for a BLIT or a COPY, and in this
+// engine it never fires: X-Plane composites with a DRAW - a full-screen pass
+// that SAMPLES the HDR target - so no transfer ever names the image that
+// reaches the screen. That is why the question has stayed open.
+//
+// The pieces to answer it are all present and were never joined: g_cbInSwapPass
+// says we are inside the pass that writes a swapchain image, g_setViews says
+// which views a bound descriptor set carries, g_viewToImage maps those to
+// images, and g_hdrTargets says which of them are scene targets.
+//
+// If this reports an image the resolve did not write, then the resolve is
+// improving a target the display never reads, and every frame is passthrough.
+// If it alternates, the resolve is right on some frames and not others - which
+// is the seam and the flicker being the same fact, once in space and once in
+// time.
+static VkImage  g_compositeSampled  = VK_NULL_HANDLE;
+static uint64_t g_compositeFrame    = 0;
+static uint32_t g_compositeMatches  = 0;
+static uint32_t g_compositeMisses   = 0;
+static VkImage  g_compositeAlt[2]   = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
 
 // ---- THE COMPUTE COMPOSITE, WHICH NO ATTACHMENT SEARCH COULD EVER FIND.
@@ -7230,6 +7586,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 if (g_taaQuiesce.load() > 0) {
                     g_taaQuiesce.fetch_sub(1);
                     g_taaStaleResume = true;
+                    ++g_quiesceSkips;
                     // Deliver the accumulated image anyway. Skipping the
                     // DISPATCH is the point of a quiesce; skipping the COPY
                     // just ships a raw frame, and a raw frame between resolved
@@ -7418,6 +7775,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // out to depend on.
                 g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
+                ++g_resolveFrames;
 
                 // ---- CLEAR THE VELOCITY TARGET HERE, NOT IN A RENDER PASS.
                 //
@@ -8247,6 +8605,41 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
     static std::atomic<uint32_t> useSample(0);
     bool sampleUse = (useSample.fetch_add(1) & 63) == 0;
 
+    // ---- THE COMPOSITE TAP. See g_compositeSampled.
+    //
+    // Cheap by construction: it does nothing at all unless this command buffer
+    // is inside a swapchain pass, which is one map lookup on a path that
+    // already takes g_lock below.
+    if (sets && n) {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, bool>::iterator sp = g_cbInSwapPass.find(cb);
+        if (sp != g_cbInSwapPass.end() && sp->second) {
+            for (uint32_t i = 0; i < n && g_compositeSampled == VK_NULL_HANDLE; ++i) {
+                std::map<VkDescriptorSet, std::vector<VkImageView> >::iterator
+                    sv = g_setViews.find(sets[i]);
+                if (sv == g_setViews.end()) continue;
+                for (size_t v = 0; v < sv->second.size(); ++v) {
+                    std::map<VkImageView, VkImage>::iterator vi =
+                        g_viewToImage.find(sv->second[v]);
+                    if (vi == g_viewToImage.end()) continue;
+                    bool isHdr = false;
+                    for (size_t q = 0; q < g_hdrTargets.size(); ++q)
+                        if (g_hdrTargets[q] == vi->second) { isHdr = true; break; }
+                    if (!isHdr) continue;
+                    g_compositeSampled = vi->second;
+                    // Remember the distinct images seen, so an alternation is
+                    // visible as two entries rather than inferred from a count.
+                    if (g_compositeAlt[0] == VK_NULL_HANDLE)
+                        g_compositeAlt[0] = vi->second;
+                    else if (g_compositeAlt[0] != vi->second &&
+                             g_compositeAlt[1] == VK_NULL_HANDLE)
+                        g_compositeAlt[1] = vi->second;
+                    break;
+                }
+            }
+        }
+    }
+
     bool latchTrace = false; bool ltOk = false;
     uint64_t ltOff = 0; uint32_t ltBase = 0, lt14 = 0, lt18 = 0, ltNd = 0,
              ltDyn = 0, ltPos = 0, ltN = 0;
@@ -8534,6 +8927,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroySwapchainKHR(
     if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
         sc == g_fgSwap.handle && g_fgSwap.fn.destroySwapchainKHR) {
         g_fgSwap.fn.destroySwapchainKHR(device, sc, alloc);
+        ++g_fgForwarded;
         // The proxy is gone; anything still holding this handle must not be
         // routed to it again.
         g_fgSwap.have   = false;
@@ -8642,6 +9036,47 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // for reasons nobody could reconstruct later.
     uint64_t frames = ++g_frameCount;
     oracle::tick(frames);
+    accumTick(g_velSnap.jitterX, g_velSnap.jitterY);
+
+    // ---- DID THE RESOLVE WRITE THE IMAGE THE SCREEN ACTUALLY READ?
+    //
+    // Exactly once per frame, past the submit, which is the only place both
+    // answers exist. See g_compositeSampled for why nothing else could tell us:
+    // the composite is a DRAW, so no blit or copy ever names the image.
+    //
+    // Counted rather than narrated. A single line saying "mismatch" proves
+    // nothing - the question is the RATIO. All-match means the seam is not
+    // this; all-miss means the resolve has never been on the displayed image;
+    // and a split near half is the alternation this was built to catch, with
+    // the two target addresses printed so it is a fact rather than a deduction.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        const VkImage sampled = g_compositeSampled;
+        if (sampled != VK_NULL_HANDLE) {
+            if (sampled == g_taaWroteImageThisFrame) ++g_compositeMatches;
+            else                                     ++g_compositeMisses;
+        }
+        if ((frames % 120) == 0) viewLedgerReport();
+        if ((frames % 120) == 0) quiesceReport();
+        if ((frames % 120) == 0) accumReport();
+        if ((frames % 120) == 0 && (g_fgProxiesBuilt || g_fgRetiredCount))
+            fgLedgerReport();
+        if ((frames % 120) == 0) {
+            const uint32_t tot = g_compositeMatches + g_compositeMisses;
+            trace("COMPOSITE: over %u frames with a sampled target - resolve "
+                  "wrote the DISPLAYED image %u time(s), a different one %u "
+                  "time(s) (%.0f%% match). Distinct sampled targets: %p / %p. "
+                  "Resolve last wrote %p, scene latched %p.",
+                  tot, g_compositeMatches, g_compositeMisses,
+                  tot ? (100.0 * (double)g_compositeMatches / (double)tot) : 0.0,
+                  (void*)g_compositeAlt[0], (void*)g_compositeAlt[1],
+                  (void*)g_taaWroteImageThisFrame, (void*)g_sceneColor.image);
+        }
+        // Re-earned every frame: a stale value would make an absent composite
+        // look like a matching one.
+        g_compositeSampled = VK_NULL_HANDLE;
+        g_compositeFrame   = frames;
+    }
     // One proxy image per frame, matching the sim's own rotation through them.
     if (g_fgActive.load(std::memory_order_relaxed)) ++g_fgOutIndex;
 
@@ -10121,15 +10556,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                     g_devices.find(dispatchKey(due[i].dev));
                 if (it != g_devices.end()) nd = it->second.destroyImage;
             }
-            // Same purge on the deferred path: this is the destroy that
-            // actually happens for an image the resolve had bound, so the view
-            // has to go here rather than four presents ago.
+            // Views first, then the image, and both outside g_lock. Anything
+            // still cached for this image is detached here; anything already
+            // detached travelled in the record.
+            std::vector<VkImageView> vs;
+            vs.swap(due[i].views);
+            {
+                std::lock_guard<std::mutex> g(g_lock);
+                taaDetachImageViews(due[i].img, vs);
+            }
+            PFN_vkDestroyImageView dview = nullptr;
             {
                 std::lock_guard<std::mutex> g(g_lock);
                 std::map<void*, DeviceData>::iterator dv =
                     g_devices.find(dispatchKey(due[i].dev));
-                if (dv != g_devices.end())
-                    taaForgetImageViews(dv->second, due[i].img);
+                if (dv != g_devices.end()) dview = dv->second.destroyImageView;
+            }
+            for (size_t v = 0; v < vs.size(); ++v) {
+                viewLedgerNoteDestroy(vs[v], due[i].img);
+                if (dview && vs[v]) dview(due[i].dev, vs[v], nullptr);
             }
             if (nd) nd(due[i].dev, due[i].img, due[i].alloc);
         }
@@ -10646,10 +11091,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 if (cur[i] != scn[i]) { ++bad; sum += fabs((double)cur[i] - (double)scn[i]); }
             static uint64_t l2 = 0;
             if ((l2++ % 300) == 0)
-                trace("TAA DELIVERY: history vs scene, SAME FRAME: %llu/%zu "
-                      "halves differ (mean |delta| %.1f). The copy-back writes "
-                      "history into the scene, so identical means it landed and "
-                      "the instability is downstream; differing means it is not "
+                trace("TAA DELIVERY: delivered vs scene, SAME FRAME: %llu/%zu "
+                      "halves differ (mean |delta| %.1f). Both strips are now "
+                      "taken from the image the copy-back ACTUALLY sends - the "
+                      "sharpen target when sharpening is on, history otherwise. "
+                      "It previously read history unconditionally and so "
+                      "reported the sharpening itself as a delivery failure. "
+                      "Identical means it landed; differing means it is not "
                       "reaching the image the display reads.",
                       (unsigned long long)bad, nHalf,
                       bad ? sum / (double)bad : 0.0);
@@ -13994,6 +14442,85 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdPushDescriptorSetKHR(
     if (next) next(cb, bindPoint, layout, set, writeCount, writes);
 }
 
+// ---- FILL THE NEUTRAL FRAME FROM THE ENGINE'S OWN STATE.
+//
+// The single place layer globals are turned into a tcore::Frame. Everything
+// downstream - FSR3 today, DLSS next - reads the Frame through an adapter and
+// never touches a global, so a unit or a sign exists once instead of once per
+// backend.
+//
+// The images are passed in rather than read here: choosing WHICH colour target
+// or output to hand an upscaler is policy that belongs at the call site, while
+// the units and conventions below are facts about the engine. Keeping those
+// two apart is the whole point of the split.
+static bool tcoreDescribe(tcore::Frame &f,
+                          VkImage colour, VkFormat colourFmt,
+                          VkImage depth,  VkFormat depthFmt,
+                          VkImage mv,     VkFormat mvFmt,
+                          VkImage out,    VkFormat outFmt,
+                          uint32_t rw, uint32_t rh,
+                          uint32_t ow, uint32_t oh,
+                          bool jitterStillPresent)
+{
+    f.reset();
+    f.index = g_frameCount;
+
+    f.colour.image = (void*)colour; f.colour.format = (uint32_t)colourFmt;
+    f.colour.w = rw; f.colour.h = rh;
+    f.depth.image  = (void*)depth;  f.depth.format  = (uint32_t)depthFmt;
+    f.depth.w  = rw; f.depth.h  = rh;
+    f.motion.image = (void*)mv;     f.motion.format = (uint32_t)mvFmt;
+    f.motion.w = rw; f.motion.h = rh;
+    f.output.image = (void*)out;    f.output.format = (uint32_t)outFmt;
+    f.output.w = ow; f.output.h = oh;
+
+    f.renderW = rw; f.renderH = rh;
+    f.outW    = ow; f.outH    = oh;
+
+    // Our velocity target stores UV, current -> previous, with the Y sign
+    // carried separately because X-Plane draws with a negative-height
+    // viewport - see taaVelYSign. The sentinel marks pixels no patched shader
+    // wrote; a backend that samples linearly across it will smear it into real
+    // vectors, which is why it is stated rather than left implicit.
+    f.mvUnit    = tcore::kMvUv;
+    f.mvDir     = tcore::kMvToPrevious;
+    f.mvYSign   = taaVelYSign();
+    f.mvScale   = taaVelScale();
+    f.mvSentinel = -1000.0f;
+
+    // ---- JITTER: PIXELS IN THE SHARE BLOCK, NDC IN THE CORE.
+    //
+    // The plugin publishes jitter in PIXELS (share.h says so, +/-0.5), and the
+    // layer scales it by g_jitterScale. The core declares NDC, so the
+    // conversion happens once, here, rather than each backend guessing which
+    // it received. NDC spans 2 across the extent, hence 2/size.
+    //
+    // jitterStillPresent is policy, not a fact about the engine: when the
+    // resolve has already unjittered the image an upscaler is about to read,
+    // the true remaining offset is ZERO and telling it otherwise makes it
+    // compensate for a displacement that is not there.
+    const float jpx = jitterStillPresent ? g_velSnap.jitterX * g_jitterScale : 0.0f;
+    const float jpy = jitterStillPresent ? g_velSnap.jitterY * g_jitterScale : 0.0f;
+    f.jitterNdcX = rw ? (jpx * 2.0f / (float)rw) : 0.0f;
+    f.jitterNdcY = rh ? (jpy * 2.0f / (float)rh) : 0.0f;
+    f.jitterIndex  = (uint32_t)g_velSnap.jitterIndex;
+    f.jitterPhases = (uint32_t)(g_velSnap.jitterPhases ? g_velSnap.jitterPhases : 8);
+
+    if (g_share && g_share->magic == TAA_MAGIC) {
+        f.depthReversed    = g_share->reverseZ != 0;
+        f.depthInfiniteFar = g_share->infiniteFar != 0;
+        f.nearPlane        = g_share->nearClip;
+        f.farPlane         = g_share->farClip;
+        f.fovYRad          = g_share->fovDeg * 3.14159265358979f / 180.0f;
+    }
+    f.frameTimeMs = g_velSnap.frameTimeMs > 0.0f ? g_velSnap.frameTimeMs : 16.6f;
+    f.reprojValid = g_taaReprojValid;
+    memcpy(f.reproj, g_taaReproj, sizeof(f.reproj));
+
+    f.valid = true;
+    return tcore::usable(f);
+}
+
 static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
     VkCommandBuffer cb, uint32_t gx, uint32_t gy, uint32_t gz)
 {
@@ -14566,7 +15093,29 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
                 fsrJitterMode < -0.5f
                     ? !(g_taaResolvedThisFrame && taaUnjitter())
                     : fsrJitterMode > 0.5f;
-            fsr3Ran = fsr3::dispatch(
+            // Build the neutral frame, then let the FSR3 adapter say what
+            // FSR3 wants of it. A failure here is a frame that does not
+            // describe a renderable state, and dispatching on it would produce
+            // plausible numbers for nothing.
+            tcore::Frame tf_;
+            tadapt::Fsr3Inputs tfsr;
+            const char *tcWhy = 0;
+            const bool tcOk =
+                tcoreDescribe(tf_, colour, colourFmt, depth,
+                              depthcopy::state().ready ? VK_FORMAT_R32_SFLOAT
+                                                       : g_sceneDepthFormat,
+                              mv, mvFmt, out, outFmt, rw, rh, ow, oh,
+                              fsrJitterPass) &&
+                tadapt::toFsr3(tf_, tfsr, &tcWhy);
+            if (!tcOk) {
+                static uint64_t said = 0;
+                if ((said++ % 600) == 0)
+                    trace("TCORE: frame not usable for FSR3 (%s) - dispatch "
+                          "skipped rather than run on a frame that does not "
+                          "describe a renderable state.",
+                          tcWhy ? tcWhy : "unknown");
+            }
+            fsr3Ran = tcOk && fsr3::dispatch(
                 dd->cmdPipelineBarrier, cb,
                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, g_sceneDepthLayout,
                 colour, colourFmt, depth,
@@ -14611,9 +15160,24 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdDispatch(
                 //
                 // Live, because the claim above is falsifiable: fsr.jitter=1
                 // restores the old pass-through and the smear should return.
-                fsrJitterPass ? g_velSnap.jitterX * g_jitterScale : 0.0f,
-                fsrJitterPass ? g_velSnap.jitterY * g_jitterScale : 0.0f,
-                vs * (float)rw, vs * ys * (float)rh,
+                // ---- FROM THE CORE, NOT DERIVED HERE.
+                //
+                // These four were computed inline: jitter straight from the
+                // share block, and vs*(rw), vs*ys*(rh) for the scale. Both are
+                // unit conversions, and a unit conversion at a call site is a
+                // convention that exists in exactly one place and is copied,
+                // subtly wrong, into the next backend. They now come from
+                // tadapt::toFsr3, which states what FSR3 wants and why, beside
+                // the DLSS adapter that wants the same units and a different
+                // jitter sign.
+                //
+                // fsr.mv_x / fsr.mv_y stay as live overrides on top - they
+                // exist to try all four sign combinations against one scene,
+                // and folding them into the core would make an experiment into
+                // a convention.
+                tfsr.jitterX, tfsr.jitterY,
+                tfsr.mvScaleX * live::f("fsr.mv_x", nullptr, 1.0f),
+                tfsr.mvScaleY * live::f("fsr.mv_y", nullptr, 1.0f),
                 // ---- SPLIT FSR3 IN HALF, LIVE.
                 //
                 // reset=true discards history every frame: the temporal half of
@@ -16980,6 +17544,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
                     g_fgSwap.proxy  = proxy;
                     g_fgSwap.handle = ffxGetVKSwapchain(proxy);
                     g_fgSwap.have   = true;
+                    ++g_fgProxiesBuilt;
                     g_fgSwap.device = device;
                     g_fgSwap.dispW  = mod.imageExtent.width;
                     g_fgSwap.dispH  = mod.imageExtent.height;

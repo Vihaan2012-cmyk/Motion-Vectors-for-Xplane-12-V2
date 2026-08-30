@@ -1344,11 +1344,34 @@ void main()
             if (wn <= 0.0) continue;                 // nothing wrote there
             float d = w0 - wn;                       // >0 => neighbour is nearer
             if (d <= 0.0) continue;                  // behind us, not an occluder
+            // ---- WEIGHTED BY THE COSINE, NOT CUT AT A THRESHOLD.
+            //
+            // The first version of this rejected a tap when
+            // dot(dir, N) < 0.1. That puts the decision boundary exactly where
+            // FLAT surfaces live: neighbours of a point on a plane lie IN that
+            // plane, so the dot product is ~0 for every one of them. Depth
+            // quantisation then jitters it across the threshold at random and
+            // each tap becomes a coin flip between contributing nothing and
+            // contributing full-strength occlusion.
+            //
+            // That is per-pixel random darkening - visible as moving black
+            // speckle, worst on bright surfaces because the occlusion is
+            // MULTIPLICATIVE: the same proportional darkening is a far larger
+            // absolute change on white runway paint or a white fuselage than
+            // on grey concrete. It was reported as exactly that.
+            //
+            // Weighting by the cosine instead makes a coplanar tap contribute
+            // ~0 smoothly, so noise around zero produces noise around zero
+            // rather than a full-amplitude flip. This is also the correct form
+            // on its own terms - the cosine factor is what makes this ambient
+            // occlusion rather than a depth-difference filter.
+            float ndv = 1.0;
             if (aoN) {
-                // Above the tangent plane, or it is the surface itself sloping.
                 vec3  v3 = mvEyeFromDist(uv + S + o, wn) - aoP;
                 float vl = length(v3);
-                if (vl < 1e-5 || dot(v3 / vl, aoNrm) < 0.1) continue;
+                if (vl < 1e-5) continue;
+                ndv = dot(v3 / vl, aoNrm);
+                if (ndv <= 0.0) continue;   // strictly below the tangent plane
             }
             // Range limit, scaled with distance so the effect stays the same
             // size on screen as geometry recedes. Without it a distant
@@ -1356,7 +1379,27 @@ void main()
             // frame edge.
             float maxD = 0.05 * w0 + 0.02;
             if (d > maxD) continue;
-            occ += d / (d + 0.5 * maxD);             // soft, saturating
+            // ---- THE FAR EDGE, WHICH THE FIRST FIX LEFT AS A STEP.
+            //
+            // The hemisphere test above smoothed the NEAR end - a tap in the
+            // surface plane now contributes ~0 instead of flipping. This end
+            // was left hard, and it is the worse of the two: the saturating
+            // curve d/(d + 0.5*maxD) is already at 0.667 by the time d reaches
+            // maxD, so a tap crossing that line jumps between two-thirds of
+            // full occlusion and nothing at all.
+            //
+            // That is why the speckle survived the first fix and moved to the
+            // fuselage: a curved surface at ~40 m has maxD near 2 m, which is
+            // exactly the range the tap offsets produce, so half the taps sit
+            // on the boundary and flip with the depth noise.
+            //
+            // Contact shadows already got this treatment in the same pass -
+            // the `far` term there - and AO should have had it at the same
+            // time. Same shape: fade out over the upper half of the range so
+            // nothing is ever dropped from a large value.
+            float aoFar = 1.0 - clamp((d - maxD * 0.5) / max(maxD * 0.5, 1e-4),
+                                      0.0, 1.0);
+            occ += (d / (d + 0.5 * maxD)) * ndv * aoFar;  // soft at both ends
         }
         float ao = 1.0 - pc.aoStrength * (occ / float(AO_TAPS));
         currA *= clamp(ao, 0.0, 1.0);
@@ -1395,7 +1438,45 @@ void main()
     // A raw four-ray gather in this position would widen the variance clamp
     // and collapse accumulation - the contact-shadow lesson.
     if ((pc.flags & FLAG_GI) != 0 && !unwritten) {
-        vec3 gi = texture(uGi, vec3(uv + S, float(layer))).rgb;
+        // ---- DEPTH-AWARE UPSAMPLE. THE GATHER IS HALF RESOLUTION.
+        //
+        // This was a single bilinear tap, which at a silhouette blends the
+        // foreground's bounce with the background's and paints a halo one
+        // half-res texel wide around every edge - the classic giveaway that a
+        // low-resolution effect was upsampled without asking what it was
+        // sitting on.
+        //
+        // The gather now records each texel's surface distance in alpha (it is
+        // what its own history rejection runs on), so the four contributing
+        // texels can be weighted by whether they describe THIS surface as well
+        // as by bilinear proximity. No push field needed: textureSize gives the
+        // gather's real dimensions, so nothing here assumes the half-res ratio.
+        const float gw0 = mvViewDepth(uv + S, float(layer), velS.z);
+        const ivec2 gSz = textureSize(uGi, 0).xy;
+        const vec2  gf  = (uv + S) * vec2(gSz) - 0.5;
+        const ivec2 gb  = ivec2(floor(gf));
+        const vec2  gfr = gf - vec2(gb);
+
+        vec3  gAcc = vec3(0.0);
+        float gWs  = 0.0;
+        for (int gi4 = 0; gi4 < 4; ++gi4) {
+            const ivec2 o = ivec2(gi4 & 1, gi4 >> 1);
+            const ivec2 q = clamp(gb + o, ivec2(0), gSz - 1);
+            const vec4  g = texelFetch(uGi, ivec3(q, layer), 0);
+            // Alpha <= 0 is the gather's "sky / never written" sentinel.
+            if (g.a <= 0.0) continue;
+            const float bw = (o.x == 0 ? 1.0 - gfr.x : gfr.x) *
+                             (o.y == 0 ? 1.0 - gfr.y : gfr.y);
+            const float rel = abs(g.a - gw0) / max(gw0, 1e-3);
+            const float w   = bw / (1.0 + rel * 32.0);
+            gAcc += g.rgb * w;
+            gWs  += w;
+        }
+        // No agreeing neighbour means no trustworthy bounce for this pixel.
+        // Falling back to the plain bilinear tap would reintroduce exactly the
+        // bleed this replaces, so the answer is no GI here - which the
+        // multiplicative composite expresses as leaving the pixel alone.
+        vec3 gi = (gWs > 1e-6) ? gAcc / gWs : vec3(0.0);
         currA *= (vec3(1.0) + max(gi, vec3(0.0)) * uReprojParams2.z);
     }
 
@@ -1468,6 +1549,25 @@ void main()
             // side - the classic self-shadowing acne.
             float bias = (0.004 + 0.02 * t) * w0;
             if (d <= bias) continue;
+            // ---- SMOOTH ACROSS THE BIAS, NOT A STEP AT IT.
+            //
+            // The same fault the AO march had, one effect further on. On flat
+            // ground - a runway, a fuselage panel - d sits right AT the bias,
+            // because a coplanar march produces exactly the depth ramp the
+            // bias is sized to ignore. Depth quantisation then flips d above
+            // and below it at random.
+            //
+            // A binary step made that flip cost a FULL 1/8 of the march, and
+            // the *2.0 below doubles it: one undecided step is a 25% darkening,
+            // 15% at csStrength 0.6. That is the moving black speckle seen on
+            // runway paint and on a white fuselage - multiplicative darkening
+            // shows most on whatever is brightest.
+            //
+            // Ramping over the bias instead means a step that barely clears it
+            // contributes almost nothing, so noise at the threshold produces
+            // noise near zero. A step well past the bias is unaffected, which
+            // is where real contact shadows live.
+            float over = clamp((d - bias) / max(bias, 1e-4), 0.0, 1.0);
             // ---- AN OCCLUDER MUST BE CLOSE, AND "CLOSE" IS A DISTANCE IN
             // METRES, NOT A FRACTION OF HOW FAR AWAY WE ARE.
             //
@@ -1480,7 +1580,13 @@ void main()
             // A contact shadow is by definition a near-field effect, so the
             // range is now a fixed world distance with only a small allowance
             // for depth precision falling off with distance.
-            if (d > 0.35 + 0.002 * w0) continue;
+            // The far edge gets the same treatment: a hard cut here is a
+            // second threshold for noise to straddle, at the exact distance
+            // where an occluder stops counting.
+            float csMax = 0.35 + 0.002 * w0;
+            if (d > csMax) continue;
+            float far = 1.0 - clamp((d - csMax * 0.5) / max(csMax * 0.5, 1e-4),
+                                    0.0, 1.0);
             // ---- ACCUMULATE, DO NOT LATCH.
             //
             // This used to be `shadow = 1.0; break;` - binary, first hit wins.
@@ -1495,7 +1601,7 @@ void main()
             // camera motion because one tap changing its mind moves the result
             // by 1/8, not by 1. The edge stays tight because the steps are
             // short; it just stops being a step function.
-            shadow += 1.0 / float(CS_STEPS);
+            shadow += (over * far) / float(CS_STEPS);
         }
         shadow = clamp(shadow * 2.0, 0.0, 1.0);
         currA *= clamp(1.0 - pc.csStrength * shadow, 0.0, 1.0);

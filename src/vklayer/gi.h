@@ -121,6 +121,7 @@ struct Push {
     float   ySign;
     float   intensity;
     int32_t steps, rays, frame, flags;
+    float   histReject;
 };
 // The resolve has had this guard since a push block silently grew past the
 // limit; the newer modules did not. A mismatch between this struct and the
@@ -128,7 +129,7 @@ struct Push {
 // the first divergence, which is how a 132-vs-128 byte mismatch once shipped.
 static_assert(sizeof(Push) <= 128,
               "gi::Push exceeds the guaranteed 128-byte push constant limit");
-static_assert(sizeof(Push) == 80,
+static_assert(sizeof(Push) == 84,
               "gi::Push changed size - update gi_gather.comp's block to match");
 enum { kGiProbes = 1, kGiReset = 2, kGiEngine = 4 };
 
@@ -503,6 +504,10 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     p.steps     = (int32_t)live::i("taa.gi_steps", "TAA_GI_STEPS", 10);
     p.rays      = (int32_t)live::i("taa.gi_rays",  "TAA_GI_RAYS",  4);
     p.frame     = (int32_t)(s.frame & 0x3fffffff);
+    // How far a reprojected texel's recorded distance may differ from this
+    // frame's before its history is thrown away. Relative to distance; see the
+    // note over the test in gi_gather.comp for why it is loose.
+    p.histReject = live::f("taa.gi_reject", "TAA_GI_REJECT", 0.25f);
     p.flags     = (haveProbes ? kGiProbes : 0) | (s.primed ? 0 : kGiReset)
                 | (haveEngine ? kGiEngine : 0);
 

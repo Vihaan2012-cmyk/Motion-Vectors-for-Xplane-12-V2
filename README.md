@@ -1,5 +1,14 @@
 # Motion Vectors for X-Plane 12
 
+<p align="center">
+  <img src="https://img.shields.io/badge/X--Plane-12-2E6DB4?logo=xplane&logoColor=white" alt="X-Plane 12">
+  <img src="https://img.shields.io/badge/Vulkan-layer-A41E22?logo=vulkan&logoColor=white" alt="Vulkan layer">
+  <img src="https://img.shields.io/badge/C%2B%2B-11-00599C?logo=cplusplus&logoColor=white" alt="C++11">
+  <img src="https://img.shields.io/badge/GLSL-compute-5586A4?logo=opengl&logoColor=white" alt="GLSL compute">
+  <img src="https://img.shields.io/badge/platform-Windows%20x64-0078D6?logo=windows&logoColor=white" alt="Windows x64">
+  <img src="https://img.shields.io/badge/license-GPL--3.0-yellow" alt="GPL-3.0">
+</p>
+
 Temporal anti-aliasing for X-Plane 12, built on per-pixel motion vectors that
 the sim does not provide.
 
