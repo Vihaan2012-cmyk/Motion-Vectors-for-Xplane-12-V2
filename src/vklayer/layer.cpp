@@ -2893,8 +2893,10 @@ static bool     g_velInjectedThisFrame = false;
 // Which pass is last is unknowable while recording it, so the previous frame's
 // count is used. A wrong guess costs one frame of history, not a corrupt image.
 static bool     g_taaResolvedThisFrame = false;
-static uint32_t g_sceneEndsThisFrame   = 0;
-static uint32_t g_sceneEndsLastFrame   = 0;
+// Atomic for the same reason as g_hdrPassesThisFrame directly below: the ++
+// is in Layer_CmdEndRendering, which records on several threads.
+static std::atomic<uint32_t> g_sceneEndsThisFrame(0);
+static std::atomic<uint32_t> g_sceneEndsLastFrame(0);
 // Candidate HDR passes seen so far this frame, and how many the LAST frame had.
 // The resolve has to run on the final one - see the block that increments this
 // - and the final one is only identifiable in arrears.
@@ -7108,7 +7110,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     // the velocity target beside it describes that same frame. Running it at
     // present time instead would resolve a composited image whose HUD and panel
     // have no vectors, which is what makes UI ghost.
-    if (wasScenePass) ++g_sceneEndsThisFrame;
+    if (wasScenePass) g_sceneEndsThisFrame.fetch_add(1, std::memory_order_relaxed);
     // Why the resolve is or is not running. Two crashes have now been blamed on
     // TAA while the log showed it never initialised, which is not a diagnosis.
     if (taaEnabled()) {
@@ -7127,7 +7129,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                   (unsigned long long)(g_frameCount - g_mvLastBindFrame.load()),
                   g_taaResolvedThisFrame ? 1 : 0,
                   g_gateDepthLastFrame.load(),
-                  g_sceneEndsThisFrame, g_sceneEndsLastFrame,
+                  g_sceneEndsThisFrame.load(std::memory_order_relaxed), g_sceneEndsLastFrame.load(std::memory_order_relaxed),
                   g_taa.ready ? 1 : 0, g_mv.ready ? 1 : 0,
                   (void*)g_mv.view, (void*)g_sceneColor.image,
                   g_sceneColor.w, g_sceneColor.h);
@@ -7450,13 +7452,14 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // path is correct after all. Kept behind TAA_TARGET_LATCH
                 // because the experiment is worth being able to repeat.
                 static const bool latchOn = getenv("TAA_TARGET_LATCH") != nullptr;
-                static VkImage  latchTarget = VK_NULL_HANDLE;
-                static uint64_t latchSeen   = 0;
-                const bool latchFresh = latchOn && latchTarget != VK_NULL_HANDLE &&
-                                        (g_frameCount - latchSeen) < 120;
+                static std::atomic<VkImage>  latchTarget(VK_NULL_HANDLE);
+                static std::atomic<uint64_t> latchSeen(0);
+                const VkImage latched = latchTarget.load(std::memory_order_relaxed);
+                const bool latchFresh = latchOn && latched != VK_NULL_HANDLE &&
+                                        (g_frameCount - latchSeen.load(std::memory_order_relaxed)) < 120;
                 if (latchFresh) {
-                    if (passInfo.color0 != latchTarget) break;
-                    latchSeen = g_frameCount;
+                    if (passInfo.color0 != latched) break;
+                    latchSeen.store(g_frameCount, std::memory_order_relaxed);
                 } else {
                     // ---- A FALLING HDR-PASS COUNT MUST NOT DROP THE FRAME.
                     //
@@ -7476,7 +7479,10 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     // with more passes than the floor a couple of trailing
                     // composites miss AA for a frame or two while the floor rises,
                     // which is invisible next to losing AA outright.
-                    static uint32_t hdrFloor = 0;
+                    // Atomic like everything else this hook mutates: a
+                    // race here wobbles the floor by one for one frame, which
+                    // the easing already tolerates - as a plain int it was UB.
+                    static std::atomic<uint32_t> hdrFloor(0);
                     if (g_hdrPassesLastFrame.load(std::memory_order_relaxed) == 0) break;
                     if (hdrFloor == 0 || g_hdrPassesLastFrame.load(std::memory_order_relaxed) < hdrFloor)
                         hdrFloor = g_hdrPassesLastFrame.load(std::memory_order_relaxed);
@@ -7491,22 +7497,23 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                               "the whole-scene wobble.",
                               (void*)passInfo.color0, hdrIdx,
                               g_hdrPassesLastFrame.load(std::memory_order_relaxed));
-                    latchTarget = passInfo.color0;
-                    latchSeen   = g_frameCount;
+                    latchTarget.store(passInfo.color0, std::memory_order_relaxed);
+                    latchSeen.store(g_frameCount, std::memory_order_relaxed);
                 }
                 gateReach(5);
 
                 {
-                    static VkImage lastChosen = VK_NULL_HANDLE;
-                    if (passInfo.color0 != lastChosen) {
-                        lastChosen = passInfo.color0;
+                    static std::atomic<VkImage> lastChosen(VK_NULL_HANDLE);
+                    if (lastChosen.exchange(passInfo.color0,
+                                            std::memory_order_relaxed)
+                            != passInfo.color0) {
                         trace("TAA CHOSEN: resolving into %p (hdr %u of %u, "
                               "sceneEnds=%u mvBinds=%d) - alternation HERE is "
                               "real: either X-Plane double-buffers the lit "
                               "target (benign, history still carries) or the "
                               "pick is drifting between two different passes",
                               (void*)passInfo.color0, hdrIdx,
-                              g_hdrPassesLastFrame.load(std::memory_order_relaxed), g_sceneEndsThisFrame,
+                              g_hdrPassesLastFrame.load(std::memory_order_relaxed), g_sceneEndsThisFrame.load(std::memory_order_relaxed),
                               (int)g_mvBindsThisFrame);
                     }
                 }
@@ -7841,6 +7848,18 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                 // The double-accumulation softness is real, but it is paid for
                 // with RCAS (fsr.sharpness), not by deleting a pass FSR3 turns
                 // out to depend on.
+                // ---- CLAIM, NOT COUNT. The .load() in the gate chain
+                // far above is check-then-act: two threads recording
+                // qualifying passes can both read 0 < 1 and both arrive here.
+                // The fetch_add is the authoritative claim, taken immediately
+                // BEFORE the record so the loser backs out having recorded
+                // nothing. It backs out what it took, so the counter stays
+                // exact for the per-present report.
+                if (resolvesThisPresent.fetch_add(1, std::memory_order_relaxed)
+                        >= maxResolves) {
+                    resolvesThisPresent.fetch_sub(1, std::memory_order_relaxed);
+                    break;
+                }
                 g_taaBackend.record(cb, tf);
                 g_taaResolvedThisFrame = true;
                 ++g_resolveFrames;
@@ -7907,7 +7926,6 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     // Hand the clear back to the render passes.
                     g_mvClearedAtPresent.store(false);
                 }
-                resolvesThisPresent.fetch_add(1, std::memory_order_relaxed);
                 gateReach(9);
                 // Watched by noteSsrFeedbackCheck for the rest of the frame.
                 g_taaWroteImageThisFrame = passInfo.color0;
@@ -10818,12 +10836,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     }
     g_velInjectedThisFrame = false;
     g_taaResolvedThisFrame = false;
-    g_sceneEndsLastFrame   = g_sceneEndsThisFrame;
+    g_sceneEndsLastFrame.store(g_sceneEndsThisFrame.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
     // Counted BEFORE the reset below: a frame that ended no scene pass is a
     // frame in which nothing drew the world.
-    if (g_sceneEndsThisFrame == 0) ++g_framesSinceScenePass;
+    if (g_sceneEndsThisFrame.load(std::memory_order_relaxed) == 0) ++g_framesSinceScenePass;
     else                            g_framesSinceScenePass = 0;
-    g_sceneEndsThisFrame   = 0;
+    g_sceneEndsThisFrame.store(0, std::memory_order_relaxed);
     // Report a change rather than only carrying it: the count moving means the
     // frame's pass structure moved, and one frame's TAA landed on the pass that
     // used to be last. Rare and self-correcting, but it should be visible.
@@ -10851,7 +10870,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                   "(hdr=%u/%u ends=%u/%u)",
                   g_gateDepthThisFrame.load(),
                   g_hdrPassesThisFrame.load(std::memory_order_relaxed), g_hdrPassesLastFrame.load(std::memory_order_relaxed),
-                  g_sceneEndsThisFrame, g_sceneEndsLastFrame);
+                  g_sceneEndsThisFrame.load(std::memory_order_relaxed), g_sceneEndsLastFrame.load(std::memory_order_relaxed));
     }
     g_gateDepthLastFrame.store(g_gateDepthThisFrame.load());
     g_gateDepthThisFrame.store(0);
