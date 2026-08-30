@@ -495,69 +495,75 @@ static uint32_t taaFindMemory(DeviceData &dd, uint32_t typeBits, VkMemoryPropert
 
 // Destroy a parked state's objects for real. Only ever called on states that
 // left service N presents ago - nothing in flight can still reference them.
-static void taaDestroyState(DeviceData &dd, TaaState &g_taa)
+// The parameter was previously NAMED g_taa, shadowing the global of the same
+// name. The shadowing was doing load-bearing work - every reference inside
+// resolved to the parked state, which is correct - but it read as if the
+// function operated on the live one, and one un-shadowed reference added later
+// would have destroyed live objects while they were bound. Named for what it
+// is instead.
+static void taaDestroyState(DeviceData &dd, TaaState &parked)
 {
-    if (g_taa.pipeline)    dd.destroyPipeline(g_taa.device, g_taa.pipeline, nullptr);
-    if (g_taa.pipeLayout)  dd.destroyPipelineLayout(g_taa.device, g_taa.pipeLayout, nullptr);
-    if (g_taa.setLayout)   dd.destroyDescriptorSetLayout(g_taa.device, g_taa.setLayout, nullptr);
-    if (g_taa.pool)        dd.destroyDescriptorPool(g_taa.device, g_taa.pool, nullptr);
-    if (g_taa.uboBuf) {
+    if (parked.pipeline)    dd.destroyPipeline(parked.device, parked.pipeline, nullptr);
+    if (parked.pipeLayout)  dd.destroyPipelineLayout(parked.device, parked.pipeLayout, nullptr);
+    if (parked.setLayout)   dd.destroyDescriptorSetLayout(parked.device, parked.setLayout, nullptr);
+    if (parked.pool)        dd.destroyDescriptorPool(parked.device, parked.pool, nullptr);
+    if (parked.uboBuf) {
         PFN_vkDestroyBuffer pfnDb =
-            (PFN_vkDestroyBuffer)dd.gdpa(g_taa.device, "vkDestroyBuffer");
-        if (pfnDb) pfnDb(g_taa.device, g_taa.uboBuf, nullptr);
+            (PFN_vkDestroyBuffer)dd.gdpa(parked.device, "vkDestroyBuffer");
+        if (pfnDb) pfnDb(parked.device, parked.uboBuf, nullptr);
     }
-    if (g_taa.uboMem)      dd.freeMemory(g_taa.device, g_taa.uboMem, nullptr);
-    if (g_taa.sampler)     dd.destroySampler(g_taa.device, g_taa.sampler, nullptr);
-    if (g_taa.samplerNearest) dd.destroySampler(g_taa.device, g_taa.samplerNearest, nullptr);
-    if (g_taa.samplerShadowLE) dd.destroySampler(g_taa.device, g_taa.samplerShadowLE, nullptr);
-    if (g_taa.samplerShadowGE) dd.destroySampler(g_taa.device, g_taa.samplerShadowGE, nullptr);
+    if (parked.uboMem)      dd.freeMemory(parked.device, parked.uboMem, nullptr);
+    if (parked.sampler)     dd.destroySampler(parked.device, parked.sampler, nullptr);
+    if (parked.samplerNearest) dd.destroySampler(parked.device, parked.samplerNearest, nullptr);
+    if (parked.samplerShadowLE) dd.destroySampler(parked.device, parked.samplerShadowLE, nullptr);
+    if (parked.samplerShadowGE) dd.destroySampler(parked.device, parked.samplerShadowGE, nullptr);
     for (int i = 0; i < 2; ++i)
-        if (g_taa.historyView[i]) dd.destroyImageView(g_taa.device, g_taa.historyView[i], nullptr);
-    for (std::map<VkImage, VkImageView>::iterator it = g_taa.sceneViews.begin();
-         it != g_taa.sceneViews.end(); ++it)
-        if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
-    g_taa.sceneViews.clear();
+        if (parked.historyView[i]) dd.destroyImageView(parked.device, parked.historyView[i], nullptr);
+    for (std::map<VkImage, VkImageView>::iterator it = parked.sceneViews.begin();
+         it != parked.sceneViews.end(); ++it)
+        if (it->second) dd.destroyImageView(parked.device, it->second, nullptr);
+    parked.sceneViews.clear();
     // The engine-image view caches added for the taps: leaked on every
     // re-init (resolution change) until this loop existed.
     std::map<VkImage, VkImageView> *caches[5] = {
-        &g_taa.flagsViews, &g_taa.edViews, &g_taa.sunViews, &g_taa.probeViews,
-        &g_taa.normViews };
+        &parked.flagsViews, &parked.edViews, &parked.sunViews, &parked.probeViews,
+        &parked.normViews };
     for (int ci = 0; ci < 5; ++ci) {
         for (std::map<VkImage, VkImageView>::iterator it = caches[ci]->begin();
              it != caches[ci]->end(); ++it)
-            if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
+            if (it->second) dd.destroyImageView(parked.device, it->second, nullptr);
         caches[ci]->clear();
     }
-    g_taa.flagsView = VK_NULL_HANDLE; g_taa.flagsValid = false;
-    g_taa.edView    = VK_NULL_HANDLE; g_taa.edValid    = false;
-    g_taa.sunView   = VK_NULL_HANDLE; g_taa.sunValid   = false;
-    g_taa.probeView = VK_NULL_HANDLE; g_taa.probeValid = false;
-    g_taa.normView  = VK_NULL_HANDLE; g_taa.normValid  = false;
-    if (g_taa.sunDummyView) dd.destroyImageView(g_taa.device, g_taa.sunDummyView, nullptr);
-    if (g_taa.sunDummy)     dd.destroyImage(g_taa.device, g_taa.sunDummy, nullptr);
-    if (g_taa.sunDummyMem)  dd.freeMemory(g_taa.device, g_taa.sunDummyMem, nullptr);
-    g_taa.sunDummyView = VK_NULL_HANDLE;
-    g_taa.sunDummy = VK_NULL_HANDLE;
-    g_taa.sunDummyMem = VK_NULL_HANDLE;
-    g_taa.sunDummyReady = false;
+    parked.flagsView = VK_NULL_HANDLE; parked.flagsValid = false;
+    parked.edView    = VK_NULL_HANDLE; parked.edValid    = false;
+    parked.sunView   = VK_NULL_HANDLE; parked.sunValid   = false;
+    parked.probeView = VK_NULL_HANDLE; parked.probeValid = false;
+    parked.normView  = VK_NULL_HANDLE; parked.normValid  = false;
+    if (parked.sunDummyView) dd.destroyImageView(parked.device, parked.sunDummyView, nullptr);
+    if (parked.sunDummy)     dd.destroyImage(parked.device, parked.sunDummy, nullptr);
+    if (parked.sunDummyMem)  dd.freeMemory(parked.device, parked.sunDummyMem, nullptr);
+    parked.sunDummyView = VK_NULL_HANDLE;
+    parked.sunDummy = VK_NULL_HANDLE;
+    parked.sunDummyMem = VK_NULL_HANDLE;
+    parked.sunDummyReady = false;
     // velView is g_mv.viewArray - g_mv owns and destroys it; destroying it
     // here too was a latent double-destroy.
-    for (std::map<VkImage, VkImageView>::iterator it = g_taa.flagsViews.begin();
-         it != g_taa.flagsViews.end(); ++it)
-        if (it->second) dd.destroyImageView(g_taa.device, it->second, nullptr);
-    g_taa.flagsViews.clear();
-    if (g_taa.flagsFallbackView) dd.destroyImageView(g_taa.device, g_taa.flagsFallbackView, nullptr);
-    if (g_taa.flagsFallback)     dd.destroyImage(g_taa.device, g_taa.flagsFallback, nullptr);
-    if (g_taa.flagsFallbackMem)  dd.freeMemory(g_taa.device, g_taa.flagsFallbackMem, nullptr);
+    for (std::map<VkImage, VkImageView>::iterator it = parked.flagsViews.begin();
+         it != parked.flagsViews.end(); ++it)
+        if (it->second) dd.destroyImageView(parked.device, it->second, nullptr);
+    parked.flagsViews.clear();
+    if (parked.flagsFallbackView) dd.destroyImageView(parked.device, parked.flagsFallbackView, nullptr);
+    if (parked.flagsFallback)     dd.destroyImage(parked.device, parked.flagsFallback, nullptr);
+    if (parked.flagsFallbackMem)  dd.freeMemory(parked.device, parked.flagsFallbackMem, nullptr);
     for (int i = 0; i < 2; ++i) {
-        if (g_taa.history[i])    dd.destroyImage(g_taa.device, g_taa.history[i], nullptr);
-        if (g_taa.historyMem[i]) dd.freeMemory(g_taa.device, g_taa.historyMem[i], nullptr);
+        if (parked.history[i])    dd.destroyImage(parked.device, parked.history[i], nullptr);
+        if (parked.historyMem[i]) dd.freeMemory(parked.device, parked.historyMem[i], nullptr);
     }
-    if (g_taa.sharpView)  dd.destroyImageView(g_taa.device, g_taa.sharpView, nullptr);
-    if (g_taa.sharpImage) dd.destroyImage(g_taa.device, g_taa.sharpImage, nullptr);
-    if (g_taa.sharpMem)   dd.freeMemory(g_taa.device, g_taa.sharpMem, nullptr);
+    if (parked.sharpView)  dd.destroyImageView(parked.device, parked.sharpView, nullptr);
+    if (parked.sharpImage) dd.destroyImage(parked.device, parked.sharpImage, nullptr);
+    if (parked.sharpMem)   dd.freeMemory(parked.device, parked.sharpMem, nullptr);
     TaaState fresh;
-    fresh.device = g_taa.device;
+    fresh.device = parked.device;
     g_taa = fresh;
 }
 
@@ -1696,7 +1702,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                // this is a single float that changes only when the viewport
                // orientation does, and the snapshot is taken further down than
                // the gather now sits.
-               g_taaVpYSign,
+               g_taaVpYSign.load(std::memory_order_relaxed),
                g_taa.normValid ? g_taa.normView : VK_NULL_HANDLE,
                giGbufBuf, giGbufOff, giGbufRange);
 
@@ -1774,7 +1780,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         memcpy(snapEd,     g_taaEdAB,    sizeof(snapEd));
         memcpy(snapIp,     g_taaInvProj, sizeof(snapIp));
         memcpy(snapReproj, g_taaReproj,  sizeof(snapReproj));
-        snapYSign = g_taaVpYSign;
+        snapYSign = g_taaVpYSign.load(std::memory_order_relaxed);
         snapReprojValid = g_taaReprojValid;
         if (g_taaShareSeq.load(std::memory_order_acquire) == s1) break;
     }

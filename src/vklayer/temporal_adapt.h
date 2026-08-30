@@ -22,6 +22,34 @@
 
 namespace tadapt {
 
+// ---- UV / NDC / PIXELS -> RENDER PIXELS, PER AXIS.
+//
+// Both backends want render pixels, so both need this, so it is written once.
+//
+// It is per-AXIS on purpose. The first version used a single scalar and
+// multiplied it by renderW for x and renderH for y, which is correct for UV and
+// for NDC and silently wrong for pixels: the scalar came out 1/renderW, so y
+// became renderH/renderW - the aspect ratio, 0.56 at 2953x1661. Latent today
+// because the layer stores UV, and exactly the kind of thing this file exists
+// to stop being rediscovered by the next backend.
+inline void mvToPixels(const tcore::Frame &f, float &sx, float &sy)
+{
+    switch (f.mvUnit) {
+    case tcore::kMvPixels:                       // already pixels
+        sx = 1.0f;                    sy = 1.0f;                    break;
+    case tcore::kMvNdc:                          // NDC spans 2 across the extent
+        sx = (float)f.renderW * 0.5f; sy = (float)f.renderH * 0.5f; break;
+    case tcore::kMvUv:
+    default:                                     // fraction of the target
+        sx = (float)f.renderW;        sy = (float)f.renderH;        break;
+    }
+    sx *= f.mvScale;
+    sy *= f.mvScale * f.mvYSign;
+    // Both backends want current -> previous. A frame storing the other
+    // direction is negated here rather than handed over mirrored.
+    if (f.mvDir == tcore::kMvToCurrent) { sx = -sx; sy = -sy; }
+}
+
 // ---------------------------------------------------------------- FSR 3 -----
 //
 // From ffx_fsr3upscaler.h, FfxFsr3UpscalerDispatchDescription:
@@ -57,15 +85,7 @@ inline bool toFsr3(const tcore::Frame &f, Fsr3Inputs &o, const char **whyNot = 0
     // the scale because FSR3 offers no separate hook for it; that is the whole
     // reason mvYSign is a field on the frame instead of being folded into the
     // stored vectors, where it could never be corrected without a re-render.
-    const float unit = (f.mvUnit == tcore::kMvUv) ? 1.0f
-                     : (f.mvUnit == tcore::kMvNdc) ? 0.5f : (1.0f / (float)(f.renderW ? f.renderW : 1));
-    o.mvScaleX = f.mvScale * unit * (float)f.renderW;
-    o.mvScaleY = f.mvScale * unit * (float)f.renderH * f.mvYSign;
-
-    // FSR3 wants current -> previous. If a frame ever stores the other
-    // direction, negate rather than silently hand it a mirrored field.
-    if (f.mvDir == tcore::kMvToCurrent) { o.mvScaleX = -o.mvScaleX;
-                                          o.mvScaleY = -o.mvScaleY; }
+    mvToPixels(f, o.mvScaleX, o.mvScaleY);
 
     // NDC spans 2 across the render extent, so NDC -> pixels is size/2.
     o.jitterX = f.jitterNdcX * 0.5f * (float)f.renderW;
@@ -130,12 +150,7 @@ inline bool toDlss(const tcore::Frame &f, DlssInputs &o,
     // Identical to the FSR3 path on purpose: same unit, same direction, so if
     // one is right and the other is not, the difference is visible as a diff
     // of these two functions rather than buried in two call sites.
-    const float unit = (f.mvUnit == tcore::kMvUv) ? 1.0f
-                     : (f.mvUnit == tcore::kMvNdc) ? 0.5f : (1.0f / (float)(f.renderW ? f.renderW : 1));
-    o.mvScaleX = f.mvScale * unit * (float)f.renderW;
-    o.mvScaleY = f.mvScale * unit * (float)f.renderH * f.mvYSign;
-    if (f.mvDir == tcore::kMvToCurrent) { o.mvScaleX = -o.mvScaleX;
-                                          o.mvScaleY = -o.mvScaleY; }
+    mvToPixels(f, o.mvScaleX, o.mvScaleY);
 
     const float s = jitterNegated ? -1.0f : 1.0f;
     o.jitterX = s * f.jitterNdcX * 0.5f * (float)f.renderW;

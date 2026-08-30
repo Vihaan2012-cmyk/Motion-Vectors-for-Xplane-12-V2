@@ -2578,6 +2578,19 @@ static float matrixCallback(float sinceLast, float, int, void *)
 
     TaaShare *s = g_share;
 
+    // Seqlock: odd means "mid-write". Before the roll below, because the roll
+    // is itself a write the reader must not observe half-done - prev and curr
+    // matrices disagreeing about which frame they belong to IS the torn state.
+    //
+    // FORCED odd rather than incremented blindly. This function has an early
+    // return (the not-in-flight path below), and a plain ++ would leave the
+    // counter odd there; the next call's ++ would then make it EVEN across the
+    // whole write, which is the protocol inverted - unreadable when idle and
+    // undetectable when it matters. Forcing parity self-heals from any state.
+    ++s->writeSeq;
+    if ((s->writeSeq & 1u) == 0) ++s->writeSeq;
+    MemoryBarrier();
+
     // Roll current into previous before overwriting.
     memcpy(s->prevProj,      s->proj,      sizeof(s->proj));
     memcpy(s->prevModelview, s->modelview, sizeof(s->modelview));
@@ -2666,6 +2679,10 @@ static float matrixCallback(float sinceLast, float, int, void *)
         g_prevSpeed    = 0.0f;
         g_jitterIndex  = 0;
         memset(g_slots, 0, sizeof(g_slots));
+        // Close the seqlock this path opened at the top, or the block stays
+        // odd for every menu frame and the layer refuses to snapshot at all.
+        MemoryBarrier();
+        ++s->writeSeq;
         return -1.0f;
     }
 
@@ -4043,6 +4060,9 @@ static float matrixCallback(float sinceLast, float, int, void *)
     MemoryBarrier();
     ++s->frame;
     s->valid = (s->frame > 1 && s->reprojValid) ? 1 : 0;
+    // Even: the write is complete, frame and valid included.
+    MemoryBarrier();
+    ++s->writeSeq;
 
     // Dump the full state twice, counted in FLIGHT frames rather than total
     // frames: once as soon as the projection is real, and again a few seconds

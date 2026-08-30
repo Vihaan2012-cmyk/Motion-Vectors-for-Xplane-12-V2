@@ -433,7 +433,11 @@ static float g_taaInvProj[2] = { 1.0f, 1.0f };
 // hook) because snapshot() is defined before it.
 static float g_taaReproj[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
 static bool  g_taaReprojValid = false;
-static float g_taaVpYSign = 1.0f;
+// Atomic rather than covered by the seqlock: its writer is
+// Layer_CmdSetViewport, which runs on X-Plane's recording threads and cannot
+// reach the snapshot()'s critical section. A single relaxed float is exactly
+// what this is - one value, no invariant tying it to its neighbours.
+static std::atomic<float> g_taaVpYSign{1.0f};
 
 static bool snapshot(Snapshot *o)
 {
@@ -441,6 +445,12 @@ static bool snapshot(Snapshot *o)
     if (!g_share || !g_share->valid) return false;
 
     for (int attempt = 0; attempt < 4; ++attempt) {
+        // Odd writeSeq is the plugin mid-write; a change across the copy is a
+        // write that started after we began. Either way the copy is torn and
+        // the old frame-equality check alone could not see the second case -
+        // see the note over writeSeq in share.h.
+        const uint32_t seq1 = g_share->writeSeq;
+        if (seq1 & 1u) continue;
         uint64_t before = g_share->frame;
 
         memcpy(o->reproj,          g_share->reproj,          sizeof(o->reproj));
@@ -543,6 +553,7 @@ static bool snapshot(Snapshot *o)
         memcpy(o->objects,  g_share->objects,  sizeof(TaaMovingObject) * o->objectCount);
 
         MemoryBarrier();
+        if (g_share->writeSeq != seq1) continue;
         if (g_share->frame == before) {
             o->frame = before;
             o->valid = true;
@@ -5538,7 +5549,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetViewport(
                       flip ? "-1" : "+1");
             }
             g_viewportYFlipped = flip;
-            g_taaVpYSign = flip ? -1.0f : 1.0f;
+            g_taaVpYSign.store(flip ? -1.0f : 1.0f, std::memory_order_relaxed);
         }
     }
 
@@ -6104,6 +6115,31 @@ static uint64_t g_xpFsrNoTarget = 0;
 // decided before shader modules are created, but WHICH upscaler dispatches is a
 // per-frame decision and can be switched in flight to compare them on the same
 // scene, weather and thermal state.
+// ---- IS THIS IMAGE STILL ALIVE, NOT MERELY NON-NULL?
+//
+// The side-car hands three image handles to FSR3 by value every present, and
+// the documented crash is not a null one: loading an aircraft destroys and
+// recreates the render targets, and mid-swap those handles are STALE - a
+// destroyed image whose handle value is still sitting in our globals. FSR3 then
+// reads freed memory. "which is what took the sim down on an aircraft change".
+//
+// fgdilate::run checks for VK_NULL_HANDLE, which cannot see that: a stale
+// handle is non-null by definition. The real guard is g_sceneColorStable, and
+// that guard was silently broken until 2026-08-30 - it compared how MANY HDR
+// targets existed rather than WHICH, so a rebuild swapping three for three left
+// the count unchanged and the settle window was never entered.
+//
+// g_allImages is maintained by vkCreateImage/vkDestroyImage, so membership is
+// exactly "the driver still has this object". Checking it turns a read of freed
+// memory into a skipped frame - which is the correct outcome and a cheap one,
+// three map lookups once per present.
+static bool imageStillLive(VkImage img)
+{
+    if (img == VK_NULL_HANDLE) return false;
+    std::lock_guard<std::mutex> g(g_lock);
+    return g_allImages.count(img) != 0;
+}
+
 static bool fsr3Wanted()
 {
     const char *e = getenv("TAA_FSR3");
@@ -7089,8 +7125,6 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                   (void*)g_mv.view, (void*)g_sceneColor.image,
                   g_sceneColor.w, g_sceneColor.h);
     }
-    const bool lastScenePass =
-        g_sceneEndsLastFrame == 0 || g_sceneEndsThisFrame >= g_sceneEndsLastFrame;
     // Resolve on the LIT pass: one full-size colour attachment, no depth
     // reload, and only after the velocity target has been bound this frame.
     // That excludes the G-buffer pass (colour=5, material data) and the cockpit
@@ -7208,20 +7242,39 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     // reach the screen; the rest are work nobody sees. The counter says how
     // many were being run, so the saving is visible rather than assumed, and
     // taa.max_resolves raises the cap if a frame ever genuinely needs more.
-    static uint32_t resolvesThisPresent = 0;
-    static uint64_t resolvePresentTag = ~0ull;
-    if (resolvePresentTag != g_frameCount) {
-        if (resolvesThisPresent > 1) {
-            static uint32_t worst = 0;
-            if (resolvesThisPresent > worst) {
-                worst = resolvesThisPresent;
-                trace("TAA COST: %u resolves ran in one presented frame - each "
-                      "is a full-resolution dispatch and only one can be seen. "
-                      "Capping at taa.max_resolves.", resolvesThisPresent);
+    // ---- ATOMIC, BECAUSE EVERY RECORDING THREAD PASSES THROUGH HERE.
+    //
+    // These sit BEFORE the lit-pass gate, so the shadow and UI command-buffer
+    // threads read and write them concurrently with the scene thread. As plain
+    // statics that is a data race - formally undefined, and practically a
+    // one-frame miscount in exactly the machinery that decides whether a
+    // resolve runs. The very reason the per-cb maps exist is recorded a few
+    // hundred lines down: "X-Plane records on multiple threads, so a global
+    // pass counter is racy". These were global pass counters.
+    //
+    // exchange() keeps the reset-once-per-present semantics under concurrency:
+    // whichever thread sees the new frame first performs the reset, the rest
+    // observe the already-updated tag.
+    static std::atomic<uint32_t> resolvesThisPresent(0);
+    static std::atomic<uint64_t> resolvePresentTag(~0ull);
+    {
+        const uint64_t prevTag =
+            resolvePresentTag.exchange(g_frameCount, std::memory_order_relaxed);
+        if (prevTag != g_frameCount) {
+            const uint32_t ran =
+                resolvesThisPresent.exchange(0, std::memory_order_relaxed);
+            if (ran > 1) {
+                static std::atomic<uint32_t> worst(0);
+                uint32_t w = worst.load(std::memory_order_relaxed);
+                while (ran > w &&
+                       !worst.compare_exchange_weak(w, ran,
+                                                    std::memory_order_relaxed)) {}
+                if (ran > w)
+                    trace("TAA COST: %u resolves ran in one presented frame - "
+                          "each is a full-resolution dispatch and only one can "
+                          "be seen. Capping at taa.max_resolves.", ran);
             }
         }
-        resolvesThisPresent = 0;
-        resolvePresentTag = g_frameCount;
     }
     // Cached: once per vkCmdEndRendering, and X-Plane ends a lot of passes.
     static uint64_t mrGen = ~(uint64_t)0;
@@ -7247,7 +7300,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     if (!reprojUsable) g_taaStaleResume = true;
     do if (litPass && taaEnabled() && !g_mv.wantDump && reprojUsable &&
         !mvBypassed() &&
-        resolvesThisPresent < maxResolves &&
+        resolvesThisPresent.load(std::memory_order_relaxed) < maxResolves &&
         mvBindAge <= 1) {
         gateReach(2);
         std::map<VkCommandBuffer, VkDevice>::iterator tci = g_cbToDevice.find(cb);
@@ -7620,16 +7673,23 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     // graveyard. One init per 60 frames is plenty - if the
                     // trigger is real it still happens, just once; while
                     // throttled the resolve skips rather than thrashes.
-                    static uint64_t lastInitFrame = 0;
-                    if (g_taa.ready && g_frameCount - lastInitFrame < 600) {
+                    // Atomic for the same reason as the counters above:
+                    // a race here admits two re-inits back to back, which is
+                    // precisely the thrash this throttle exists to prevent -
+                    // and a re-init is the single most dangerous thing this
+                    // hook can do.
+                    static std::atomic<uint64_t> lastInitFrame(0);
+                    if (g_taa.ready &&
+                        g_frameCount - lastInitFrame.load(std::memory_order_relaxed) < 600) {
                         static uint64_t thrLog = 0;
                         if ((thrLog++ % 120) == 0)
                             trace("TAA: re-init THROTTLED (last init %llu "
                                   "frames ago) - resolve skipped this frame",
-                                  (unsigned long long)(g_frameCount - lastInitFrame));
+                                  (unsigned long long)(g_frameCount -
+                                   lastInitFrame.load(std::memory_order_relaxed)));
                         break;
                     }
-                    lastInitFrame = g_frameCount;
+                    lastInitFrame.store(g_frameCount, std::memory_order_relaxed);
                     // A shape change is a history discontinuity in its own right.
                     tf.reset |= temporal::RESET_RESOLUTION;
                     taaInit(tdd, tci->second, passInfo.color0, litFmt,
@@ -7839,7 +7899,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     // Hand the clear back to the render passes.
                     g_mvClearedAtPresent.store(false);
                 }
-                ++resolvesThisPresent;
+                resolvesThisPresent.fetch_add(1, std::memory_order_relaxed);
                 gateReach(9);
                 // Watched by noteSsrFeedbackCheck for the rest of the frame.
                 g_taaWroteImageThisFrame = passInfo.color0;
@@ -9205,6 +9265,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         live::onoff("taa.fg_dilate", "TAA_FG_DILATE", true)) {
         const float vs = taaVelScale() * live::f("fsr.mv_x", nullptr, 1.0f);
         const float ys = taaVelYSign() * live::f("fsr.mv_y", nullptr, 1.0f);
+        // Belt and braces with g_sceneColorStable above: that says the scene
+        // has settled, this says these particular objects still exist. The two
+        // failed independently before - the settle window was never entered
+        // because its trigger was broken, and nothing else checked.
+        const bool liveHandles = imageStillLive(g_sceneColor.image) &&
+                                 imageStillLive(g_sceneDepth) &&
+                                 imageStillLive(g_mv.image);
+        if (!liveHandles) {
+            static uint64_t said = 0;
+            if ((said++ % 120) == 0)
+                trace("FG DILATE: skipped - one of the three images handed to "
+                      "FSR3 is no longer live (colour %p depth %p mv %p). A "
+                      "stale handle here is a read of freed memory, which is "
+                      "what took the sim down on an aircraft change.",
+                      (void*)g_sceneColor.image, (void*)g_sceneDepth,
+                      (void*)g_mv.image);
+        }
+        if (liveHandles)
         fgdilate::run(g_sceneColor.image, g_sceneColor.format, g_sceneColor.layout,
                       g_sceneDepth, g_sceneDepthFormat, g_sceneDepthLayout,
                       g_mv.image, kMvFormat,
@@ -14516,6 +14594,28 @@ static bool tcoreDescribe(tcore::Frame &f,
     f.frameTimeMs = g_velSnap.frameTimeMs > 0.0f ? g_velSnap.frameTimeMs : 16.6f;
     f.reprojValid = g_taaReprojValid;
     memcpy(f.reproj, g_taaReproj, sizeof(f.reproj));
+
+    // ---- THE IMAGES MUST STILL EXIST, NOT MERELY BE NON-NULL.
+    //
+    // tcore::usable checks that a handle is present and the sizes are sane. It
+    // cannot check that the driver still owns the object, because the core has
+    // no Vulkan dependency by design - so the liveness test lives here, at the
+    // one place that has both the frame and the layer's image census.
+    //
+    // This is the crash that took the sim down on an aircraft change, and it is
+    // worth being precise about why a null check never caught it: a destroyed
+    // image leaves its handle value sitting in our globals, so it is non-null,
+    // plausible, and freed. Every backend routed through this function gets the
+    // test for free, which is the argument for routing them through it.
+    if (!imageStillLive(colour) || !imageStillLive(depth) || !imageStillLive(mv)) {
+        static uint64_t said = 0;
+        if ((said++ % 600) == 0)
+            trace("TCORE: refusing the frame - an input image is no longer live "
+                  "(colour %p depth %p mv %p). Non-null but destroyed is what a "
+                  "stale handle looks like.",
+                  (void*)colour, (void*)depth, (void*)mv);
+        return false;
+    }
 
     f.valid = true;
     return tcore::usable(f);

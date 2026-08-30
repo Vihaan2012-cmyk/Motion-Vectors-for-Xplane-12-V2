@@ -641,6 +641,25 @@ struct TaaShare {
     uint64_t layerHeartbeat;
 
     int32_t valid;            // 0 until two frames of history exist
+
+    // ---- THE WRITE SEQUENCE. frame ALONE WAS NOT A SEQLOCK.
+    //
+    // The layer snapshots this block with: before = frame; copy; check
+    // frame == before. That detects a write that COMPLETED during the copy and
+    // cannot detect one that STARTED during it - the plugin bumps frame only
+    // after the last field, so a reader overlapping the write window copies
+    // half-old, half-new fields and the check still passes. A torn reproj
+    // matrix is one frame of wrong reprojection: a single-frame jump, of
+    // exactly the kind that gets reported as motion looking subtly wrong and
+    // never reproduces on demand.
+    //
+    // writeSeq goes ODD before the first field is touched and EVEN after the
+    // last (frame and valid included). The reader rejects odd and re-reads on
+    // change - the same protocol the layer already uses internally for its
+    // frame-thread globals. Appended at the end so structSize still describes
+    // every prior field at its old offset; mixed plugin/layer versions already
+    // fail closed at MapViewOfFile before this could mislead anyone.
+    uint32_t writeSeq;
 };
 
 // ------------------------------------------------------------ matrix helpers
