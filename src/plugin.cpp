@@ -1937,12 +1937,12 @@ static bool openShare()
     if (g_share) return true;
 
     g_shareHandle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                       0, sizeof(TaaShare), TAA_SHARE_NAME);
+                                       0, TAA_SHARE_MAP_BYTES, TAA_SHARE_NAME);
     if (!g_shareHandle) {
         xlog("share: CreateFileMapping failed (%lu)", GetLastError());
         return false;
     }
-    g_share = (TaaShare*)MapViewOfFile(g_shareHandle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(TaaShare));
+    g_share = (TaaShare*)MapViewOfFile(g_shareHandle, FILE_MAP_ALL_ACCESS, 0, 0, TAA_SHARE_MAP_BYTES);
     if (!g_share) {
         xlog("share: MapViewOfFile failed (%lu)", GetLastError());
         return false;
@@ -2498,6 +2498,22 @@ static int autoStartDrawCb(XPLMDrawingPhase, int, void *)
     return 1;
 }
 
+// ---- PUBLISH THE FRAME: copy the live struct into the idle slot, flip.
+//
+// See the note over pubIdx in share.h. The copy is of the WHOLE struct, layer-
+// owned fields included - stale copies of those in a pub slot are harmless
+// because the reader's snapshot only consumes plugin-owned fields; the layer
+// reads its own fields (and fgHold) from the live struct as before.
+static void taaPublish(void)
+{
+    if (!g_share) return;
+    TaaShare *pub = TAA_SHARE_PUB(g_share);
+    const uint32_t nxt = (g_share->pubIdx ^ 1u) & 1u;
+    memcpy(&pub[nxt], g_share, sizeof(TaaShare));
+    MemoryBarrier();
+    g_share->pubIdx = nxt;
+}
+
 static float matrixCallback(float sinceLast, float, int, void *)
 {
     // Real elapsed time, not a guessed constant - the delay before placing the
@@ -2582,19 +2598,6 @@ static float matrixCallback(float sinceLast, float, int, void *)
     pumpControl();
 
     TaaShare *s = g_share;
-
-    // Seqlock: odd means "mid-write". Before the roll below, because the roll
-    // is itself a write the reader must not observe half-done - prev and curr
-    // matrices disagreeing about which frame they belong to IS the torn state.
-    //
-    // FORCED odd rather than incremented blindly. This function has an early
-    // return (the not-in-flight path below), and a plain ++ would leave the
-    // counter odd there; the next call's ++ would then make it EVEN across the
-    // whole write, which is the protocol inverted - unreadable when idle and
-    // undetectable when it matters. Forcing parity self-heals from any state.
-    ++s->writeSeq;
-    if ((s->writeSeq & 1u) == 0) ++s->writeSeq;
-    MemoryBarrier();
 
     // Roll current into previous before overwriting.
     memcpy(s->prevProj,      s->proj,      sizeof(s->proj));
@@ -2684,10 +2687,9 @@ static float matrixCallback(float sinceLast, float, int, void *)
         g_prevSpeed    = 0.0f;
         g_jitterIndex  = 0;
         memset(g_slots, 0, sizeof(g_slots));
-        // Close the seqlock this path opened at the top, or the block stays
-        // odd for every menu frame and the layer refuses to snapshot at all.
-        MemoryBarrier();
-        ++s->writeSeq;
+        // Publish even here: the reader must see valid=0 in a coherent copy,
+        // not by luck of reading the live struct at the right instant.
+        taaPublish();
         return -1.0f;
     }
 
@@ -4065,9 +4067,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
     MemoryBarrier();
     ++s->frame;
     s->valid = (s->frame > 1 && s->reprojValid) ? 1 : 0;
-    // Even: the write is complete, frame and valid included.
-    MemoryBarrier();
-    ++s->writeSeq;
+    taaPublish();
 
     // Dump the full state twice, counted in FLIGHT frames rather than total
     // frames: once as soon as the projection is real, and again a few seconds

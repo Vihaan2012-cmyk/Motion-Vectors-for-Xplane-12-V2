@@ -648,25 +648,41 @@ struct TaaShare {
 
     int32_t valid;            // 0 until two frames of history exist
 
-    // ---- THE WRITE SEQUENCE. frame ALONE WAS NOT A SEQLOCK.
+    // ---- THE PUBLISH INDEX. frame ALONE WAS NOT A SEQLOCK, AND A SEQLOCK
+    // AROUND THIS STRUCT WAS NOT ONE EITHER.
     //
-    // The layer snapshots this block with: before = frame; copy; check
+    // First fault: the layer snapshotted with before = frame; copy; check
     // frame == before. That detects a write that COMPLETED during the copy and
-    // cannot detect one that STARTED during it - the plugin bumps frame only
-    // after the last field, so a reader overlapping the write window copies
-    // half-old, half-new fields and the check still passes. A torn reproj
-    // matrix is one frame of wrong reprojection: a single-frame jump, of
-    // exactly the kind that gets reported as motion looking subtly wrong and
-    // never reproduces on demand.
+    // cannot detect one that STARTED during it, so a reader overlapping the
+    // write window copied half-old, half-new matrices and passed the check -
+    // one frame of wrong reprojection, the kind that reads as motion looking
+    // subtly wrong and never reproduces on demand.
     //
-    // writeSeq goes ODD before the first field is touched and EVEN after the
-    // last (frame and valid included). The reader rejects odd and re-reads on
-    // change - the same protocol the layer already uses internally for its
-    // frame-thread globals. Appended at the end so structSize still describes
-    // every prior field at its old offset; mixed plugin/layer versions already
-    // fail closed at MapViewOfFile before this could mislead anyone.
-    uint32_t writeSeq;
+    // Second fault, tried and measured before this: an odd/even seqlock around
+    // the flight callback. The callback interleaves its writes with dataref
+    // reads across its whole body, so the odd window spans MILLISECONDS - and
+    // the reader retries in microseconds, so every retry lands inside the same
+    // window. That converts "occasionally torn" into "frequently stale", which
+    // on a rolling aircraft is the ground visibly racing. Worse.
+    //
+    // So: double buffer. The callback writes this live struct exactly as it
+    // always did - the live fields keep their immediacy for single-word
+    // readers like fgHold and keep working for the LAYER-owned fields it
+    // writes back (heartbeat, fps, vram). When a frame's state is complete,
+    // the plugin memcpys the whole struct into pub slot (pubIdx ^ 1) - two
+    // full copies of TaaShare live directly after this struct in the mapping,
+    // see TAA_SHARE_MAP_BYTES - and then flips pubIdx. The reader copies only
+    // from pub[pubIdx] and rereads pubIdx after: the writer never touches the
+    // slot the reader was directed to, so a torn snapshot is structurally
+    // impossible rather than merely detected. ~1 KB memcpy once per flight
+    // loop; the flip is the publication.
+    uint32_t pubIdx;
 };
+
+// The mapping holds the live struct plus the two publish slots.
+#define TAA_SHARE_MAP_BYTES  ((DWORD)(sizeof(TaaShare) * 3))
+// The slots, given the mapped base.
+#define TAA_SHARE_PUB(base)  ((TaaShare *)((char *)(base) + sizeof(TaaShare)))
 
 // ------------------------------------------------------------ matrix helpers
 //

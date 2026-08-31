@@ -339,7 +339,7 @@ static void openShare()
         return;
     }
 
-    TaaShare *s = (TaaShare*)MapViewOfFile(g_shareHandle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(TaaShare));
+    TaaShare *s = (TaaShare*)MapViewOfFile(g_shareHandle, FILE_MAP_ALL_ACCESS, 0, 0, TAA_SHARE_MAP_BYTES);
     if (!s) { trace("SHARE: MapViewOfFile failed %lu", GetLastError()); return; }
     if (s->magic != TAA_MAGIC) { trace("SHARE: bad magic 0x%08X", s->magic); return; }
 
@@ -439,36 +439,43 @@ static bool  g_taaReprojValid = false;
 // what this is - one value, no invariant tying it to its neighbours.
 static std::atomic<float> g_taaVpYSign{1.0f};
 
+// Measured, because the last two protocols were argued about instead: ok is a
+// coherent copy delivered, fail is four attempts losing to the flip (should be
+// ~never), notReady is the menu / pre-publish state (normal at startup).
+static std::atomic<uint64_t> g_snapOk(0), g_snapFail(0), g_snapNotReady(0);
+
 static bool snapshot(Snapshot *o)
 {
     o->valid = false;
     if (!g_share || !g_share->valid) return false;
 
+    // The pub slots sit after the live struct in the mapping; see share.h.
+    // The writer only ever touches the slot pubIdx does NOT name, so a copy
+    // from pub[pubIdx] cannot tear - the reread below only catches the flip
+    // itself landing mid-copy, which one retry resolves.
+    TaaShare *pubs = TAA_SHARE_PUB(g_share);
     for (int attempt = 0; attempt < 4; ++attempt) {
-        // Odd writeSeq is the plugin mid-write; a change across the copy is a
-        // write that started after we began. Either way the copy is torn and
-        // the old frame-equality check alone could not see the second case -
-        // see the note over writeSeq in share.h.
-        const uint32_t seq1 = g_share->writeSeq;
-        if (seq1 & 1u) continue;
-        uint64_t before = g_share->frame;
+        const uint32_t idx = g_share->pubIdx & 1u;
+        const TaaShare *src = &pubs[idx];
+        if (!src->valid) { g_snapNotReady.fetch_add(1, std::memory_order_relaxed); return false; }
+        uint64_t before = src->frame;
 
-        memcpy(o->reproj,          g_share->reproj,          sizeof(o->reproj));
+        memcpy(o->reproj,          src->reproj,          sizeof(o->reproj));
         g_taaShareSeq.fetch_add(1, std::memory_order_release);   // -> odd
-        memcpy(g_taaReproj,        g_share->reproj,          sizeof(g_taaReproj));
-        g_taaReprojValid = g_share->reprojValid != 0;
-        memcpy(o->invCurrViewProj, g_share->invCurrViewProj, sizeof(o->invCurrViewProj));
-        memcpy(o->prevViewProj,    g_share->prevViewProj,    sizeof(o->prevViewProj));
-        memcpy(o->world,           g_share->world,           sizeof(o->world));
-        memcpy(o->proj,            g_share->proj,            sizeof(o->proj));
+        memcpy(g_taaReproj,        src->reproj,          sizeof(g_taaReproj));
+        g_taaReprojValid = src->reprojValid != 0;
+        memcpy(o->invCurrViewProj, src->invCurrViewProj, sizeof(o->invCurrViewProj));
+        memcpy(o->prevViewProj,    src->prevViewProj,    sizeof(o->prevViewProj));
+        memcpy(o->world,           src->world,           sizeof(o->world));
+        memcpy(o->proj,            src->proj,            sizeof(o->proj));
         // Engine-depth linearization for the resolve: view = -B/(d+A). Taken
         // from the LIVE projection, so cockpit near-clip scaling (the engine
         // scales clip planes per view - cockpit/near_clip_ratio) is tracked
         // rather than assumed.
-        g_taaEdAB[0] = g_share->proj[10];
-        g_taaEdAB[1] = g_share->proj[14];
-        g_taaInvProj[0] = g_share->proj[0] != 0.0f ? 1.0f / g_share->proj[0] : 1.0f;
-        g_taaInvProj[1] = g_share->proj[5] != 0.0f ? 1.0f / g_share->proj[5] : 1.0f;
+        g_taaEdAB[0] = src->proj[10];
+        g_taaEdAB[1] = src->proj[14];
+        g_taaInvProj[0] = src->proj[0] != 0.0f ? 1.0f / src->proj[0] : 1.0f;
+        g_taaInvProj[1] = src->proj[5] != 0.0f ? 1.0f / src->proj[5] : 1.0f;
         // ---- THE SUN BELONGS INSIDE THE CRITICAL SECTION. IT WAS OUTSIDE IT.
         //
         // The resolve reads g_taaSunView inside its seqlock retry loop, so it
@@ -484,27 +491,27 @@ static bool snapshot(Snapshot *o)
         // on a TRANSITION: the frame the plugin first publishes a real vector
         // over zeros, or a view change, where half the components are still 0
         // and the direction points somewhere the sun is not.
-        g_taaSunView[0]  = g_share->sunViewX;
-        g_taaSunView[1]  = g_share->sunViewY;
-        g_taaSunView[2]  = g_share->sunViewZ;
+        g_taaSunView[0]  = src->sunViewX;
+        g_taaSunView[1]  = src->sunViewY;
+        g_taaSunView[2]  = src->sunViewZ;
         g_taaShareSeq.fetch_add(1, std::memory_order_release);   // -> even
-        memcpy(o->prevProj,        g_share->prevProj,        sizeof(o->prevProj));
-        memcpy(o->bodyReproj,      g_share->bodyReproj,      sizeof(o->bodyReproj));
-        o->bodyReprojValid = g_share->bodyReprojValid;
-        o->camBodyDrift    = g_share->camBodyDrift;
-        o->camGap          = g_share->camGap;
-        o->selfTestPhase      = g_share->selfTestPhase;
-        o->viewType           = g_share->viewType;
-        o->selfTestExpectedPx = g_share->selfTestExpectedPx;
-        o->reverseZ      = g_share->reverseZ;
-        o->historyReset  = g_share->historyReset;
-        o->resetReason   = g_share->resetReason;
-        o->viewportW     = g_share->viewportW;
-        o->viewportH     = g_share->viewportH;
-        o->nearClip      = g_share->nearClip;
-        o->farClip       = g_share->farClip;
-        o->fovDeg        = g_share->fovDeg;
-        o->simTime       = g_share->simTime;
+        memcpy(o->prevProj,        src->prevProj,        sizeof(o->prevProj));
+        memcpy(o->bodyReproj,      src->bodyReproj,      sizeof(o->bodyReproj));
+        o->bodyReprojValid = src->bodyReprojValid;
+        o->camBodyDrift    = src->camBodyDrift;
+        o->camGap          = src->camGap;
+        o->selfTestPhase      = src->selfTestPhase;
+        o->viewType           = src->viewType;
+        o->selfTestExpectedPx = src->selfTestExpectedPx;
+        o->reverseZ      = src->reverseZ;
+        o->historyReset  = src->historyReset;
+        o->resetReason   = src->resetReason;
+        o->viewportW     = src->viewportW;
+        o->viewportH     = src->viewportH;
+        o->nearClip      = src->nearClip;
+        o->farClip       = src->farClip;
+        o->fovDeg        = src->fovDeg;
+        o->simTime       = src->simTime;
 
         // Derived here rather than published, because the plugin's frame and
         // the layer's frame are not the same thing - the plugin publishes from
@@ -513,16 +520,16 @@ static bool snapshot(Snapshot *o)
         // consume keeps it honest.
         {
             static double prevSim = -1.0;
-            double dt = (prevSim >= 0.0) ? (g_share->simTime - prevSim) : 0.0;
-            prevSim = g_share->simTime;
+            double dt = (prevSim >= 0.0) ? (src->simTime - prevSim) : 0.0;
+            prevSim = src->simTime;
             if (dt > 0.0 && dt < 1.0) o->frameTimeMs = (float)(dt * 1000.0);
             else                      o->frameTimeMs = 16.6f;
         }
-        o->jitterX       = g_share->jitterX;
-        o->jitterY       = g_share->jitterY;
-        o->jitterIndex   = g_share->jitterIndex;
-        o->jitterPhases  = g_share->jitterPhases;
-        o->lodBias       = g_share->lodBias;
+        o->jitterX       = src->jitterX;
+        o->jitterY       = src->jitterY;
+        o->jitterIndex   = src->jitterIndex;
+        o->jitterPhases  = src->jitterPhases;
+        o->lodBias       = src->lodBias;
         // ---- SAY WHAT THE SUN IS DOING, PERIODICALLY.
         //
         // Contact shadows were built with no way to see this value at all. If
@@ -543,25 +550,27 @@ static bool snapshot(Snapshot *o)
                           ? "  - all zero: below the horizon, or not published"
                           : "");
         }
-        o->camX          = g_share->camX;
-        o->camY          = g_share->camY;
-        o->camZ          = g_share->camZ;
-        o->camDelta      = g_share->camDelta;
-        o->objectCount   = g_share->objectCount;
+        o->camX          = src->camX;
+        o->camY          = src->camY;
+        o->camZ          = src->camZ;
+        o->camDelta      = src->camDelta;
+        o->objectCount   = src->objectCount;
         if (o->objectCount   < 0) o->objectCount   = 0;
         if (o->objectCount   > TAA_MAX_OBJECTS)  o->objectCount  = TAA_MAX_OBJECTS;
-        memcpy(o->objects,  g_share->objects,  sizeof(TaaMovingObject) * o->objectCount);
+        memcpy(o->objects,  src->objects,  sizeof(TaaMovingObject) * o->objectCount);
 
         MemoryBarrier();
-        if (g_share->writeSeq != seq1) continue;
-        if (g_share->frame == before) {
+        if ((g_share->pubIdx & 1u) != idx) continue;   // flipped mid-copy
+        if (src->frame == before) {
             o->frame = before;
             o->valid = true;
+            g_snapOk.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     }
     // Four consecutive tears cannot happen at one write per frame; treat as no
     // data rather than using a half-torn matrix.
+    g_snapFail.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 
@@ -1233,6 +1242,12 @@ static void accumReport()
 {
     if (!g_accFrames) return;
     const double pc = 100.0 / (double)g_accFrames;
+    trace("SNAPSHOT: %llu coherent, %llu failed, %llu not-ready. Failed should "
+          "be ~zero - the double buffer cannot tear, so a failure is four flip "
+          "collisions in a row and worth knowing about.",
+          (unsigned long long)g_snapOk.load(std::memory_order_relaxed),
+          (unsigned long long)g_snapFail.load(std::memory_order_relaxed),
+          (unsigned long long)g_snapNotReady.load(std::memory_order_relaxed));
     trace("ACCUM LEDGER: %llu frames | reprojection unchanged %llu (%.1f%%) | "
           "jitter unchanged %llu (%.1f%%) | BOTH unchanged %llu (%.1f%%) - "
           "those frames could not have accumulated anything, longest "
