@@ -1394,6 +1394,22 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
     fprintf(f, "      a consistent signed angle is a rotation applied somewhere;\n");
     fprintf(f, "      large absolute with near-zero mean is scatter, not a transform\n\n");
 
+    // ---- EIGHT TEXELS, RAW, NO GATES.
+    //
+    // Every filtered view of this target has contradicted every writer theory
+    // in turn. This prints the four half channels of eight texels spread
+    // across the frame with no reconstruction, no coverage gate, no depth
+    // gate - the bytes themselves, decoded and nothing else. Whatever tuple
+    // pattern appears IS the writer's signature.
+    fprintf(f, "RAW TEXELS (ungated)  x,y : R G B A\n");
+    for (int t = 0; t < 8; ++t) {
+        const uint32_t rx = (in.w * (uint32_t)(t * 2 + 1)) / 16u;
+        const uint32_t ry = (in.h * (uint32_t)(t * 2 + 1)) / 16u;
+        const size_t i3 = ((size_t)ry * in.w + rx) * in.halves;
+        fprintf(f, "  %4u,%4u : %14.6f %14.6f %14.6f %14.6f\n", rx, ry,
+                velHalfToFloat(in.px[i3]),     velHalfToFloat(in.px[i3 + 1]),
+                velHalfToFloat(in.px[i3 + 2]), velHalfToFloat(in.px[i3 + 3]));
+    }
     fprintf(f, "RAW PIXELS (residual over 8 px) - flow in pixels\n");
     fprintf(f, "  %6s %6s | %9s %9s | %9s %9s | %9s %9s | %8s\n",
             "x", "y", "meas dx", "meas dy", "full dx", "full dy",

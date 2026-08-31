@@ -443,6 +443,10 @@ static std::atomic<float> g_taaVpYSign{1.0f};
 // coherent copy delivered, fail is four attempts losing to the flip (should be
 // ~never), notReady is the menu / pre-publish state (normal at startup).
 static std::atomic<uint64_t> g_snapOk(0), g_snapFail(0), g_snapNotReady(0);
+// Dynamic colour-state coverage for the appended velocity slot - see the
+// hooks above Layer_DestroyImageView. Declared here because the present-time
+// ledger reports them long before the hooks are defined.
+static std::atomic<uint64_t> g_dynMaskCalls(0), g_dynMaskPatched(0);
 
 static bool snapshot(Snapshot *o)
 {
@@ -9159,6 +9163,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         }
         if ((frames % 120) == 0) viewLedgerReport();
         if ((frames % 120) == 0) quiesceReport();
+        if ((frames % 120) == 0 && g_dynMaskCalls.load(std::memory_order_relaxed))
+            trace("DYN MASK LEDGER: %llu dynamic colorWriteMask calls seen, "
+                  "%llu extended to cover the velocity slot. Zero seen would "
+                  "have killed the theory; nonzero extended is the foreign "
+                  "write being closed per draw.",
+                  (unsigned long long)g_dynMaskCalls.load(std::memory_order_relaxed),
+                  (unsigned long long)g_dynMaskPatched.load(std::memory_order_relaxed));
         if ((frames % 120) == 0) accumReport();
         if ((frames % 120) == 0 && (g_fgProxiesBuilt || g_fgRetiredCount))
             fgLedgerReport();
@@ -9960,6 +9971,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                           m10, m11, (double)fresh.proj[14], zInf);
                 }
                 if (!g_usePluginReproj) memcpy(g_velSnap.reproj, r, sizeof(r));
+                // ---- THE PUSHED MATRIX, NUMERICALLY, AT LAST.
+                //
+                // MV CALIB compared this matrix against the field AT THE SCREEN
+                // CENTRE, where ndc is zero - so a pure SCALE error contributes
+                // nothing there and "matrix at infinity says (0,0)" is exactly
+                // what a radially broken matrix also says. The one instrument
+                // that "cleared" the matrix was blind to the failure mode the
+                // field shows. Parked, this must reduce to K: diag(1,1,·,·)
+                // with [10]=1,[11]=1,[14]=proj14 and zero translation. Any
+                // other shape names the wrong input outright.
+                {
+                    static uint64_t rlog = 0;
+                    if ((rlog++ % 240) == 0)
+                        trace("MV PUSHED MATRIX: [%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | "
+                              "%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f] "
+                              "proj0=%.4f proj5=%.4f prevProj0=%.4f prevProj5=%.4f",
+                              r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+                              r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15],
+                              fresh.proj[0], fresh.proj[5],
+                              prevProjSaved[0], prevProjSaved[5]);
+                }
 
                 // Both, once in a while, so the difference is a measurement
                 // rather than a claim. Column 3 plus column 2 is the centre ray
@@ -13370,6 +13402,44 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                  p; p = p->pNext)
                 if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
                     src = (const VkPipelineRenderingCreateInfo*)p;
+            // ---- CENSUS OF WHAT THIS SKIP THROWS AWAY.
+            //
+            // Any pipeline skipped here still renders into passes we extend,
+            // declaring one attachment fewer than the pass carries - and if it
+            // arrived through graphics_pipeline_library linking, its blend
+            // state (and its write masks) live in a fragment-output LIBRARY
+            // this code has never once looked at. The provenance census
+            // proved the velocity target is written entirely by shaders that
+            // are not ours; this names the population that could be doing it.
+            {
+                static std::atomic<uint64_t> nSkipNoSrc(0), nSkipNoBlend(0),
+                                             nLib(0), nTaken(0);
+                bool isLib = false;
+                for (const VkBaseInStructure *pn =
+                         (const VkBaseInStructure *)ci[i].pNext;
+                     pn; pn = pn->pNext)
+                    if (pn->sType ==
+                        VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR ||
+                        pn->sType ==
+                        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT)
+                        isLib = true;
+                if (isLib) nLib.fetch_add(1, std::memory_order_relaxed);
+                if (!src) nSkipNoSrc.fetch_add(1, std::memory_order_relaxed);
+                else if (!ci[i].pColorBlendState)
+                    nSkipNoBlend.fetch_add(1, std::memory_order_relaxed);
+                else nTaken.fetch_add(1, std::memory_order_relaxed);
+                const uint64_t tot = nSkipNoSrc + nSkipNoBlend + nLib + nTaken;
+                if (tot == 200 || (tot % 2000) == 0)
+                    trace("PIPE CENSUS: taken %llu | skipped no-rendering-info "
+                          "%llu | skipped NULL-blend-in-dynamic-rendering %llu "
+                          "| library-involved %llu. The NULL-blend and library "
+                          "columns are pipelines whose velocity-slot write "
+                          "mask this layer has NEVER set.",
+                          (unsigned long long)nTaken.load(),
+                          (unsigned long long)nSkipNoSrc.load(),
+                          (unsigned long long)nSkipNoBlend.load(),
+                          (unsigned long long)nLib.load());
+            }
             if (!src || !ci[i].pColorBlendState) continue;
             // Mirror of the pass hook's depth-only rule: passes with zero
             // colour attachments are no longer extended, so a zero-attachment
@@ -18010,6 +18080,139 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyPipelineLayout(
     if (next) next(device, layout, alloc);
 }
 
+// ============================================================================
+// ---- DYNAMIC COLOUR STATE MUST COVER THE APPENDED VELOCITY SLOT.
+//
+// The static blend state sets the velocity attachment's colorWriteMask to 0 on
+// every unpatched pipeline - the guard this codebase already fought for once.
+// VK_EXT_extended_dynamic_state3 makes that guard dead letter: a pipeline that
+// declares VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT takes its masks from
+// vkCmdSetColorWriteMaskEXT at draw time, and X-Plane naturally sets them for
+// ITS OWN attachments only. The appended slot's dynamic mask is then simply
+// undefined - and measured on this driver, undefined means WRITE EVERYTHING:
+// the channel-2 provenance census found that not one sampled pixel of the
+// velocity target had been written by our patched fragments. Full-screen
+// passes were painting their own data - signed, radial, O(1..20) - over the
+// whole field, every frame, and every matrix theory chased in the meantime was
+// downstream of it.
+//
+// The repair is to complete what X-Plane starts: whenever it sets colour
+// write/blend state for exactly its own attachment range inside a pass that
+// carries our appended slot, append one more entry that says "not this one".
+// These hooks fire only inside extended passes; every other call forwards
+// untouched. Counters say whether the sim uses these entry points at all, so
+// the theory is confirmed or destroyed by numbers rather than argued.
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetColorWriteMaskEXT(
+    VkCommandBuffer cb, uint32_t first, uint32_t count,
+    const VkColorComponentFlags *pMasks)
+{
+    PFN_vkCmdSetColorWriteMaskEXT next = nullptr;
+    bool inMv = false; uint32_t slot = 0;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+            if (di != g_devices.end() && di->second.gdpa)
+                next = (PFN_vkCmdSetColorWriteMaskEXT)
+                    di->second.gdpa(ci->second, "vkCmdSetColorWriteMaskEXT");
+        }
+        std::map<VkCommandBuffer, bool>::iterator mb = g_cbMvBoundPass.find(cb);
+        inMv = (mb != g_cbMvBoundPass.end() && mb->second);
+        std::map<VkCommandBuffer, CbPassInfo>::iterator pi = g_cbPassInfo.find(cb);
+        if (pi != g_cbPassInfo.end()) slot = pi->second.colorCount;
+    }
+    g_dynMaskCalls.fetch_add(1, std::memory_order_relaxed);
+    if (!next) return;
+    if (inMv && pMasks && first + count == slot) {
+        // X-Plane covered exactly its own attachments; ours is the next index.
+        VkColorComponentFlags ext[9];
+        const uint32_t n = count > 8 ? 8 : count;
+        for (uint32_t i = 0; i < n; ++i) ext[i] = pMasks[i];
+        ext[n] = 0;                                  // the velocity slot: no writes
+        g_dynMaskPatched.fetch_add(1, std::memory_order_relaxed);
+        static uint64_t said = 0;
+        if ((said++ % 100000) == 0)
+            trace("DYN MASK: extended a dynamic colorWriteMask set (%u+1 "
+                  "attachments) - the appended velocity slot now has an "
+                  "EXPLICIT zero mask instead of an undefined one. This is the "
+                  "full-frame foreign write, closed.", count);
+        next(cb, first, n + 1, ext);
+        return;
+    }
+    next(cb, first, count, pMasks);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetColorBlendEnableEXT(
+    VkCommandBuffer cb, uint32_t first, uint32_t count, const VkBool32 *pEnables)
+{
+    PFN_vkCmdSetColorBlendEnableEXT next = nullptr;
+    bool inMv = false; uint32_t slot = 0;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+            if (di != g_devices.end() && di->second.gdpa)
+                next = (PFN_vkCmdSetColorBlendEnableEXT)
+                    di->second.gdpa(ci->second, "vkCmdSetColorBlendEnableEXT");
+        }
+        std::map<VkCommandBuffer, bool>::iterator mb = g_cbMvBoundPass.find(cb);
+        inMv = (mb != g_cbMvBoundPass.end() && mb->second);
+        std::map<VkCommandBuffer, CbPassInfo>::iterator pi = g_cbPassInfo.find(cb);
+        if (pi != g_cbPassInfo.end()) slot = pi->second.colorCount;
+    }
+    if (!next) return;
+    if (inMv && pEnables && first + count == slot) {
+        VkBool32 ext[9];
+        const uint32_t n = count > 8 ? 8 : count;
+        for (uint32_t i = 0; i < n; ++i) ext[i] = pEnables[i];
+        ext[n] = VK_FALSE;                           // no blending into velocity
+        next(cb, first, n + 1, ext);
+        return;
+    }
+    next(cb, first, count, pEnables);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Layer_CmdSetColorBlendEquationEXT(
+    VkCommandBuffer cb, uint32_t first, uint32_t count,
+    const VkColorBlendEquationEXT *pEq)
+{
+    PFN_vkCmdSetColorBlendEquationEXT next = nullptr;
+    bool inMv = false; uint32_t slot = 0;
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        std::map<VkCommandBuffer, VkDevice>::iterator ci = g_cbToDevice.find(cb);
+        if (ci != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator di = g_devices.find(dispatchKey(ci->second));
+            if (di != g_devices.end() && di->second.gdpa)
+                next = (PFN_vkCmdSetColorBlendEquationEXT)
+                    di->second.gdpa(ci->second, "vkCmdSetColorBlendEquationEXT");
+        }
+        std::map<VkCommandBuffer, bool>::iterator mb = g_cbMvBoundPass.find(cb);
+        inMv = (mb != g_cbMvBoundPass.end() && mb->second);
+        std::map<VkCommandBuffer, CbPassInfo>::iterator pi = g_cbPassInfo.find(cb);
+        if (pi != g_cbPassInfo.end()) slot = pi->second.colorCount;
+    }
+    if (!next) return;
+    if (inMv && pEq && first + count == slot) {
+        VkColorBlendEquationEXT ext[9];
+        const uint32_t n = count > 8 ? 8 : count;
+        for (uint32_t i = 0; i < n; ++i) ext[i] = pEq[i];
+        memset(&ext[n], 0, sizeof(ext[n]));
+        ext[n].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        ext[n].dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ext[n].colorBlendOp        = VK_BLEND_OP_ADD;
+        ext[n].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        ext[n].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ext[n].alphaBlendOp        = VK_BLEND_OP_ADD;
+        next(cb, first, n + 1, ext);
+        return;
+    }
+    next(cb, first, count, pEq);
+}
+
 static VKAPI_ATTR void VKAPI_CALL Layer_DestroyImageView(
     VkDevice device, VkImageView view, const VkAllocationCallbacks *alloc)
 {
@@ -18653,6 +18856,9 @@ MV_GetDeviceProcAddr(VkDevice device, const char *name)
     RETURN_IF("vkResetDescriptorPool",                 Layer_ResetDescriptorPool)
     RETURN_IF("vkDestroyImageView",                    Layer_DestroyImageView)
     RETURN_IF("vkDestroyPipeline",                     Layer_DestroyPipeline)
+    RETURN_IF("vkCmdSetColorWriteMaskEXT",             Layer_CmdSetColorWriteMaskEXT)
+    RETURN_IF("vkCmdSetColorBlendEnableEXT",           Layer_CmdSetColorBlendEnableEXT)
+    RETURN_IF("vkCmdSetColorBlendEquationEXT",         Layer_CmdSetColorBlendEquationEXT)
     RETURN_IF("vkResetCommandBuffer",                  Layer_ResetCommandBuffer)
     RETURN_IF("vkResetCommandPool",                    Layer_ResetCommandPool)
     RETURN_IF("vkDestroyCommandPool",                  Layer_DestroyCommandPool)
