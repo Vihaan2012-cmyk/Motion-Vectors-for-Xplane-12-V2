@@ -29,6 +29,11 @@ on top of it, all optional and all tunable live:
 - **Ambient occlusion and contact shadows** — near-field shading the sim's
   cascades cannot resolve, cosine-weighted and ramped so thresholds never
   show as speckle.
+- **A shader-family vector policy** — X-Plane's shipped shader pack, hashed
+  and classified: ground, objects, ocean and sky stay trusted motion-vector
+  sources; draped decals and glows inherit the vector beneath them; in-pass
+  UI, text and windshield rain write an exact zero. Wrong vectors are excluded
+  as a class instead of chased one bug at a time.
 - **TAAU** — temporal upsampling: render low, accumulate detail at output
   resolution.
 - **FSR3 upscaling and frame generation** — through a temporal core that

@@ -3874,11 +3874,112 @@ static float matrixCallback(float sinceLast, float, int, void *)
         // near field, where errors are largest. Better to fall back to the world
         // frame, which is at least correct for everything that is not the
         // aeroplane.
-        if (resolved && bodyTrusted && rigid && taaInverse(invAc, Ac)) {
+        // ---- EXACT INVERSE, NOT THE COFACTOR ONE.
+        //
+        // (proj * Mc)^-1 through the general cofactor expansion spans the
+        // projection's dynamic range - infinite far plane, centimetre near -
+        // and its w row degrades: the identical conditioning failure the
+        // layer's world path already replaced with the four-term perspective
+        // inverse. Compose from the two exact pieces instead:
+        // (proj * Mc)^-1 = Mc^-1 * proj^-1. Mc is rigid (the `rigid` gate
+        // below vouches for it), so its inverse is a transpose and a rotated
+        // negation; proj^-1 is closed-form, every term a reciprocal of a
+        // well-scaled number. This is what taa.body_zero=0 falls back to, so
+        // the body matrix is a genuine alternative rather than a return to
+        // the +-12 UV cockpit garbage the cofactor inverse produced.
+        bool invOk = false;
+        {
+            float invMc[16];
+            memset(invMc, 0, sizeof(invMc));
+            for (int c = 0; c < 3; ++c)
+                for (int r = 0; r < 3; ++r)
+                    invMc[c * 4 + r] = Mc[r * 4 + c];
+            for (int r = 0; r < 3; ++r)
+                invMc[12 + r] = -(Mc[r * 4 + 0] * Mc[12] +
+                                  Mc[r * 4 + 1] * Mc[13] +
+                                  Mc[r * 4 + 2] * Mc[14]);
+            invMc[15] = 1.0f;
+            const float p0  = s->proj[0],  p5  = s->proj[5];
+            const float p10 = s->proj[10], p11 = s->proj[11], p14 = s->proj[14];
+            if (p0 != 0.0f && p5 != 0.0f && p11 != 0.0f && p14 != 0.0f) {
+                float invP[16];
+                memset(invP, 0, sizeof(invP));
+                invP[0]  = 1.0f / p0;              // x_view from x_clip
+                invP[5]  = 1.0f / p5;              // y_view from y_clip
+                invP[11] = 1.0f / p14;             // w_view from z_clip
+                invP[14] = 1.0f / p11;             // z_view from w_clip
+                invP[15] = -p10 / (p11 * p14);
+                taaMul(invAc, invMc, invP);
+                invOk = true;
+            }
+        }
+        if (resolved && bodyTrusted && rigid && invOk) {
             taaMul(s->bodyReproj, Ap, invAc);
             s->bodyReprojValid = 1;
         } else {
             s->bodyReprojValid = 0;
+        }
+        // ---- DATUM CHECK: WHAT EACH PATH SAYS THE AIRCRAFT DATUM DID ON SCREEN.
+        //
+        // Measured with viz=2 (build 22, chase view, 144 kt): the airframe was
+        // saturated red - more motion than anything on screen - while it
+        // barely moved. The same matrix was exact at a standstill. So print,
+        // once a second in external views, the body path's own answer for the
+        // datum (b = origin) against the world path's answer for the same
+        // point, in milli-NDC, plus the per-frame aircraft and camera travel.
+        // A wrong matrix becomes a number with components, not a colour.
+        {
+            static int every = 0;
+            const bool external = s->viewType != 1026 && s->viewType != 1000 &&
+                                  s->viewType != 1017;
+            static const bool datumOn = getenv("TAA_DATUM_CHECK") != nullptr;
+            if (datumOn && external && invOk && (++every % 60) == 0) {
+                auto ndc = [](const float *M, const float *v, float *o) {
+                    float c[4];
+                    for (int r = 0; r < 4; ++r)
+                        c[r] = M[0*4+r]*v[0] + M[1*4+r]*v[1] + M[2*4+r]*v[2] + M[3*4+r]*v[3];
+                    o[0] = c[3] != 0.0f ? c[0] / c[3] : 0.0f;
+                    o[1] = c[3] != 0.0f ? c[1] / c[3] : 0.0f;
+                    o[2] = c[3];
+                };
+                const float b[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                float nc[3], npB[3], npW[3];
+                ndc(Ac, b, nc);                 // datum now
+                ndc(Ap, b, npB);                // datum last frame, body path (Ap directly)
+                // world path: the datum treated as a static world point at its
+                // CURRENT camera-relative position, seen through last frame's camera
+                float pw[4] = {Bc[12], Bc[13], Bc[14], 1.0f};
+                float PW[16]; taaMul(PW, s->prevProj, prevWorldRel);
+                ndc(PW, pw, npW);
+                // The LAYER never applies Ap directly: it pushes bodyReproj*K and the
+                // shader multiplies (x, y, w, 1). Reproduce that exactly on the datum.
+                float cl[4];
+                for (int r = 0; r < 4; ++r)
+                    cl[r] = Ac[0*4+r]*b[0] + Ac[1*4+r]*b[1] + Ac[2*4+r]*b[2] + Ac[3*4+r]*b[3];
+                float Kf[16]; memset(Kf, 0, sizeof(Kf));
+                Kf[0] = 1.0f; Kf[5] = 1.0f; Kf[10] = 1.0f; Kf[11] = 1.0f; Kf[14] = s->proj[14];
+                float BK[16]; taaMul(BK, s->bodyReproj, Kf);
+                const float v4[4] = {cl[0], cl[1], cl[3], 1.0f};
+                float npL[3]; ndc(BK, v4, npL);
+                // and Ap*invAc*clip with the TRUE clip (no K): isolates invAc from K
+                float AI[16]; taaMul(AI, Ap, invAc);
+                float npI[3]; ndc(AI, cl, npI);
+                double dOwn = havePrevBody ? sqrt((ownXd-prevOwn[0])*(ownXd-prevOwn[0]) +
+                                                 (ownYd-prevOwn[1])*(ownYd-prevOwn[1]) +
+                                                 (ownZd-prevOwn[2])*(ownZd-prevOwn[2])) : 0.0;
+                xlog("DATUM CHECK view=%d valid=%d gap=%.1f | datum now ndc(%.4f %.4f) w=%.1f | "
+                     "BODY says prev ndc(%.4f %.4f) -> vec %.1f %.1f mNDC | "
+                     "WORLD says prev ndc(%.4f %.4f) -> vec %.1f %.1f mNDC | "
+                     "LAYER FORMULA bodyReproj*K*(x,y,w,1) -> vec %.1f %.1f mNDC | "
+                     "Ap*invAc*trueclip -> vec %.1f %.1f mNDC | "
+                     "aircraft moved %.3f m, camera moved %.3f m this frame",
+                     s->viewType, s->bodyReprojValid, gap, nc[0], nc[1], nc[2],
+                     npB[0], npB[1], 1000.0f*(npB[0]-nc[0]), 1000.0f*(npB[1]-nc[1]),
+                     npW[0], npW[1], 1000.0f*(npW[0]-nc[0]), 1000.0f*(npW[1]-nc[1]),
+                     1000.0f*(npL[0]-nc[0]), 1000.0f*(npL[1]-nc[1]),
+                     1000.0f*(npI[0]-nc[0]), 1000.0f*(npI[1]-nc[1]),
+                     dOwn, (double)s->camDelta);
+            }
         }
 
         // Report state changes, and report PROGRESS while unresolved. Without

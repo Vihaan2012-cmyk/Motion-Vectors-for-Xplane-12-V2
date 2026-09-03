@@ -13,6 +13,14 @@ $env:TAA_VELOCITY            = "1"
 $env:TAA_LAYER_TRACE         = "1"
 Remove-Item Env:VK_LAYER_SETTINGS_PATH -ErrorAction SilentlyContinue
 
+# ---- NO DIAGNOSTIC READBACK ON A PLAIN RUN.
+#
+# taa_dump_every.txt in TEMP arms a periodic GPU readback (launch_xp_pid.ps1
+# sets it). It survives the run that armed it, and the readback stalls the sim
+# for a beat each time it fires - which read as "X-Plane crashed" once. A plain
+# launch is not a measurement, so it stands the arm down every time.
+Set-Content -Path (Join-Path $env:TEMP "taa_dump_every.txt") -Value "0" -Encoding ascii
+
 # ---- A CLEAN TRACE PER RUN, VERIFIED.
 #
 # Remove-Item on the trace fails silently while a dying X-Plane still holds the

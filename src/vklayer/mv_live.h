@@ -43,6 +43,9 @@ static std::map<std::string, std::string> g_kv;
 static std::string             g_path;
 static uint64_t                g_stamp   = 0;
 static uint64_t                g_reloads = 0;
+// Defined below; the reload report needs it to say when a locked key is edited.
+inline const std::map<std::string, const char *> &shippedMap();
+
 static bool                    g_everSeen = false;
 
 inline const char *path()
@@ -230,12 +233,38 @@ inline void loadNow()
     std::lock_guard<std::mutex> g(g_mtx);
     // Report only what CHANGED. A full dump every reload buries the one line
     // that matters, and the reason for reloading is almost always a single edit.
+    // Whether the shipped table is in force for THIS file's contents. A locked
+    // key edited in the ini is accepted into g_kv and then never read - lookup()
+    // returns the shipped value first. That silence cost a whole evening:
+    // taa.nearfield_m=0.0 sat in the ini through every "near-field disarmed"
+    // test while the layer ran 5.0 the entire time. Say it on the line itself.
+    bool lockedNow = true;
+    {
+        std::map<std::string, std::string>::iterator ul = kv.find("taa.unlock");
+        if (ul != kv.end() && !(ul->second == "0" || ul->second == "off" ||
+                                ul->second == "false" || ul->second == "no"))
+            lockedNow = false;
+    }
     for (std::map<std::string, std::string>::iterator it = kv.begin();
          it != kv.end(); ++it) {
         std::map<std::string, std::string>::iterator o = g_kv.find(it->first);
-        if (o == g_kv.end() || o->second != it->second)
-            trace("LIVE: %s = %s%s", it->first.c_str(), it->second.c_str(),
-                  o == g_kv.end() ? "  (new)" : "");
+        if (o == g_kv.end() || o->second != it->second) {
+            const char *shipped = nullptr;
+            if (lockedNow) {
+                std::map<std::string, const char *>::const_iterator sh =
+                    shippedMap().find(it->first);
+                if (sh != shippedMap().end() && it->second != sh->second)
+                    shipped = sh->second;
+            }
+            if (shipped)
+                trace("LIVE: %s = %s%s  *** IGNORED: the shipped tuning table locks "
+                      "this key at %s - set taa.unlock=1 for the ini to win",
+                      it->first.c_str(), it->second.c_str(),
+                      o == g_kv.end() ? "  (new)" : "", shipped);
+            else
+                trace("LIVE: %s = %s%s", it->first.c_str(), it->second.c_str(),
+                      o == g_kv.end() ? "  (new)" : "");
+        }
     }
     for (std::map<std::string, std::string>::iterator it = g_kv.begin();
          it != g_kv.end(); ++it)
@@ -390,7 +419,7 @@ static const Shipped kShipped[] = {
     { "taa.ao_radius",         "12.0"   },
     // Measured at -0.5 and it cost about half the frame rate at 4K on 8 GB of
     // VRAM. It stays at 0 unless someone deliberately unlocks and retunes it.
-    { "taa.lod_bias",          "0.0"    },
+    { "taa.lod_bias",          "-0.5"   },
 };
 static_assert(sizeof(kShipped) / sizeof(kShipped[0]) == MV_SHIPPED_COUNT,
               "kShipped changed size - update MV_SHIPPED_COUNT and the Lua "

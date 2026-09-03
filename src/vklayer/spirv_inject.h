@@ -56,8 +56,56 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdarg>
+#include <string>
+#include <atomic>
+#include <mutex>
+#include <process.h>
 
 namespace spvinj {
+
+
+// ---- THE WRITER TABLE, IN ITS OWN FILE.
+//
+// trace() backs off per call site after 64 lines, keeping only powers of two.
+// The pid -> module-hash lines are exactly the table a PID-mode readback is
+// read against, and the one pid that matters is never a power of two: pid 165
+// owned the racing lines and its line did not exist. So the table goes to
+// %TAA_MV_DIAG%\mv_pid_table_<pid>.txt (TEMP if unset), every line, no
+// back-off, and the PIPE lines from pipeline creation join it so a pid can be
+// read against the layout and blend state it was drawn with.
+inline void pidLog(const char *fmt, ...)
+{
+    static std::mutex mtx;
+    static std::string path;
+    std::lock_guard<std::mutex> g(mtx);
+    if (path.empty()) {
+        const char *dir = getenv("TAA_MV_DIAG");
+        if (!dir || !*dir) dir = getenv("TEMP");
+        if (!dir || !*dir) dir = ".";
+        char buf[640];
+        snprintf(buf, sizeof(buf), "%s\\mv_pid_table_%d.txt", dir, (int)_getpid());
+        path = buf;
+        FILE *h = fopen(path.c_str(), "w");
+        if (h) {
+            fprintf(h, "# vs/fs <pid> <module hash> <words>   - the tag a texel carries "
+                       "(channel B in PID mode) names this module\n"
+                       "# PIPE ...                            - one line per patched "
+                       "pipeline: which vertex pid it draws with, whether its layout "
+                       "carries our push range, and X-Plane's own blend state\n");
+            fclose(h);
+        }
+    }
+    FILE *f = fopen(path.c_str(), "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 
 enum {
     OpName = 5, OpMemberName = 6,
@@ -542,7 +590,8 @@ enum Result {
 // Returns INJ_OK and fills `out` on success. `location` receives the varying
 // location chosen, which the paired fragment shader has to read from.
 inline Result inject(const uint32_t *code, size_t sizeBytes,
-                     std::vector<uint32_t> &out, uint32_t *location)
+                     std::vector<uint32_t> &out, uint32_t *location,
+                     uint32_t *vsPidOut = nullptr)
 {
     if (!code || sizeBytes < 20) return INJ_MALFORMED;
     std::vector<uint32_t> w(code, code + sizeBytes / 4);
@@ -736,8 +785,9 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     uint32_t idPCVar       = bound++;
     // Per-vertex-module tag, mirroring the fragment one. The fragment tag named
     // the wrong stage: it only divides varyings, while prevClip is built here.
-    static uint32_t s_vsPidCounter = 0;
+    static std::atomic<uint32_t> s_vsPidCounter(0);
     const uint32_t myVsPid = ++s_vsPidCounter;
+    if (vsPidOut) *vsPidOut = myVsPid;
     // Set when this module is the one being dumped, so the PATCHED words can be
     // written too. The original was dumped before; the injected code itself has
     // never been read back, and the identity it is supposed to implement fails
@@ -751,6 +801,8 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
         for (size_t k = 0; k < w.size(); ++k) { vh ^= (uint64_t)w[k]; vh *= 1099511628211ull; }
         trace("MV VS PID %u -> module hash %016llx, %llu words",
               myVsPid, (unsigned long long)vh, (unsigned long long)w.size());
+        pidLog("vs %u %016llx %llu", myVsPid, (unsigned long long)vh,
+               (unsigned long long)w.size());
         // Match on the module HASH, not the pid. The pid counter follows module
         // creation order, which varies between runs - pid 180 identified the
         // terrain shader in one run and did not exist in the next. The hash is
@@ -1134,7 +1186,20 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     const uint32_t idChainBody = bound++, idBodyMat = bound++, idPrevBody = bound++;
     body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrPCMat4); body.push_back(idChainBody); body.push_back(idPCVar); body.push_back(idConst2NF);
     body.push_back(head(OpLoad, 4));        body.push_back(idMat4);      body.push_back(idBodyMat);   body.push_back(idChainBody);
-    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4); body.push_back(idPrevBody); body.push_back(idBodyMat); body.push_back(idLoadedPos);
+    // ---- THE BODY PATH TAKES THE SAME VECTOR AS THE WORLD PATH.
+    //
+    // This multiplied the body matrix by the FULL clip position (x, y, z, w)
+    // while the world path - and the layer, which pushes bodyReproj * K in
+    // the same (x, y, w, 1) convention - had long since moved on. Applied to
+    // (x, y, z, w), the K-form matrix lands prev.w = z_clip instead of w, and
+    // z_clip = w - near, so every near-field vertex reported a pseudo-motion
+    // of near / w: radial, inversely proportional to distance, ~1 px on the
+    // ground a few metres from a chase camera and enormous inside a cockpit.
+    // Measured as the "racing" taxi markings (8.9% of terrain_0's texels
+    // moving at a camera that had not) and killed by the prev = curr probe,
+    // which bypasses exactly this select. Same operand as the world multiply.
+    body.push_back(head(OpMatrixTimesVector, 5)); body.push_back(idV4); body.push_back(idPrevBody); body.push_back(idBodyMat);
+    body.push_back(clipToClip ? (flipForMatrix ? idFlipped : idLoadedPos) : idViewVec);
     body.push_back(head(OpSelect, 6)); body.push_back(idV4); body.push_back(idPrevSel); body.push_back(idNFcmp); body.push_back(idPrevBody); body.push_back(idPrevClip);
 
     // ---- DEBUG: REPORT THE MATRIX THE VERTEX SHADER ACTUALLY LOADED.
@@ -1414,7 +1479,8 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 //
 inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
                              std::vector<uint32_t> &out, uint32_t attachmentIndex,
-                             bool alphaBlended)
+                             bool alphaBlended, bool zeroVel = false,
+                             bool tagHalf = false)
 {
     if (!code || sizeBytes < 20) return INJ_MALFORMED;
     std::vector<uint32_t> w(code, code + sizeBytes / 4);
@@ -1643,7 +1709,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // prevDepth is verified good and no longer worth a channel. Spending it on
     // a per-module tag turns "some subset" into a name: bin the error by tag,
     // then dump that module's SPIR-V and read what it actually does.
-    static uint32_t s_pidCounter = 0;
+    static std::atomic<uint32_t> s_pidCounter(0);
     const uint32_t myPid = ++s_pidCounter;
     uint32_t newPid = 0;
     if (!idV2)        { newV2       = bound++; idV2        = newV2; }
@@ -1696,6 +1762,8 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
         }
         trace("MV FS PID %u -> module hash %016llx, %llu words",
               myPid, (unsigned long long)h, (unsigned long long)w.size());
+        pidLog("fs %u %016llx %llu", myPid, (unsigned long long)h,
+               (unsigned long long)w.size());
     }
 
     globals.push_back(head(OpVariable, 4)); globals.push_back(idPtrInV4);  globals.push_back(idInCurr); globals.push_back(SC_Input);
@@ -1761,8 +1829,11 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // instead of by assuming the answer.
     static const bool writeDepth = getenv("TAA_MV_WRITE_DEPTH") != nullptr;
     static const bool wantRGBA   = getenv("TAA_MV_RGBA") != nullptr;
-    const uint32_t idCh0 = writeDepth ? idCw : idMx;
-    const uint32_t idCh1 = writeDepth ? idPw : idMy;
+    // zeroVel: the screen-fixed overlay class. The truthful vector for a
+    // pixel that does not move on screen is exactly (0, 0); depth and the
+    // coverage gate stay real, so AO and the alpha select keep working.
+    const uint32_t idCh0 = writeDepth ? idCw : (zeroVel ? idConstZero : idMx);
+    const uint32_t idCh1 = writeDepth ? idPw : (zeroVel ? idConstZero : idMy);
     // In RGBA mode both arrive together: velocity in xy, depths in zw, so the
     // flow can be predicted from measured depth instead of from an epipolar
     // line that degenerates near the focus of expansion.
@@ -1781,7 +1852,8 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // reject unwritten texels by the R sentinel before comparing this, never by
     // the depth alone. Under the alpha SELECT blend it follows the same binary
     // choice as RG, so B always describes whichever surface won the texel.
-    const uint32_t idCh2 = idCw;
+    // Non-const: PID mode overrides it with the vertex tag (below).
+    uint32_t idCh2 = idCw;
     // Channel 3 carries the VERTEX shader's tag, which the vertex stage stamped
     // into currClip.z - the component this shader never reads. The fragment's
     // own tag named a stage that only performs a divide; prevClip is computed
@@ -1844,10 +1916,30 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idRawPy); body.push_back(idLp); body.push_back(1);
     }
     if (idConstPid) {
-        const uint32_t idVsTag = bound++;
+        uint32_t idVsTag = bound++;
         body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat);
         body.push_back(idVsTag); body.push_back(idLc); body.push_back(2);
-        idCh3 = idVsTag;
+        if (tagHalf) {
+            // +0.5 on the tag for a no-depth-write pipeline: the readback can
+            // then tell one vertex shader's draped layers from its base mesh.
+            const uint32_t idTagged = bound++;
+            body.push_back(head(OpFAdd, 5)); body.push_back(idFloat);
+            body.push_back(idTagged); body.push_back(idVsTag); body.push_back(idConstHalf);
+            idVsTag = idTagged;
+        }
+        // ---- THE TAG RIDES IN THE DEPTH CHANNEL, NOT THE ALPHA.
+        //
+        // It used to replace alpha. Alpha is the 0-or-1 select the blend stage
+        // reads as SRC_ALPHA for every alpha-blended pipeline, so a tag of 165
+        // there turned the select into out = 165*src - 164*dst: every decal's
+        // velocity came back amplified ~165x and mixed with what lay beneath,
+        // the cockpit glass stamped garbage across the whole view, and the
+        // resolve's coverage gate read "covered" everywhere. The diagnostic
+        // was corrupting the very thing it measured. Depth is the channel the
+        // diagnostic can spare - it only ever named the writer's distance -
+        // and alpha keeps its select, so blended draws are measured exactly
+        // as they ship.
+        idCh2 = idVsTag;
     }
     // ---- THE TRANSPARENCY GATE (C13), in the output alpha.
     //
@@ -1865,7 +1957,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // variant per module instead of two.
     {
         const bool anyDebug = writeDepth || wantRGBA || fieldChk || matDump ||
-                              rawClip || idConstPid;
+                              rawClip;   // PID mode keeps the gate: its tag is in .z
         // ---- ONLY ALPHA-BLENDED PIPELINES HAVE AN OPACITY TO READ.
         //
         // The gate reads the alpha of colour attachment 0 and calls it

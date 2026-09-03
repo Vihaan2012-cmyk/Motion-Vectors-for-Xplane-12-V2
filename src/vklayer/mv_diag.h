@@ -56,11 +56,17 @@ struct MvDiagInput {
     double medianFrac;
 };
 
+// Reports written this arm cycle. Four per cycle; the layer zeroes it when
+// taa_dump_every.txt changes value, so re-arming (0, then 240) after changing
+// view buys four more reports without a relaunch. All four of one session were
+// spent in the cockpit while the defect under test lived in the external view.
+static int g_mvDiagWritten = 0;
+
 static void mvWriteDiagnostic(const MvDiagInput &in)
 {
     const char *dir = getenv("TAA_MV_DIAG");
     if (!dir) return;
-    static int nWritten = 0;
+    int &nWritten = g_mvDiagWritten;
     if (nWritten >= 4) return;
     // ---- ONLY WRITE WHEN THE FIELD IS ACTUALLY BROKEN.
     //
@@ -776,64 +782,6 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
         // error is bimodal - most pixels perfect, about a quarter ruined - and
         // nothing shared (the matrix, the inputs, prev.w) can do that. This
         // names the subset instead of guessing at it.
-        if (getenv("TAA_MV_PID")) {
-            struct PidAcc { double sum; uint64_t n, bad; double worst; };
-            std::map<int, PidAcc> byPid;
-            for (uint32_t y = 0; y < in.h; y += 4) {
-                for (uint32_t x = 0; x < in.w; x += 4) {
-                    const size_t i2 = ((size_t)y * in.w + x) * in.halves;
-                    const double vx = velHalfToFloat(in.px[i2]);
-                    const double vy = velHalfToFloat(in.px[i2 + 1]);
-                    const double d  = velHalfToFloat(in.px[i2 + 2]);
-                    const double pf = velHalfToFloat(in.px[i2 + 3]);
-                    if (!(d > 0.0) || d != d || vx != vx || vy != vy) continue;
-                    // Instance index 0 is the ordinary path and most of the
-                    // frame; excluding it hid exactly the pixels under test.
-                    const int pid = (int)(pf + 0.5);
-                    if (pid < 0) continue;
-                    static const double vSign2 = getenv("TAA_MV_VNEG") ? -1.0 : 1.0;
-                    const double u    = ((x + 0.5) / (double)in.w) * 2.0 - 1.0;
-                    const double vTop = (((y + 0.5) / (double)in.h) * 2.0 - 1.0) * vSign2;
-                    const double xc = u * d, yc = vTop * d;
-                    const double nx = M[0]*xc + M[4]*yc + M[8]*d + M[12];
-                    const double ny = M[1]*xc + M[5]*yc + M[9]*d + M[13];
-                    const double nw = M[3]*xc + M[7]*yc + M[11]*d + M[15];
-                    if (fabs(nw) < 1e-9) continue;
-                    const double predX = (nx / nw - u)    * 0.5;
-                    const double predY = (ny / nw - vTop) * 0.5;
-                    const double ex = (vx - predX) * 2.0 * hw;
-                    const double ey = (vy - predY) * 2.0 * hh;
-                    const double err = sqrt(ex*ex + ey*ey);
-                    PidAcc &a = byPid[pid];
-                    a.sum += err; ++a.n;
-                    if (err > 1.0) ++a.bad;
-                    if (err > a.worst) a.worst = err;
-                }
-            }
-            fprintf(f, "\nERROR BY %s (channel 3 tag)\n",
-                    getenv("TAA_MV_INST") ? "INSTANCE INDEX" : "FRAGMENT SHADER");
-            fprintf(f, "  %6s %10s %10s %10s %12s %10s\n",
-                    "pid", "pixels", "bad>1px", "bad%", "mean err", "worst");
-            std::vector<std::pair<uint64_t, int> > order;
-            for (std::map<int, PidAcc>::const_iterator it = byPid.begin();
-                 it != byPid.end(); ++it)
-                order.push_back(std::make_pair(it->second.bad, it->first));
-            std::sort(order.begin(), order.end());
-            std::reverse(order.begin(), order.end());
-            const size_t show = order.size() < 24 ? order.size() : 24;
-            for (size_t k = 0; k < show; ++k) {
-                const PidAcc &a = byPid[order[k].second];
-                fprintf(f, "  %6d %10llu %10llu %9.2f%% %12.4f %10.2f\n",
-                        order[k].second, (unsigned long long)a.n,
-                        (unsigned long long)a.bad,
-                        a.n ? 100.0 * a.bad / (double)a.n : 0.0,
-                        a.n ? a.sum / (double)a.n : -1.0, a.worst);
-            }
-            fprintf(f, "  %llu distinct fragment shaders covered this frame\n",
-                    (unsigned long long)byPid.size());
-            fprintf(f, "      a few pids owning nearly all the bad pixels names\n");
-            fprintf(f, "      the shader family to dump and read\n");
-        }
 
         fprintf(f, "\n  The epipolar metric called rows 1890-2159 174 px wrong.\n");
         fprintf(f, "  If this says otherwise, the metric was the defect.\n");
@@ -1321,6 +1269,10 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
     fprintf(f, "view=%d phase=%d  target %ux%u  epipolar median %.3f px  relative %.5f\n",
             in.viewType, in.phase, in.w, in.h, in.medianAbsPx, in.medianFrac);
     fprintf(f, "camera moved %.4f m between the two frames\n\n", (double)g_diagDcMetres);
+    if (getenv("TAA_MV_PID"))
+        fprintf(f, "PID MODE: channel B carries the writer's vertex-module tag, not depth.\n"
+                   "Every depth-based section below (predictions, epipolar, AO/contact)\n"
+                   "is NOT meaningful in this report; read MOTION BY VERTEX SHADER.\n\n");
 
     fprintf(f, "PIXEL CENSUS (every 4th pixel both ways)\n");
     fprintf(f, "  sampled            %llu\n", (unsigned long long)nTotal);
@@ -1401,7 +1353,78 @@ static void mvWriteDiagnostic(const MvDiagInput &in)
     // across the frame with no reconstruction, no coverage gate, no depth
     // gate - the bytes themselves, decoded and nothing else. Whatever tuple
     // pattern appears IS the writer's signature.
-    fprintf(f, "RAW TEXELS (ungated)  x,y : R G B A\n");
+    // The per-writer table used to live inside the TAA_MV_RGBA branch above, so
+    // a PID-only session printed everything except the one table it was run
+    // for. It is unconditional on the main path now.
+    if (getenv("TAA_MV_PID")) {
+        // ---- WHICH VERTEX SHADER WROTE WHAT MOTION.
+        //
+        // Channel B carries the vertex module's tag (the fragment copies
+        // currClip.z through); alpha keeps its 0/1 select so blended
+        // draws are measured as they ship. With depth gone there is no
+        // matrix prediction to score against, so writers are ranked by
+        // the motion they emit. At a static camera every nonzero row is a
+        // wrong writer by definition, and the header says how far the
+        // camera moved.
+        const double hw = in.w * 0.5, hh = in.h * 0.5;   // px per UV, halved
+        struct PidAcc { double sum, worst, sx, sy; uint64_t n, moving; };
+        std::map<int, PidAcc> byPid;
+        uint64_t fractional = 0, tagged = 0;
+        for (uint32_t y = 0; y < in.h; y += 4) {
+            for (uint32_t x = 0; x < in.w; x += 4) {
+                const size_t i2 = ((size_t)y * in.w + x) * in.halves;
+                const double vx = velHalfToFloat(in.px[i2]);
+                const double vy = velHalfToFloat(in.px[i2 + 1]);
+                const double pf = velHalfToFloat(in.px[i2 + 2]);
+                if (vx != vx || vy != vy || pf != pf) continue;
+                if (pf < 0.5 || pf > 1.0e6) continue;      // unwritten / sentinel
+                ++tagged;
+                const int pid = (int)(pf + 0.5);
+                if (fabs(pf - (double)pid) > 0.01) ++fractional;
+                const double ex = vx * 2.0 * hw, ey = vy * 2.0 * hh;
+                const double mag = sqrt(ex * ex + ey * ey);
+                PidAcc &a = byPid[pid];
+                a.sum += mag; a.sx += ex; a.sy += ey; ++a.n;
+                if (mag > 1.0) ++a.moving;
+                if (mag > a.worst) a.worst = mag;
+            }
+        }
+        fprintf(f, "\nMOTION BY VERTEX SHADER (channel B tag; camera moved %.4f m)\n",
+                (double)g_diagDcMetres);
+        fprintf(f, "  %6s %10s %10s %8s %11s %10s %20s\n",
+                "pid", "pixels", ">1px", "%", "mean |v|px", "worst px", "mean vector px");
+        std::vector<std::pair<uint64_t, int> > order;
+        for (std::map<int, PidAcc>::const_iterator it = byPid.begin();
+             it != byPid.end(); ++it)
+            order.push_back(std::make_pair(it->second.moving, it->first));
+        std::sort(order.begin(), order.end());
+        std::reverse(order.begin(), order.end());
+        const size_t show = order.size() < 24 ? order.size() : 24;
+        for (size_t k = 0; k < show; ++k) {
+            const PidAcc &a = byPid[order[k].second];
+            fprintf(f, "  %6d %10llu %10llu %7.2f%% %11.3f %10.2f %9.2f %9.2f\n",
+                    order[k].second, (unsigned long long)a.n,
+                    (unsigned long long)a.moving,
+                    a.n ? 100.0 * a.moving / (double)a.n : 0.0,
+                    a.n ? a.sum / (double)a.n : 0.0, a.worst,
+                    a.n ? a.sx / (double)a.n : 0.0,
+                    a.n ? a.sy / (double)a.n : 0.0);
+        }
+        fprintf(f, "  %llu distinct vertex shaders covered this frame; %llu of %llu "
+                   "tagged texels carried a NON-INTEGER tag%s\n",
+                (unsigned long long)byPid.size(), (unsigned long long)fractional,
+                (unsigned long long)tagged,
+                fractional ? " - a constant varying cannot interpolate to a "
+                             "fraction; those texels were blended or written "
+                             "by an unpatched stage" : "");
+        fprintf(f, "  pid -> module hash: %%TEMP%%\\mv_pid_table_<pid>.txt (or the "
+                   "TAA_MV_DIAG dir). PIPE lines there give each pid's layout and "
+                   "blend state. TAA_MV_DUMP_HASH=<hash> dumps the module.\n");
+    }
+
+    fprintf(f, getenv("TAA_MV_PID")
+                   ? "RAW TEXELS (ungated)  x,y : R G B(=vertex pid) A(=select)\n"
+                   : "RAW TEXELS (ungated)  x,y : R G B A\n");
     for (int t = 0; t < 8; ++t) {
         const uint32_t rx = (in.w * (uint32_t)(t * 2 + 1)) / 16u;
         const uint32_t ry = (in.h * (uint32_t)(t * 2 + 1)) / 16u;

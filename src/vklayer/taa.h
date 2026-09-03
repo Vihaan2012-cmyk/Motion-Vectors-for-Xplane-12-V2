@@ -1499,10 +1499,29 @@ static void taaBindFlags(DeviceData &dd, VkImage image, VkFormat fmt,
 // deliberately no path for frames with no candidate pass at all, because the
 // destination would be a guess and copying into the wrong half is the smearing
 // the target-latch experiment produced.
-static void taaRecordDeliverOnly(DeviceData &dd, VkCommandBuffer cb, VkImage scene)
+static void taaRecordDeliverOnly(DeviceData &dd, VkCommandBuffer cb, VkImage scene,
+                                 uint32_t dstW, uint32_t dstH)
 {
     if (!g_taa.ready || !taaEnabled() || !g_taa.historyCleared) return;
     if (scene == VK_NULL_HANDLE || !dd.cmdCopyImage) return;
+    // ---- THE COPY REGION IS g_taa.w x g_taa.h. IT MUST FIT THE DESTINATION.
+    //
+    // On a resolution change X-Plane rebuilds its offscreen at a new (often
+    // smaller) size while g_taa still holds the previous dimensions until the
+    // resolve re-inits it. This deliver-only path runs BEFORE that re-init, so
+    // without this guard it issues a vkCmdCopyImage whose extent is larger than
+    // the destination image - an out-of-bounds transfer the driver faults on.
+    // Skip the delivery for the frames where the sizes disagree; the resolve
+    // path re-inits g_taa and normal delivery resumes.
+    if (g_taa.w != dstW || g_taa.h != dstH) {
+        static uint64_t nSkip = 0;
+        if ((nSkip++ % 120) == 0)
+            trace("TAA DELIVER: destination %ux%u != accumulation %ux%u - copy "
+                  "SKIPPED (a resolution change is mid-flight; delivering the "
+                  "old size into the new image would overrun it - the resize CTD).",
+                  dstW, dstH, g_taa.w, g_taa.h);
+        return;
+    }
     // The most recently written buffer. The flip happens at the end of a
     // resolve, so the freshest history is the one the index no longer points at.
     const uint32_t src = g_taa.historyWrite ^ 1u;
@@ -1908,14 +1927,28 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     VkDeviceSize sdOff = 0, sdRange = 0;
     {
         std::lock_guard<std::mutex> g(g_lock);
+        // Only a region bound within the last two frames is trusted: the
+        // cascade block lives in a ring buffer whose offset moves per frame,
+        // and an older offset points at memory the CPU is rewriting. With no
+        // fresh region the sun tap simply stays off this frame (contact reads
+        // fully lit), which is invisible - unlike the dots a torn block makes.
         std::map<VkCommandBuffer, MvShadowRegion>::iterator it =
             g_cbShadowRegion.find(cb);
-        if (it != g_cbShadowRegion.end()) {
+        if (it != g_cbShadowRegion.end() && it->second.frame + 2 >= g_frameCount) {
             sdBuf = it->second.buf; sdOff = it->second.off;
             sdRange = it->second.range;
-        } else if (g_shadowDataBuf != VK_NULL_HANDLE) {
+        } else if (g_shadowDataBuf != VK_NULL_HANDLE &&
+                   g_shadowDataFrame + 2 >= g_frameCount) {
             sdBuf = g_shadowDataBuf; sdOff = g_shadowDataOff;
             sdRange = g_shadowDataRange;
+        } else if (g_shadowDataBuf != VK_NULL_HANDLE) {
+            static uint64_t stale = 0;
+            if ((++stale % 600) == 1)
+                trace("SUN TAP: shadow region is %llu frames old - tap skipped this "
+                      "frame rather than read a rewritten ring-buffer block "
+                      "(%llu skips so far)",
+                      (unsigned long long)(g_frameCount - g_shadowDataFrame),
+                      (unsigned long long)stale);
         }
     }
     VkBuffer     gbBuf = VK_NULL_HANDLE;
@@ -1924,10 +1957,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         std::lock_guard<std::mutex> g(g_lock);
         std::map<VkCommandBuffer, MvShadowRegion>::iterator it =
             g_cbGbufRegion.find(cb);
-        if (it != g_cbGbufRegion.end()) {
+        if (it != g_cbGbufRegion.end() && it->second.frame + 2 >= g_frameCount) {
             gbBuf = it->second.buf; gbOff = it->second.off;
             gbRange = it->second.range;
-        } else if (g_gbufDataBuf != VK_NULL_HANDLE) {
+        } else if (g_gbufDataBuf != VK_NULL_HANDLE &&
+                   g_gbufDataFrame + 2 >= g_frameCount) {
             gbBuf = g_gbufDataBuf; gbOff = g_gbufDataOff;
             gbRange = g_gbufDataRange;
         }

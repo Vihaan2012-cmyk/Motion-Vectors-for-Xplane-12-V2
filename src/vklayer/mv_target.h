@@ -762,7 +762,7 @@ static void mvReport(double camMoved, uint64_t nowShareFrame)
                 static const bool plainChannels =
                     !getenv("TAA_MV_WRITE_DEPTH") && !getenv("TAA_MV_RGBA") &&
                     !getenv("TAA_MV_FIELDCHK")   && !getenv("TAA_MV_MATDUMP") &&
-                    !getenv("TAA_MV_RAWCLIP")    && !getenv("TAA_MV_PID");
+                    !getenv("TAA_MV_RAWCLIP");   // PID keeps the .w select
                 if (plainChannels && kMvHalves >= 4 &&
                     velHalfToFloat(px[i + 3]) < 0.5f) {
                     ++zero; ++n;

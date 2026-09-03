@@ -1010,8 +1010,12 @@ static bool spirvPullsVertices(const std::vector<uint32_t> &w)
 // gets a real coverage gate. Without this the first one to arrive would
 // hand its variant to the other.
 typedef std::pair<VkShaderModule, uint32_t> FragModKey;
-typedef std::pair<FragModKey, bool> FragKey;
+typedef std::pair<FragModKey, int> FragKey;   // bit 0: alphaBlended, bit 1: zero-velocity, bit 2: PID tag +0.5 (no depth write)
 static std::map<FragKey, VkShaderModule> g_fragVariant;
+// Patched vertex variant -> the pid its injected code stamps (TAA_MV_PID), so
+// a pipeline can be logged with the tag its draws will carry. Under g_lock;
+// cleared with the other variant maps when the varying pair moves.
+static std::map<VkShaderModule, uint32_t> g_vertVariantPid;
 static uint64_t g_fragVariants = 0, g_fragPatchFail = 0;
 static bool g_patchedWasFrag = false;
 static uint64_t g_injOk        = 0;
@@ -2040,7 +2044,11 @@ static std::map<VkDescriptorSetLayout, std::vector<uint32_t> > g_layoutDynBinds;
 static std::map<VkDescriptorSet, std::vector<uint32_t> >       g_setDynBinds;
 static std::map<VkDescriptorSet, VkDescriptorPool>             g_setPool;
 
-struct MvShadowRegion { VkBuffer buf; VkDeviceSize off, range; };
+// frame: the frame the region was bound in. X-Plane's cascade and gbuffer
+// data live in a ring buffer whose dynamic offset moves every frame; a region
+// from an older frame points at memory the CPU is already rewriting. The
+// resolve only trusts a region stamped within the last two frames.
+struct MvShadowRegion { VkBuffer buf; VkDeviceSize off, range; uint64_t frame = 0; };
 static std::map<VkDescriptorSet,  MvShadowRegion> g_setShadowRegion;
 static std::map<VkCommandBuffer,  MvShadowRegion> g_cbShadowRegion;
 // u_gbuffer_data (binding 18, ~112 bytes): the engine's depth-linearization
@@ -2134,6 +2142,7 @@ static const char *formatName(VkFormat f);
 
 static VkImageLayout g_sceneDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
+#include "mv_family_table.h"
 #include "mv_target.h"
 #include "spirv_inject.h"
 #include "xpfsr_spv.h"
@@ -2291,6 +2300,11 @@ struct FgSwap {
     uint32_t                         dispW   = 0, dispH = 0;
     VkFormat                         dispFmt = VK_FORMAT_UNDEFINED;
     VkDevice                         device  = VK_NULL_HANDLE;  // the device this proxy belongs to
+    // The surface the proxy's real swapchain was created on. A NEW swapchain
+    // on this surface retires that one in the driver whether or not X-Plane
+    // names it as oldSwapchain - so this, not oldSwapchain, is the trigger for
+    // tearing the proxy down.
+    VkSurfaceKHR                     surface = VK_NULL_HANDLE;
     FfxSwapchain                     proxy   = nullptr;
     VkSwapchainKHR                   handle  = VK_NULL_HANDLE;  // what XP holds
     bool                             have    = false;
@@ -2410,6 +2424,16 @@ static bool fgClaimRetired(VkSwapchainKHR h)
 }
 
 static std::atomic<bool> g_fgActive(false);
+// Frame generation SUSPENDED for the rest of the session: X-Plane created a
+// swapchain the proxy does not own (window moved to another monitor, a second
+// window such as the IOS opened). The proxy's underlying swapchain is about to
+// be abandoned or rebuilt under it; keeping interpolation running through that
+// transition access-violated in the driver (measured, nvoglv64.dll, right
+// after "Created swapchain" + "Rebuilding offscreens"). Routing is deliberately
+// NOT touched: acquire/present on the proxy handle must keep reaching FFX's
+// proxy until X-Plane destroys that handle (the destroy hook then retires it).
+// Only generation and the dilate side-car stop. Relaunch re-enables FG.
+static std::atomic<bool> g_fgSuspended(false);
 // Which proxy image FSR3 writes this frame; advanced once per present.
 static uint32_t          g_fgOutIndex = 0;
 // Frame-generation config applied to the proxy? One-shot per proxy - the
@@ -2584,6 +2608,8 @@ static VkImage g_envProbeImage  = VK_NULL_HANDLE;   // "environment_probes"
 // trace says so, which is the observable that decides the next move.
 static VkBuffer     g_shadowDataBuf    = VK_NULL_HANDLE;
 static VkDeviceSize g_shadowDataOff    = 0;
+static uint64_t     g_shadowDataFrame  = 0;   // frame of the global-latest region
+static uint64_t     g_gbufDataFrame    = 0;
 static VkDeviceSize g_shadowDataRange  = 0;
 static uint64_t     g_shadowDataSeen   = 0;
 // The gbuf equivalent, and both hold the DYNAMIC-OFFSET-RESOLVED location as
@@ -5439,6 +5465,17 @@ static float g_jitterScale = 0.0f;
 // three orders of magnitude and one axis convention wrong, which is why the
 // value is stored at the single site that knows what was applied.
 static float g_appliedJitX = 0.0f, g_appliedJitY = 0.0f;
+// ---- ONE JITTER PER FRAME, LATCHED AT THE FIRST BIND.
+//
+// g_velSnap is refreshed in the PRESENT hook while X-Plane's worker threads
+// may already be recording the next frame. Binds before that refresh read
+// jitter N, binds after it read jitter N+1, and the resolve reads whatever is
+// current when its pass ends - so within one frame the un-jitter could cancel
+// a different offset than the one part of the geometry was drawn with. Latch
+// the raw pixel jitter once per frame (first bind after the present reset)
+// and use the latch everywhere; the snapshot may change underneath.
+static float g_frameJitX = 0.0f, g_frameJitY = 0.0f;
+static bool  g_frameJitLatched = false;
 // Reads the jitter out of THIS command buffer's pending-push slot - defined
 // below the slot machinery it needs, used above it by the resolve.
 static bool mvPendingJitter(VkCommandBuffer cb, float *jx, float *jy);
@@ -6292,9 +6329,49 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
 
                 // Body-frame reprojection applies only to the cockpit pass, and
                 // only when a pass index has been measured and configured.
-                g_cbInCockpitPass[cb] =
-                    (g_cockpitPassIndex > 0 &&
-                     (int)g_cbScenePassCount[cb] == g_cockpitPassIndex);
+                // taa.nearfield_pass=1: FINGERPRINT the cockpit pass instead of
+                // configuring its index. A scene-sized pass that CLEARS depth
+                // and is not the first of the frame is the panel drawn over the
+                // world regardless of distance - measured in the pass census
+                // as pass 2 (colour=3, depth cleared) in 3-D cockpit views.
+                // With the near-field armed only inside it, the body frame is
+                // applied to cockpit geometry by construction: a terminal wall
+                // three metres away while taxiing stays world-static, and no
+                // ground triangle can straddle anything. Off by default until
+                // a run has confirmed the fingerprint; live.
+                {
+                    static uint64_t nfpGen = ~(uint64_t)0;
+                    static int      nfpVal = 0;
+                    const bool passMode = live::iCached("taa.nearfield_pass",
+                                                        "TAA_NEARFIELD_PASS", 0,
+                                                        nfpGen, nfpVal) != 0;
+                    const VkRenderingAttachmentInfo *dfp = info->pDepthAttachment;
+                    // ONLY in a cockpit view. A depth-clearing scene pass 2
+                    // also exists in external views, and matching it there
+                    // marked apron/object geometry as "cockpit", which re-armed
+                    // the near-field straddle and brought the racing back in
+                    // chase view. The camera only rides the airframe in a
+                    // cockpit view, so that is the only place near-field means
+                    // anything.
+                    const int cvt = g_velSnap.viewType;
+                    const bool cockpitView = (cvt == 1026 || cvt == 1000 || cvt == 1017);
+                    const bool fingerprint = passMode && cockpitView &&
+                        g_cbScenePassCount[cb] > 1 &&
+                        dfp && dfp->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    g_cbInCockpitPass[cb] =
+                        (g_cockpitPassIndex > 0 &&
+                         (int)g_cbScenePassCount[cb] == g_cockpitPassIndex) || fingerprint;
+                    if (fingerprint) {
+                        static uint64_t nfp = 0;
+                        if (++nfp <= 3 || (nfp % 2000) == 0)
+                            trace("COCKPIT PASS: fingerprinted scene pass %u (%ux%u, "
+                                  "colour=%u, depth cleared) - near-field armed inside it "
+                                  "only (%llu so far)", g_cbScenePassCount[cb],
+                                  info->renderArea.extent.width,
+                                  info->renderArea.extent.height,
+                                  info->colorAttachmentCount, (unsigned long long)nfp);
+                    }
+                }
 
                 // ---- WHAT EACH SCENE PASS ACTUALLY IS.
                 //
@@ -6723,6 +6800,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
         if (!sceneNow) {
             std::lock_guard<std::mutex> g(g_lock);
             g_cbInScenePass[cb] = false;
+            g_cbInCockpitPass[cb] = false;   // never let a cockpit-pass flag outlive its pass
         }
 
         // ---- THE 3D/UI BOUNDARY, and where the resolve goes.
@@ -7103,6 +7181,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
         std::lock_guard<std::mutex> g(g_lock);
         wasScenePass = g_cbInScenePass[cb];
         g_cbInScenePass[cb] = false;
+        g_cbInCockpitPass[cb] = false;   // never let a cockpit-pass flag outlive its pass
         std::map<VkCommandBuffer, bool>::iterator mb = g_cbMvBoundPass.find(cb);
         if (mb != g_cbMvBoundPass.end()) { mvBoundPass = mb->second; mb->second = false; }
         std::map<VkCommandBuffer, CbPassInfo>::iterator pit = g_cbPassInfo.find(cb);
@@ -7239,7 +7318,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
             std::map<void*, DeviceData>::iterator ddi =
                 g_devices.find(dispatchKey(dci->second));
             if (ddi != g_devices.end())
-                taaRecordDeliverOnly(ddi->second, cb, passInfo.color0);
+                taaRecordDeliverOnly(ddi->second, cb, passInfo.color0,
+                                     passInfo.w, passInfo.h);
         }
     }
     if (litPass && taaEnabled() && !g_taaResolvedThisFrame && mvBindAge > 1) {
@@ -7603,8 +7683,12 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     const float ySignR = g_viewportYFlipped ? -1.0f : 1.0f;
                     const float wR = (float)g_taa.w, hR = (float)g_taa.h;
                     if (wR > 0.0f && hR > 0.0f) {
-                        tf.jitter.x = 2.0f * g_velSnap.jitterX * g_jitterScale / wR;
-                        tf.jitter.y = ySignR * 2.0f * g_velSnap.jitterY * g_jitterScale / hR;
+                        // The latched per-frame jitter, not the live snapshot:
+                        // it is what this frame's geometry was actually offset by.
+                        const float jx = g_frameJitLatched ? g_frameJitX : g_velSnap.jitterX;
+                        const float jy = g_frameJitLatched ? g_frameJitY : g_velSnap.jitterY;
+                        tf.jitter.x = 2.0f * jx * g_jitterScale / wR;
+                        tf.jitter.y = ySignR * 2.0f * jy * g_jitterScale / hR;
                     } else {
                         tf.jitter.x = tf.jitter.y = 0.0f;
                     }
@@ -7679,7 +7763,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                     // just ships a raw frame, and a raw frame between resolved
                     // ones is the alternation the history/composited split
                     // measured (0.447 against 3.78).
-                    taaRecordDeliverOnly(tdd, cb, passInfo.color0);
+                    taaRecordDeliverOnly(tdd, cb, passInfo.color0,
+                                         passInfo.w, passInfo.h);
                     break;
                 }
                 gateReach(7);
@@ -8802,12 +8887,23 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                     if (ok) {
                         MvShadowRegion r;
                         r.buf = m.buf; r.off = off; r.range = m.shadowRange;
+                        r.frame = g_frameCount;
                         g_cbShadowRegion[cb] = r;
-                        if (g_cbShadowRegion.size() > 512)
-                            g_cbShadowRegion.erase(g_cbShadowRegion.begin());
+                        // Evict by AGE, not by handle order: erase(begin()) threw
+                        // away the lowest handle, which could be this frame's
+                        // scene command buffer - the resolve then fell back to
+                        // a stale global offset and contact shadows read a
+                        // block the CPU was rewriting (the periodic black dots).
+                        if (g_cbShadowRegion.size() > 512) {
+                            for (std::map<VkCommandBuffer, MvShadowRegion>::iterator e =
+                                     g_cbShadowRegion.begin(); e != g_cbShadowRegion.end();) {
+                                if (e->second.frame + 8 < g_frameCount) g_cbShadowRegion.erase(e++);
+                                else ++e;
+                            }
+                        }
                         // Global latest, resolved offset - the resolve reads this.
                         g_shadowDataBuf = r.buf; g_shadowDataOff = r.off;
-                        g_shadowDataRange = r.range;
+                        g_shadowDataRange = r.range; g_shadowDataFrame = r.frame;
                     }
                     static uint64_t lseen = 0;
                     if ((lseen++ % 3000) == 0) {
@@ -8828,10 +8924,17 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(
                     if (ok) {
                         MvShadowRegion r;
                         r.buf = m.buf; r.off = off; r.range = m.gbufRange;
+                        r.frame = g_frameCount;
                         g_cbGbufRegion[cb] = r;
-                        if (g_cbGbufRegion.size() > 512)
-                            g_cbGbufRegion.erase(g_cbGbufRegion.begin());
+                        if (g_cbGbufRegion.size() > 512) {
+                            for (std::map<VkCommandBuffer, MvShadowRegion>::iterator e =
+                                     g_cbGbufRegion.begin(); e != g_cbGbufRegion.end();) {
+                                if (e->second.frame + 8 < g_frameCount) g_cbGbufRegion.erase(e++);
+                                else ++e;
+                            }
+                        }
                         g_gbufDataBuf = r.buf; g_gbufDataOff = r.off;
+                        g_gbufDataFrame = r.frame;
                         g_gbufDataRange = r.range;
                     }
                 }
@@ -9312,6 +9415,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     if (g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
         fgdilate::state().ready && g_sceneColorStable >= 120 &&
         !fgHeldForAircraftSwap() &&
+        !g_fgSuspended.load(std::memory_order_relaxed) &&
         g_sceneColor.image != VK_NULL_HANDLE &&
         g_sceneDepth != VK_NULL_HANDLE && g_mv.ready &&
         live::onoff("taa.fg_dilate", "TAA_FG_DILATE", true)) {
@@ -9382,13 +9486,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                                // upscaler stay live, to tell the generation-present
                                // machinery apart from FSR3 / the proxy itself.
                                live::onoff("taa.fg_gen", "TAA_FG_GEN", true);
-        if (!g_fgConfigApplied || canInterp != g_fgGenEnabled) {
+        const bool genWant = canInterp &&
+                             !g_fgSuspended.load(std::memory_order_relaxed);
+        if (!g_fgConfigApplied || genWant != g_fgGenEnabled) {
             g_fgConfigApplied = true;
-            g_fgGenEnabled    = canInterp;
+            g_fgGenEnabled    = genWant;
             FfxFrameGenerationConfig cfg;
             memset(&cfg, 0, sizeof(cfg));
             cfg.swapChain               = g_fgSwap.proxy;
-            cfg.frameGenerationEnabled  = canInterp;
+            cfg.frameGenerationEnabled  = genWant;
             cfg.frameGenerationCallback = fg::dispatchCallback;
             cfg.frameGenerationCallbackContext = nullptr;
             // Synchronous: FFX's own guidance is to avoid its async path when the
@@ -9400,8 +9506,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             trace("FG: frame generation config %s (%d) - generation is now %s "
                   "(interpolation inputs %s).",
                   ce == FFX_OK ? "accepted" : "REJECTED", (int)ce,
-                  canInterp ? "ENABLED" : "disabled - clean passthrough, no black frame",
-                  canInterp ? "present" : "absent");
+                  genWant ? "ENABLED" : "disabled - clean passthrough, no black frame",
+                  genWant ? "present" : "absent");
         }
     }
 
@@ -10216,8 +10322,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             if (f) {
                 int v = 0;
                 if (fscanf(f, "%d", &v) == 1 && v >= 0 && v != dumpEvery) {
-                    trace("VEL: dump interval -> %d frames (was %d)", v, dumpEvery);
+                    trace("VEL: dump interval -> %d frames (was %d); diagnostic "
+                          "report quota reset to 4", v, dumpEvery);
                     dumpEvery = v;
+                    g_mvDiagWritten = 0;
                 }
                 fclose(f);
             }
@@ -10883,6 +10991,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     }
     g_velInjectedThisFrame = false;
     g_taaResolvedThisFrame = false;
+    g_frameJitLatched = false;   // next frame latches its own jitter at its first bind
     g_sceneEndsLastFrame.store(g_sceneEndsThisFrame.load(std::memory_order_relaxed),
                                std::memory_order_relaxed);
     // Counted BEFORE the reset below: a frame that ended no scene pass is a
@@ -12778,6 +12887,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreatePipelineLayout(
 // takes a VkPipeline and returns its layout - the association exists only in
 // the create info, which is gone by the time the draw happens.
 static std::map<VkPipeline, VkPipelineLayout> g_pipelineLayoutOf;
+// Pipelines whose vertex module belongs to a world-static family (terrain,
+// ground, ocean, sky - mv_family_table.h). The near-field select is disarmed
+// for them at bind time: see the threshold push.
+static std::set<VkPipeline> g_pipelineGround;
 
 // ---- WHAT TO PUSH, PER COMMAND BUFFER, PUSHED AGAIN AT DRAW TIME.
 //
@@ -13052,6 +13165,7 @@ static void mvPickLocationsOnce()
             flushedV = g_vertVariant.size();
             flushedF = g_fragVariant.size();
             g_vertVariant.clear();
+            g_vertVariantPid.clear();
             g_patchedVertModules.clear();
             g_fragVariant.clear();
             // The refusal tally described the OLD pair. Keeping it would blend
@@ -13127,9 +13241,9 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
     }
 
     std::vector<uint32_t> patched;
-    uint32_t loc = 0;
+    uint32_t loc = 0, vsPid = 0;
     VkShaderModule out = VK_NULL_HANDLE;
-    spvinj::Result ir = spvinj::inject(src.data(), src.size() * 4, patched, &loc);
+    spvinj::Result ir = spvinj::inject(src.data(), src.size() * 4, patched, &loc, &vsPid);
     mvNoteInjectReason(ir);
     if (ir == spvinj::INJ_OK) mvMaybeDumpSpirv(patched, "vert");
     if (ir == spvinj::INJ_OK) {
@@ -13146,6 +13260,7 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
     std::lock_guard<std::mutex> g(g_lock);
     g_vertVariant[orig] = out;
     g_patchedVertModules.insert(out);
+    if (out != VK_NULL_HANDLE) g_vertVariantPid[out] = vsPid;
     if (out == VK_NULL_HANDLE) {
         ++g_vertPatchFail;
         // Report the breakdown on a schedule tied to failures, so a run that
@@ -13166,9 +13281,11 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
 // ~1500 modules, so without the cache this would re-patch and re-create the
 // same module thousands of times.
 static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
-                                      uint32_t attachmentIndex, bool alphaBlended)
+                                      uint32_t attachmentIndex, bool alphaBlended,
+                                      bool zeroVel, bool tagHalf)
 {
-    FragKey key(FragModKey(orig, attachmentIndex), alphaBlended);
+    FragKey key(FragModKey(orig, attachmentIndex),
+                (alphaBlended ? 1 : 0) | (zeroVel ? 2 : 0) | (tagHalf ? 4 : 0));
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<FragKey, VkShaderModule>::iterator it = g_fragVariant.find(key);
@@ -13186,7 +13303,8 @@ static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
 
     std::vector<uint32_t> patched;
     spvinj::Result fr = spvinj::injectFragment(src.data(), src.size() * 4, patched,
-                                               attachmentIndex, alphaBlended);
+                                               attachmentIndex, alphaBlended, zeroVel,
+                                               tagHalf);
     // The VERTEX module's Location decorations were verified from a dump - 30
     // and 31, both stored. The FRAGMENT module's INPUT locations never were,
     // and a mismatch there would deliver zeros through a varying that looks
@@ -13381,8 +13499,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
     std::vector<std::vector<VkPipelineColorBlendAttachmentState> > blendAtt;
     std::vector<std::vector<VkPipelineShaderStageCreateInfo> > stages;
     std::vector<char> mvPatchedThisCall;
+    std::vector<char> mvGroundThisCall;   // world-static family, per pipeline
 
     if (ci && count) mvPatchedThisCall.assign(count, 0);
+    if (ci && count) mvGroundThisCall.assign(count, 0);
 
     if (g_spirvLive && ci && count) {
         ci2.assign(ci, ci + count);
@@ -13725,8 +13845,127 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             bool fragPatched = false;
             uint64_t fragHash = 0;      // FNV-1a of the original fragment SPIR-V
             bool     maskVelocity = false;  // in TAA_MASK_FRAG -> write no velocity
+            uint64_t vertHash = 0;      // FNV-1a of the original vertex SPIR-V
+            bool     famMasked = false; // policy says: do not write velocity
+            bool     famDepthOnly = false; // ...but keep the depth channel (blended decals)
+            bool     zeroVelClass = false; // screen-fixed overlay: writes vel = (0,0)
             stages[i].assign(ci[i].pStages, ci[i].pStages + ci[i].stageCount);
             bool vertPatched = false;
+
+            // ---- ISOLATE THE GROUND FROM THE THINGS THAT DO NOT NEED IT.
+            //
+            // Only the trusted writers (terrain, objects, ocean, sky) feed
+            // vectors to the resolve and frame generation. Everything else in
+            // the pass gets one of two policies, decided per VERTEX module
+            // hash (mv_family_table.h, generated from X-Plane's own shader
+            // pack) before any stage is patched, because the fragment variant
+            // depends on it:
+            //
+            //   MASKED    draped decals (the racing line3d taxi markings),
+            //             airport rasters, glows, cloud/post passes - write
+            //             nothing; their pixels keep the trusted vector of
+            //             whatever they are painted on.
+            //   ZERO-VEL  screen-fixed overlays inside the scene pass (legacy
+            //             plugin/UI drawing, in-pass text, manipulators,
+            //             windshield rain) - their truthful vector IS (0,0),
+            //             and inheriting the world behind a floating window is
+            //             what made plugin UI shaky. Coverage and depth stay
+            //             real, so AO and the alpha select keep working.
+            //
+            // The additive rule backs the table up: blending with dst = ONE is
+            // a glow, a glow does not occlude, so it never replaces velocity -
+            // this catches runtime-specialised variants whose hashes are not
+            // in the shipped pack (measured: the cockpit light billboards).
+            // TAA_MV_PID runs disable all of it: diagnostics measure raw.
+            for (uint32_t s = 0; !noPatch && s < ci[i].stageCount; ++s) {
+                if (!(ci[i].pStages[s].stage & VK_SHADER_STAGE_VERTEX_BIT)) continue;
+                std::lock_guard<std::mutex> g(g_lock);
+                std::map<VkShaderModule, std::vector<uint32_t> >::iterator mc =
+                    g_moduleCode.find(ci[i].pStages[s].module);
+                if (mc != g_moduleCode.end()) vertHash = mvFragHash(mc->second);
+            }
+            // In PID diagnostic runs the policy is COMPUTED but not applied,
+            // so the pipeline table can still say what a normal run would do.
+            bool wouldMask = false, wouldZero = false;
+            {
+                static const bool off = getenv("TAA_NO_FAMILY_MASK") ||
+                                        getenv("TAA_MV_PID");
+                bool wouldDepthOnly = false;
+                if (!noPatch) {
+                    // ---- ONLY OPAQUE GEOMETRY WRITES VECTORS.
+                    //
+                    // The racing taxi markings survived the line3d mask because
+                    // X-Plane draws them through terrain_17 - a BLENDED variant
+                    // of the trusted terrain family - and it reached the GPU
+                    // through the creation-time patch, which no hash table on
+                    // the pipeline path can see. The write mask can: whatever
+                    // module ends up in the pipeline, the appended slot's mask
+                    // decides what lands. So the rule stops being a family list
+                    // and becomes structural. Anything alpha-blended is drawn
+                    // ON something opaque that already wrote the correct
+                    // vector; it keeps only its depth (the select blend puts
+                    // the decal's depth where its texels are opaque, which IS
+                    // the ground depth - AO and contact stay right on the
+                    // markings). Additive is a glow and adding into the depth
+                    // channel would corrupt it, so additive writes nothing.
+                    // The zero-velocity class wins first: a screen-fixed
+                    // overlay's truthful vector is (0,0), strictly better than
+                    // inheriting the world behind it.
+                    // ---- MEASURED, NOT ASSUMED: "blended" is NOT "decal" here.
+                    // X-Plane draws its BASE terrain premultiplied (src = ONE,
+                    // dst = 1 - alpha; 1728 of 1733 terrain pipelines in one
+                    // session), so a rule that masks every blended pipeline
+                    // masks the ground itself and the whole world smears
+                    // along its own surface under camera motion - seen. The
+                    // structural part of the policy is therefore ONLY the
+                    // additive rule (a glow does not occlude); everything else
+                    // is the named table. Table-masked pipelines that blend
+                    // keep their depth channel through the select blend, so
+                    // AO and contact stay right on markings.
+                    if (mvFamilyZero(vertHash))        wouldZero = true;
+                    else if (mvFamilyMasked(vertHash)) wouldMask = true;
+                    const VkPipelineColorBlendStateCreateInfo *cbF = ci[i].pColorBlendState;
+                    const bool blends = cbF && cbF->attachmentCount > 0 &&
+                                        cbF->pAttachments[0].blendEnable == VK_TRUE;
+                    const bool additive = blends &&
+                        cbF->pAttachments[0].dstColorBlendFactor == VK_BLEND_FACTOR_ONE;
+                    if (!wouldZero && additive) wouldMask = true;
+                    // ---- DRAPED LAYERS: blended AND no depth write.
+                    //
+                    // The racing taxi markings are written by terrain_0 - the
+                    // base terrain shader - measured at a static camera: 8.9%
+                    // of its texels moving, every other shader exact zero. The
+                    // only per-pipeline split in that shader's four flavours
+                    // is depthWrite: the base mesh writes depth, the draped
+                    // marking layers painted over it do not. A draped layer
+                    // sits ON an opaque surface that already wrote the correct
+                    // vector, so it keeps only its depth. The base mesh
+                    // (dw=1) and the premultiplied ground are untouched - the
+                    // over-broad "all blended" rule that smeared the world
+                    // stopped exactly one condition short of this.
+                    const VkPipelineDepthStencilStateCreateInfo *dsF = ci[i].pDepthStencilState;
+                    const bool drapedLayer = blends && !additive && dsF &&
+                                             dsF->depthWriteEnable == VK_FALSE;
+                    if (!wouldZero && drapedLayer) wouldMask = true;
+                    wouldDepthOnly = wouldMask && blends && !additive;
+                    if (!off) {
+                        famMasked    = wouldMask;
+                        famDepthOnly = wouldDepthOnly;
+                        zeroVelClass = wouldZero;
+                    }
+                    if (famMasked || zeroVelClass) {
+                        static std::atomic<uint64_t> nPol(0);
+                        const uint64_t n = ++nPol;
+                        if (n <= 5 || (n % 2000) == 0)
+                            trace("FAMILY POLICY: %llu pipelines under policy so far "
+                                  "(this one: vert %016llx -> %s)",
+                                  (unsigned long long)n,
+                                  (unsigned long long)vertHash,
+                                  famMasked ? "no velocity write"
+                                            : "zero-velocity variant");
+                    }
+                }
+            }
             for (uint32_t s = 0; !noPatch && s < ci[i].stageCount; ++s) {
                 if (ci[i].pStages[s].stage & VK_SHADER_STAGE_FRAGMENT_BIT) {
                     // Identify the fragment for naming / masking BEFORE patching,
@@ -13800,8 +14039,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     const bool alphaBlended =
                         cb && cb->attachmentCount > 0 &&
                         cb->pAttachments[0].blendEnable == VK_TRUE;
+                    // PID measurement: pipelines that do not write depth get
+                    // tag + 0.5, so one vertex shader's draped and base flavours
+                    // read apart in the readback. Only in PID runs (otherwise
+                    // the channel is depth and the offset would be a lie).
+                    static const bool pidTag = getenv("TAA_MV_PID") != nullptr;
+                    const VkPipelineDepthStencilStateCreateInfo *dsT = ci[i].pDepthStencilState;
+                    const bool tagHalf = pidTag && dsT && dsT->depthWriteEnable == VK_FALSE;
                     VkShaderModule use = mvPatchFragment(
-                        device, ci[i].pStages[s].module, mvIndex, alphaBlended);
+                        device, ci[i].pStages[s].module, mvIndex, alphaBlended,
+                        zeroVelClass, tagHalf);
                     if (use != VK_NULL_HANDLE) {
                         stages[i][s].module = use;
                         fragPatched = true;
@@ -13819,7 +14066,57 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // patched vertex shader writes; pairing one with an unpatched
             // partner gives undefined inputs, which read as zero and produce a
             // velocity field of zeros that looks like working plumbing.
+            mvGroundThisCall[i]  = mvFamilyGround(vertHash) ? 1 : 0;
             mvPatchedThisCall[i] = (fragPatched && vertPatched);
+
+            // ---- PID MODE: ONE LINE PER PIPELINE INTO THE WRITER TABLE.
+            //
+            // A tag names a vertex module; this names what that module was
+            // drawn WITH. A pid whose layout does not carry our push range
+            // reads an undefined matrix. A pid whose attachment 0 blends is a
+            // decal or glass and went through the select. Both are the first
+            // two questions asked of any writer the readback singles out, and
+            // both are answered here rather than inferred later.
+            {
+                static const bool pidMode = getenv("TAA_MV_PID") != nullptr;
+                if (pidMode) {
+                    uint32_t vsPidThis = 0;
+                    bool layoutPC = false;
+                    {
+                        std::lock_guard<std::mutex> lg(g_lock);
+                        for (size_t s2 = 0; s2 < stages[i].size(); ++s2) {
+                            if (!(stages[i][s2].stage & VK_SHADER_STAGE_VERTEX_BIT)) continue;
+                            std::map<VkShaderModule, uint32_t>::iterator pit =
+                                g_vertVariantPid.find(stages[i][s2].module);
+                            if (pit != g_vertVariantPid.end()) vsPidThis = pit->second;
+                        }
+                        std::map<VkPipelineLayout, bool>::iterator lt =
+                            g_layoutHasOurPC.find(ci[i].layout);
+                        layoutPC = (lt != g_layoutHasOurPC.end() && lt->second);
+                    }
+                    const VkPipelineColorBlendStateCreateInfo *cbp = ci[i].pColorBlendState;
+                    const bool b0 = cbp && cbp->attachmentCount > 0 &&
+                                    cbp->pAttachments[0].blendEnable == VK_TRUE;
+                    const VkPipelineDepthStencilStateCreateInfo *dsp = ci[i].pDepthStencilState;
+                    spvinj::pidLog("PIPE vs=%u frag=%016llx layoutPC=%d vertPatched=%d "
+                                   "fragPatched=%d blend0=%d src=%d dst=%d colour=%u "
+                                   "depthTest=%d depthWrite=%d%s",
+                                   vsPidThis, (unsigned long long)fragHash,
+                                   layoutPC ? 1 : 0, vertPatched ? 1 : 0,
+                                   fragPatched ? 1 : 0, b0 ? 1 : 0,
+                                   b0 ? (int)cbp->pAttachments[0].srcColorBlendFactor : -1,
+                                   b0 ? (int)cbp->pAttachments[0].dstColorBlendFactor : -1,
+                                   src ? src->colorAttachmentCount : 0u,
+                                   dsp ? (int)dsp->depthTestEnable : -1,
+                                   dsp ? (int)dsp->depthWriteEnable : -1,
+                                   famMasked ? (famDepthOnly ? " [MASKED depth-only]"
+                                                                   : " [FAMILY MASKED]")
+                                             : zeroVelClass ? " [ZERO-VEL]"
+                                             : wouldMask ? " [policy: would-mask]"
+                                             : wouldZero ? " [policy: would-zero]"
+                                             : maskVelocity ? " [VELOCITY MASKED]" : "");
+                }
+            }
 
             // Name each distinct patched fragment once, with the traits that pick
             // out a see-through surface (blend off + not writing depth), so the
@@ -14025,7 +14322,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // maskVelocity: a see-through surface (canopy glass) named in
             // TAA_MASK_FRAG - patched for format consistency, but its velocity
             // write is masked so the world behind it keeps its own motion.
-            mvBlend.colorWriteMask = (fragPatched && !maskVelocity) ? mvMaskOn : 0;
+            mvBlend.colorWriteMask =
+                (!fragPatched || maskVelocity) ? 0
+                : famMasked ? (famDepthOnly ? (VkColorComponentFlags)VK_COLOR_COMPONENT_B_BIT
+                                            : (VkColorComponentFlags)0)
+                : mvMaskOn;
             // ---- ALPHA-BLENDED PIPELINES GET A PER-PIXEL SELECT, NOT A STAMP.
             //
             // With blending off, the propeller disc and the canopy glass write
@@ -14064,10 +14365,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // modes, where .w carries diagnostics rather than a 0-or-1 gate and
             // "blending" it would corrupt both.
             {
+                // TAA_MV_PID is no longer a debug channel here: its tag rides
+                // in .z and .w keeps the 0/1 select, so blended pipelines get
+                // the shipping blend under it too - which is the point of
+                // measuring them.
                 static const bool debugChannels =
                     getenv("TAA_MV_WRITE_DEPTH") || getenv("TAA_MV_RGBA") ||
                     getenv("TAA_MV_FIELDCHK")   || getenv("TAA_MV_MATDUMP") ||
-                    getenv("TAA_MV_RAWCLIP")    || getenv("TAA_MV_PID");
+                    getenv("TAA_MV_RAWCLIP");
                 if (fragPatched && !debugChannels &&
                     sb->attachmentCount > 0 && sb->pAttachments[0].blendEnable) {
                     mvBlend.blendEnable         = VK_TRUE;
@@ -14193,6 +14498,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
         for (uint32_t i = 0; i < count; ++i) {
             if (out[i] == VK_NULL_HANDLE) continue;
             g_pipelineLayoutOf[out[i]] = ci[i].layout;
+            if (i < mvGroundThisCall.size() && mvGroundThisCall[i]) {
+                g_pipelineGround.insert(out[i]);
+                static uint64_t nGround = 0;
+                if (++nGround <= 3 || (nGround % 2000) == 0)
+                    trace("NEAR FIELD: %llu world-static pipelines so far will "
+                          "bind with a ZERO near-field threshold - ground never "
+                          "takes the body frame, and a per-vertex select across "
+                          "a triangle that straddles the threshold is how the "
+                          "apron markings raced", (unsigned long long)nGround);
+            } else {
+                g_pipelineGround.erase(out[i]);   // handle reuse
+            }
 
             // IS THIS PIPELINE GEOMETRY, OR A FULL-SCREEN QUAD?
             //
@@ -15645,6 +15962,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
 
     VkPipelineLayout layout = VK_NULL_HANDLE;
     bool isGeometry = false, inScene = false, inCockpit = false;
+    bool groundPipe = false;   // world-static family: near-field select disarmed
     {
         std::lock_guard<std::mutex> g(g_lock);
 
@@ -15692,6 +16010,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             g_pipelineLayoutOf.find(pipeline);
         if (it == g_pipelineLayoutOf.end()) return;
         layout = it->second;
+        groundPipe = (g_pipelineGround.count(pipeline) != 0);
         std::map<VkPipelineLayout, bool>::iterator lt = g_layoutHasOurPC.find(layout);
         if (lt == g_layoutHasOurPC.end() || !lt->second) return;
 
@@ -15879,8 +16198,64 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         K[10] = 1.0f; K[11] = 1.0f;
         K[14] = g_velSnap.proj[14];
         float bodyView[16];
-        if (g_velSnap.bodyReprojValid)
+        // taa.body_zero (default ON): near-field geometry is declared
+        // stationary relative to the camera outright. The cockpit is the one
+        // population where camera-derived world motion is WRONG and where the
+        // plugin's body matrix has measurably produced +-12 UV garbage
+        // (vs-module 292, additive cockpit billboards, static camera). Zero is
+        // exact for a fixed view and costs at most a brief ghost during head
+        // pans; the live key flips it back to the body matrix for comparison.
+        static uint64_t s_bzGen = ~(uint64_t)0;
+        static int      s_bzVal = -1;
+        const bool bodyZero =
+            live::iCached("taa.body_zero", "TAA_BODY_ZERO", 1, s_bzGen, s_bzVal) != 0;
+        // ---- CHASE VIEW: THE AIRFRAME IS NOT WHERE THE WORLD VECTOR SAYS.
+        //
+        // Measured (build 20, view 1018): the camera moved 4-5 m per frame
+        // following the aircraft, bodyValid=1, body-frame 0. Every fuselage
+        // pixel therefore carried the WORLD vector - the camera's motion -
+        // while the airframe itself barely moved on screen. History for the
+        // livery was fetched from where the terrain went; the clamp fought it
+        // every frame (detail flicker at alpha 0.35, smear at 0.12). K is
+        // right only when the camera is bolted to the airframe; in the chase
+        // view the exact answer is the plugin's body reprojection, which
+        // carries the camera's motion RELATIVE to the airframe (orbit, lag).
+        // MEASURED (build 21, viz=1): with this path armed the livery detail
+        // carries the SAME vector as the paint around it, so the flicker is
+        // not a per-pixel vector defect - but at alpha_moving 0.12 the window
+        // rows and small text DOUBLED (history fetched from the wrong place).
+        // The body matrix is built from an aircraft pose read in the plugin's
+        // flight loop, not at draw time; at 200 kt a one-frame pose mismatch
+        // is 5 m. Until the pose is draw-synchronised this path is no better
+        // than the world vector in the chase view. Default OFF; taa.chase_body=1
+        // re-arms it for the next investigation.
+        static uint64_t s_cbGen = ~(uint64_t)0;
+        static int      s_cbVal = -1;
+        const bool chaseBodyOn =
+            live::iCached("taa.chase_body", "TAA_CHASE_BODY", 0, s_cbGen, s_cbVal) != 0;
+        const bool chaseView = chaseBodyOn && (g_velSnap.viewType == 1018) &&
+                               g_velSnap.bodyReprojValid != 0;
+        if ((!bodyZero || chaseView) && g_velSnap.bodyReprojValid)
             taaMul(bodyView, g_velSnap.bodyReproj, K);
+        // ---- BODY SLOT RECEIPT: the exact numbers the shader multiplies with.
+        //
+        // The plugin reproduces bodyReproj*K*(x,y,w,1) on the datum and gets
+        // zero; the shader painted the airframe saturated red from what it
+        // was handed. Print what was handed, once a second in the chase view,
+        // so the two can be diffed number by number.
+        if (chaseView) {
+            static uint64_t nRc = 0;
+            if ((++nRc % 20000) == 1) {
+                const float *B = g_velSnap.bodyReproj;
+                trace("BODY SLOT view=%d valid=%d thr=%.1f | bodyReproj rows: "
+                      "[%.5f %.5f %.5f %.5f | %.5f %.5f %.5f %.5f | %.5f %.5f %.5f %.5f | %.5f %.5f %.5f %.5f] "
+                      "| K[14]=%.5f | pushed body*K col3=(%.5f %.5f %.5f %.5f)",
+                      g_velSnap.viewType, g_velSnap.bodyReprojValid, (double)block[18],
+                      B[0], B[4], B[8], B[12], B[1], B[5], B[9], B[13],
+                      B[2], B[6], B[10], B[14], B[3], B[7], B[11], B[15],
+                      K[14], bodyView[12], bodyView[13], bodyView[14], bodyView[15]);
+            }
+        }
         else
         {
             // ---- IDENTITY, NOT THE WORLD MATRIX. THIS IS THE COCKPIT SHAKE.
@@ -15906,8 +16281,13 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             // pushes. It is also what the world matrix degenerates to when the
             // camera is still, so this changes nothing in the case the old code
             // was right about, and fixes every case it was wrong about.
-            memset(bodyView, 0, sizeof(bodyView));
-            bodyView[0] = bodyView[5] = bodyView[10] = bodyView[15] = 1.0f;
+            // K, not plain identity. The shader's vector is (x, y, w, 1),
+            // so "did not move" must map w back into prev.w - that is K's
+            // [11] = 1 row. Plain identity left prev.w = 1 against a real
+            // curr.w, which divides into a radial pseudo-motion proportional
+            // to (1 - 1/w) - the fallback was quietly wrong in the exact way
+            // this slot exists to prevent.
+            memcpy(bodyView, K, sizeof(bodyView));
         }
         memcpy(block + 20, bodyView, 64);
     }
@@ -15961,18 +16341,23 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             // when the projection is legitimately still zero" from "failing
             // every frame" - and those want opposite fixes. A rate is the only
             // form of this measurement worth having.
-            static uint64_t nSeen = 0, nBad = 0;
+            static uint64_t nSeen = 0, nBad = 0, nBadLast = 0;
             if (g_share) {
                 ++nSeen;
                 if (!g_share->reprojValid) ++nBad;
-                if ((nSeen % 600) == 0)
+                if ((nSeen % 600) == 0) {
+                    // The cumulative rate reads as a periodic fault long after
+                    // the load-phase burst (917 in the first 1200 pushes, then
+                    // none) - say how many are NEW since the last line.
                     trace("MV REPROJ VALIDITY: %llu of %llu pushes had NO valid "
-                          "reprojection (%.1f%%). Those frames carry a stale or "
-                          "identity matrix, so every vector in them is zero. "
-                          "A rate near 0 means the inverse is healthy and the "
-                          "resolve duty gap is cadence, not failure.",
+                          "reprojection (%.1f%% cumulative, %llu NEW since the "
+                          "last line). New = 0 means the inverse is healthy now "
+                          "and the earlier ones were the load phase.",
                           (unsigned long long)nBad, (unsigned long long)nSeen,
-                          100.0 * (double)nBad / (double)nSeen);
+                          100.0 * (double)nBad / (double)nSeen,
+                          (unsigned long long)(nBad - nBadLast));
+                    nBadLast = nBad;
+                }
             }
         }
         const bool failing = (g_velSnap.viewType != 0 && g_velSnap.viewType != 1026);
@@ -16079,8 +16464,35 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             // through every session and the resolve averaged identical
             // samples. The value now lives in g_jitterScale, computed once per
             // frame from the live enable, default 1.0 while resolving.
-            block[16] =  2.0f * g_velSnap.jitterX * g_jitterScale / w;
-            block[17] = ySign * 2.0f * g_velSnap.jitterY * g_jitterScale / h;
+            if (!g_frameJitLatched) {
+                g_frameJitX = g_velSnap.jitterX;
+                g_frameJitY = g_velSnap.jitterY;
+                g_frameJitLatched = true;
+            }
+            // ---- NOTHING DRAWN AFTER THE RESOLVE MAY BE JITTERED.
+            //
+            // The resolve un-jitters the scene image ONCE, at the end of the
+            // lit pass (measured: "hdr 4 of 4"). Geometry recorded after that
+            // - the late overlay passes: glass, HUD, instrument faces, a
+            // handful of draws in pass ordinals 6 and 7 - was still being
+            // jittered by this push, and nothing ever resampled it back. It
+            // trembled by half a pixel every frame on top of a rock-steady
+            // world: the "cockpit shake" that survived every near-field and
+            // body-matrix change and stopped only with jitter off. Post-resolve
+            // draws land on an already un-jittered image, so their correct
+            // jitter is exactly zero.
+            if (g_taaResolvedThisFrame) {
+                block[16] = block[17] = 0.0f;
+                static uint64_t nPost = 0;
+                if ((++nPost % 50000) == 1)
+                    trace("JITTER: post-resolve bind pushed ZERO jitter (%llu so far) - "
+                          "geometry drawn after the resolve is never un-jittered, so "
+                          "jittering it is a tremble, not anti-aliasing.",
+                          (unsigned long long)nPost);
+            } else {
+                block[16] =  2.0f * g_frameJitX * g_jitterScale / w;
+                block[17] = ySign * 2.0f * g_frameJitY * g_jitterScale / h;
+            }
             g_appliedJitX = block[16];
             g_appliedJitY = block[17];
             if (block[16] != 0.0f || block[17] != 0.0f) ++g_jitterApplied;
@@ -16152,13 +16564,82 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     const int nfView = live::iCached("taa.nearfield_view", "TAA_NEARFIELD_VIEW",
                                      -1, nfGen, nfVal);
     const int vt     = g_velSnap.viewType;
-    const bool ridesAirframe = (vt == 1000 || vt == 1017 ||
-                                vt == 1018 || vt == 1026);
+    // ---- COCKPIT VIEWS ONLY. 1018 is the external chase camera on this
+    // install (measured: every external-view readback reported view=1018), and
+    // the body frame is the WRONG frame for a camera that orbits a parked
+    // aircraft: with the near-field armed there, fuselage vertices inside the
+    // threshold were declared stationary on screen while the camera moved -
+    // the ghosted livery lettering. Inside the cockpit the camera rides the
+    // airframe by construction; outside it, everything reprojects by the
+    // camera. (The chase-view aircraft in flight then takes the world path -
+    // the same as before near-field existed; the per-fragment select is the
+    // real cure for that and is not written yet.)
+    const bool ridesAirframe = (vt == 1000 || vt == 1017 || vt == 1026);
     const bool provisional = (nfView < 0)      ? ridesAirframe
                            : (nfView == 0)     ? false
                                                : (vt == nfView);
-    if ((g_velSnap.bodyReprojValid || provisional) && g_nearFieldM > 0.0f)
+    // Near-field is a cockpit-VIEW concept: only there does the camera ride
+    // the airframe, so only there is a body frame the right frame. provisional
+    // is that gate (ridesAirframe, or a pinned view). bodyReprojValid used to
+    // OR in here and armed near-field in external views, where it is wrong and
+    // caused the chase-view racing.
+    if (provisional && g_nearFieldM > 0.0f)
         block[18] = g_nearFieldM;
+    // Chase view (1018): the airframe sits camGap metres from the camera and
+    // extends up to ~80 m beyond the datum, so the select must reach past ALL
+    // of it - a fuselage triangle straddling the threshold would mix frames
+    // (the racing-lines mechanism). Ground families still bind at 0 below;
+    // static objects inside this radius get the airframe's own motion as
+    // error, which is zero parked and sub-pixel while taxiing. Only when the
+    // plugin's body matrix is valid this frame (a zoom breaks rigidity for a
+    // frame - the world path is the right fallback then, not K).
+    static uint64_t s_cbGen2 = ~(uint64_t)0;
+    static int      s_cbVal2 = -1;
+    const bool chaseBodyOn2 =
+        live::iCached("taa.chase_body", "TAA_CHASE_BODY", 0, s_cbGen2, s_cbVal2) != 0;
+    if (chaseBodyOn2 && nfView < 0 && g_velSnap.viewType == 1018 &&
+        g_velSnap.bodyReprojValid != 0) {
+        float chaseM = g_velSnap.camGap + 120.0f;
+        if (chaseM > 400.0f) chaseM = 400.0f;
+        block[18] = chaseM;
+        static uint64_t nChase = 0;
+        if ((++nChase % 20000) == 1)
+            trace("NEAR-FIELD (chase view 1018): airframe reprojected in the BODY "
+                  "frame - threshold %.0f m (camera %.1f m from the datum). Before "
+                  "this the fuselage carried the world vector, i.e. the camera's "
+                  "motion, and the livery's history came from where the terrain went.",
+                  (double)chaseM, (double)g_velSnap.camGap);
+    }
+    // ---- THE GROUND NEVER TAKES THE BODY FRAME.
+    //
+    // The select runs per VERTEX. An apron triangle can span hundreds of
+    // metres, and in a chase view one of its vertices sits under the camera
+    // (w < threshold) while the rest are at 50-200 m. That vertex took the
+    // body-frame prev, the others the world-frame prev, and perspective
+    // interpolation - which weights the near vertex by 1/w, i.e. dominantly -
+    // spread a previous position from the wrong frame across the whole
+    // triangle. Measured: 8.9% of terrain_0's texels moving at a camera that
+    // had not, all of them on triangles reaching into the near field; base
+    // terrain fully beyond it read exact zeros; the prev = curr probe (which
+    // bypasses this select) zeroed everything. World-static geometry has no
+    // body frame to be in, so its pipelines push a zero threshold and every
+    // vertex takes the world path consistently. Objects keep the select.
+    // taa.nearfield_pass: outside the fingerprinted cockpit pass nothing is
+    // airframe geometry, whatever its distance.
+    static uint64_t s_npGen = ~(uint64_t)0;
+    static int      s_npVal = 0;
+    const bool nfPassMode =
+        live::iCached("taa.nearfield_pass", "TAA_NEARFIELD_PASS", 0, s_npGen, s_npVal) != 0;
+    // The whole cockpit pass is airframe geometry (the world was drawn in
+    // earlier passes), so arm ALL of it - a huge threshold every vertex passes
+    // - instead of a 5 m distance select that a windshield-frame-to-panel
+    // triangle straddles. inCockpit is now true only in a cockpit view's
+    // cockpit pass, so outside it this disarms completely.
+    if (nfPassMode) block[18] = inCockpit ? 1.0e30f : 0.0f;
+    // LAST, so nothing above can re-arm it: world-static geometry never takes
+    // the body frame - not by distance, not by pass. If the cockpit-pass
+    // fingerprint ever matched a pass that also drew ground, this still holds.
+    if (groundPipe) block[18] = 0.0f;
 
     // Never silent again. The select being disarmed is invisible from every
     // downstream measurement - the field simply carries world motion on the
@@ -16166,7 +16647,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     {
         static int lastVt = -1;
         static float lastThr = -1.0f;
-        if (vt != lastVt || block[18] != lastThr) {
+        if (vt != lastVt || (!nfPassMode && block[18] != lastThr)) {
             lastVt = vt; lastThr = block[18];
             trace("NEAR FIELD SELECT: view=%d bodyValid=%d -> threshold %.2f m "
                   "(0 means DISARMED: every vertex takes the world matrix and "
@@ -17527,10 +18008,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
     // oldSwapchain, which is the only value that is true of the swapchain FFX
     // is about to build. Getting this wrong is not a lost feature, it is the
     // sim exiting - which is exactly what it did.
-    if (g_fgSwap.have && ci->oldSwapchain != VK_NULL_HANDLE &&
-        ci->oldSwapchain == g_fgSwap.handle) {
-        trace("FG: X-Plane is recreating its swapchain and handed back our "
-              "proxy as oldSwapchain - tearing it down first.");
+    // ---- SAME SURFACE = THE PROXY'S SWAPCHAIN IS BEING REPLACED. TEAR IT DOWN.
+    //
+    // Measured three times (same driver site, nvoglv64+0xf3de7f): X-Plane
+    // toggles fullscreen-exclusive on a focus change and creates a NEW
+    // swapchain on the SAME surface with oldSwapchain = NULL. The driver
+    // retires the previous swapchain on that surface anyway; the proxy - still
+    // "have", still routing acquire/present to FFX - then presents images the
+    // driver has already retired, and the sim dies. Suspending interpolation
+    // alone (build 17) was not enough, because the routing was the fault.
+    // The oldSwapchain == proxy case (aircraft change) already did the right
+    // thing; the trigger is now the surface, which covers both.
+    const bool proxyHandedBack = g_fgSwap.have && ci->oldSwapchain != VK_NULL_HANDLE &&
+                                 ci->oldSwapchain == g_fgSwap.handle;
+    const bool sameSurface     = g_fgSwap.have && g_fgSwap.surface != VK_NULL_HANDLE &&
+                                 ci->surface == g_fgSwap.surface;
+    if (proxyHandedBack || sameSurface) {
+        trace(proxyHandedBack
+              ? "FG: X-Plane is recreating its swapchain and handed back our "
+                "proxy as oldSwapchain - tearing it down first."
+              : "FG: X-Plane is creating a NEW swapchain on the proxy's surface "
+                "(oldSwapchain not ours - a fullscreen-exclusive toggle or a "
+                "window move). The driver will retire the proxy's swapchain; "
+                "tearing the proxy down FIRST so nothing presents through it. "
+                "Frame generation is off for the rest of this session.");
+        g_fgSuspended.store(true, std::memory_order_relaxed);
         if (g_fgSwap.fn.destroySwapchainKHR)
             g_fgSwap.fn.destroySwapchainKHR(device, g_fgSwap.handle, alloc);
         // X-Plane still owns this handle and will destroy it itself once this
@@ -17543,7 +18045,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
         g_fgSwap.handle = VK_NULL_HANDLE;
         g_fgSwap.proxy  = nullptr;
         g_fgActive.store(false, std::memory_order_relaxed);
-        mod.oldSwapchain = VK_NULL_HANDLE;
+        if (proxyHandedBack) mod.oldSwapchain = VK_NULL_HANDLE;
     }
     // Any other recreation while a proxy is live is left to the driver: the
     // creation block further down requires !g_fgSwap.have, so no second proxy
@@ -17552,13 +18054,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
     // dereferenced anything. This block only says so once; the refusal itself
     // is that !have, not anything here.
     if (g_fgSwap.have && live::onoff("taa.fg", "TAA_FG", false)) {
-        static bool said = false;
-        if (!said) {
-            said = true;
-            trace("FG: a swapchain is being created while the proxy is still "
-                  "live - leaving this one to the driver. Frame generation "
-                  "stays bound to the proxy it was configured for.");
-        }
+        // "Leaving it to the driver" was right; "generation stays bound to the
+        // proxy" was the crash. The proxy's swapchain is being replaced or
+        // joined by another window; interpolating through that is a driver AV.
+        const bool first = !g_fgSuspended.exchange(true, std::memory_order_relaxed);
+        if (first)
+            trace("FG SUSPENDED: X-Plane created a swapchain the proxy does not "
+                  "own (window/monitor change or a second window). Interpolation "
+                  "and the dilate side-car are OFF for the rest of this session; "
+                  "presents still pass through the proxy untouched, and the proxy "
+                  "is retired when X-Plane destroys its old swapchain. Relaunch "
+                  "to re-enable frame generation.");
     }
     // ---- FFX'S FI SWAPCHAIN CANNOT USE AN sRGB SWAPCHAIN. MEASURED.
     //
@@ -17772,6 +18278,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateSwapchainKHR(
                     g_fgSwap.have   = true;
                     ++g_fgProxiesBuilt;
                     g_fgSwap.device = device;
+                    g_fgSwap.surface = mod.surface;
                     g_fgSwap.dispW  = mod.imageExtent.width;
                     g_fgSwap.dispH  = mod.imageExtent.height;
                     g_fgSwap.dispFmt = mod.imageFormat;   // post-substitution, i.e. UNORM
@@ -18054,6 +18561,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyPipeline(
             g_pipelineMvPatched.erase(pipe);
             g_pipelineIsGeometry.erase(pipe);
             g_pipelineLayoutOf.erase(pipe);
+            g_pipelineGround.erase(pipe);
         }
     }
     if (next) next(device, pipe, alloc);

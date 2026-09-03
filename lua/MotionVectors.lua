@@ -493,7 +493,7 @@ end
   Backends. Only TAA exists; the rest are drawn greyed so the roadmap is
   visible rather than implied.
 --------------------------------------------------------------------------- ]]
-local BACKENDS = { "TAA", "DLSS", "FSR", "XeSS", "DLAA", "FG", "MFG" }
+local BACKENDS = { "TAA", "DLSS", "FSR", "FG", "SSGI" }
 
 -- Last non-zero value of each float effect, so the toggle row can put back what
 -- the user had rather than the built-in default. Session-scoped on purpose: the
@@ -604,6 +604,10 @@ local SETTINGS = {
     group = "TAA", help = "" },
   { key = "taa.nearfield_view", label = "nearfield_view", kind = "int", def = -1, lo = -1, hi = 2000,
     group = "TAA", help = "---- NEAR-FIELD DISTANCE, in metres, into the spare .z of the jitter vec4." },
+  { key = "taa.body_zero", label = "body_zero", kind = "bool", def = true, lo = nil, hi = nil,
+    group = "TAA", help = "Near-field geometry is stationary relative to the camera (exact zero vector). Off = the plugin body matrix." },
+  { key = "taa.nearfield_pass", label = "nearfield_pass", kind = "bool", def = false, lo = nil, hi = nil,
+    group = "TAA", help = "Arm the near-field only inside the fingerprinted cockpit pass (depth-clearing, not first) instead of by distance. Live." },
   { key = "taa.no_accum", label = "no_accum", kind = "bool", def = false, lo = nil, hi = nil,
     group = "TAA", help = "" },
   { key = "taa.no_motion", label = "no_motion", kind = "bool", def = false, lo = nil, hi = nil,
@@ -1368,18 +1372,27 @@ local function build(w, x, y)
                     and "Frame generation OFF - restart X-Plane to take effect."
                     or  "Frame generation ON - restart X-Plane to take effect.")
             end
+        elseif b == "SSGI" then
+            -- Screen-space bounce light. Live: the gather pass reads taa.gi
+            -- every frame, so this takes effect on the next frame, no restart.
+            local giOn = (ini_get("taa.gi", "0") == "1")
+            if styled_button(b, 76, 22, giOn and C_GREEN or C_GREY_ED,
+                             giOn and C_GREEN_BG or C_GREY_BG, true) then
+                ini_set("taa.gi", giOn and "0" or "1")
+                logf(C_GREEN, giOn and "SSGI OFF." or "SSGI ON - live.")
+            end
         else
             styled_button(b, 76, 22, C_DIM, C_GREY_BG, false)
         end
     end
-    text(C_DIM, "DLSS, FSR, XeSS, DLAA and MFG are not implemented yet.")
+    text(C_DIM, "DLSS and FSR are not implemented yet. SSGI is live; FG needs a relaunch.")
     if fgOn then
         text(C_AMBER, "Frame generation ON - takes effect on the next launch.")
     else
         text(C_DIM, "FG interpolates a frame between every rendered pair."
                  .. " Takes effect on the next launch.")
     end
-    text(C_DIM, "Known issue: changing aircraft while FG is on crashes the sim.")
+    text(C_DIM, "Note: moving the window to another monitor or opening a second window (IOS) suspends FG until relaunch.")
 
     ------------------------------------------------------------------ effects
     --
