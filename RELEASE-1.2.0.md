@@ -26,6 +26,16 @@ proxy kept presenting retired images. The proxy is now torn down first; frame
 generation stays off for the rest of that session. A resolution change no
 longer copies the old extent into a smaller target.
 
+**Screen-space GI, and the engine's own buffers.** The layer now listens to
+X-Plane naming its own images and reads the engine's depth directly
+("gbuffer-harvest"): pixels no shader wrote get a depth-reconstructed vector
+instead of none. On top of that sits a new SSGI gather pass (`taa.gi`,
+`taa.gi_strength`, default 0.5) that bounces light from the engine's lit
+buffer; escaped rays contribute zero, so it shows mostly in enclosed spaces
+(cockpit, hangars, under wings) and little in open sky. The depth
+linearization sign shared by GI, AO and contact shadows was inverted and is
+fixed.
+
 **Thin taxi lines.** `taa.lod_bias` ships at -0.5 so fragmented line
 markings survive anti-aliasing.
 
