@@ -16,11 +16,16 @@ param(
     # Module hash from mv_pid_table_<pid>.txt (the "vs <pid> <hash>" line of the
     # writer you want to read). The layer writes that module's original and
     # patched SPIR-V to %TEMP%\mv_vs_<pid>.spv / mv_vs_<pid>_patched.spv.
-    [string]$DumpHash = ""
+    [string]$DumpHash = "",
+    [switch]$RawPolicy
 )
 Set-Location $PSScriptRoot
 $env:TAA_MV_PID  = "1"
 $env:TAA_MV_DIAG = $env:TEMP
+# Keep the shipped family/additive policy APPLIED in the readback run unless
+# -RawPolicy: an additive full-screen overlay in the cockpit otherwise blends
+# its tag over every texel and the census sees nothing underneath.
+if ($RawPolicy) { Remove-Item Env:TAA_MV_PID_POLICY -ErrorAction SilentlyContinue } else { $env:TAA_MV_PID_POLICY = "1" }
 if ($DumpHash) { $env:TAA_MV_DUMP_HASH = $DumpHash; Write-Host "will dump module $DumpHash" -ForegroundColor Cyan }
 else { Remove-Item Env:TAA_MV_DUMP_HASH -ErrorAction SilentlyContinue }
 Write-Host "PID mode: tag in channel B, table -> $env:TEMP\mv_pid_table_<pid>.txt" -ForegroundColor Cyan

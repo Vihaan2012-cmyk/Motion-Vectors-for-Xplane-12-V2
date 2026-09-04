@@ -4055,7 +4055,13 @@ static float matrixCallback(float sinceLast, float, int, void *)
     else if (g_prevViewType >= 0 && s->viewType != g_prevViewType) reason = TAA_RESET_VIEWTYPE;
     else if (g_prevVpW && (s->viewportW != g_prevVpW || s->viewportH != g_prevVpH))
                                                                    reason = TAA_RESET_VIEWPORT;
-    else if (g_prevFov > 0 && fabsf(s->fovDeg - g_prevFov) > 0.5f) reason = TAA_RESET_FOV;
+    // A cockpit zoom changed the FOV by more than 0.5 deg on ~every frame of a
+    // continuous zoom (measured: 1480 of 1650 frames), and each one discarded
+    // history - the raw jittered frame then re-accumulated for a second, which
+    // is the "text smears into itself when I zoom". Both reprojection paths
+    // carry prevProj * ... * proj^-1 and follow a FOV change exactly, so the
+    // reset is reserved for a view-mode-sized jump.
+    else if (g_prevFov > 0 && fabsf(s->fovDeg - g_prevFov) > 20.0f) reason = TAA_RESET_FOV;
     else if (g_prevPaused >= 0 && s->paused != g_prevPaused)       reason = TAA_RESET_PAUSE;
     else if (dt < 0.0 || dt > 1.0)                                 reason = TAA_RESET_TIMEJUMP;
     // Teleport: a jump no aircraft could fly. 1500 m/s is past anything in the

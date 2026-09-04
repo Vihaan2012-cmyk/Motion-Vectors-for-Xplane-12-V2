@@ -196,6 +196,17 @@ static TaaState g_taa;
 // number of times the resolve happens to record - see the note at the flip.
 static bool g_taaFlipArmed = true;
 
+// Near-field radius (metres) the bind hook is currently arming in a cockpit
+// view, 0 in every other view. Read by the resolve fill (uReprojParams2.w).
+static float g_taaCockpitNearM = 0.0f;
+// Set by the bind hook when this frame's projection differs from the previous
+// one (a zoom step). The resolve then treats every pixel as moving for that
+// frame: near the screen centre a zoom step moves text by less than the
+// moving-pixel threshold, so those pixels kept the 5% base alpha and dragged
+// twenty frames of old-scale history behind them - the "text smears into
+// itself when I zoom" that survived exact vectors and the removed FOV reset.
+static bool  g_taaProjChanged = false;
+
 struct TaaPush {
     float invSizeX, invSizeY;
     float jitterX, jitterY;
@@ -1832,8 +1843,14 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         // a strength for a result that does not exist.
         slot[22] = (gi::resultView() != VK_NULL_HANDLE)
                  ? live::f("taa.gi_strength", "TAA_GI_STRENGTH", 0.5f) : 0.0f;
-        slot[22] = 0.0f;
-        slot[23] = 0.0f;
+        // (A placeholder `slot[22] = 0.0f;` from the cascade-tap commit sat
+        // here after the line above and silently zeroed the strength: SSGI
+        // gathered every frame and composited nothing. Measured as "no visible
+        // difference with GI on". Removed 2026-09-04.)
+        // Cockpit near-field radius for the resolve's reconstruction gate
+        // (see taa.comp): set per bind by the near-field logic in the bind
+        // hook, 0 outside cockpit views.
+        slot[23] = g_taaCockpitNearM;
     }
 
     VkDescriptorImageInfo ii[8];
@@ -2090,7 +2107,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     pcv.varClip  = taaVarClip();
     pcv.movedDead = taaMovedDead();
     pcv.alphaMoving = taaAlphaMoving();
-    pcv.alphaMovingPx = taaAlphaMovingPx();
+    pcv.alphaMovingPx = g_taaProjChanged ? 0.0f : taaAlphaMovingPx();
     // Read once; the main dispatch ignores it (mode != SHARPEN) but it must be
     // defined, and the sharpen pass below reuses this same block.
     const float sharpAmt  = taaSharpen();

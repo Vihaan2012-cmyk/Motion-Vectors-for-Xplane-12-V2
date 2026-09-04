@@ -5476,6 +5476,16 @@ static float g_appliedJitX = 0.0f, g_appliedJitY = 0.0f;
 // and use the latch everywhere; the snapshot may change underneath.
 static float g_frameJitX = 0.0f, g_frameJitY = 0.0f;
 static bool  g_frameJitLatched = false;
+// ---- JITTER EPOCH ACCOUNTING: does every draw the resolve un-jitters share
+// the resolve's jitter? Counted between consecutive resolves (recording
+// order), not between presents: the present resets the latch while worker
+// threads may already be recording the next frame, so binds before the reset
+// and binds after it can carry different jitters within ONE resolved image.
+// Measured cockpit shake that survives every matrix fix and stops only with
+// jitter off, and gets WORSE with a weaker blend, is exactly this symptom.
+static std::atomic<uint64_t> g_epBinds(0), g_epDiff(0), g_epZero(0);
+static float g_epFirstX = 0.0f, g_epFirstY = 0.0f;
+static std::atomic<bool> g_epHaveFirst(false);
 // Reads the jitter out of THIS command buffer's pending-push slot - defined
 // below the slot machinery it needs, used above it by the resolve.
 static bool mvPendingJitter(VkCommandBuffer cb, float *jx, float *jy);
@@ -7689,6 +7699,30 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
                         const float jy = g_frameJitLatched ? g_frameJitY : g_velSnap.jitterY;
                         tf.jitter.x = 2.0f * jx * g_jitterScale / wR;
                         tf.jitter.y = ySignR * 2.0f * jy * g_jitterScale / hR;
+                        {
+                            static uint64_t nEp = 0, sumDiff = 0, sumBinds = 0, epMismatch = 0;
+                            const uint64_t b = g_epBinds.exchange(0, std::memory_order_relaxed);
+                            const uint64_t d = g_epDiff.exchange(0, std::memory_order_relaxed);
+                            const uint64_t z = g_epZero.exchange(0, std::memory_order_relaxed);
+                            const bool have = g_epHaveFirst.exchange(false, std::memory_order_relaxed);
+                            const float fx = g_epFirstX, fy = g_epFirstY;
+                            // the resolve's own jitter in the same NDC units as the pushes
+                            const float rx = 2.0f * jx * g_jitterScale / wR;
+                            const float ry = ySignR * 2.0f * jy * g_jitterScale / hR;
+                            const bool resolveDiffers = have && (fx != rx || fy != ry);
+                            sumDiff += d; sumBinds += b; if (resolveDiffers) ++epMismatch;
+                            (void)z;
+                            if ((++nEp % 300) == 0)
+                                trace("JITTER EPOCH: over %llu resolves, %llu of %llu jittered binds "
+                                      "carried a jitter DIFFERENT from their frame's first, and the "
+                                      "resolve's own jitter differed from the frame's first in %llu "
+                                      "frames | this frame: %llu binds, %llu differ, %llu zero, first "
+                                      "(%.5f %.5f) resolve (%.5f %.5f)",
+                                      (unsigned long long)nEp, (unsigned long long)sumDiff,
+                                      (unsigned long long)sumBinds, (unsigned long long)epMismatch,
+                                      (unsigned long long)b, (unsigned long long)d,
+                                      (unsigned long long)z, fx, fy, rx, ry);
+                        }
                     } else {
                         tf.jitter.x = tf.jitter.y = 0.0f;
                     }
@@ -13888,8 +13922,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // so the pipeline table can still say what a normal run would do.
             bool wouldMask = false, wouldZero = false;
             {
+                // TAA_MV_PID_POLICY=1 keeps the policy APPLIED in a readback
+                // run: without it an additive full-screen overlay (cockpit,
+                // vs 588bf66bd38049fa) blends its tag over every texel and the
+                // census sees nothing underneath (measured: 307424 of 307424
+                // tags non-integer in the cockpit view).
                 static const bool off = getenv("TAA_NO_FAMILY_MASK") ||
-                                        getenv("TAA_MV_PID");
+                                        (getenv("TAA_MV_PID") && !getenv("TAA_MV_PID_POLICY"));
                 bool wouldDepthOnly = false;
                 if (!noPatch) {
                     // ---- ONLY OPAQUE GEOMETRY WRITES VECTORS.
@@ -16235,8 +16274,63 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             live::iCached("taa.chase_body", "TAA_CHASE_BODY", 0, s_cbGen, s_cbVal) != 0;
         const bool chaseView = chaseBodyOn && (g_velSnap.viewType == 1018) &&
                                g_velSnap.bodyReprojValid != 0;
-        if ((!bodyZero || chaseView) && g_velSnap.bodyReprojValid)
-            taaMul(bodyView, g_velSnap.bodyReproj, K);
+        // ---- ZOOM. K encodes "this vertex did not move on screen", which is
+        // exact for a camera bolted to the airframe - until the PROJECTION
+        // changes. A FOV zoom moves every cockpit pixel radially while K keeps
+        // saying zero, so history is fetched from the wrong radius and the
+        // panel text smears into itself (measured: "cockpit text smears when
+        // I zoom in and out"). bodyReproj carries prevProj * ... * proj^-1 and
+        // is exact across a zoom; use it on any frame whose projection differs
+        // from the previous one, K otherwise (its exact zero beats the
+        // numerically-derived near-identity when nothing changes).
+        const bool projChanged =
+            memcmp(g_velSnap.proj, g_velSnap.prevProj, sizeof(g_velSnap.proj)) != 0;
+        g_taaProjChanged = projChanged;   // read by the resolve fill this frame
+        if (projChanged && g_velSnap.bodyReprojValid) {
+            // Zoom frames only: the magnitude view showed the cockpit BLACK
+            // (zero) while zooming although this path was selected. Print the
+            // terms: for a pure FOV change bodyReproj[0] must equal
+            // prevProj[0]/proj[0] (not 1), and (bodyReproj*K)[0] the same.
+            static uint64_t nZf = 0;
+            if ((++nZf % 2000) == 1) {
+                const float *B = g_velSnap.bodyReproj;
+                float BK[16]; taaMul(BK, B, K);
+                trace("ZOOM FRAME: proj[0]=%.5f prevProj[0]=%.5f ratio=%.5f | bodyReproj[0]=%.5f "
+                      "[5]=%.5f [12]=%.5f [13]=%.5f [15]=%.5f | (bodyReproj*K)[0]=%.5f [5]=%.5f "
+                      "[11]=%.5f [15]=%.5f | valid=%d camGap=%.2f",
+                      g_velSnap.proj[0], g_velSnap.prevProj[0],
+                      g_velSnap.proj[0] != 0.0f ? g_velSnap.prevProj[0] / g_velSnap.proj[0] : 0.0f,
+                      B[0], B[5], B[12], B[13], B[15], BK[0], BK[5], BK[11], BK[15],
+                      g_velSnap.bodyReprojValid, g_velSnap.camGap);
+            }
+        }
+        {
+            // Receipt: the zoom census wrote exactly zero for the cockpit while
+            // the projection changed on 1480 frames - so say, once a second in
+            // cockpit views, whether this path fires and what it compares.
+            static uint64_t nZ = 0, nZoom = 0;
+            if (projChanged) ++nZoom;
+            if ((++nZ % 20000) == 1 &&
+                (g_velSnap.viewType == 1026 || g_velSnap.viewType == 1000 || g_velSnap.viewType == 1017))
+                trace("ZOOM PATH: %llu of %llu body-slot fills saw a projection change | "
+                      "proj[0]=%.5f prevProj[0]=%.5f proj[5]=%.5f prevProj[5]=%.5f | "
+                      "bodyValid=%d bodyZero=%d -> %s",
+                      (unsigned long long)nZoom, (unsigned long long)nZ,
+                      g_velSnap.proj[0], g_velSnap.prevProj[0], g_velSnap.proj[5], g_velSnap.prevProj[5],
+                      g_velSnap.bodyReprojValid, bodyZero ? 1 : 0,
+                      ((!bodyZero || chaseView || projChanged) && g_velSnap.bodyReprojValid)
+                          ? "bodyReproj*K" : "K (zero)");
+        }
+        // ---- ONE decision, then the receipt. A receipt block inserted between
+        // this `if` and its `else` (build 25) captured the `else`, so every
+        // non-chase view overwrote the reprojection with K after computing it:
+        // zoom frames wrote zero (measured black in viz=2) and body_zero=0 did
+        // nothing in the cockpit. The decision is a named bool now; the K
+        // rationale below stays as a comment.
+        const bool useBodyMatrix =
+            (!bodyZero || chaseView || projChanged) && g_velSnap.bodyReprojValid;
+        if (useBodyMatrix) taaMul(bodyView, g_velSnap.bodyReproj, K);
+        else               memcpy(bodyView, K, sizeof(bodyView));
         // ---- BODY SLOT RECEIPT: the exact numbers the shader multiplies with.
         //
         // The plugin reproduces bodyReproj*K*(x,y,w,1) on the datum and gets
@@ -16256,8 +16350,6 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
                       K[14], bodyView[12], bodyView[13], bodyView[14], bodyView[15]);
             }
         }
-        else
-        {
             // ---- IDENTITY, NOT THE WORLD MATRIX. THIS IS THE COCKPIT SHAKE.
             //
             // "Fall back to the world matrix" sounds conservative and is the
@@ -16287,8 +16379,6 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             // curr.w, which divides into a radial pseudo-motion proportional
             // to (1 - 1/w) - the fallback was quietly wrong in the exact way
             // this slot exists to prevent.
-            memcpy(bodyView, K, sizeof(bodyView));
-        }
         memcpy(block + 20, bodyView, 64);
     }
     // Recorded for the diagnostic. block[18] is the near-field threshold the
@@ -16496,6 +16586,16 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             g_appliedJitX = block[16];
             g_appliedJitY = block[17];
             if (block[16] != 0.0f || block[17] != 0.0f) ++g_jitterApplied;
+            {
+                g_epBinds.fetch_add(1, std::memory_order_relaxed);
+                if (block[16] == 0.0f && block[17] == 0.0f) {
+                    g_epZero.fetch_add(1, std::memory_order_relaxed);
+                } else if (!g_epHaveFirst.exchange(true, std::memory_order_relaxed)) {
+                    g_epFirstX = block[16]; g_epFirstY = block[17];
+                } else if (block[16] != g_epFirstX || block[17] != g_epFirstY) {
+                    g_epDiff.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
     }
 
@@ -16585,6 +16685,9 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // caused the chase-view racing.
     if (provisional && g_nearFieldM > 0.0f)
         block[18] = g_nearFieldM;
+    // The resolve needs the same radius to stop depth-reconstructing camera
+    // motion onto unwritten cockpit pixels (taa.comp, uReprojParams2.w).
+    g_taaCockpitNearM = (provisional && g_nearFieldM > 0.0f) ? g_nearFieldM : 0.0f;
     // Chase view (1018): the airframe sits camGap metres from the camera and
     // extends up to ~80 m beyond the datum, so the select must reach past ALL
     // of it - a fuselage triangle straddling the threshold would mix frames
@@ -16639,7 +16742,22 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     // LAST, so nothing above can re-arm it: world-static geometry never takes
     // the body frame - not by distance, not by pass. If the cockpit-pass
     // fingerprint ever matched a pass that also drew ground, this still holds.
-    if (groundPipe) block[18] = 0.0f;
+    // ---- GROUND FAMILIES IN COCKPIT VIEWS KEEP A SHORT NEAR-FIELD RADIUS.
+    //
+    // Measured (build 29 census, view 1026, parked, engines running): ONE
+    // shader - terrain_15 - tagged every texel of the frame with a uniform
+    // world vector of 1-5 px while the camera bobbed 1-2 mm. The magnitude
+    // puts that surface ~30 cm from the eye: it is the cockpit object itself,
+    // drawn with a terrain-family shader. The ground rule below sent it down
+    // the world path with radius 0, so the panel carried the camera's own
+    // vibration as motion and shook - parked or flying, and worse with a
+    // weaker blend. In cockpit views a ground-family draw inside the cockpit
+    // near-field radius IS the cockpit (the apron under an airliner's nose is
+    // farther than that from the pilot's eye), so keep the normal select
+    // there; external views keep 0, which is where the apron straddle was
+    // measured. A per-fragment select would remove the trade-off entirely.
+    if (groundPipe)
+        block[18] = (ridesAirframe && g_nearFieldM > 0.0f) ? g_nearFieldM : 0.0f;
 
     // Never silent again. The select being disarmed is invisible from every
     // downstream measurement - the field simply carries world motion on the

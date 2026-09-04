@@ -1019,7 +1019,23 @@ void main()
     bool reconstructed = false;
     if (unwritten && (pc.flags & FLAG_DEPTH_REPROJECT) != 0 &&
         uReprojParams.y > 0.5) {
-        vel = mvReconstructVel(uv + S, float(layer)) * pc.velScale;
+        // ---- NOT FOR THE COCKPIT. The reconstruction is the CAMERA's motion
+        // through the world, exact for scenery and wrong by the whole flight
+        // speed for anything bolted to the airframe. Masked-family draws in
+        // the 3-D cockpit (overlays, instrument faces) write no vector and
+        // used to inherit this camera-motion vector: history fetched from
+        // where the WORLD went, on a panel that never moves on screen - the
+        // cockpit shake that survived every matrix fix, stopped with jitter
+        // off and got worse with a weaker blend. uReprojParams2.w carries the
+        // cockpit near-field radius (metres) in cockpit views, 0 elsewhere:
+        // an unwritten pixel nearer than that is airframe, and its true
+        // vector is zero.
+        const float nearM = uReprojParams2.w;
+        if (nearM > 0.0 && mvViewDepth(uv + S, float(layer), velS.z) < nearM) {
+            vel = vec2(0.0);
+        } else {
+            vel = mvReconstructVel(uv + S, float(layer)) * pc.velScale;
+        }
         reconstructed = true;
     }
     // ---- THE COVERAGE MASK (C13 -> C14).
@@ -1437,6 +1453,13 @@ void main()
     // the gather has its OWN accumulator, so what arrives is already smooth.
     // A raw four-ray gather in this position would widen the variance clamp
     // and collapse accumulation - the contact-shadow lesson.
+    // The GI factor applied to the current sample. Kept so the clamp box
+    // below can be built in the SAME space: the gather's noise pattern rotates
+    // every frame by design, so a box built from the raw neighbourhood pulled
+    // history back toward un-lit values each frame and the clamp fought the
+    // composite - a per-frame tremble strongest exactly where GI is strongest
+    // (the cockpit). Measured the first session SSGI actually composited.
+    vec3 giMul = vec3(1.0);
     if ((pc.flags & FLAG_GI) != 0 && !unwritten) {
         // ---- DEPTH-AWARE UPSAMPLE. THE GATHER IS HALF RESOLUTION.
         //
@@ -1477,7 +1500,8 @@ void main()
         // bleed this replaces, so the answer is no GI here - which the
         // multiplicative composite expresses as leaving the pixel alone.
         vec3 gi = (gWs > 1e-6) ? gAcc / gWs : vec3(0.0);
-        currA *= (vec3(1.0) + max(gi, vec3(0.0)) * uReprojParams2.z);
+        giMul = vec3(1.0) + max(gi, vec3(0.0)) * uReprojParams2.z;
+        currA *= giMul;
     }
 
     // ---- CONTACT SHADOWS: THE SHADOW THE SHADOW MAP IS TOO COARSE TO DRAW.
@@ -1739,7 +1763,9 @@ void main()
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             vec2  quv = uv + S + vec2(dx, dy) * tsz;
-            vec3  c = rgb2ycocg(tm(texture(uScene, vec3(quv, float(layer))).rgb));
+            // Same GI factor as the centre sample: GI is low-frequency, and the
+            // box must describe the space the current sample now lives in.
+            vec3  c = rgb2ycocg(tm(texture(uScene, vec3(quv, float(layer))).rgb * giMul));
             m1 += c;
             m2 += c * c;
             nmin = min(nmin, c);
