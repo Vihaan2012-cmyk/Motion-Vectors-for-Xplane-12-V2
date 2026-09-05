@@ -229,6 +229,14 @@ inline void loadNow()
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
         while (*p == ' ' || *p == '\t') ++p;
+        // A UTF-8 BOM is not whitespace. Notepad and PowerShell's
+        // -Encoding utf8 both put one on line 1, which made that line's key
+        // "\xEF\xBB\xBFtaa.unlock" - so taa.unlock never matched and every
+        // shipped key stayed locked no matter what the file said. Found by
+        // the stability sweep: three locked-key flips measured exactly
+        // baseline. Strip it wherever it turns up, not just on line 1.
+        if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
+            (unsigned char)p[2] == 0xBF) p += 3;
         if (*p == '#' || *p == ';' || *p == '\n' || *p == '\r' || !*p) continue;
         char *eq = strchr(p, '=');
         if (!eq) continue;
