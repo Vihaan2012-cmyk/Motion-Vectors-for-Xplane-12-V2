@@ -127,9 +127,21 @@ static bool traceSiteAllow(const char *fmt, uint64_t *nth)
     return true;   // table full: print rather than silently drop
 }
 
+// The vulkan-1.dll shim publishes its flags with SetEnvironmentVariable, which
+// writes the Win32 environment block; the CRT's getenv() answers from a
+// snapshot taken at process start and never sees them. Read Win32 first or the
+// whole mod runs degraded whenever the shim launches us (no trace, no velocity).
+static bool mvEnvSet(const char *name)
+{
+    char b[8];
+    if (GetEnvironmentVariableA(name, b, (DWORD)sizeof(b)) > 0) return true;
+    if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) return getenv(name) != nullptr;
+    return true;
+}
+
 static void trace(const char *fmt, ...)
 {
-    static const bool on = getenv("TAA_LAYER_TRACE") != nullptr;
+    static const bool on = mvEnvSet("TAA_LAYER_TRACE");
     if (!on) return;
 
     static std::string path;
@@ -432,6 +444,9 @@ static float g_taaInvProj[2] = { 1.0f, 1.0f };
 // g_taaVpYSign mirrors g_viewportYFlipped (declared far below, at the viewport
 // hook) because snapshot() is defined before it.
 static float g_taaReproj[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+// Full projection (cameraViewToClip) for DLSS-D constants; only invProj X/Y
+// were kept before, which RR's slSetConstants cannot use.
+static float g_taaProjFull[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
 static bool  g_taaReprojValid = false;
 // Atomic rather than covered by the seqlock: its writer is
 // Layer_CmdSetViewport, which runs on X-Plane's recording threads and cannot
@@ -480,6 +495,7 @@ static bool snapshot(Snapshot *o)
         g_taaEdAB[1] = src->proj[14];
         g_taaInvProj[0] = src->proj[0] != 0.0f ? 1.0f / src->proj[0] : 1.0f;
         g_taaInvProj[1] = src->proj[5] != 0.0f ? 1.0f / src->proj[5] : 1.0f;
+        memcpy(g_taaProjFull, src->proj, sizeof(g_taaProjFull));
         // ---- THE SUN BELONGS INSIDE THE CRITICAL SECTION. IT WAS OUTSIDE IT.
         //
         // The resolve reads g_taaSunView inside its seqlock retry loop, so it
@@ -1061,7 +1077,7 @@ static void armSpirvInject()
     // parsed EVERY shader module anyway - thousands per complex aircraft -
     // for statistics nobody would read. Dormant now means dormant: the
     // Felis-load crash lived somewhere in that pointless work.
-    const char *velEnv = getenv("TAA_VELOCITY");
+    const char *velEnv = mvEnvSet("TAA_VELOCITY") ? "1" : nullptr;
     const bool velArmed = velEnv && velEnv[0] == '1' && velEnv[1] == '\0';
     g_spirvInject = velArmed && envOn("TAA_SPIRV_INJECT");
     g_spirvLive   = envOn("TAA_SPIRV_LIVE") && g_spirvInject;
@@ -2721,10 +2737,15 @@ static std::map<VkBuffer, uint64_t>     g_allBuffers;   // size in bytes
 #include "oracle_probe_spv.h"
 #include "oracle_sundump_spv.h"
 #include "oracle.h"
+#include "metrics.h"   // image-quality measurement, armed by taa.metrics=1
 
 #include "gi_gather_spv.h"
+#include "gi_denoise_spv.h"
 #include "gi.h"
+#include "dlssd.h"   // DLSS-D Ray Reconstruction (feature 1001), honest Streamline path
 #include "taa.h"
+#include "mv_nr_probe.h"   // THROWAWAY SPIKE: TAA_NR_PROBE=1
+#include "mv_sl_probe.h"   // THROWAWAY SPIKE: TAA_SL_PROBE=1 (Streamline path)
 
 // The neutral frame description and the per-backend adapters. Included after
 // taa.h because tcoreDescribe below reads g_taa; the headers themselves depend
@@ -9364,7 +9385,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     const bool needDepthCp = !depthcopy::state().ready && !depthcopy::state().failed;
     const bool needSideCar = !fgdilate::state().ready  && !fgdilate::state().failed;
     const bool needPrep    = !fgprep::state().ready    && !fgprep::state().failed;
-    if (fsrReplaceEnabled() && fsr3Wanted() &&
+    // ---- FRAME GENERATION'S INPUTS DO NOT BELONG TO THE FSR3 UPSCALER.
+    //
+    // Measured (every trace on disk, 247 FPS samples): "frame generation is
+    // NOT doubling (1.00x)" and one config line per run, "generation is now
+    // disabled ... (interpolation inputs absent)". The depth copy, the dilate
+    // side-car and the prepare pass that produce those inputs were created
+    // only inside this block, and this block ran only under fsr.replace=1 AND
+    // fsr.backend_fsr3=1 - the FSR3 UPSCALER's switches, which the panel never
+    // sets. Under the shipped TAA backend the FFX proxy therefore presented
+    // real frames forever. The upscaler context stays behind its own switches
+    // below; the frame-generation inputs are created whenever the proxy is
+    // live and taa.fg is on.
+    const bool fgInputsWanted = g_fgActive.load(std::memory_order_relaxed) &&
+                                g_fgSwap.have &&
+                                live::onoff("taa.fg", "TAA_FG", false);
+    const bool fsr3Path = fsrReplaceEnabled() && fsr3Wanted();
+    if ((fsr3Path || fgInputsWanted) &&
         (needFsr3 || needDepthCp || needSideCar || needPrep)) {
         VkDevice dev = VK_NULL_HANDLE; VkPhysicalDevice ph = VK_NULL_HANDLE;
         PFN_vkGetDeviceProcAddr gd = nullptr;
@@ -9395,6 +9432,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         if (dev && ph && gd && rw && rh && g_sceneDepth != VK_NULL_HANDLE)
             depthcopy::ensure(dev, ph, gd, g_getPhysMemProps,
                               g_sceneDepth, g_sceneDepthFormat, rw, rh);
+        // The FSR3 context is also the dilate side-car's engine: fgdilate::run
+        // dispatches it with the output discarded and keeps only the dilated
+        // depth / motion vectors in u.shared[] - which is what canInterp
+        // reads. fgprep (the "own" prepare pass) is created but never
+        // recorded anywhere, so this is the only path that fills the inputs.
         if (dev && ph && gd && rw && rh && ow && oh && rw < ow)
             fsr3::ensure(dev, ph, gd, g_getPhysMemProps, rw, rh, ow, oh);
         // The side-car's own command pool, buffer, fence and throwaway output.
@@ -9459,21 +9501,45 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         // has settled, this says these particular objects still exist. The two
         // failed independently before - the settle window was never entered
         // because its trigger was broken, and nothing else checked.
-        const bool liveHandles = imageStillLive(g_sceneColor.image) &&
-                                 imageStillLive(g_sceneDepth) &&
-                                 imageStillLive(g_mv.image);
+        // g_sceneColor is the target identified at scene discovery; after
+        // "STABLE RESET: HDR targets 0 -> 2" the resolve moved to the live one
+        // (g_taa.sceneImage) while this stayed on a destroyed handle, so the
+        // side-car skipped every frame ("no longer live"). Follow the resolve.
+        VkImage        scColour = g_sceneColor.image;
+        VkFormat       scFormat = g_sceneColor.format;
+        VkImageLayout  scLayout = g_sceneColor.layout;
+        if (!imageStillLive(scColour) && imageStillLive(g_taa.sceneImage)) {
+            std::lock_guard<std::mutex> g(g_lock);
+            std::map<VkImage, ColorTarget>::iterator it = g_colorImages.find(g_taa.sceneImage);
+            if (it != g_colorImages.end()) {
+                scColour = it->second.image; scFormat = it->second.format; scLayout = it->second.layout;
+                static bool said = false;
+                if (!said) { said = true; trace("FG DILATE: scene colour re-pointed at the resolve's target %p (identified one %p is dead)", (void*)scColour, (void*)g_sceneColor.image); }
+            }
+        }
+        // The velocity target is OURS: mv_target.h creates it through the
+        // next layer's vkCreateImage, so it never enters g_allImages (which is
+        // filled by our own create hook) and imageStillLive() said "dead" for
+        // it on every frame of every run. That single false negative is why
+        // the side-car never ran and frame generation never had inputs. Its
+        // lifetime is g_mv's own; the registry check applies to the engine's
+        // images only.
+        const bool liveColour = imageStillLive(scColour);
+        const bool liveDepth  = imageStillLive(g_sceneDepth);
+        const bool liveMv     = g_mv.ready && g_mv.image != VK_NULL_HANDLE;
+        const bool liveHandles = liveColour && liveDepth && liveMv;
         if (!liveHandles) {
             static uint64_t said = 0;
             if ((said++ % 120) == 0)
                 trace("FG DILATE: skipped - one of the three images handed to "
-                      "FSR3 is no longer live (colour %p depth %p mv %p). A "
-                      "stale handle here is a read of freed memory, which is "
-                      "what took the sim down on an aircraft change.",
-                      (void*)g_sceneColor.image, (void*)g_sceneDepth,
-                      (void*)g_mv.image);
+                      "FSR3 is no longer live (colour %p live=%d, depth %p live=%d, "
+                      "mv %p live=%d). A stale handle here is a read of freed "
+                      "memory, which is what took the sim down on an aircraft change.",
+                      (void*)scColour, liveColour ? 1 : 0, (void*)g_sceneDepth,
+                      liveDepth ? 1 : 0, (void*)g_mv.image, liveMv ? 1 : 0);
         }
         if (liveHandles)
-        fgdilate::run(g_sceneColor.image, g_sceneColor.format, g_sceneColor.layout,
+        fgdilate::run(scColour, scFormat, scLayout,
                       g_sceneDepth, g_sceneDepthFormat, g_sceneDepthLayout,
                       g_mv.image, kMvFormat,
                       g_sceneColor.w, g_sceneColor.h,
@@ -9515,6 +9581,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                                u.shared[0] != VK_NULL_HANDLE &&
                                u.shared[1] != VK_NULL_HANDLE &&
                                u.shared[2] != VK_NULL_HANDLE &&
+                               // "Present" means WRITTEN, not allocated: build 36
+                               // enabled generation on allocated-but-never-written
+                               // shared images (the dilate side-car had skipped every
+                               // frame on a stale colour handle) and the interpolator
+                               // presented frames built from undefined memory - black
+                               // flicker. runs counts real side-car writes.
+                               fgdilate::state().runs > 0 &&
                                // Isolation override: taa.fg_gen=0 forces
                                // generation OFF while the proxy swapchain and the
                                // upscaler stay live, to tell the generation-present
@@ -10430,7 +10503,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // Off, this layer forwards every call unmodified: no GPU work, no
     // allocations, no barriers on X-Plane's resources.
     static const bool velWanted = []{
-        const char *e = getenv("TAA_VELOCITY");
+        const char *e = mvEnvSet("TAA_VELOCITY") ? "1" : nullptr;
         bool on = (e && e[0] == '1' && e[1] == '\0');
         trace("VEL: velocity pass %s", on ? "ARMED (TAA_VELOCITY=1)"
                                           : "DISARMED - observation only");
@@ -11677,6 +11750,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_DestroyDevice(
             g_devices.find(dispatchKey(device));
         if (it != g_devices.end() && it->second.gdpa)
             oracle::shutdown(it->second, device);
+            metrics::shutdown(it->second, device);
     }
     taau::shutdown();
     gi::shutdown();
@@ -11895,6 +11969,23 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
           ci->pApplicationInfo ? VK_API_VERSION_MAJOR(ci->pApplicationInfo->apiVersion) : 1u,
           ci->pApplicationInfo ? VK_API_VERSION_MINOR(ci->pApplicationInfo->apiVersion) : 0u,
           ci->pApplicationInfo ? "present" : "absent, so 1.0 by default");
+
+    // ---- ACTUALLY RAISE IT. The block above only LOGGED; appInfo was built
+    // empty and never attached, so X-Plane's 1.1 request stood and Streamline
+    // threw on the missing 1.3 entry points. Only when a Streamline path is
+    // armed (DLSS-D or the SL probe), so the shipped TAA path is untouched.
+    if (mvdlssd::enabled() || slProbeEnabled()) {
+        if (ci->pApplicationInfo) appInfo = *ci->pApplicationInfo;
+        else { appInfo.apiVersion = VK_API_VERSION_1_0; appInfo.pApplicationName = nullptr; appInfo.pEngineName = nullptr; }
+        const uint32_t want = VK_API_VERSION_1_3;
+        if (appInfo.apiVersion < want) {
+            trace("INSTANCE: raising API %u.%u -> 1.3 for Streamline (safe: a max, "
+                  "not a behaviour demand)",
+                  VK_API_VERSION_MAJOR(appInfo.apiVersion), VK_API_VERSION_MINOR(appInfo.apiVersion));
+            appInfo.apiVersion = want;
+        }
+        ci2.pApplicationInfo = &appInfo;
+    }
 
     std::vector<const char*> instExts;
 
@@ -17105,6 +17196,9 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
             g_nextEnumDeviceExt(phys, nullptr, &n, have.data());
         }
         trace("DEVICE: driver offers %zu device extensions", have.size());
+        if (nrProbeEnabled()) nrProbeDeviceExtensions(g_appInstance, phys, have, exts);   // spike
+        if (slProbeEnabled()) slProbeDeviceExtensions(g_appInstance, phys, have, exts);   // spike: Streamline
+        if (mvdlssd::enabled()) mvdlssd::deviceExtensions(g_appInstance, phys, have, exts);   // DLSS-D
 
         // ---- STREAMLINE'S OWN REQUIREMENTS, ADDED FROM ITS OWN LIST.
         //
@@ -17247,8 +17341,9 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         // and TAA go with it. Only the frame generation names are gated.
         //
         // TAA_DLSS_EXT=1 re-arms them for whoever takes the DLSS-G path up.
-        static const bool wantDlssExt = getenv("TAA_DLSS_EXT") &&
-                                        atoi(getenv("TAA_DLSS_EXT")) != 0;
+        const bool wantDlssExt = (getenv("TAA_DLSS_EXT") &&
+                                  atoi(getenv("TAA_DLSS_EXT")) != 0) ||
+                                 mvdlssd::enabled() || slProbeEnabled();
         for (size_t k = 0; k < sizeof(kWanted)/sizeof(kWanted[0]); ++k) {
             if (!wantLowLatency &&
                 (!strcmp(kWanted[k], "VK_NV_low_latency2") ||
@@ -17379,6 +17474,24 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
             trace("DEVICE: memoryPriority feature requested - our own "
                   "allocations will be marked low so the driver demotes them "
                   "before X-Plane's textures");
+        }
+
+        // ---- PRIVATE DATA, which Streamline needs for its swap-chain state.
+        // Streamline logs "vkCreatePrivateDataSlot not available" and throws
+        // without it. The extension makes the entry point legal; the feature
+        // bit lets slots actually be created. DLSS-D only.
+        static VkPhysicalDevicePrivateDataFeatures pdFeat;
+        bool havePriv = false;
+        for (size_t i = 0; i < exts.size(); ++i)
+            if (!strcmp(exts[i], "VK_EXT_private_data")) havePriv = true;
+        if (havePriv) {
+            memset(&pdFeat, 0, sizeof(pdFeat));
+            pdFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES;
+            pdFeat.privateData = VK_TRUE;
+            pdFeat.pNext = (void*)ci2.pNext;
+            ci2.pNext = &pdFeat;
+            trace("DEVICE: privateData feature requested - Streamline private "
+                  "data slots (DLSS-D)");
         }
 
         // ---- THE VRAM SYSTEM'S EXTENSIONS, added defensively if the driver
@@ -17656,6 +17769,15 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     dd.device        = *out;
     dd.phys          = phys;
     dd.gdpa          = nextGDPA;
+    if (nrProbeEnabled())   // spike: DLSS-NR viability, see mv_nr_probe.h
+        nrProbeAfterDevice(g_appInstance, phys, *out, nextGIPA, nextGDPA,
+                           g_deviceFamilies.empty() ? 0u : g_deviceFamilies[0]);
+    if (slProbeEnabled())   // spike: DLSS-NR via Streamline, see mv_sl_probe.h
+        slProbeAfterDevice(g_appInstance, phys, *out,
+                           g_deviceFamilies.empty() ? 0u : g_deviceFamilies[0]);
+    if (mvdlssd::enabled())   // DLSS-D Ray Reconstruction init, see dlssd.h
+        mvdlssd::initAtDevice(g_appInstance, phys, *out,
+                              g_deviceFamilies.empty() ? 0u : g_deviceFamilies[0]);
     // ---- THE FIRST DEVICE, AND ONLY THE FIRST. MEASURED, NOT ASSUMED.
     //
     // The comment that stood here said "set once and never changed - which is

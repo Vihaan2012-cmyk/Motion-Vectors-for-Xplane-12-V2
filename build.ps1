@@ -236,6 +236,33 @@ for ($i = 0; $i -lt $giwords.Count; $i += 8) {
 [IO.File]::WriteAllText("$src/vklayer/gi_gather_spv.h", $gisb.ToString())
 Write-Host ("  gi_gather_spv.h: {0} words" -f $giwords.Count)
 
+Write-Host "Compiling GI denoise shader..."
+$gdTmp = Join-Path $env:TEMP "gi_denoise.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/gi_denoise.comp" -o $gdTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "gi_denoise.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $gdTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "gi_denoise.comp failed spirv-val" }
+}
+$gdbytes = [System.IO.File]::ReadAllBytes($gdTmp)
+$gdwords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $gdbytes.Length; $i += 4) {
+    $gdwords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($gdbytes, $i)))
+}
+$gdsb = New-Object System.Text.StringBuilder
+[void]$gdsb.AppendLine("// Generated from src/shaders/gi_denoise.comp by build.ps1 - do not edit.")
+[void]$gdsb.AppendLine("#pragma once")
+[void]$gdsb.AppendLine("#include <stdint.h>")
+[void]$gdsb.AppendLine("")
+[void]$gdsb.AppendLine("static const uint32_t kGiDenoiseSpv[] = {")
+for ($i = 0; $i -lt $gdwords.Count; $i += 8) {
+    $n = [Math]::Min(8, $gdwords.Count - $i)
+    [void]$gdsb.AppendLine("    " + (($gdwords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$gdsb.AppendLine("};")
+[IO.File]::WriteAllText("$src/vklayer/gi_denoise_spv.h", $gdsb.ToString())
+Write-Host ("  gi_denoise_spv.h: {0} words" -f $gdwords.Count)
+
 Write-Host "Compiling TAAU shader..."
 $tuTmp = Join-Path $env:TEMP "taau.spv"
 & $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/taau.comp" -o $tuTmp | Out-Null
@@ -262,6 +289,33 @@ for ($i = 0; $i -lt $tuwords.Count; $i += 8) {
 [void]$tusb.AppendLine("};")
 [IO.File]::WriteAllText("$src/vklayer/taau_spv.h", $tusb.ToString())
 Write-Host ("  taau_spv.h: {0} words" -f $tuwords.Count)
+
+Write-Host "Compiling metrics shader..."
+$mtTmp = Join-Path $env:TEMP "metrics.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/metrics.comp" -o $mtTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "metrics.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $mtTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "metrics.comp failed spirv-val" }
+}
+$mtbytes = [System.IO.File]::ReadAllBytes($mtTmp)
+$mtwords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $mtbytes.Length; $i += 4) {
+    $mtwords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($mtbytes, $i)))
+}
+$mtsb = New-Object System.Text.StringBuilder
+[void]$mtsb.AppendLine("// Generated from src/shaders/metrics.comp by build.ps1 - do not edit.")
+[void]$mtsb.AppendLine("#pragma once")
+[void]$mtsb.AppendLine("#include <stdint.h>")
+[void]$mtsb.AppendLine("")
+[void]$mtsb.AppendLine("static const uint32_t kMetricsSpv[] = {")
+for ($i = 0; $i -lt $mtwords.Count; $i += 8) {
+    $n = [Math]::Min(8, $mtwords.Count - $i)
+    [void]$mtsb.AppendLine("    " + (($mtwords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$mtsb.AppendLine("};")
+[IO.File]::WriteAllText("$src/vklayer/metrics_spv.h", $mtsb.ToString())
+Write-Host ("  metrics_spv.h: {0} words" -f $mtwords.Count)
 
 Write-Host "Compiling oracle sun-dump shader..."
 $sdTmp = Join-Path $env:TEMP "oracle_sundump.spv"
@@ -519,12 +573,21 @@ if ($haveFfx -and (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
 # first call, with no output at all.
 Write-Host "Building Vulkan layer..."
 & g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
-  -I"$vksdk\Include" -m64 -O2 -std=c++17 -D__USE_MINGW_ANSI_STDIO=1 `
+  -I"$vksdk\Include" -I"$root\third_party\DLSS" -I"$root\third_party\Streamline\include" -m64 -O2 -std=c++17 -D__USE_MINGW_ANSI_STDIO=1 `
   @sdkDefines @sdkIncludes $ffxDefine `
   "-I$ffxSdk\sdk\include" @ffxObjs `
   -static -static-libgcc -static-libstdc++
 if ($LASTEXITCODE -ne 0) { throw "layer build failed" }
 Copy-Item "$src\vklayer\VkLayer_mv.json" "$out\vklayer" -Force
+
+Write-Host "Building Vulkan shim (vulkan-1.dll)..."
+# The forwarding vulkan-1.dll shim: installs beside X-Plane.exe, forwards the
+# whole Vulkan API to vk_real_mv.dll (a copy of the system loader) via the .def,
+# implements the six loader entry points, and hosts Streamline for DLSS-D.
+& g++ -shared -o "$out\vulkan-1.dll" "$src\shim\mv_vkshim.cpp" "$src\shim\mv_vkshim.def" `
+  -I"$vksdk\Include" -I"$root\third_party\Streamline\include" -m64 -O2 -std=c++17 -D__USE_MINGW_ANSI_STDIO=1 `
+  -static -static-libgcc -static-libstdc++
+if ($LASTEXITCODE -ne 0) { throw "shim build failed" }
 
 Write-Host "Building launcher..."
 # -mwindows: no console window. The launcher sets the two loader variables and

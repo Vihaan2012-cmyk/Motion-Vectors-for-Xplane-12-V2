@@ -642,7 +642,7 @@ local SETTINGS = {
     group = "TAA", help = "---- REMOVE ONE INPUT AT A TIME." },
   { key = "taa.vel_ypos", label = "vel_ypos", kind = "bool", def = false, lo = nil, hi = nil,
     group = "TAA", help = "-1.0 is the shipping belief (negative-height viewport => d(uv_y) = -vel_y)." },
-  { key = "taa.viz", label = "viz", kind = "int", def = 0, lo = 0, hi = 10,
+  { key = "taa.viz", label = "viz", kind = "int", def = 0, lo = 0, hi = 11,
     group = "TAA", help = "0 off, 1 motion, 2 magnitude, 3 invalid, 4 history, 5 weight, 6 clamp, 8 written, 10 view depth" },
   { key = "taa.viz_scale", label = "viz_scale", kind = "float", def = 1.0, lo = 0.0, hi = 8.0,
     group = "TAA", help = "" },

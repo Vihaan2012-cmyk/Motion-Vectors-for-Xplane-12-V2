@@ -1,0 +1,69 @@
+#version 450
+// gi_denoise.comp - edge-aware a-trous filter for the SSGI gather.
+//
+// The gather averages a handful of rays per half-res texel and accumulates
+// them over time; what is left is still texel-to-texel variance that the
+// composite reproduced as hard squares on every pale surface. This is the
+// standard SVGF-style answer: a 5x5 B3-spline kernel, run twice with the
+// tap spacing doubled (a-trous), weighted by how much each tap's surface
+// agrees with the centre - distance from the gather's own alpha channel, and
+// the engine's normal when it is bound. Sky texels (alpha <= 0) are neither
+// read nor written over. Output keeps the centre's distance in alpha so the
+// composite's depth-aware upsample still works on the filtered image.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2DArray uSrc;     // half res: rgb radiance, a = view distance
+layout(binding = 1) uniform sampler2DArray uNormal;  // render res, engine spheremap .xy (or src again when absent)
+layout(binding = 2, rgba16f) uniform image2DArray uDst;
+
+layout(push_constant) uniform P {
+    ivec2 halfSize;
+    ivec2 fullSize;
+    int   step;        // 1 for the first pass, 2 for the second
+    int   flags;       // DN_NORMALS: binding 1 is a real normal image
+    float sigmaZ;      // relative distance tolerance (0.05 = 5% of the centre distance)
+    float sigmaN;      // normal power
+} pc;
+const int DN_NORMALS = 1;
+
+vec3 engineNormal(vec2 uv)
+{
+    vec2 e = texture(uNormal, vec3(uv, 0.0)).xy;
+    float f = dot(e, e);
+    return vec3(e * sqrt(max(0.0, 1.0 - f * 0.25)), 1.0 - f * 0.5);
+}
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= pc.halfSize.x || px.y >= pc.halfSize.y) return;
+    vec4 c = texelFetch(uSrc, ivec3(px, 0), 0);
+    if (c.a <= 0.0) {                       // sky / never written: pass through
+        imageStore(uDst, ivec3(px, 0), c);
+        return;
+    }
+    const bool useN = (pc.flags & DN_NORMALS) != 0;
+    const vec2 hs = vec2(pc.halfSize);
+    vec3 nc = useN ? engineNormal((vec2(px) + 0.5) / hs) : vec3(0.0, 0.0, 1.0);
+    const float h[5] = float[5](1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0);
+    vec3  acc = c.rgb * h[2] * h[2];
+    float ws  = h[2] * h[2];
+    for (int j = -2; j <= 2; ++j)
+    for (int i = -2; i <= 2; ++i) {
+        if (i == 0 && j == 0) continue;
+        ivec2 q = px + ivec2(i, j) * pc.step;
+        if (q.x < 0 || q.y < 0 || q.x >= pc.halfSize.x || q.y >= pc.halfSize.y) continue;
+        vec4 t = texelFetch(uSrc, ivec3(q, 0), 0);
+        if (t.a <= 0.0) continue;
+        float wz = exp(-abs(t.a - c.a) / max(pc.sigmaZ * c.a, 1e-4));
+        float wn = 1.0;
+        if (useN) {
+            vec3 nq = engineNormal((vec2(q) + 0.5) / hs);
+            wn = pow(max(dot(nc, nq), 0.0), pc.sigmaN);
+        }
+        float w = h[i + 2] * h[j + 2] * wz * wn;
+        acc += t.rgb * w;
+        ws  += w;
+    }
+    imageStore(uDst, ivec3(px, 0), vec4(acc / max(ws, 1e-6), c.a));
+}

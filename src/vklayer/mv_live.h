@@ -139,6 +139,22 @@ inline void writeTemplate()
 "#                       timings, and the live values in force.\n"
 "# report.every    0     dump it automatically every N frames. 0 disables.\n"
 "#\n"
+"# ---------------------------------------------------------------- measure\n"
+"# Image-quality numbers, aggregate only, to %TEMP%\\mv_metrics.txt. Nothing\n"
+"# per-pixel is ever read back. sweep.ps1 drives this to rank configurations.\n"
+"#\n"
+"# taa.metrics         0/1   arm the measurement pass.\n"
+"# taa.metrics_report  600   frames per report window.\n"
+"# taa.metrics_mask    0     bit0: exclude raw depth > metrics_cut (the near\n"
+"#                           cockpit shell). bit1: exclude raw depth < metrics_far\n"
+"#                           (sky). Run ONCE unmasked and read the depth\n"
+"#                           histogram before setting either - the encoding is\n"
+"#                           measured, not assumed.\n"
+"# taa.metrics_cut     0.0   near threshold, raw depth.\n"
+"# taa.metrics_far     0.0   far threshold, raw depth.\n"
+"# taa.metrics_flick   0.008 luma swing that counts as a sign reversal (~2 LSB).\n"
+"#                           Below 1 LSB the flicker rate measures dither.\n"
+"#\n"
 "# ---------------------------------------------------------------- vram system\n"
 "# vram.enable     1     master switch for the whole VRAM system.\n"
 "# vram.shape      1     budget shaping: low-pass + monotone-under-free +\n"
@@ -483,12 +499,36 @@ inline float f(const char *key, const char *env, float dflt)
 // Presence-only environment variables (TAA_RESOLVE and friends) are true when
 // SET, whatever their value, so the live equivalent has to mean the same thing
 // while still being able to say "off" - which the environment cannot.
+// The vulkan-1.dll shim hands us its flags with SetEnvironmentVariable, which
+// writes the Win32 environment block. The CRT's getenv() answers from a
+// snapshot taken at process start and NEVER sees those - the Vulkan loader
+// reads Win32 (which is why the layer loads at all), so reading them with
+// getenv silently missed the shim handshake and the layer ran a second slInit.
+// Read Win32 first, fall back to the CRT for variables set before launch.
+inline bool envset(const char *name)
+{
+    if (!name) return false;
+    char b[8];
+    if (GetEnvironmentVariableA(name, b, (DWORD)sizeof(b)) > 0) return true;
+    if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) return getenv(name) != nullptr;
+    return true;   // present but longer than the probe buffer
+}
+
+inline std::string envstr(const char *name)
+{
+    char b[1024];
+    DWORD n = name ? GetEnvironmentVariableA(name, b, (DWORD)sizeof(b)) : 0;
+    if (n > 0 && n < sizeof(b)) return std::string(b, n);
+    const char *c = name ? getenv(name) : nullptr;
+    return c ? std::string(c) : std::string();
+}
+
 inline bool onoff(const char *key, const char *env, bool dflt)
 {
     std::string v;
     if (lookup(key, v))
         return !(v == "0" || v == "off" || v == "false" || v == "no");
-    if (env) if (getenv(env)) return true;
+    if (env) if (envset(env)) return true;
     return dflt;
 }
 

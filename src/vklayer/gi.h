@@ -81,6 +81,7 @@ struct State {
     VkSampler             sampNear = VK_NULL_HANDLE;  // velocity + depth
 
     static const uint32_t kSets = 8;
+    static const uint32_t kDnMax = 4;   // a-trous passes at most: steps 1, 2, 4, 8
     VkDescriptorSet sets[kSets] = { VK_NULL_HANDLE };
     uint32_t nextSet = 0;
 
@@ -90,6 +91,20 @@ struct State {
     VkImage        hist[2]     = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkDeviceMemory histMem[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkImageView    histView[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    // Denoiser: two extra half-res images (a-trous pass 1 -> den[0], pass 2
+    // -> den[1]); the composite reads den[1]. The temporal history stays
+    // unfiltered so accumulation and filtering never feed each other.
+    VkImage        den[2]      = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceMemory denMem[2]   = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView    denView[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkShaderModule        smDn   = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dslDn  = VK_NULL_HANDLE;
+    VkPipelineLayout      plDn   = VK_NULL_HANDLE;
+    VkPipeline            pipeDn = VK_NULL_HANDLE;
+    VkDescriptorSet setsDn[kDnMax * kSets] = { VK_NULL_HANDLE };
+    uint32_t nextSetDn = 0;
+    bool     denoised = false;   // den[denOut] holds this frame's filtered result
+    uint32_t denOut   = 1;       // which of den[] the last pass wrote
     uint32_t w = 0, h = 0;
     bool     laidOut = false;
     bool     primed  = false;
@@ -107,7 +122,13 @@ inline VkImageView resultView()
 {
     State &s = state();
     if (!s.ready || !s.primed) return VK_NULL_HANDLE;
-    return s.histView[1u - (s.frame & 1u)];   // what the last dispatch wrote
+    // record() reads rd = frame&1, writes 1-rd, then increments frame - so
+    // after the increment the image just written is histView[frame & 1].
+    // This returned the OTHER one: the composite was reading the previous
+    // frame's gather (one frame stale under reprojection). When the denoiser
+    // ran this frame, its second pass is the result.
+    if (s.denoised && s.denView[s.denOut & 1u] != VK_NULL_HANDLE) return s.denView[s.denOut & 1u];
+    return s.histView[s.frame & 1u];
 }
 
 struct Push {
@@ -132,9 +153,24 @@ static_assert(sizeof(Push) <= 128,
 static_assert(sizeof(Push) == 84,
               "gi::Push changed size - update gi_gather.comp's block to match");
 enum { kGiProbes = 1, kGiReset = 2, kGiEngine = 4 };
+struct DnPush {
+    int32_t halfW, halfH;
+    int32_t fullW, fullH;
+    int32_t step, flags;
+    float   sigmaZ, sigmaN;
+};
+static_assert(sizeof(DnPush) == 32, "gi::DnPush changed size - update gi_denoise.comp");
+enum { kDnNormals = 1 };
 
 inline void freeHistory(State &s)
 {
+    for (int i = 0; i < 2; ++i) {
+        if (s.denView[i] && s.destroyView) s.destroyView(s.dev, s.denView[i], nullptr);
+        if (s.den[i] && s.destroyImage)    s.destroyImage(s.dev, s.den[i], nullptr);
+        if (s.denMem[i] && s.freeMem)      s.freeMem(s.dev, s.denMem[i], nullptr);
+        s.denView[i] = VK_NULL_HANDLE; s.den[i] = VK_NULL_HANDLE; s.denMem[i] = VK_NULL_HANDLE;
+    }
+    s.denoised = false;
     for (int i = 0; i < 2; ++i) {
         if (s.histView[i] && s.destroyView) s.destroyView(s.dev, s.histView[i], nullptr);
         if (s.hist[i] && s.destroyImage)    s.destroyImage(s.dev, s.hist[i], nullptr);
@@ -193,9 +229,39 @@ inline bool ensureHistory(DeviceData &dd, State &s, uint32_t w, uint32_t h)
             freeHistory(s); return false;
         }
     }
+    for (int i = 0; i < 2; ++i) {
+        VkImageCreateInfo ic;
+        memset(&ic, 0, sizeof(ic));
+        ic.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ic.imageType = VK_IMAGE_TYPE_2D;
+        ic.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ic.extent.width = w; ic.extent.height = h; ic.extent.depth = 1;
+        ic.mipLevels = 1; ic.arrayLayers = 1;
+        ic.samples = VK_SAMPLE_COUNT_1_BIT;
+        ic.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (s.createImage(s.dev, &ic, nullptr, &s.den[i]) != VK_SUCCESS) { freeHistory(s); return false; }
+        VkMemoryRequirements mr; s.imgReq(s.dev, s.den[i], &mr);
+        VkMemoryAllocateInfo ma; memset(&ma, 0, sizeof(ma));
+        ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ma.allocationSize = mr.size;
+        ma.memoryTypeIndex = taaFindMemory(dd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (ma.memoryTypeIndex == UINT32_MAX ||
+            s.allocMem(s.dev, &ma, nullptr, &s.denMem[i]) != VK_SUCCESS ||
+            s.bindImage(s.dev, s.den[i], s.denMem[i], 0) != VK_SUCCESS) { freeHistory(s); return false; }
+        VkImageViewCreateInfo v; memset(&v, 0, sizeof(v));
+        v.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        v.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        v.format = ic.format; v.image = s.den[i];
+        v.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        v.subresourceRange.levelCount = 1; v.subresourceRange.layerCount = 1;
+        if (s.createView(s.dev, &v, nullptr, &s.denView[i]) != VK_SUCCESS) { freeHistory(s); return false; }
+    }
+    s.laidOut = false;   // the new images need their first layout transition
     s.w = w; s.h = h;
-    trace("GI: half-res history pair allocated %ux%u (%.1f MB total)", w, h,
-          2.0 * (double)w * (double)h * 8.0 / 1048576.0);
+    trace("GI: half-res history pair + denoise pair allocated %ux%u (%.1f MB total)", w, h,
+          4.0 * (double)w * (double)h * 8.0 / 1048576.0);
     return true;
 }
 
@@ -286,15 +352,15 @@ inline bool init(DeviceData &dd, VkDevice dev)
 
     VkDescriptorPoolSize psz[3];
     psz[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    psz[0].descriptorCount = 6 * State::kSets;
+    psz[0].descriptorCount = 6 * State::kSets + 2 * State::kDnMax * State::kSets;
     psz[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    psz[1].descriptorCount = 1 * State::kSets;
+    psz[1].descriptorCount = 1 * State::kSets + State::kDnMax * State::kSets;
     psz[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     psz[2].descriptorCount = 1 * State::kSets;
     VkDescriptorPoolCreateInfo dp;
     memset(&dp, 0, sizeof(dp));
     dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dp.maxSets = State::kSets; dp.poolSizeCount = 3; dp.pPoolSizes = psz;
+    dp.maxSets = (1 + State::kDnMax) * State::kSets; dp.poolSizeCount = 3; dp.pPoolSizes = psz;
     if (s.createPool(dev, &dp, nullptr, &s.pool) != VK_SUCCESS) return false;
     VkDescriptorSetLayout lays[State::kSets];
     for (uint32_t i = 0; i < State::kSets; ++i) lays[i] = s.dsl;
@@ -321,8 +387,44 @@ inline bool init(DeviceData &dd, VkDevice dev)
     sc.magFilter = VK_FILTER_NEAREST; sc.minFilter = VK_FILTER_NEAREST;
     if (s.createSamp(dev, &sc, nullptr, &s.sampNear) != VK_SUCCESS) return false;
 
+    // ---- the denoiser: module, 3-binding layout, 32-byte push, its own sets
+    {
+        VkShaderModuleCreateInfo dm; memset(&dm, 0, sizeof(dm));
+        dm.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        dm.codeSize = sizeof(kGiDenoiseSpv); dm.pCode = kGiDenoiseSpv;
+        if (s.createSm(dev, &dm, nullptr, &s.smDn) != VK_SUCCESS) return false;
+        VkDescriptorSetLayoutBinding db[3]; memset(db, 0, sizeof(db));
+        for (int i = 0; i < 3; ++i) {
+            db[i].binding = (uint32_t)i; db[i].descriptorCount = 1;
+            db[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            db[i].descriptorType = (i == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                            : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        }
+        VkDescriptorSetLayoutCreateInfo ddl; memset(&ddl, 0, sizeof(ddl));
+        ddl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        ddl.bindingCount = 3; ddl.pBindings = db;
+        if (s.createDsl(dev, &ddl, nullptr, &s.dslDn) != VK_SUCCESS) return false;
+        VkPushConstantRange dpr; dpr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; dpr.offset = 0; dpr.size = sizeof(DnPush);
+        VkPipelineLayoutCreateInfo dpli; memset(&dpli, 0, sizeof(dpli));
+        dpli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        dpli.setLayoutCount = 1; dpli.pSetLayouts = &s.dslDn;
+        dpli.pushConstantRangeCount = 1; dpli.pPushConstantRanges = &dpr;
+        if (s.createPl(dev, &dpli, nullptr, &s.plDn) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo dcp; memset(&dcp, 0, sizeof(dcp));
+        dcp.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        dcp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        dcp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        dcp.stage.module = s.smDn; dcp.stage.pName = "main"; dcp.layout = s.plDn;
+        if (s.createPipe(dev, VK_NULL_HANDLE, 1, &dcp, nullptr, &s.pipeDn) != VK_SUCCESS) return false;
+        VkDescriptorSetLayout dlays[State::kDnMax * State::kSets];
+        for (uint32_t i = 0; i < State::kDnMax * State::kSets; ++i) dlays[i] = s.dslDn;
+        VkDescriptorSetAllocateInfo dda; memset(&dda, 0, sizeof(dda));
+        dda.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dda.descriptorPool = s.pool; dda.descriptorSetCount = State::kDnMax * State::kSets; dda.pSetLayouts = dlays;
+        if (s.allocSets(dev, &dda, s.setsDn) != VK_SUCCESS) return false;
+    }
     s.ready = true;
-    trace("GI: gather pipeline ready.");
+    trace("GI: gather + denoise pipelines ready.");
     return true;
 }
 
@@ -352,15 +454,15 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     }
 
     if (!s.laidOut) {
-        VkImageMemoryBarrier hb[2];
+        VkImageMemoryBarrier hb[4];
         memset(hb, 0, sizeof(hb));
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < 4; ++i) {
             hb[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             hb[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             hb[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
             hb[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             hb[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            hb[i].image = s.hist[i];
+            hb[i].image = (i < 2) ? s.hist[i] : s.den[i - 2];
             hb[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             hb[i].subresourceRange.levelCount = 1;
             hb[i].subresourceRange.layerCount = 1;
@@ -369,7 +471,7 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
         }
         s.barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-                  0, nullptr, 2, hb);
+                  0, nullptr, 4, hb);
         s.laidOut = true;
     }
 
@@ -419,6 +521,11 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
                             (gbufBuf != VK_NULL_HANDLE) && gbufRange >= 96;
 
     const bool haveProbes = (probeView != VK_NULL_HANDLE) &&
+                            // OFF: the engine already lit every surface by the sky. Feeding
+                            // escaped rays the environment capture adds that light a second
+                            // time - measured as the whole apron blowing out white. Escaped
+                            // rays contribute zero (commit 6ccc90a had it right); only real
+                            // surface hits are bounce the engine does not already provide.
                             live::onoff("taa.gi_probes", "TAA_GI_PROBES", false);
 
     VkDescriptorImageInfo ii[8];
@@ -501,8 +608,12 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
     // ray would then be cast into the wrong hemisphere.
     p.ySign     = ySign;
     p.intensity = 1.0f;   // applied at composite; see the shader's note
-    p.steps     = (int32_t)live::i("taa.gi_steps", "TAA_GI_STEPS", 10);
-    p.rays      = (int32_t)live::i("taa.gi_rays",  "TAA_GI_RAYS",  4);
+    // Eight cosine-weighted rays with six steps each: the same march budget
+    // as 4x10 (48 samples) spent on directions instead of depth, which is
+    // what a denoised half-res field wants - variance between rays, not
+    // resolution along one.
+    p.steps     = (int32_t)live::i("taa.gi_steps", "TAA_GI_STEPS", 6);
+    p.rays      = (int32_t)live::i("taa.gi_rays",  "TAA_GI_RAYS",  8);
     p.frame     = (int32_t)(s.frame & 0x3fffffff);
     // How far a reprojected texel's recorded distance may differ from this
     // frame's before its history is thrown away. Relative to distance; see the
@@ -526,6 +637,51 @@ inline void record(DeviceData &dd, VkDevice dev, VkCommandBuffer cb,
               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr,
               0, nullptr);
 
+    s.denoised = false;
+    if (live::onoff("taa.gi_denoise", "TAA_GI_DENOISE", true) && s.pipeDn != VK_NULL_HANDLE) {
+        // A-trous: pass k reads the previous pass (the fresh accumulation for
+        // pass 0) and writes den[k & 1] with the tap spacing doubled each time -
+        // steps 1, 2, 4. Two passes (13x13 texel support) left the sparse hot
+        // texels of an 8-ray gather as 9x9 plateaus on pale surfaces; the third
+        // pass fills the holes the dilated kernel leaves. Live: taa.gi_dn_passes.
+        int nDn = (int)live::i("taa.gi_dn_passes", "TAA_GI_DN_PASSES", 3);
+        if (nDn < 1) nDn = 1; if (nDn > (int)State::kDnMax) nDn = (int)State::kDnMax;
+        for (int pass = 0; pass < nDn; ++pass) {
+            const uint32_t di = s.nextSetDn; s.nextSetDn = (di + 1) % (State::kDnMax * State::kSets);
+            VkDescriptorSet dset = s.setsDn[di];
+            VkDescriptorImageInfo dii[3]; memset(dii, 0, sizeof(dii));
+            dii[0].sampler = s.sampNear; dii[0].imageView = pass == 0 ? s.histView[wrIdx] : s.denView[(pass + 1) & 1];
+            dii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            dii[1].sampler = s.sampNear; dii[1].imageView = haveEngine ? normalView : dii[0].imageView;
+            dii[1].imageLayout = haveEngine ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+            dii[2].imageView = s.denView[pass & 1]; dii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkWriteDescriptorSet dwr[3]; memset(dwr, 0, sizeof(dwr));
+            for (int k = 0; k < 3; ++k) {
+                dwr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                dwr[k].dstSet = dset; dwr[k].dstBinding = (uint32_t)k; dwr[k].descriptorCount = 1;
+                dwr[k].descriptorType = (k == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                dwr[k].pImageInfo = &dii[k];
+            }
+            s.updSets(dev, 3, dwr, 0, nullptr);
+            DnPush dp;
+            dp.halfW = (int32_t)hw; dp.halfH = (int32_t)hh; dp.fullW = (int32_t)fullW; dp.fullH = (int32_t)fullH;
+            dp.step = 1 << pass;
+            dp.flags = haveEngine ? kDnNormals : 0;
+            dp.sigmaZ = live::f("taa.gi_dn_sigma_z", "TAA_GI_DN_SIGMA_Z", 0.05f);
+            dp.sigmaN = live::f("taa.gi_dn_sigma_n", "TAA_GI_DN_SIGMA_N", 32.0f);
+            s.bindPipe(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeDn);
+            s.bindSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.plDn, 0, 1, &dset, 0, nullptr);
+            s.pushConst(cb, s.plDn, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dp), &dp);
+            s.dispatch(cb, (hw + 7) / 8, (hh + 7) / 8, 1);
+            VkMemoryBarrier dmb; memset(&dmb, 0, sizeof(dmb));
+            dmb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            dmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; dmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            s.barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      0, 1, &dmb, 0, nullptr, 0, nullptr);
+        }
+        s.denOut = (uint32_t)(nDn - 1) & 1u;
+        s.denoised = true;
+    }
     s.primed = true;
     if (!s.announced) {
         s.announced = true;

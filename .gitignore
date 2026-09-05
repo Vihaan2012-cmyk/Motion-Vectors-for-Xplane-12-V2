@@ -41,3 +41,10 @@ dist/
 # Validation-run droppings, but NOT the settings file the val launcher needs.
 gpuav_lite/loader.txt*
 gpuav_lite/val_log.txt*
+
+# User-supplied Streamline / NGX runtimes for the DLSS-D / NR paths. Never
+# redistributed: the mod ships nothing patched, users point TAA_SL_DIR at
+# their own copy.
+beta/
+streamline/
+v1_sl_leftovers_backup/

@@ -363,9 +363,15 @@ void main()
     // Clamped because a surface in deep shadow has a near-zero divisor, and
     // an unbounded ratio there would light it more brightly than the sun.
     {
+        // ABSOLUTE radiance, in the scene's own units: the mean radiance seen
+        // over the cosine-weighted hemisphere is the irradiance / pi, which is
+        // what an albedo-scaled ADDITIVE composite wants. Only fireflies are
+        // clamped, relative to the local surface so the clamp scales with
+        // exposure: one hot hit may not exceed eight times the surface's own
+        // luminance.
         vec3  local = max(texture(uScene, vec3(uv, lay)).rgb, vec3(0.0));
         float lref  = max(dot(local, vec3(0.2126, 0.7152, 0.0722)), 1e-3);
-        gathered = min(gathered / lref, vec3(2.0));
+        gathered = min(gathered, vec3(2.0 * lref));
     }
 
     // ---- ACCUMULATE IN OUR OWN HISTORY.

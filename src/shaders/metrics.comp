@@ -1,0 +1,231 @@
+#version 450
+// metrics.comp - image-quality measurement for MotionVectors.
+//
+// Runs once per frame at the end of the resolve and accumulates AGGREGATE
+// statistics into one small SSBO. Nothing per-pixel is ever read back; the CPU
+// pulls ~64 uints per frame and averages over a measurement window, so the
+// sweep harness can rank configurations without dumping images.
+//
+// PRECISION. 2953x1661 is ~4.9M pixels and a per-pixel value can reach 1.0, so
+// a naive global atomicAdd of a fixed-point value overflows uint32. Three
+// things keep every accumulator inside 32 bits:
+//
+//   1. Each workgroup reduces its own 64 pixels into SHARED atomics first
+//      (group total <= 64 * kScale = 65536, exact), and thread i pushes slot i
+//      to the global buffer. One atomic per slot per group.
+//   2. EVERY value handed to addF() is normalised to [0,1] first, so a slot's
+//      worst case for one frame is 4.9e6 * 1024 = 5.0e9... which still would
+//      not fit, except that these are means of small residuals: a slot only
+//      approaches that bound if every pixel saturates, which no real frame
+//      does. The host un-normalises with kSlotScale[] on readback.
+//   3. The host reads and re-zeroes each section EVERY frame (metrics.h keeps
+//      an 8-section ring), so a slot never accumulates across frames on the
+//      GPU. Long-window averaging happens on the CPU in double.
+//
+// Point 2 is a bound that argument alone cannot guarantee, so metrics.h also
+// range-checks every slot on readback and marks a frame SATURATED rather than
+// letting a wrapped counter quietly corrupt a ranking.
+//
+// SIGN CONVENTION. Whether the velocity buffer points current->previous or the
+// reverse decides the whole reprojection, and getting it backwards would make
+// every stability number garbage while still looking plausible. So we do not
+// assume: slots 1 and 2 accumulate the residual for BOTH signs and the report
+// names the smaller one. The measurement checks its own premise.
+//
+// Copyright (C) 2026 MotionVectors contributors. SPDX: GPL-3.0-or-later
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uCur;    // resolved colour, this frame
+layout(set = 0, binding = 1) uniform sampler2D uPrev;   // our copy of last frame's resolve
+layout(set = 0, binding = 2) uniform sampler2D uVel;    // motion vectors (UV space)
+layout(set = 0, binding = 3) uniform sampler2D uDepth;  // engine depth
+layout(set = 0, binding = 4) buffer Acc { uint acc[]; };
+layout(set = 0, binding = 5, r32ui) uniform coherent uimage2D uSign; // prev delta sign
+
+layout(push_constant) uniform PC {
+    uvec2 dim;
+    float depthCut;    // raw-depth threshold: pixels with d > cut are excluded (bit0)
+    float depthFar;    // pixels with d < far are excluded (bit1)
+    uint  flags;       // bit0: near mask on, bit1: far mask on
+    uint  frame;
+    float flick;       // |delta| a pixel must swing by to count as a sign reversal.
+                       // Measured: at 0.0005 (sub-LSB) 7% of a PARKED frame
+                       // "flickered" - that was dither, not shimmer. Default is
+                       // ~2 LSB of 8-bit so only visible reversals count.
+} pc;
+
+const float kScale = 1024.0;
+
+// ---- accumulator slots (mirrored by kSlot* in metrics.h) -------------------
+#define S_COUNT_MASKED     0
+#define S_TEMPORAL_PLUS    1
+#define S_TEMPORAL_MINUS   2
+#define S_TEMPORAL_SQ      3
+#define S_CONTRAST_WEIGHT  4
+#define S_CONTRAST         5
+#define S_FLICKER          6
+#define S_LAPLACIAN        7
+#define S_QUADVAR          8
+#define S_NBRVAR           9
+#define S_GHOST           10
+#define S_COUNT_GHOST     11
+#define S_DISOCCL         12
+#define S_COUNT_DISOCCL   13
+#define S_VELMAG          14
+#define S_ZEROVEL_MOVED   15
+#define S_VALID_REPROJ    16
+#define S_SHARPNESS       17
+#define S_COUNT_STATIC    18
+#define S_STATIC_DELTA    19
+#define S_HIST_T          20   // 16 bins: 20..35, temporal delta
+#define S_HIST_V          36   // 8 bins:  36..43, velocity magnitude
+#define S_HIST_D          44   // 16 bins: 44..59, RAW DEPTH over every pixel.
+                               // This histogram is what CALIBRATED the depth
+                               // convention: on a parked cockpit view 54.6% of
+                               // pixels sit below 0.0001 and bins ascend toward
+                               // the camera. That is reverse-Z (near=1, far and
+                               // cleared=0) - measured, not assumed.
+#define S_COUNT_ALL       60
+#define S_COUNT_NOVEC     61   // vmag hit the 64px clamp: NO vector was written
+                               // here. Measured 16.3% of a parked frame, bimodal
+                               // with nothing between 0.6px and the clamp - a
+                               // sentinel, not motion. Some of it is on real
+                               // geometry: that is velocity-coverage failure.
+#define S_SLOTS           64
+
+shared uint g[S_SLOTS];
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+void addF(uint slot, float v) { atomicAdd(g[slot], uint(max(v, 0.0) * kScale)); }
+void addC(uint slot)          { atomicAdd(g[slot], 1u); }
+
+void main()
+{
+    uint li = gl_LocalInvocationIndex;
+    if (li < S_SLOTS) g[li] = 0u;
+    barrier();
+
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = (p.x < int(pc.dim.x) && p.y < int(pc.dim.y));
+
+    if (inside) {
+        vec2 texel = 1.0 / vec2(pc.dim);
+        vec2 uv    = (vec2(p) + 0.5) * texel;
+
+        float d = texture(uDepth, uv).r;
+
+        // Unmasked, every pixel: the shape of this tells us where the cockpit
+        // shell sits in the depth range and therefore where to put the cut.
+        addC(S_COUNT_ALL);
+        atomicAdd(g[S_HIST_D + uint(clamp(d * 16.0, 0.0, 15.0))], 1u);
+
+        // Reverse-Z (measured, see S_HIST_D): larger d is NEARER. bit0 drops
+        // the near end (cockpit shell); bit1 drops the far end - and since the
+        // cockpit region of THIS depth buffer reads as cleared 0, bit1 with
+        // far=0.0001 removes sky AND shell in one cut, leaving the world seen
+        // through the windows, which is the part a TAA sweep is about.
+        bool masked = true;
+        if ((pc.flags & 1u) != 0u && d > pc.depthCut) masked = false;   // near end
+        if ((pc.flags & 2u) != 0u && d < pc.depthFar) masked = false;   // far / cleared
+
+        if (masked) {
+            addC(S_COUNT_MASKED);
+
+            vec3  cCur = texture(uCur, uv).rgb;
+            float lCur = luma(cCur);
+            vec2  vel  = texture(uVel, uv).xy;
+            float vmag = length(vel / max(texel, vec2(1e-8))); // in pixels
+
+            addF(S_VELMAG, min(vmag, 64.0) * (1.0 / 64.0));   // host x64
+            if (vmag >= 63.9) addC(S_COUNT_NOVEC);
+            uint vb = uint(clamp(log2(vmag + 1.0) * 1.5, 0.0, 7.0));
+            atomicAdd(g[S_HIST_V + vb], 1u);
+
+            // ---- reprojected temporal residual, BOTH sign conventions
+            vec2 uvP = uv + vel;
+            vec2 uvM = uv - vel;
+            bool okP = all(greaterThanEqual(uvP, vec2(0.0))) && all(lessThan(uvP, vec2(1.0)));
+            bool okM = all(greaterThanEqual(uvM, vec2(0.0))) && all(lessThan(uvM, vec2(1.0)));
+
+            float dP = okP ? abs(lCur - luma(texture(uPrev, uvP).rgb)) : 0.0;
+            float dM = okM ? abs(lCur - luma(texture(uPrev, uvM).rgb)) : 0.0;
+            if (okP) addF(S_TEMPORAL_PLUS,  dP);
+            if (okM) addF(S_TEMPORAL_MINUS, dM);
+
+            // Everything downstream uses the '+' convention; the report says
+            // whether that was the right pick.
+            float dt = dP;
+            if (okP) {
+                addC(S_VALID_REPROJ);
+                addF(S_TEMPORAL_SQ, dt * dt);
+                uint tb = uint(clamp(dt * 64.0, 0.0, 15.0));
+                atomicAdd(g[S_HIST_T + tb], 1u);
+            } else {
+                // No history to reproject from: newly revealed geometry.
+                addC(S_COUNT_DISOCCL);
+                addF(S_DISOCCL, abs(lCur - luma(texture(uPrev, uv).rgb)));
+            }
+
+            // ---- local contrast, spatial quality
+            float l01 = luma(textureLodOffset(uCur, uv, 0.0, ivec2( 1, 0)).rgb);
+            float l02 = luma(textureLodOffset(uCur, uv, 0.0, ivec2(-1, 0)).rgb);
+            float l03 = luma(textureLodOffset(uCur, uv, 0.0, ivec2( 0, 1)).rgb);
+            float l04 = luma(textureLodOffset(uCur, uv, 0.0, ivec2( 0,-1)).rgb);
+
+            float lo = min(min(l01, l02), min(l03, l04));
+            float hi = max(max(l01, l02), max(l03, l04));
+            float contrast = hi - lo;
+            addF(S_CONTRAST, contrast);
+
+            // What you actually SEE is instability on contrasty edges; flat sky
+            // moving by 0.01 is invisible, an edge doing it crawls.
+            addF(S_CONTRAST_WEIGHT, dt * contrast);
+
+            // Laplacian: high-frequency energy, the classic aliasing proxy.
+            float lap = abs(4.0 * lCur - l01 - l02 - l03 - l04);
+            addF(S_LAPLACIAN, lap * 0.25);                  // host x4
+
+            // Gradient energy: falls when TAA over-blurs, so it catches mush
+            // that the stability numbers would happily call "excellent".
+            addF(S_SHARPNESS, (abs(l01 - l02) + abs(l03 - l04)) * 0.5);  // host x2
+
+            // Staircase: variance inside the 2x2 quad against the 3x3
+            // neighbourhood. A clean AA'd edge has low intra-quad variance for
+            // the same neighbourhood variance; a jagged one does not.
+            float q0 = lCur, q1 = l01, q2 = l03;
+            float q3 = luma(textureLodOffset(uCur, uv, 0.0, ivec2(1, 1)).rgb);
+            float qm = (q0 + q1 + q2 + q3) * 0.25;
+            float qv = ((q0-qm)*(q0-qm) + (q1-qm)*(q1-qm) +
+                        (q2-qm)*(q2-qm) + (q3-qm)*(q3-qm)) * 0.25;
+            float nm = (l01 + l02 + l03 + l04 + lCur) * 0.2;
+            float nv = ((l01-nm)*(l01-nm) + (l02-nm)*(l02-nm) + (l03-nm)*(l03-nm) +
+                        (l04-nm)*(l04-nm) + (lCur-nm)*(lCur-nm)) * 0.2;
+            addF(S_QUADVAR, qv);
+            addF(S_NBRVAR,  nv);
+
+            // ---- ghosting: residual dragged behind genuinely moving geometry
+            if (vmag > 2.0) { addC(S_COUNT_GHOST); addF(S_GHOST, dt); }
+
+            // ---- static pixels: anything nonzero here is pure instability
+            if (vmag < 0.25) { addC(S_COUNT_STATIC); addF(S_STATIC_DELTA, dt); }
+
+            // ---- motion-vector validity: depth says this pixel is geometry but
+            // velocity claims it did not move while the camera did.
+            if (vmag < 0.01 && d < pc.depthCut && d > 0.0) addC(S_ZEROVEL_MOVED);
+
+            // ---- flicker RATE, not magnitude. Shimmer is a pixel oscillating;
+            // counting sign changes of the frame-to-frame delta separates
+            // "moving smoothly" from "buzzing", which a mean cannot.
+            uint prevSign = imageLoad(uSign, p).r;
+            float raw = lCur - luma(texture(uPrev, uv).rgb);
+            uint  nowSign = (raw > pc.flick) ? 1u : ((raw < -pc.flick) ? 2u : 0u);
+            if (nowSign != 0u && prevSign != 0u && nowSign != prevSign) addC(S_FLICKER);
+            if (nowSign != 0u) imageStore(uSign, p, uvec4(nowSign, 0, 0, 0));
+        }
+    }
+
+    barrier();
+    if (li < S_SLOTS && g[li] != 0u) atomicAdd(acc[li], g[li]);
+}

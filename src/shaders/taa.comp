@@ -311,6 +311,7 @@ const int FLAG_PROBE_TAP      = 16384; // binding 8 carries the env cubemaps
 const int FLAG_GBUF_TAP       = 32768; // binding 10 carries u_gbuffer_data
 const int FLAG_GI             = 65536; // binding 11 carries gathered bounce
 const int FLAG_NORMAL_TAP     = 131072; // binding 12 carries gbuf-normal
+const int FLAG_BOX_MOD        = 262144; // clamp box built in the modulated sample's space
 // view distance from engine depth; fb is the injected clip-w fallback so a
 // wrong identification degrades to exactly the previous behaviour.
 // Velocity reconstructed from engine depth + camera motion, in EXACTLY the
@@ -557,6 +558,7 @@ const int VIZ_CLAMP     = 6;   // how far the clamp moved history, in sigma
 const int VIZ_WRITTEN   = 8;   // did ANY shader write velocity here - WHITE
 const int VIZ_SUNVIS    = 9;   // engine-cascade sun visibility per pixel
 const int VIZ_PROBE     = 10;  // engine cubemap radiance along the view ray
+const int VIZ_GI        = 11;  // the gathered bounce, relative to the pixel's own luminance
                                // yes, BLACK no. Ungated by every other
                                // setting, deliberately: VIZ_MOTION zeroes the
                                // unwritten sentinel, so "nothing wrote here"
@@ -1296,6 +1298,11 @@ void main()
     if (pc.sharpen > 0.001)
         currA = sharpenCurrent(currA, uv + S, float(layer), pc.invSize);
 
+    // The sample before AO, bounce and contact shadow are applied: what the
+    // clamp box's neighbourhood taps are, so the ratio final/raw is exactly
+    // the modulation those taps need to sit in the same space as currA.
+    const vec3 currRaw = currA;
+
     // ---- AMBIENT OCCLUSION, FROM THE DEPTH ALREADY IN THE VELOCITY TARGET.
     //
     // X-Plane ships SSAO, but it is spatial: a small sample budget re-drawn
@@ -1460,6 +1467,7 @@ void main()
     // composite - a per-frame tremble strongest exactly where GI is strongest
     // (the cockpit). Measured the first session SSGI actually composited.
     vec3 giMul = vec3(1.0);
+    vec3 giShow = vec3(0.0);   // VIZ_GI: the field as the composite received it
     if ((pc.flags & FLAG_GI) != 0 && !unwritten) {
         // ---- DEPTH-AWARE UPSAMPLE. THE GATHER IS HALF RESOLUTION.
         //
@@ -1480,18 +1488,26 @@ void main()
         const ivec2 gb  = ivec2(floor(gf));
         const vec2  gfr = gf - vec2(gb);
 
+        // ---- 4x4 DEPTH-AWARE UPSAMPLE, NOT 2x2.
+        //
+        // The gather averages four rays per half-res texel; even after its
+        // temporal accumulation neighbouring texels disagree by a lot, and a
+        // 2x2 bilinear reproduced that disagreement as hard half-res squares
+        // on every pale surface. Sixteen taps with a Gaussian footprint and
+        // the same depth weight smooth the texel-to-texel variance while
+        // still refusing to bleed across depth edges.
         vec3  gAcc = vec3(0.0);
         float gWs  = 0.0;
-        for (int gi4 = 0; gi4 < 4; ++gi4) {
-            const ivec2 o = ivec2(gi4 & 1, gi4 >> 1);
-            const ivec2 q = clamp(gb + o, ivec2(0), gSz - 1);
+        for (int gy = -1; gy <= 2; ++gy)
+        for (int gx = -1; gx <= 2; ++gx) {
+            const ivec2 q = clamp(gb + ivec2(gx, gy), ivec2(0), gSz - 1);
             const vec4  g = texelFetch(uGi, ivec3(q, layer), 0);
             // Alpha <= 0 is the gather's "sky / never written" sentinel.
             if (g.a <= 0.0) continue;
-            const float bw = (o.x == 0 ? 1.0 - gfr.x : gfr.x) *
-                             (o.y == 0 ? 1.0 - gfr.y : gfr.y);
+            const vec2  dd  = vec2(gx, gy) - gfr;          // tap offset from the sample point, in half-res texels
+            const float sw  = exp(-0.5 * dot(dd, dd));      // sigma = 1 texel
             const float rel = abs(g.a - gw0) / max(gw0, 1e-3);
-            const float w   = bw / (1.0 + rel * 32.0);
+            const float w   = sw / (1.0 + rel * 32.0);
             gAcc += g.rgb * w;
             gWs  += w;
         }
@@ -1500,8 +1516,30 @@ void main()
         // bleed this replaces, so the answer is no GI here - which the
         // multiplicative composite expresses as leaving the pixel alone.
         vec3 gi = (gWs > 1e-6) ? gAcc / gWs : vec3(0.0);
-        giMul = vec3(1.0) + max(gi, vec3(0.0)) * uReprojParams2.z;
-        currA *= giMul;
+        // ---- ADDITIVE, ALBEDO-SCALED. Indirect light is albedo x irradiance
+        // ADDED to the lit colour, not a gain on the surface's own brightness.
+        // The engine exposes no albedo image, so the lit colour's chroma
+        // (colour / luminance) stands in for it, and the bounce is bounded at
+        // twice the pixel's own luminance so a bright hit can fill a shadow
+        // without ever whiting out sunlit paint.
+        const float lc  = max(dot(currA, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+        giShow = gi / lc;
+        const vec3  alb = currA / lc;
+        // At most half the pixel's own luminance, times the strength: bounce is
+        // fill light in shadow, never a second sun on lit paint.
+        const vec3  bounce = alb * min(max(gi, vec3(0.0)), vec3(0.5 * lc)) * uReprojParams2.z;
+        currA += bounce;
+        giMul = vec3(1.0) + bounce / max(currA, vec3(1e-4));
+    }
+    if (pc.viz == VIZ_GI) {
+        // The gathered bounce as the composite receives it, relative to the
+        // pixel's own luminance: 0.5 (mid grey) is the composite's cap, 1.0 is
+        // bounce equal to the lit colour, black is none or no GI. Squares HERE
+        // are in the field (gather, accumulation, denoiser); a smooth picture
+        // here with squares on screen means the composite or the clamp made
+        // them. Toggle taa.gi_denoise to see the raw accumulation instead.
+        imageStore(uHistory, ivec3(px, layer), vec4(clamp(giShow, 0.0, 1.0), 0.0));
+        return;
     }
 
     // ---- CONTACT SHADOWS: THE SHADOW THE SHADOW MAP IS TOO COARSE TO DRAW.
@@ -1759,13 +1797,29 @@ void main()
     //
     // Sampling with the same offset costs a filtered fetch instead of a texel
     // fetch and puts the statistics in the sample's own frame of reference.
+    // ---- THE BOX IS BUILT IN THE SPACE OF THE SAMPLE IT JUDGES.
+    //
+    // AO, bounce and contact shadow were applied to currA above and NOT to
+    // its neighbours. On a flat surface the box is tight, so history that
+    // carried those effects was clamped back to the un-modulated colour every
+    // frame and each effect survived only at the blend weight: invisible on
+    // a parked frame, and popping in as the weight rose with camera motion.
+    // For the bounce that pop-in read as squares that appear while moving.
+    //
+    // The centre's own factor is applied to all nine taps. The effects are
+    // low-frequency (half-res field, 12 px AO radius), so the approximation
+    // is at most a texel wide. Build 27 did this for GI alone (giMul) and
+    // was reverted for "static blocks" - which were the frozen-composite bug
+    // of the same build, not the box space. taa.box_mod=0 restores the raw
+    // box for comparison.
+    const vec3 boxMod = ((pc.flags & FLAG_BOX_MOD) != 0)
+                      ? clamp(currA / max(currRaw, vec3(1e-6)), vec3(0.0), vec3(4.0))
+                      : vec3(1.0);
     vec2 tsz = 1.0 / vec2(size);
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             vec2  quv = uv + S + vec2(dx, dy) * tsz;
-            // Same GI factor as the centre sample: GI is low-frequency, and the
-            // box must describe the space the current sample now lives in.
-            vec3  c = rgb2ycocg(tm(texture(uScene, vec3(quv, float(layer))).rgb * giMul));
+            vec3  c = rgb2ycocg(tm(texture(uScene, vec3(quv, float(layer))).rgb * boxMod));
             m1 += c;
             m2 += c * c;
             nmin = min(nmin, c);

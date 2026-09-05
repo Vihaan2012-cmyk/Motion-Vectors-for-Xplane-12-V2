@@ -117,6 +117,10 @@ struct TaaState {
     // Bindings 7/8: the engine's sun cascades and environment probes.
     std::map<VkImage, VkImageView> sunViews, probeViews, normViews;
     VkImageView     normView  = VK_NULL_HANDLE;
+    // Native image + format for DLSS-D resource tagging (views alone are not
+    // enough for Streamline; it wants the VkImage and its VkFormat).
+    VkImage         edImage   = VK_NULL_HANDLE;  VkFormat edFormat   = VK_FORMAT_UNDEFINED;
+    VkImage         normImage = VK_NULL_HANDLE;  VkFormat normFormat = VK_FORMAT_UNDEFINED;
     bool            normValid = false;
     // 1x1 D16 dummy for binding 7's fallback. A COMPARISON sampler on the
     // RGBA16F velocity view was invalid Vulkan for every frame the cascades
@@ -319,6 +323,7 @@ enum {
     kTaaFlagGbufTap       = 1 << 15,  // binding 10 carries u_gbuffer_data
     kTaaFlagGi            = 1 << 16,  // binding 11 carries gathered bounce
     kTaaFlagNormalTap     = 1 << 17,  // binding 12 carries gbuf-normal
+    kTaaFlagBoxMod        = 1 << 18,  // clamp box in the modulated sample's space
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -1239,8 +1244,10 @@ static void taaBindEngineDepth(DeviceData &dd, VkImage image, VkFormat fmt,
     if (image == VK_NULL_HANDLE || samples != VK_SAMPLE_COUNT_1_BIT) {
         g_taa.edView  = VK_NULL_HANDLE;
         g_taa.edValid = false;
+        g_taa.edImage = VK_NULL_HANDLE; g_taa.edFormat = VK_FORMAT_UNDEFINED;
         return;
     }
+    g_taa.edImage = image; g_taa.edFormat = fmt;
     std::map<VkImage, VkImageView>::iterator it = g_taa.edViews.find(image);
     if (it != g_taa.edViews.end()) {
         g_taa.edView  = it->second;
@@ -1344,8 +1351,10 @@ static void taaBindNormals(DeviceData &dd, VkImage image, VkFormat fmt,
                            uint32_t layers, VkSampleCountFlagBits samples)
 {
     if (image == VK_NULL_HANDLE || samples != VK_SAMPLE_COUNT_1_BIT) {
-        g_taa.normView = VK_NULL_HANDLE; g_taa.normValid = false; return;
+        g_taa.normView = VK_NULL_HANDLE; g_taa.normValid = false;
+        g_taa.normImage = VK_NULL_HANDLE; g_taa.normFormat = VK_FORMAT_UNDEFINED; return;
     }
+    g_taa.normImage = image; g_taa.normFormat = fmt;
     std::map<VkImage, VkImageView>::iterator it = g_taa.normViews.find(image);
     if (it != g_taa.normViews.end()) {
         g_taa.normView = it->second;
@@ -1595,11 +1604,57 @@ static void taaRecordDeliverOnly(DeviceData &dd, VkCommandBuffer cb, VkImage sce
                           0, nullptr, 0, nullptr, 1, &post[1]);
 }
 
+// The metrics dispatch has to see the frame AS PRESENTED, and there are two
+// places the resolve can finish: the TAA composite, and the DLSS-D early
+// return. Both leave the scene image in COLOR_ATTACHMENT_OPTIMAL (dlssd.h
+// restores in.sceneLayout on its way out), so one helper serves both - and a
+// sweep comparing RR against TAA gets numbers for both instead of an empty
+// row it would misread as "stable".
+static void taaRecordMetrics(DeviceData &dd, VkCommandBuffer cb)
+{
+    metrics::Inputs mi;
+    mi.cb = cb;
+    mi.scene = g_taa.sceneImage; mi.sceneView = g_taa.sceneView;
+    mi.sceneFmt = g_taa.format;
+    mi.velView = g_taa.velView;
+    mi.depthView = g_taa.edView;
+    mi.w = g_taa.w; mi.h = g_taa.h;
+    metrics::record(dd, g_taa.device, mi);
+}
+
 static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                              float jitterX, float jitterY, bool reset,
                              bool cameraMoved)
 {
     if (!g_taa.ready || !taaEnabled()) return;
+
+    // ---- DLSS-D RAY RECONSTRUCTION (feature 1001) REPLACES the TAA resolve.
+    // When taa.dlssd is on and RR runs, it consumes the freshly rendered scene
+    // (colour/depth/mvec/normals), writes its neural result back into the scene
+    // image, and we return before the TAA composite so the two never fight.
+    // Honest first wiring (see dlssd.h): needs an on-PC run to validate the
+    // resource layouts and the image. Falls through to normal TAA if RR is off
+    // or did not run this frame.
+    if (mvdlssd::enabled()) {
+        mvdlssd::RecordInputs ri{};
+        ri.cb = cb;
+        ri.sceneImg = g_taa.sceneImage; ri.sceneView = g_taa.sceneView;
+        ri.sceneFmt = g_taa.format;     ri.sceneLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        ri.velImg = g_mv.image;         ri.velView = g_taa.velView;
+        ri.velFmt = kMvFormat;          ri.velLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ri.depthImg = g_taa.edImage;    ri.depthView = g_taa.edView;
+        ri.depthFmt = g_taa.edFormat;   ri.depthLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ri.normImg = g_taa.normImage;   ri.normView = g_taa.normView;
+        ri.normFmt = g_taa.normFormat;  ri.normLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ri.w = g_taa.w; ri.h = g_taa.h;
+        ri.proj = g_taaProjFull; ri.reproj = g_taaReproj;
+        ri.jitterX = jitterX; ri.jitterY = jitterY;
+        ri.depthInverted = false;
+        if (mvdlssd::record(dd, g_taa.device, dd.phys, ri)) {
+            taaRecordMetrics(dd, cb);
+            return;   // RR produced the frame; skip the TAA composite
+        }
+    }
 
     // One-time: the 1x1 comparison-sampler dummy leaves UNDEFINED layout the
     // first time any resolve records - sampling an UNDEFINED image is itself
@@ -1841,8 +1896,12 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         // GI strength: see the note on uReprojParams2 in the shader. Zeroed
         // when the gather has produced nothing, so the composite cannot read
         // a strength for a result that does not exist.
-        slot[22] = (gi::resultView() != VK_NULL_HANDLE)
-                 ? live::f("taa.gi_strength", "TAA_GI_STRENGTH", 0.5f) : 0.0f;
+        // Gated on GI being ON, not merely on its output image existing: with
+        // taa.gi switched off the gather stops but its last result stayed
+        // bound and was composited onto every frame - a frozen imprint of the
+        // last lit frame (measured twice, "white boxes frozen", "imprinted").
+        slot[22] = (gi::enabled() && gi::resultView() != VK_NULL_HANDLE)
+                 ? live::f("taa.gi_strength", "TAA_GI_STRENGTH", 0.35f) : 0.0f;
         // (A placeholder `slot[22] = 0.0f;` from the cascade-tap commit sat
         // here after the line above and silently zeroed the strength: SSGI
         // gathered every frame and composited nothing. Measured as "no visible
@@ -2153,10 +2212,12 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                  | (reprojOn            ? kTaaFlagDepthReproject : 0)
                  | (sunTap              ? kTaaFlagSunTap        : 0)
                  | (gbufTap             ? kTaaFlagGbufTap       : 0)
-                 | ((gi::resultView() != VK_NULL_HANDLE)
+                 | ((gi::enabled() && gi::resultView() != VK_NULL_HANDLE)
                                         ? kTaaFlagGi            : 0)
                  | (g_taa.probeValid    ? kTaaFlagProbeTap      : 0)
                  | (normTap             ? kTaaFlagNormalTap     : 0)
+                 | (live::onoff("taa.box_mod", "TAA_BOX_MOD", true)
+                                        ? kTaaFlagBoxMod        : 0)
                  | (taaFreezeHistory() ? kTaaFlagFreezeHistory : 0)
                  | (taaNoMotion()      ? kTaaFlagNoMotion      : 0)
                  | (taaNoAccum()       ? kTaaFlagNoAccum       : 0)
@@ -2504,6 +2565,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // The oracle's content probe rides the same command buffer, after the
     // resolve - scene complete, engine targets in their read layouts.
     oracle::record(dd, g_taa.device, cb);
+
+    // Image-quality measurement rides the same spot, and for the same reason:
+    // this is the frame as it will be presented, so what metrics scores is what
+    // the user actually sees rather than an intermediate. Off unless armed.
+    taaRecordMetrics(dd, cb);
     // Numeric dump of the two captured engine blocks - the instrument that
     // replaced testing sun-tap plumbing on the user's eyes.
     if (sunTap && gbufTap)
