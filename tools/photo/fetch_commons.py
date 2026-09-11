@@ -7,19 +7,26 @@ non-commercial strings (public domain, CC0, CC BY), records licence + author + s
 file for attribution, and downloads a 4096 px rendition when the original is huge. Not a
 scraper: one API call at a time, a real User-Agent, resumable, and a byte cap.
 
+Domain filters (the reference set is for a photoreal pass, so it must look like a
+photograph taken from a modern aircraft): files dated before --min-year are skipped,
+Historic American Engineering / Buildings Survey records (HAER/HABS, black-and-white film)
+are skipped by title, credit and category, and every download is checked for colour -
+grayscale files are deleted on arrival. --clean applies the same rules to what is already
+on disk and rewrites the manifest.
+
     python tools/photo/fetch_commons.py --out E:/PhotoRef --max-gb 50
-    python tools/photo/fetch_commons.py --out E:/PhotoRef --max-gb 50 --depth 2 --seeds "Aerial photographs of Los Angeles"
+    python tools/photo/fetch_commons.py --out E:/PhotoRef --clean
 
 Output: <out>/commons/<category>/<file>, <out>/manifest.jsonl (one line per file: url, licence,
 author, credit, category, dims, bytes, sha1), <out>/fetch.log.
 
 Copyright (C) 2026 MotionVectors contributors. SPDX: GPL-3.0-or-later
 """
-import argparse, hashlib, json, os, re, sys, time, urllib.parse, urllib.request
+import argparse, json, os, re, sys, time, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 API = "https://commons.wikimedia.org/w/api.php"
-UA = "MotionVectors-PhotoRef/0.1 (X-Plane neural rendering research; https://github.com/Vihaan2012-cmyk/Motion-Vectors-for-Xplane-12-V2)"
+UA = "MotionVectors-PhotoRef/0.2 (X-Plane neural rendering research; https://github.com/Vihaan2012-cmyk/Motion-Vectors-for-Xplane-12-V2)"
 SEEDS = [
     "Aerial photographs of Los Angeles",
     "Aerial photographs of Los Angeles County, California",
@@ -37,7 +44,8 @@ SEEDS = [
     "Oblique aerial photographs",
     "Aerial photographs of Europe",
 ]
-SKIP_CAT = re.compile(r"map|diagram|drawing|painting|lithograph|postcard|engraving|model|logo|chart|scan|\b19[0-4]\d\b|\b18\d\d\b", re.I)
+SKIP_CAT = re.compile(r"map|diagram|drawing|painting|lithograph|postcard|engraving|model|logo|chart|scan|historic american|HAER|HABS|black and white|monochrome|\b19[0-8]\d\b|\b18\d\d\b", re.I)
+HAER_RX = re.compile(r"\bHAER\b|\bHABS\b|Historic American|LCCN199|LC-DIG-h|Survey \(Library of Congress\)", re.I)
 OK_MIME = {"image/jpeg", "image/png", "image/tiff"}
 
 def log(f, msg):
@@ -52,7 +60,7 @@ def api(params, tries=5):
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.loads(r.read().decode("utf-8"))
-        except Exception as e:
+        except Exception:
             time.sleep(2.0 * (k + 1))
             if k == tries - 1: raise
     return None
@@ -62,14 +70,30 @@ def licence_ok(meta):
     if not s: return False, s
     if s.startswith("public domain") or s.startswith("pd") or s in ("cc0", "cc0 1.0", "no restrictions", "pdm", "cc-zero", "cc zero"): return True, s
     if s.startswith("cc by") or s.startswith("cc-by"):
-        bad = ("sa", "nc", "nd")
         tail = s.replace("cc by", "").replace("cc-by", "")
-        if any(("-" + b) in tail or (" " + b) in tail for b in bad): return False, s
+        if any(("-" + b) in tail or (" " + b) in tail for b in ("sa", "nc", "nd")): return False, s
         return True, s
     return False, s
 
+def year_of(date):
+    m = re.search(r"(1[89]\d\d|20\d\d)", date or "")
+    return int(m.group(1)) if m else None
+
+def strip_html(s):
+    return re.sub(r"<[^>]+>", "", s or "")
+
+def is_gray(path):
+    """Mean channel spread on a 128 px thumbnail; under 6/255 is monochrome (film, scans)."""
+    try:
+        from PIL import Image
+        im = Image.open(path); im.draft("RGB", (256, 256)); im = im.convert("RGB").resize((128, 128))
+        b = im.tobytes(); n = len(b) // 3
+        d = sum(abs(b[3*i] - b[3*i+1]) + abs(b[3*i+1] - b[3*i+2]) for i in range(n)) / max(n, 1)
+        return d < 6.0
+    except Exception:
+        return False
+
 def members(cat):
-    """(files, subcats) of a category, all pages."""
     files, subs, cont = [], [], {}
     while True:
         r = api(dict(action="query", list="categorymembers", cmtitle="Category:" + cat, cmtype="file|subcat", cmlimit="500", **cont))
@@ -84,7 +108,6 @@ def members(cat):
     return files, subs
 
 def infos(titles):
-    """imageinfo for up to 50 File: titles."""
     r = api(dict(action="query", prop="imageinfo", titles="|".join(titles), iiprop="url|size|mime|sha1|extmetadata", iiurlwidth="4096", iiextmetadatafilter="LicenseShortName|Artist|Credit|DateTimeOriginal|ImageDescription|LicenseUrl|Attribution"))
     out = []
     for p in (r or {}).get("query", {}).get("pages", []):
@@ -108,27 +131,55 @@ def fetch(url, dst, tries=4):
             time.sleep(2.0 * (k + 1))
     return 0
 
+def rejected(rec, min_year):
+    y = year_of(rec.get("date"))
+    if y is not None and y < min_year: return "year %d" % y
+    if HAER_RX.search((rec.get("title") or "") + " " + (rec.get("credit") or "") + " " + (rec.get("category") or "")): return "HAER/HABS"
+    return None
+
+def clean(out, min_year, logf):
+    man_path = os.path.join(out, "manifest.jsonl")
+    recs = [json.loads(l) for l in open(man_path, encoding="utf-8")] if os.path.exists(man_path) else []
+    keep, why = [], {}
+    for r in recs:
+        reason = rejected(r, min_year)
+        if not reason and os.path.exists(r["file"]) and is_gray(r["file"]): reason = "grayscale"
+        if not reason and not os.path.exists(r["file"]): reason = "missing"
+        if reason:
+            why[reason] = why.get(reason, 0) + 1
+            try: os.remove(r["file"])
+            except Exception: pass
+        else:
+            keep.append(r)
+    with open(man_path, "w", encoding="utf-8") as f:
+        for r in keep: f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    log(logf, "clean: kept %d of %d (%.2f GB); removed %s" % (len(keep), len(recs), sum(r["bytes"] for r in keep) / 1e9, why or "nothing"))
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="E:/PhotoRef"); ap.add_argument("--max-gb", type=float, default=50.0)
     ap.add_argument("--depth", type=int, default=3); ap.add_argument("--min-width", type=int, default=1400)
+    ap.add_argument("--min-year", type=int, default=1995)
     ap.add_argument("--workers", type=int, default=4); ap.add_argument("--seeds", default="")
+    ap.add_argument("--clean", action="store_true", help="apply the domain filters to what is on disk and exit")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     logf = open(os.path.join(a.out, "fetch.log"), "a", encoding="utf-8")
+    if a.clean:
+        clean(a.out, a.min_year, logf); return
     man_path = os.path.join(a.out, "manifest.jsonl")
-    done = set()
+    done, total = set(), 0
     if os.path.exists(man_path):
         for line in open(man_path, encoding="utf-8"):
-            try: done.add(json.loads(line)["pageid"])
+            try:
+                r = json.loads(line); done.add(r["pageid"]); total += r["bytes"]
             except Exception: pass
-    total = sum(json.loads(l)["bytes"] for l in open(man_path, encoding="utf-8")) if os.path.exists(man_path) else 0
     man = open(man_path, "a", encoding="utf-8")
     cap = a.max_gb * 1e9
     seeds = [s.strip() for s in a.seeds.split(";") if s.strip()] or SEEDS
-    log(logf, "start: %d already fetched (%.1f GB), cap %.0f GB, %d seeds, depth %d" % (len(done), total / 1e9, a.max_gb, len(seeds), a.depth))
+    log(logf, "start: %d already fetched (%.1f GB), cap %.0f GB, %d seeds, depth %d, min year %d" % (len(done), total / 1e9, a.max_gb, len(seeds), a.depth, a.min_year))
     seen_cat, queue = set(), [(s, 0) for s in seeds]
-    nfiles = nok = nskip = 0
+    nok = nskip = ngray = 0
     pool = ThreadPoolExecutor(max_workers=a.workers)
     while queue and total < cap:
         cat, d = queue.pop(0)
@@ -149,7 +200,6 @@ def main():
                 log(logf, "imageinfo failed: %s" % e); continue
             time.sleep(0.2)
             for pageid, title, ii in batch:
-                nfiles += 1
                 if pageid in done: continue
                 meta = ii.get("extmetadata", {}) or {}
                 ok, lic = licence_ok(meta)
@@ -162,26 +212,30 @@ def main():
                 dst = os.path.join(catdir, name)
                 rec = dict(pageid=pageid, title=title, category=cat, url=url, source="https://commons.wikimedia.org/wiki/" + urllib.parse.quote(title),
                            licence=lic, licence_url=(meta.get("LicenseUrl", {}).get("value") or ""),
-                           author=re.sub(r"<[^>]+>", "", meta.get("Artist", {}).get("value") or "")[:200],
-                           credit=re.sub(r"<[^>]+>", "", meta.get("Credit", {}).get("value") or "")[:200],
-                           attribution=re.sub(r"<[^>]+>", "", meta.get("Attribution", {}).get("value") or "")[:200],
-                           date=(meta.get("DateTimeOriginal", {}).get("value") or "")[:40],
+                           author=strip_html(meta.get("Artist", {}).get("value"))[:200], credit=strip_html(meta.get("Credit", {}).get("value"))[:200],
+                           attribution=strip_html(meta.get("Attribution", {}).get("value"))[:200], date=(meta.get("DateTimeOriginal", {}).get("value") or "")[:40],
                            width=ii.get("width"), height=ii.get("height"), mime=ii.get("mime"), sha1=ii.get("sha1"), file=dst, rendition="original" if use_orig else "4096px")
+                if rejected(rec, a.min_year): nskip += 1; continue
                 jobs.append((rec, url, dst))
         if not jobs:
-            log(logf, "%-60s files %4d, nothing new (licence/size filtered)" % (cat[:60], len(files))); continue
+            log(logf, "%-60s files %4d, nothing new (filtered)" % (cat[:60], len(files))); continue
         os.makedirs(catdir, exist_ok=True)
         futs = {pool.submit(fetch, url, dst): rec for rec, url, dst in jobs}
         got = 0
         for fu in as_completed(futs):
             rec = futs[fu]; n = fu.result()
             if n <= 0: continue
+            if is_gray(rec["file"]):
+                ngray += 1
+                try: os.remove(rec["file"])
+                except Exception: pass
+                continue
             rec["bytes"] = n; total += n; got += 1; nok += 1; done.add(rec["pageid"])
             man.write(json.dumps(rec, ensure_ascii=False) + "\n"); man.flush()
             if total >= cap: break
-        log(logf, "%-60s files %4d -> fetched %3d | total %d files %.1f GB | queue %d" % (cat[:60], len(files), got, nok + len(done) - nok, total / 1e9, len(queue)))
+        log(logf, "%-60s files %4d -> fetched %3d | total %d files %.1f GB | gray dropped %d | queue %d" % (cat[:60], len(files), got, len(done), total / 1e9, ngray, len(queue)))
     pool.shutdown(wait=False, cancel_futures=True)
-    log(logf, "done: %d files on disk, %.1f GB, %d skipped by licence/size, %d categories" % (len(done), total / 1e9, nskip, len(seen_cat)))
+    log(logf, "done: %d files on disk, %.1f GB, %d skipped by licence/size/date/HAER, %d grayscale dropped, %d categories" % (len(done), total / 1e9, nskip, ngray, len(seen_cat)))
 
 if __name__ == "__main__":
     main()
