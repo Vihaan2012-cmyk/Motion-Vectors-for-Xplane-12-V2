@@ -3901,7 +3901,43 @@ static float matrixCallback(float sinceLast, float, int, void *)
         static float  prevR[16];
         static bool   havePrevBody = false;
 
-        memcpy(Bp, havePrevBody ? prevR : R, sizeof(Bp));
+        // ---- WHICH ROTATION DELTA IS THE RENDER'S? (taa.body_rot, live)
+        //
+        // With the airframe finally on the body path (2026-09-11) a residual
+        // remains that scales with pitch RATE: a smooth top-to-bottom gradient
+        // in viz=1 and a tail smear on a pull-up. The datum check cannot see
+        // it - a rotation error is zero at the CG. Three candidates, selectable
+        // live so one relaunch settles it: 0 = prevR as sampled (delta
+        // prevR*R^-1, today's), 1 = that delta inverted (R*prevR^T*R - the
+        // quaternion handedness question: wrong handedness DOUBLES the true
+        // rotation), 2 = no rotation delta at all (R in both frames, a
+        // translation-only body frame - the floor to compare against).
+        {
+            static int rotMode = 0, rotEvery = 0;
+            if ((rotEvery++ % 60) == 0) {
+                double v = 0.0;
+                if (liveIniFloat("taa.body_rot", &v)) {
+                    int m = (int)v; if (m < 0) m = 0; if (m > 2) m = 2;
+                    if (m != rotMode) {
+                        rotMode = m;
+                        xlog("body frame: taa.body_rot=%d (%s)", m,
+                             m == 0 ? "prevR as sampled" : m == 1 ? "rotation delta INVERTED" : "no rotation delta");
+                    }
+                }
+            }
+            float R0[16]; memcpy(R0, R, sizeof(R0));
+            R0[3] = R0[7] = R0[11] = 0.0f; R0[12] = R0[13] = R0[14] = 0.0f; R0[15] = 1.0f;
+            if (!havePrevBody || rotMode == 2) {
+                memcpy(Bp, R0, sizeof(Bp));
+            } else if (rotMode == 1) {
+                float Rt[16];                     // prevR's 3x3 transposed = its inverse
+                for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) Rt[c * 4 + r] = prevR[r * 4 + c];
+                Rt[3] = Rt[7] = Rt[11] = 0.0f; Rt[12] = Rt[13] = Rt[14] = 0.0f; Rt[15] = 1.0f;
+                float T[16]; taaMul(T, R0, Rt); taaMul(Bp, T, R0);   // R * prevR^T * R
+            } else {
+                memcpy(Bp, prevR, sizeof(Bp));
+            }
+        }
         Bp[12] = havePrevBody ? (float)(prevOwn[0] - (double)s->camX) : relX;
         Bp[13] = havePrevBody ? (float)(prevOwn[1] - (double)s->camY) : relY;
         Bp[14] = havePrevBody ? (float)(prevOwn[2] - (double)s->camZ) : relZ;
