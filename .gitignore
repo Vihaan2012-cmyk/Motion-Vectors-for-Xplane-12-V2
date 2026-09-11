@@ -52,3 +52,6 @@ v1_sl_leftovers_backup/
 # training checkpoints, logs and preview renders never belong in the repo
 tools/nn/ckpt/
 tools/nn/out/
+
+# Rust photo fetcher build output
+tools/photo/fetcher/target/

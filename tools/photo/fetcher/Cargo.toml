@@ -1,0 +1,20 @@
+[package]
+name = "photoref-fetch"
+version = "0.1.0"
+edition = "2021"
+description = "Licence-clean aerial photo reference set from Wikimedia Commons (MotionVectors photoreal module)"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde_json = "1"
+regex = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
+futures = "0.3"
+anyhow = "1"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
