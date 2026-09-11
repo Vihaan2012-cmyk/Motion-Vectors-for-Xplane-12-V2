@@ -1304,12 +1304,17 @@ static void patchTextureScaleFloor()
     }
 
     //  movss xmm9, dword ptr [rip + 0xf5176b]      -> 0.0625, the floor
-    static const unsigned char kFloorOrig[9] =
-        { 0xF3, 0x44, 0x0F, 0x10, 0x0D, 0x6B, 0x17, 0xF5, 0x00 };
-    //  mov dword ptr [rsp+0x48], 0x3d800000        -> 0.0625, the fallback
-    static const unsigned char kFallbackOrig[8] =
-        { 0xC7, 0x44, 0x24, 0x48, 0x00, 0x00, 0x80, 0x3D };
-    static const ptrdiff_t kFallbackDelta = 0xEB;   // site2 - site1
+    // movss xmm9, [rip+disp32]  (the floor, 0.0625 in .rdata) followed by
+    // comiss xmm7, xmm9 ; jb rel32 (the fallback branch). The displacement differs per
+    // build (0x00F5176B in 12.4.3, 0x00FC9E1D in 12.4.4-b1), so it is wildcarded; the
+    // tail is what makes the match unique.
+    static const unsigned char kFloorHead[5] = { 0xF3, 0x44, 0x0F, 0x10, 0x0D };
+    static const unsigned char kFloorTail[6] = { 0x41, 0x0F, 0x2F, 0xF9, 0x0F, 0x82 };
+    const size_t kFloorLen = 5 + 4 + 6;                 // head, disp32, tail
+    // 12.4.3 fallback: mov dword [rsp+0x48], 0x3D800000 (0.0625 immediate) - patched.
+    // 12.4.4-b1 fallback: movaps xmm7, xmm9 - reuses the floor register, nothing to patch.
+    static const unsigned char kFallbackImm[3]  = { 0xC7, 0x44, 0x24 };   // + slot byte + imm32
+    static const unsigned char kFallbackCopy[4] = { 0x41, 0x0F, 0x28, 0xF9 };
 
     HMODULE base = GetModuleHandleA(nullptr);
     if (!base) { xlog("scale floor: no module handle"); return; }
@@ -1326,8 +1331,9 @@ static void patchTextureScaleFloor()
         if (memcmp(sec[i].Name, ".text", 5) == 0) {
             unsigned char *p = b + sec[i].VirtualAddress;
             size_t n = sec[i].Misc.VirtualSize;
-            for (size_t k = 0; k + sizeof(kFloorOrig) <= n; ++k) {
-                if (memcmp(p + k, kFloorOrig, sizeof(kFloorOrig)) == 0) {
+            for (size_t k = 0; k + kFloorLen <= n; ++k) {
+                if (memcmp(p + k, kFloorHead, sizeof(kFloorHead)) == 0 &&
+                    memcmp(p + k + 9, kFloorTail, sizeof(kFloorTail)) == 0) {
                     if (!found) found = p + k;
                     if (++hits > 1) break;
                 }
@@ -1350,11 +1356,20 @@ static void patchTextureScaleFloor()
         return;
     }
 
-    unsigned char *fallback = found + kFallbackDelta;
-    if (memcmp(fallback, kFallbackOrig, sizeof(kFallbackOrig)) != 0) {
-        xlog("scale floor: the fallback store is not at +0x%X from the floor load "
-             "- the function has been rearranged. Refusing to patch, because "
-             "raising the floor alone would change nothing.", (unsigned)kFallbackDelta);
+    // Follow the jb: rel32 sits right after the 0F 82 of the tail (found+15), target is
+    // measured from the end of that instruction (found+19).
+    int32_t jbRel = 0;
+    memcpy(&jbRel, found + 15, 4);
+    unsigned char *fallback = found + 19 + jbRel;
+    const bool fallbackIsImm  = memcmp(fallback, kFallbackImm, sizeof(kFallbackImm)) == 0 &&
+                                memcmp(fallback + 4, "\x00\x00\x80\x3D", 4) == 0;
+    const bool fallbackIsCopy = memcmp(fallback, kFallbackCopy, sizeof(kFallbackCopy)) == 0;
+    if (!fallbackIsImm && !fallbackIsCopy) {
+        xlog("scale floor: the fallback at +0x%llX (jb target) is neither the 0.0625 store nor "
+             "the register copy: %02X %02X %02X %02X %02X %02X %02X %02X - the function has been "
+             "rearranged. Refusing to patch, because raising the floor alone might change nothing.",
+             (unsigned long long)(fallback - b), fallback[0], fallback[1], fallback[2], fallback[3],
+             fallback[4], fallback[5], fallback[6], fallback[7]);
         g_floorRaised = true;
         return;
     }
@@ -1382,7 +1397,7 @@ static void patchTextureScaleFloor()
         return;
     }
 
-    unsigned char *next = found + sizeof(kFloorOrig);
+    unsigned char *next = found + 9;                     // end of the movss (head + disp32)
     long long disp = (long long)(target - next);
     if (disp > 0x7FFFFFFFLL || disp < -0x80000000LL) {
         xlog("scale floor: constant too far for a 32-bit displacement - refusing.");
@@ -1392,36 +1407,38 @@ static void patchTextureScaleFloor()
     int32_t d32 = (int32_t)disp;
 
     DWORD old = 0;
-    if (!VirtualProtect(found, sizeof(kFloorOrig), PAGE_EXECUTE_READWRITE, &old)) {
+    if (!VirtualProtect(found, 9, PAGE_EXECUTE_READWRITE, &old)) {
         xlog("scale floor: VirtualProtect failed at the floor load (%lu)", GetLastError());
         g_floorRaised = true;
         return;
     }
     memcpy(found + 5, &d32, 4);
-    VirtualProtect(found, sizeof(kFloorOrig), old, &old);
+    VirtualProtect(found, 9, old, &old);
 
     // The fallback is an IMMEDIATE inside the instruction, so it is written
     // directly rather than repointed.
-    unsigned char newFallback[8];
-    memcpy(newFallback, kFallbackOrig, 4);      // C7 44 24 48
-    memcpy(newFallback + 4, &want, 4);
-    if (!VirtualProtect(fallback, sizeof(newFallback), PAGE_EXECUTE_READWRITE, &old)) {
-        xlog("scale floor: VirtualProtect failed at the fallback store (%lu) - the "
-             "floor is raised but the fallback still writes 0.0625, so the pager "
-             "can still reach a sixteenth.", GetLastError());
-        g_floorRaised = true;
-        return;
+    if (fallbackIsImm) {
+        unsigned char newFallback[8];
+        memcpy(newFallback, fallback, 4);           // C7 44 24 <slot>
+        memcpy(newFallback + 4, &want, 4);
+        if (!VirtualProtect(fallback, sizeof(newFallback), PAGE_EXECUTE_READWRITE, &old)) {
+            xlog("scale floor: VirtualProtect failed at the fallback store (%lu) - the "
+                 "floor is raised but the fallback still writes 0.0625, so the pager "
+                 "can still reach a sixteenth.", GetLastError());
+            g_floorRaised = true;
+            return;
+        }
+        memcpy(fallback, newFallback, sizeof(newFallback));
+        VirtualProtect(fallback, sizeof(newFallback), old, &old);
+        FlushInstructionCache(GetCurrentProcess(), fallback, sizeof(newFallback));
     }
-    memcpy(fallback, newFallback, sizeof(newFallback));
-    VirtualProtect(fallback, sizeof(newFallback), old, &old);
-
-    FlushInstructionCache(GetCurrentProcess(), found, kFallbackDelta + sizeof(newFallback));
+    FlushInstructionCache(GetCurrentProcess(), found, 9);
     g_floorRaised = true;
     g_floorValue  = want;
-    xlog("scale floor: texture scale floor raised from 0.0625 to %g (patched "
-         "+0x%llX and +0x%llX in memory only - X-Plane.exe on disk is untouched)",
-         (double)want,
-         (unsigned long long)(found - b),
+    xlog("scale floor: texture scale floor raised from 0.0625 to %g (patched the floor load at "
+         "+0x%llX%s +0x%llX in memory only - X-Plane.exe on disk is untouched)",
+         (double)want, (unsigned long long)(found - b),
+         fallbackIsImm ? " and the fallback store at" : "; the fallback reuses the floor register at",
          (unsigned long long)(fallback - b));
     if (want >= 1.0f)
         xlog("scale floor: at 1.0 the pager can no longer reduce texture "
