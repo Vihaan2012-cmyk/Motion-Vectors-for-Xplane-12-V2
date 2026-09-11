@@ -1573,8 +1573,19 @@ function mv_open()
     float_wnd_set_imgui_builder(wnd, "build")
     float_wnd_set_onclose(wnd, "onclose")
     -- Place it once, in our own coordinates, so dragging has a known origin.
-    win_l = 120
-    win_t = (SCREEN_HEIGHT or 1080) - 120
+    -- float_wnd_set_geometry takes GLOBAL desktop coordinates, and the sim window
+    -- does not have to start at (0,0): on a second monitor its left edge is that
+    -- monitor's desktop x (3840 on the 4K + Ultragear pair), so a literal
+    -- (120, H-120) landed on the other screen and the panel 'never opened'.
+    -- FlyWithLua creates the window inside the sim window; start from there.
+    local gl, gt = nil, nil
+    if type(float_wnd_get_geometry) == "function" then gl, gt = float_wnd_get_geometry(wnd) end
+    if gl and gt then
+        win_l, win_t = gl, gt
+    else
+        win_l = 120
+        win_t = (SCREEN_HEIGHT or 1080) - 120
+    end
     apply_geometry()
 end
 
