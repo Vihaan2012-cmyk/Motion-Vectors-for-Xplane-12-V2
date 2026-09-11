@@ -168,6 +168,53 @@ inline bool makeImage(VkDevice device, PFN_vkGetDeviceProcAddr gdpa,
 // depthImage is depthcopy's R32_SFLOAT copy; velImage is our velocity target,
 // which is a 2D ARRAY (stereo), so its view must be an array view to match the
 // shader's sampler2DArray.
+// Release everything ensure() built. Waits for the device first: the dilate
+// side-car second command buffer and the interpolation dispatch may both be
+// reading these images on the GPU when the render size or the depth copy changes.
+inline void teardown(VkDevice device, PFN_vkGetDeviceProcAddr gdpa)
+{
+    State &s = state();
+    if (!device || !gdpa) return;
+    PFN_vkDeviceWaitIdle waitIdle = (PFN_vkDeviceWaitIdle)gdpa(device, "vkDeviceWaitIdle");
+    PFN_vkDestroyImageView destroyView = (PFN_vkDestroyImageView)gdpa(device, "vkDestroyImageView");
+    PFN_vkDestroyImage destroyImage = (PFN_vkDestroyImage)gdpa(device, "vkDestroyImage");
+    PFN_vkFreeMemory freeMem = (PFN_vkFreeMemory)gdpa(device, "vkFreeMemory");
+    PFN_vkDestroySampler destroySampler = (PFN_vkDestroySampler)gdpa(device, "vkDestroySampler");
+    PFN_vkDestroyDescriptorPool destroyPool = (PFN_vkDestroyDescriptorPool)gdpa(device, "vkDestroyDescriptorPool");
+    PFN_vkDestroyDescriptorSetLayout destroySetLayout = (PFN_vkDestroyDescriptorSetLayout)gdpa(device, "vkDestroyDescriptorSetLayout");
+    PFN_vkDestroyPipelineLayout destroyPipeLayout = (PFN_vkDestroyPipelineLayout)gdpa(device, "vkDestroyPipelineLayout");
+    PFN_vkDestroyPipeline destroyPipeline = (PFN_vkDestroyPipeline)gdpa(device, "vkDestroyPipeline");
+    if (waitIdle) waitIdle(device);
+    s.ready = false; s.readySlot = -1; s.writeSlot = 0;
+    if (destroyPipeline && s.pipeline) destroyPipeline(device, s.pipeline, nullptr);
+    if (destroyPipeLayout && s.pipeLayout) destroyPipeLayout(device, s.pipeLayout, nullptr);
+    if (destroyPool && s.pool) destroyPool(device, s.pool, nullptr);      // frees set[]
+    if (destroySetLayout && s.setLayout) destroySetLayout(device, s.setLayout, nullptr);
+    if (destroySampler && s.sampler) destroySampler(device, s.sampler, nullptr);
+    if (destroyView && s.depthView) destroyView(device, s.depthView, nullptr);
+    if (destroyView && s.velView) destroyView(device, s.velView, nullptr);
+    s.pipeline = VK_NULL_HANDLE; s.pipeLayout = VK_NULL_HANDLE; s.pool = VK_NULL_HANDLE;
+    s.setLayout = VK_NULL_HANDLE; s.sampler = VK_NULL_HANDLE;
+    s.depthView = VK_NULL_HANDLE; s.velView = VK_NULL_HANDLE;
+    s.set[0] = s.set[1] = VK_NULL_HANDLE;
+    for (int i = 0; i < 2; ++i) {
+        if (destroyView && s.dilDepthView[i])  destroyView(device, s.dilDepthView[i], nullptr);
+        if (destroyView && s.dilMvView[i])     destroyView(device, s.dilMvView[i], nullptr);
+        if (destroyView && s.prevDepthView[i]) destroyView(device, s.prevDepthView[i], nullptr);
+        if (destroyImage && s.dilDepth[i])  destroyImage(device, s.dilDepth[i], nullptr);
+        if (destroyImage && s.dilMv[i])     destroyImage(device, s.dilMv[i], nullptr);
+        if (destroyImage && s.prevDepth[i]) destroyImage(device, s.prevDepth[i], nullptr);
+        if (freeMem && s.dilDepthMem[i])  freeMem(device, s.dilDepthMem[i], nullptr);
+        if (freeMem && s.dilMvMem[i])     freeMem(device, s.dilMvMem[i], nullptr);
+        if (freeMem && s.prevDepthMem[i]) freeMem(device, s.prevDepthMem[i], nullptr);
+        s.dilDepthView[i] = s.dilMvView[i] = s.prevDepthView[i] = VK_NULL_HANDLE;
+        s.dilDepth[i] = s.dilMv[i] = s.prevDepth[i] = VK_NULL_HANDLE;
+        s.dilDepthMem[i] = s.dilMvMem[i] = s.prevDepthMem[i] = VK_NULL_HANDLE;
+    }
+    s.depthSrc = VK_NULL_HANDLE; s.velSrc = VK_NULL_HANDLE;
+    s.w = 0; s.h = 0;
+}
+
 inline bool ensure(VkDevice device, VkPhysicalDevice phys,
                    PFN_vkGetDeviceProcAddr gdpa,
                    PFN_vkGetPhysicalDeviceMemoryProperties getMemProps,
@@ -184,12 +231,16 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     // A changed input image means the views are stale. Rebuilding is out of
     // scope here - report and refuse rather than sample a destroyed image,
     // which is the failure this whole session kept chasing.
+    // Inputs or size changed (FSR toggled in X-Plane, a resize, a rebuilt depth
+    // copy): tear down and rebuild. Standing down here left views over a
+    // destroyed depth-copy image feeding interpolation - the black flicker and
+    // smeared text after an FSR toggle on 2026-09-10.
     if (s.ready) {
-        trace("FG PREPARE: inputs changed (depth %p->%p, velocity %p->%p) - "
-              "standing down rather than sampling stale views.",
-              (void*)s.depthSrc, (void*)depthImage, (void*)s.velSrc, (void*)velImage);
-        s.failed = true;
-        return false;
+        trace("FG PREPARE: inputs changed (depth %p->%p, velocity %p->%p, %ux%u->%ux%u) - "
+              "tearing down and rebuilding.",
+              (void*)s.depthSrc, (void*)depthImage, (void*)s.velSrc, (void*)velImage,
+              s.w, s.h, w, h);
+        teardown(device, gdpa);
     }
 
     s.device = device;

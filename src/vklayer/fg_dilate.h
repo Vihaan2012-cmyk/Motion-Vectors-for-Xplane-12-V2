@@ -220,8 +220,14 @@ inline bool run(VkImage colour, VkFormat colourFmt, VkImageLayout colourLayout,
     }
     if (colour == VK_NULL_HANDLE || depthRaw == VK_NULL_HANDLE || mv == VK_NULL_HANDLE)
         return false;
-    if (!fsr3::state().ready || fsr3::state().failed) return false;
+    // The legacy upscaler route is only needed when the prep pass is absent; at
+    // native resolution the upscaler context never exists (render == display).
+    const bool prepReady = fgprep::state().ready && !fgprep::state().failed;
+    if (!prepReady && (!fsr3::state().ready || fsr3::state().failed)) return false;
     if (!depthcopy::state().ready) return false;
+    // The copy must have been built over THIS depth image; after a destroy it is
+    // invalidated (srcImage null) until ensure() rebuilds it at present time.
+    if (depthcopy::state().srcImage != depthRaw) return false;
 
     if (s.reset(s.cb, 0) != VK_SUCCESS) return false;
 

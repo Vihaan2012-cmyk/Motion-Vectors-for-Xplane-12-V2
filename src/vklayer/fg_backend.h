@@ -473,8 +473,16 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     // The dilated depth's own description carries the right extent, so it is the
     // authority - the resources and the size cannot disagree if the size comes
     // from the resource.
-    fd.renderSize.width   = u.sharedDesc[1].width  ? u.sharedDesc[1].width  : s.renderW;
-    fd.renderSize.height  = u.sharedDesc[1].height ? u.sharedDesc[1].height : s.renderH;
+    // The dilated inputs have their own size; the legacy upscaler keeps its old
+    // render size across an FSR toggle while the prep pass follows the scene,
+    // and a mismatch here warps every vector.
+    if (ownInputs) {
+        fd.renderSize.width   = fgprep::state().w ? fgprep::state().w : s.renderW;
+        fd.renderSize.height  = fgprep::state().h ? fgprep::state().h : s.renderH;
+    } else {
+        fd.renderSize.width   = u.sharedDesc[1].width  ? u.sharedDesc[1].width  : s.renderW;
+        fd.renderSize.height  = u.sharedDesc[1].height ? u.sharedDesc[1].height : s.renderH;
+    }
     fd.interpolationRect  = p->interpolationRect;
 
     fd.opticalFlowVector  = od.opticalFlowVector;

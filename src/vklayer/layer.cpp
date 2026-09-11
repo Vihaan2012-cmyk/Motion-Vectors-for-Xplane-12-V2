@@ -9413,8 +9413,53 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                                 g_fgSwap.have &&
                                 live::onoff("taa.fg", "TAA_FG", false);
     const bool fsr3Path = fsrReplaceEnabled() && fsr3Wanted();
-    if ((fsr3Path || fgInputsWanted) &&
-        (needFsr3 || needDepthCp || needSideCar || needPrep)) {
+    const bool wantFgOrFsr = fsr3Path || fgInputsWanted;
+    // ---- THE TAA RESOLVE WANTS THE DEPTH COPY TOO.
+    //
+    // The resolve's engine-depth tap (taa.pos_harvest) read X-Plane's depth
+    // image directly, and that read was noisy frame to frame - the periodic
+    // contact-shadow dots (see the note above the gather in taa.h). It now
+    // reads depthcopy's R32 image, so the copy must exist whenever the tap is
+    // on, not only under FSR3 / frame generation - and it must be REBUILT when
+    // the sim recreates its depth (resize, aircraft load): a copy over a dead
+    // image would be a use-after-free, and a copy over the wrong image would
+    // silently fall back to the direct read. Built here, for the reason the
+    // comment above gives: never while a command buffer is being recorded.
+    bool taaDepthStale = false;
+    // The depth copy is rebuilt whenever ANY consumer is live, not only the
+    // resolve's harvest/capture. Layer_DestroyImage nulls srcImage when X-Plane
+    // destroys the scene depth (resize, flight change) and leaves ready=true so
+    // ensure() can tear the old views down properly; with only fg wanting the
+    // copy this branch was skipped, nothing was rebuilt, and the dilate side-car
+    // kept recording a barrier on a null image and a dispatch through a view of
+    // the freed one - the 0xC0000005 in nvoglv64 at 0x332 on 2026-09-10 19:12.
+    if ((taaPosHarvest() || nncap::captureArmed() || wantFgOrFsr) && !depthcopy::state().failed) {
+        std::lock_guard<std::mutex> g(g_lock);
+        taaDepthStale = g_sceneDepth != VK_NULL_HANDLE && g_sceneColor.w && g_sceneColor.h &&
+                        (!depthcopy::state().ready ||
+                         depthcopy::state().srcImage != g_sceneDepth ||
+                         depthcopy::state().w != g_sceneColor.w ||
+                         depthcopy::state().h != g_sceneColor.h);
+    }
+    // A render-size change (FSR toggled in X-Plane) or a rebuilt depth copy
+    // leaves every FG input stage sized or sourced wrong while still ready;
+    // each ensure() below compares and rebuilds, so re-enter whenever one is stale.
+    bool fgStale = false;
+    if (wantFgOrFsr) {
+        std::lock_guard<std::mutex> g(g_lock);
+        const uint32_t rw0 = g_sceneColor.w, rh0 = g_sceneColor.h;
+        if (rw0 && rh0) {
+            if (depthcopy::state().ready &&
+                (depthcopy::state().w != rw0 || depthcopy::state().h != rh0 ||
+                 depthcopy::state().srcImage != g_sceneDepth)) fgStale = true;
+            if (fgprep::state().ready && !fgprep::state().failed &&
+                (fgprep::state().w != rw0 || fgprep::state().h != rh0 ||
+                 fgprep::state().depthSrc != depthcopy::state().image ||
+                 fgprep::state().velSrc != g_mv.image)) fgStale = true;
+        }
+    }
+    if ((wantFgOrFsr && (needFsr3 || needDepthCp || needSideCar || needPrep)) ||
+        taaDepthStale || fgStale) {
         VkDevice dev = VK_NULL_HANDLE; VkPhysicalDevice ph = VK_NULL_HANDLE;
         PFN_vkGetDeviceProcAddr gd = nullptr;
         uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
@@ -9449,20 +9494,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         // depth / motion vectors in u.shared[] - which is what canInterp
         // reads. fgprep (the "own" prepare pass) is created but never
         // recorded anywhere, so this is the only path that fills the inputs.
-        if (dev && ph && gd && rw && rh && ow && oh && rw < ow)
+        if (wantFgOrFsr && dev && ph && gd && rw && rh && ow && oh && rw < ow)
             fsr3::ensure(dev, ph, gd, g_getPhysMemProps, rw, rh, ow, oh);
         // The side-car's own command pool, buffer, fence and throwaway output.
         // Built here for the same reason as the two above: creating pipelines
         // while a command buffer is being recorded is what killed the sim
         // earlier. Needs the GAME queue, which fgPickQueues chose at swapchain
         // creation and g_fgQ now keeps.
-        if (dev && ph && gd && ow && oh && g_fgQ.game != VK_NULL_HANDLE)
+        if (wantFgOrFsr && dev && ph && gd && ow && oh && g_fgQ.game != VK_NULL_HANDLE)
             fgdilate::ensure(dev, ph, gd, g_getPhysMemProps,
                              g_fgQ.gameFam, g_fgQ.game, ow, oh);
         // The self-contained prepare pass. Needs depthcopy's R32_SFLOAT image
         // (a compute shader cannot sample X-Plane's combined depth-stencil) and
         // our velocity target, so it is built after both exist.
-        if (dev && ph && gd && rw && rh &&
+        if (wantFgOrFsr && dev && ph && gd && rw && rh &&
             depthcopy::state().ready && g_mv.ready)
             fgprep::ensure(dev, ph, gd, g_getPhysMemProps,
                            depthcopy::state().image, g_mv.image, kMvFormat, rw, rh);
@@ -9589,10 +9634,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         // and the swapchain shows its uninitialised output buffer. So the enable
         // bit tracks capability, and the config is re-applied only when it flips.
         fsr3::State &u = fsr3::state();
-        const bool canInterp = u.ready && !u.failed &&
-                               u.shared[0] != VK_NULL_HANDLE &&
-                               u.shared[1] != VK_NULL_HANDLE &&
-                               u.shared[2] != VK_NULL_HANDLE &&
+        // Inputs come from our own prep pass (any resolution) or, failing that,
+        // the legacy upscaler side-car (only exists when render < display).
+        const bool prepInputs = fgprep::state().ready && !fgprep::state().failed &&
+                                fgprep::state().readySlot >= 0;
+        const bool fsr3Inputs = u.ready && !u.failed &&
+                                u.shared[0] != VK_NULL_HANDLE &&
+                                u.shared[1] != VK_NULL_HANDLE &&
+                                u.shared[2] != VK_NULL_HANDLE;
+        const bool canInterp = (prepInputs || fsr3Inputs) &&
+                               /* shared[0]: see fsr3Inputs */
+                               /* shared[1]: see fsr3Inputs */
+                               /* shared[2]: see fsr3Inputs */
                                // "Present" means WRITTEN, not allocated: build 36
                                // enabled generation on allocated-but-never-written
                                // shared images (the dilate side-car had skipped every

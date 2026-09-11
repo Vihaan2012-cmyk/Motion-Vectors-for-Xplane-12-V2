@@ -394,6 +394,10 @@ inline void record(PFN_vkCmdBindPipeline bindPipe,
 {
     State &s = state();
     if (!s.ready || s.failed) return;
+    // Invalidated by Layer_DestroyImage and not yet rebuilt: srcView refers to a
+    // freed image and srcImage is null. A barrier on a null image and a dispatch
+    // through that view is the driver crash this file exists to prevent.
+    if (s.srcImage == VK_NULL_HANDLE || s.srcView == VK_NULL_HANDLE) return;
     if (!bindPipe || !bindSets || !dispatch || !barrierFn) return;
 
     // The destination starts UNDEFINED and must be GENERAL to be written. Done
