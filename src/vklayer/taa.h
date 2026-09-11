@@ -59,6 +59,11 @@ struct TaaState {
     VkDeviceMemory  historyMem[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkImageView     historyView[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     uint32_t        historyWrite   = 0;   // index written this frame
+    // EXPERIMENTAL taa.conf_exp: last frame's clip-w beside the colour history, same ping-pong.
+    VkImage         hdepth[2]      = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceMemory  hdepthMem[2]   = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView     hdepthView[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    bool            hdepthInit     = false;
     // ---- THE SHARPEN TARGET. A THIRD BUFFER THAT NEVER FEEDS BACK.
     //
     // MODE_SHARPEN reads the resolved history and writes here; the copy-to-screen
@@ -324,6 +329,9 @@ enum {
     kTaaFlagGi            = 1 << 16,  // binding 11 carries gathered bounce
     kTaaFlagNormalTap     = 1 << 17,  // binding 12 carries gbuf-normal
     kTaaFlagBoxMod        = 1 << 18,  // clamp box in the modulated sample's space
+    kTaaFlagAccumExp      = 1 << 19,  // EXPERIMENTAL taa.accum_exp: sample-count history length
+    kTaaFlagConfExp       = 1 << 20,  // EXPERIMENTAL taa.conf_exp: confidence-widened box + depth-consistency reset
+    kTaaFlagScreenReset   = 1 << 21,  // taa.screen_reset: near + screen-static + 3x3 mean changed => take the frame
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -533,8 +541,10 @@ static void taaDestroyState(DeviceData &dd, TaaState &parked)
     if (parked.samplerNearest) dd.destroySampler(parked.device, parked.samplerNearest, nullptr);
     if (parked.samplerShadowLE) dd.destroySampler(parked.device, parked.samplerShadowLE, nullptr);
     if (parked.samplerShadowGE) dd.destroySampler(parked.device, parked.samplerShadowGE, nullptr);
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < 2; ++i) {
         if (parked.historyView[i]) dd.destroyImageView(parked.device, parked.historyView[i], nullptr);
+        if (parked.hdepthView[i])  dd.destroyImageView(parked.device, parked.hdepthView[i], nullptr);
+    }
     for (std::map<VkImage, VkImageView>::iterator it = parked.sceneViews.begin();
          it != parked.sceneViews.end(); ++it)
         if (it->second) dd.destroyImageView(parked.device, it->second, nullptr);
@@ -574,6 +584,8 @@ static void taaDestroyState(DeviceData &dd, TaaState &parked)
     for (int i = 0; i < 2; ++i) {
         if (parked.history[i])    dd.destroyImage(parked.device, parked.history[i], nullptr);
         if (parked.historyMem[i]) dd.freeMemory(parked.device, parked.historyMem[i], nullptr);
+        if (parked.hdepth[i])     dd.destroyImage(parked.device, parked.hdepth[i], nullptr);
+        if (parked.hdepthMem[i])  dd.freeMemory(parked.device, parked.hdepthMem[i], nullptr);
     }
     if (parked.sharpView)  dd.destroyImageView(parked.device, parked.sharpView, nullptr);
     if (parked.sharpImage) dd.destroyImage(parked.device, parked.sharpImage, nullptr);
@@ -682,6 +694,23 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     // sampled as history, so the sharpen it holds cannot compound. Optional: on
     // any failure it is left null and taaRecordResolve falls back to copying the
     // resolved history straight to screen, exactly as before the sharpen existed.
+    {   // EXPERIMENTAL taa.conf_exp: depth history, R16F, created beside the colour history.
+        VkImageCreateInfo dci = ici; dci.format = VK_FORMAT_R16G16B16A16_SFLOAT;   // clip-w, vx, vy
+        g_taa.hdepthInit = false;
+        for (int hi = 0; hi < 2; ++hi) {
+            g_taa.hdepth[hi] = VK_NULL_HANDLE; g_taa.hdepthMem[hi] = VK_NULL_HANDLE; g_taa.hdepthView[hi] = VK_NULL_HANDLE;
+            if (dd.createImage(dev, &dci, nullptr, &g_taa.hdepth[hi]) != VK_SUCCESS) { g_taa.hdepth[hi] = VK_NULL_HANDLE; break; }
+            VkMemoryRequirements mr; dd.getImageMemReq(dev, g_taa.hdepth[hi], &mr);
+            VkMemoryAllocateInfo mai; memset(&mai, 0, sizeof(mai));
+            mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; mai.allocationSize = mr.size;
+            mai.memoryTypeIndex = taaFindMemory(dd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (mai.memoryTypeIndex == UINT32_MAX || dd.allocateMemory(dev, &mai, nullptr, &g_taa.hdepthMem[hi]) != VK_SUCCESS) {
+                dd.destroyImage(dev, g_taa.hdepth[hi], nullptr); g_taa.hdepth[hi] = VK_NULL_HANDLE; g_taa.hdepthMem[hi] = VK_NULL_HANDLE; break;
+            }
+            dd.bindImageMemory(dev, g_taa.hdepth[hi], g_taa.hdepthMem[hi], 0);
+        }
+        if (!g_taa.hdepth[0] || !g_taa.hdepth[1]) trace("TAA: depth history not created - taa.conf_exp unavailable");
+    }
     g_taa.sharpLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (dd.createImage(dev, &ici, nullptr, &g_taa.sharpImage) == VK_SUCCESS) {
         VkMemoryRequirements mr;
@@ -717,6 +746,14 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     for (int hi = 0; hi < 2; ++hi) {
         ivci.image = g_taa.history[hi];
         if (dd.createImageView(dev, &ivci, nullptr, &g_taa.historyView[hi]) != VK_SUCCESS) return false;
+    }
+    if (g_taa.hdepth[0] && g_taa.hdepth[1]) {
+        ivci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        for (int hi = 0; hi < 2; ++hi) {
+            ivci.image = g_taa.hdepth[hi];
+            if (dd.createImageView(dev, &ivci, nullptr, &g_taa.hdepthView[hi]) != VK_SUCCESS) g_taa.hdepthView[hi] = VK_NULL_HANDLE;
+        }
+        ivci.format = fmt;
     }
     // The sharpen target's view. If it fails, disable the sharpen rather than
     // the whole resolve - the copy-back falls back to the history image.
@@ -871,7 +908,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                   "override stays off");
     }
 
-    VkDescriptorSetLayoutBinding b[13];
+    VkDescriptorSetLayoutBinding b[15];
     memset(b, 0, sizeof(b));
     // Binding 0 is a SAMPLER now, not a storage image: the dispatch only reads
     // the scene. That is what lets the scene target keep X-Plane's own usage
@@ -909,14 +946,16 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     // bound to the velocity view when unidentified, gated by kTaaFlagNormalTap
     // exactly like every other engine tap.
     b[12].binding = 12; b[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    for (int i = 0; i < 13; ++i) {
+    b[13].binding = 13; b[13].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;   // depth history, read
+    b[14].binding = 14; b[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            // depth history, write
+    for (int i = 0; i < 15; ++i) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci;
     memset(&dlci, 0, sizeof(dlci));
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 13; dlci.pBindings = b;
+    dlci.bindingCount = 15; dlci.pBindings = b;
     if (dd.createDescriptorSetLayout(dev, &dlci, nullptr, &g_taa.setLayout) != VK_SUCCESS) return false;
 
     VkPushConstantRange pcr;
@@ -969,9 +1008,9 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
 
     VkDescriptorPoolSize ps[3];
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    ps[0].descriptorCount = 1 * TaaState::kSets;   // history write only
+    ps[0].descriptorCount = 2 * TaaState::kSets;   // history write + depth history write
     ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    ps[1].descriptorCount = 9 * TaaState::kSets;   // + sun cascades, env probes, GI, normals
+    ps[1].descriptorCount = 10 * TaaState::kSets;  // + sun cascades, env probes, GI, normals, depth history
     ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ps[2].descriptorCount = 3 * TaaState::kSets;   // reproj + u_shadow_data + u_gbuffer_data
     VkDescriptorPoolCreateInfo dpci;
@@ -1759,12 +1798,19 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                               0, nullptr, 0, nullptr, 2, att);
-        VkImageMemoryBarrier hist[2] = { bar[1], barRead };
+        VkImageMemoryBarrier hist[4] = { bar[1], barRead, bar[1], barRead };
+        uint32_t nHist = 2;
+        if (g_taa.hdepthView[0] && g_taa.hdepthView[1]) {              // EXPERIMENTAL taa.conf_exp: depth history rides the same barriers
+            hist[2].image = g_taa.hdepth[hw_]; hist[3].image = g_taa.hdepth[hr_];
+            hist[2].oldLayout = hist[3].oldLayout = g_taa.hdepthInit ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            hist[2].newLayout = hist[3].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            g_taa.hdepthInit = true; nHist = 4;
+        }
         dd.cmdPipelineBarrier(cb,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                               VK_PIPELINE_STAGE_TRANSFER_BIT,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                              0, nullptr, 0, nullptr, 2, hist);
+                              0, nullptr, 0, nullptr, nHist, hist);
     }
 
     // ---- THE GATHER, AFTER THE TRANSITIONS AND BEFORE THE RESOLVE.
@@ -2170,11 +2216,23 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     viewLedgerNoteBind(ii[7].imageView,  VK_NULL_HANDLE);
     viewLedgerNoteBind(nii.imageView,    VK_NULL_HANDLE);
 
-    VkWriteDescriptorSet wrAll[13];
+    const bool hd = g_taa.hdepthView[0] != VK_NULL_HANDLE && g_taa.hdepthView[1] != VK_NULL_HANDLE;
+    VkDescriptorImageInfo hdi[2]; memset(hdi, 0, sizeof(hdi));
+    hdi[0].sampler = g_taa.samplerNearest; hdi[0].imageView = hd ? g_taa.hdepthView[hr_] : g_taa.velView;
+    hdi[0].imageLayout = hd ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    hdi[1].imageView = hd ? g_taa.hdepthView[hw_] : g_taa.historyView[hw_];   // only written under the flag, which requires hd
+    hdi[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet wrhd[2]; memset(wrhd, 0, sizeof(wrhd));
+    for (int k = 0; k < 2; ++k) {
+        wrhd[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wrhd[k].dstSet = set;
+        wrhd[k].dstBinding = 13u + (uint32_t)k; wrhd[k].descriptorCount = 1; wrhd[k].pImageInfo = &hdi[k];
+        wrhd[k].descriptorType = k == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    VkWriteDescriptorSet wrAll[15];
     for (int k = 0; k < 8; ++k) wrAll[k] = wr[k];
     wrAll[8] = wru; wrAll[9] = wrs; wrAll[10] = wrg; wrAll[11] = wrgi;
-    wrAll[12] = wrn;
-    dd.updateDescriptorSets(g_taa.device, 13, wrAll, 0, nullptr);
+    wrAll[12] = wrn; wrAll[13] = wrhd[0]; wrAll[14] = wrhd[1];
+    dd.updateDescriptorSets(g_taa.device, 15, wrAll, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -2286,7 +2344,14 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                  | (taaCrUnjitter()    ? kTaaFlagCrUnjitter    : 0)
                  | (live::onoff("taa.novec_by_vel", nullptr, false)
                         ? kTaaFlagNoVecByVel : 0)
-                 | (taaDilate()        ? kTaaFlagDilate        : 0);
+                 | (taaDilate()        ? kTaaFlagDilate        : 0)
+                 | (live::onoff("taa.accum_exp", "TAA_ACCUM_EXP", false)
+                                        ? kTaaFlagAccumExp      : 0)
+                 | ((live::onoff("taa.conf_exp", "TAA_CONF_EXP", false) &&
+                     g_taa.hdepthView[0] != VK_NULL_HANDLE && g_taa.hdepthView[1] != VK_NULL_HANDLE)
+                                        ? kTaaFlagConfExp       : 0)
+                 | (live::onoff("taa.screen_reset", "TAA_SCREEN_RESET", true)
+                                        ? kTaaFlagScreenReset   : 0);
     pcv.velScale = taaVelScale();
     pcv.velYSign = taaVelYSign();
     pcv.flagsValid = (g_taa.flagsValid && taaObjFlags()) ? 1 : 0;

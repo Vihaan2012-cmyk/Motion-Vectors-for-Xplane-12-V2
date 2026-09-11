@@ -154,6 +154,8 @@ layout(binding = 11) uniform sampler2DArray uGi;
 // The engine's own eye-space normals, spheremap-encoded in .xy. Dummy-bound to
 // the velocity view when unidentified; read only under FLAG_NORMAL_TAP.
 layout(binding = 12) uniform sampler2DArray uNormal;
+layout(binding = 13)          uniform sampler2DArray uHistDepthPrev;  // EXPERIMENTAL taa.conf_exp: last frame's clip-w
+layout(binding = 14, rgba16f) uniform image2DArray  uHistDepthOut;   // this frame's clip-w and vector, read next frame
 
 layout(binding = 10, std140) uniform EngineGbuf {
     vec4 gViewportSize;        // xy = size, zw = 1/size
@@ -311,6 +313,8 @@ const int FLAG_PROBE_TAP      = 16384; // binding 8 carries the env cubemaps
 const int FLAG_GBUF_TAP       = 32768; // binding 10 carries u_gbuffer_data
 const int FLAG_GI             = 65536; // binding 11 carries gathered bounce
 const int FLAG_NORMAL_TAP     = 131072; // binding 12 carries gbuf-normal
+const int FLAG_ACCUM_EXP      = 524288; // EXPERIMENTAL taa.accum_exp: history length from a sample count, not speed
+const int FLAG_CONF_EXP       = 1048576; // EXPERIMENTAL taa.conf_exp: confidence widens the clamp box; depth mismatch resets
 const int FLAG_BOX_MOD        = 262144; // clamp box built in the modulated sample's space
 // view distance from engine depth; fb is the injected clip-w fallback so a
 // wrong identification degrades to exactly the previous behaviour.
@@ -1675,6 +1679,27 @@ void main()
     }
 
     vec3 hist = sampleHistory(hUv, float(layer), vec2(size));
+    // ---- EXPERIMENTAL (taa.conf_exp): how many samples does this history hold, and is
+    // it still the same surface? The count is the reciprocal of last frame's blend
+    // weight (history alpha at the reprojected position). The surface test compares
+    // this pixel's clip-w with the one stored at the reprojected position last frame:
+    // a real disocclusion changes depth, a sub-pixel line missed by the jitter does not.
+    float confN = 0.0; bool confDepthOk = true;
+    if ((pc.flags & FLAG_CONF_EXP) != 0) {
+        float aPrevC = clamp(texture(uHistorySampler, vec3(hUv, float(layer))).a, 0.0, 1.0);
+        confN = (aPrevC > 1e-4) ? (1.0 / aPrevC - 1.0) : 0.0;
+        vec3  hp    = texture(uHistDepthPrev, vec3(hUv, float(layer))).rgb;   // last frame: clip-w, vx, vy at the reprojected position
+        float wPrev = hp.r;
+        float wCur  = velS.z;
+        confDepthOk = (wCur > 0.0) && (wPrev > 0.0) && (abs(wCur - wPrev) < 0.05 * max(wCur, wPrev) + 0.5);
+        // Velocity consistency: a wrong vector jumps frame to frame; a smooth camera
+        // swing changes it by a fraction of a pixel. Over 1 px of change starts the
+        // decay, 3 px is a reset. This is what the speed ramp was standing in for.
+        float dvPx = length((velS.xy - hp.gb) * vec2(size));
+        float rejV = clamp((dvPx - 1.0) / 2.0, 0.0, 1.0);
+        if (!confDepthOk) confN = 0.0;
+        confN *= (1.0 - rejV);
+    }
 
     // History straight to screen, before anything is done to it. If this does
     // not smear along motion when frozen, what is displayed is not the history
@@ -1845,6 +1870,30 @@ void main()
                                    smoothstep(0.02, 0.15, luma(tm(currA))));
     vec3 lo    = max(mu - clipK * sigma, nmin);
     vec3 hi    = min(mu + clipK * sigma, nmax);
+    if ((pc.flags & FLAG_ACCUM_EXP) != 0 && pc.movedDead > 0.0) {
+        // ---- EXPERIMENTAL (taa.accum_exp + taa.moved_dead): NEVER CLAMP TIGHTER
+        // THAN THE DEADBAND. A sub-pixel strip - a taxiway at range - is missed
+        // on some jitter phases; the neighbourhood is then uniform, sigma ~ 0,
+        // the box collapses to a hair and the averaged strip in history is
+        // clamped away, so it blinks. The deadband already declares corrections
+        // this small to be no evidence of stale history; let it floor the box in
+        // the same absolute units (movedDead x 1 % of luma), so low-contrast
+        // sub-pixel detail survives a missed phase while a disocclusion, which
+        // is large, still clamps.
+        vec3 bf = vec3(pc.movedDead * (0.01 * luma(tm(currA)) + 1e-4));
+        lo = min(lo, mu - bf);
+        hi = max(hi, mu + bf);
+    }
+    if ((pc.flags & FLAG_CONF_EXP) != 0 && confDepthOk) {
+        // ---- EXPERIMENTAL (taa.conf_exp): CONFIDENCE WIDENS THE BOX. A pixel whose
+        // history has averaged sixteen frames on the same surface has earned a box
+        // up to 4x wider, so a sub-pixel taxiway line survives the phases that miss
+        // it. A disocclusion never gets here: the depth test zeroed confN and the
+        // reset below takes the frame outright.
+        float widen = 1.0 + 1.0 * clamp((confN - 1.0) / 7.0, 0.0, 1.0);   // capped at 2x: 4x admitted ghosts on camera moves (2026-09-10)
+        lo = mu - (mu - lo) * widen;
+        hi = mu + (hi - mu) * widen;
+    }
 
     vec3 hRaw = rgb2ycocg(tm(hist));
     vec3 hy   = clamp(hRaw, lo, hi);
@@ -1966,6 +2015,43 @@ void main()
     float t       = clamp(speedPx / max(pc.alphaMovingPx, 1e-3), 0.0, 1.0);
     float aBase   = mix(pc.alpha, max(pc.alpha, pc.alphaMoving), t);
     float a = clamp(aBase + pc.gain * moved * aBase, aBase, 1.0);
+    if ((pc.flags & FLAG_ACCUM_EXP) != 0) {
+        // ---- EXPERIMENTAL (taa.accum_exp): CONFIDENCE, NOT SPEED, SETS HISTORY LENGTH.
+        //
+        // The speed ramp above shortens history wherever a pixel moves fast, as a
+        // hedge against vectors that are slightly wrong. With correct vectors it
+        // only costs samples. Here the length comes from a per-pixel count: the
+        // weight this pixel blended with last frame sits in history alpha at the
+        // reprojected position, and its reciprocal is how many samples the history
+        // holds. Evidence that history is wrong - the clamp having to move it -
+        // resets the count; speed does not touch it. A reset pixel re-accumulates
+        // 1, 1/2, 1/3 ... down to pc.alpha, so fast-but-tracked content converges
+        // fully and a wrong vector decays in a few frames instead of smearing.
+        float aPrev = clamp(texture(uHistorySampler, vec3(hUv, float(layer))).a, 0.0, 1.0);
+        float nPrev = (aPrev > 1e-4) ? (1.0 / aPrev - 1.0) : 0.0;
+        float rej   = clamp(pc.gain * moved, 0.0, 1.0);
+        // Under taa.conf_exp the count no longer listens to `moved` at all when the depth
+        // says same surface. `moved` divides the clamp correction by the neighbourhood
+        // sigma, and on smooth moving ground sigma is ~0: bilinear resampling noise then
+        // reads as a large correction every frame and the count never builds (measured
+        // 2026-09-10: the whole far ground blending at 0.4-0.6 per frame). The box still
+        // bounds the VALUE each frame; the depth test below is the reset.
+        if ((pc.flags & FLAG_CONF_EXP) != 0 && confDepthOk) {
+            // Colour decay in ABSOLUTE terms: how far the history sits from the current
+            // 3x3 mean, tonemapped YCoCg. Below 0.12 (a faint line, resampling noise) the
+            // count is untouched; above 0.22 it is reset. Not sigma-normalised, so smooth
+            // ground no longer resets every frame; depth mismatch still resets hard below.
+            rej = max(clamp((length(hRaw - mu) - 0.12) / 0.10, 0.0, 1.0), 1.0 - (confN + 1.0) / (nPrev + 1.0));   // colour decay, and the velocity-consistency decay already folded into confN
+        }
+        float n     = nPrev * (1.0 - rej);
+        // The stored weight 1/(N+1) means N frames are in history; blending this frame
+        // as the (N+1)-th at equal weight is 1/(N+2). Writing 1/(N+1) here was an
+        // off-by-one with a fixed point at 1: an empty history stored 1, read back as
+        // empty, and every pixel took the current frame forever (measured 2026-09-10:
+        // history alpha 1.000 on every pixel of a captured frame).
+        a = max(1.0 / (n + 2.0), pc.alpha);
+    }
+    if ((pc.flags & FLAG_CONF_EXP) != 0 && !confDepthOk) a = 1.0;   // depth changed: a real disocclusion, take the frame
 
     // Moving-geometry pixels take the current frame outright - see uFlags.
     if (pc.flagsValid != 0) {
@@ -2032,4 +2118,5 @@ void main()
     // 1 means it is raw current frame with nothing behind it. Storing it here
     // costs nothing and hands the next pass the one number it was missing.
     imageStore(uHistory, ivec3(px, layer), vec4(outc, a));
+    if ((pc.flags & FLAG_CONF_EXP) != 0) imageStore(uHistDepthOut, ivec3(px, layer), vec4(velS.z, velS.x, velS.y, 0.0));
 }
