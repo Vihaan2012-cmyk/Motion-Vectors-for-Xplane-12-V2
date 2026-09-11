@@ -42,6 +42,10 @@ struct State {
     VkDeviceMemory   mem    = VK_NULL_HANDLE;
     VkImageView      dstView = VK_NULL_HANDLE;
     VkImageView      srcView = VK_NULL_HANDLE;  // depth aspect of X-Plane's image
+    // The same R32 copy as a 2D ARRAY view: the TAA resolve declares its
+    // engine-depth binding as sampler2DArray (VR layers), and a view's type
+    // must match the sampler's. One layer, same image, same values.
+    VkImageView      arrayView = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkDescriptorPool      pool      = VK_NULL_HANDLE;
@@ -122,10 +126,12 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
 
         // The two views first - srcView is the dangling one, dstView belongs to
         // our own image which is about to go too.
-        if (destroyView && s.srcView) destroyView(device, s.srcView, nullptr);
-        if (destroyView && s.dstView) destroyView(device, s.dstView, nullptr);
+        if (destroyView && s.srcView)   destroyView(device, s.srcView, nullptr);
+        if (destroyView && s.dstView)   destroyView(device, s.dstView, nullptr);
+        if (destroyView && s.arrayView) destroyView(device, s.arrayView, nullptr);
         s.srcView = VK_NULL_HANDLE;
         s.dstView = VK_NULL_HANDLE;
+        s.arrayView = VK_NULL_HANDLE;
 
         // Our R32_SFLOAT copy is sized for the old extent. Even when the extent
         // is unchanged it must go, because its dstView did.
@@ -262,6 +268,13 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     if (createView(device, &ivci, nullptr, &s.dstView) != VK_SUCCESS) {
         s.failed = true; trace("DEPTH COPY: destination view failed"); return false;
     }
+    // The array-typed twin for the resolve (see State::arrayView). A 2D_ARRAY
+    // view over a one-layer 2D image is legal; only the type differs.
+    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    if (createView(device, &ivci, nullptr, &s.arrayView) != VK_SUCCESS) {
+        s.failed = true; trace("DEPTH COPY: array view failed"); return false;
+    }
+    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
 
     // ---- descriptors
     VkDescriptorSetLayoutBinding binds[2];

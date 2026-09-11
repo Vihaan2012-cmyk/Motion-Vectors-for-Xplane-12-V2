@@ -1884,7 +1884,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // Still ahead of the resolve's own dispatch, so the result is composited
     // in the same frame, with the gather's trailing barrier ordering it.
     gi::record(dd, g_taa.device, cb, g_taa.sceneView, g_taa.velView,
-               g_taa.edValid ? g_taa.edView : VK_NULL_HANDLE,
+               g_taa.edValid ? edBindView : VK_NULL_HANDLE,
                g_taa.probeValid ? g_taa.probeView : VK_NULL_HANDLE,
                g_taa.w, g_taa.h, g_taaEdAB[0], g_taaEdAB[1],
                g_taaInvProj[0], g_taaInvProj[1],
@@ -2043,10 +2043,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // Binding 5: the engine's depth when identified, the velocity target as a
     // dummy otherwise (any float array view satisfies the layout; the shader
     // never samples it unless kTaaFlagEngineDepth is set, and that flag is only
-    // set when edValid). Same no-barrier reasoning as binding 4: by resolve
-    // time the deferred shading, clouds and fog have all sampled this image,
-    // so the engine has already moved it to a shader-readable layout.
-    ii[5].imageView = g_taa.edValid ? g_taa.edView : g_taa.velView;
+    // set when edValid). edBindView is the barriered R32 copy whenever it is
+    // available (see the note above the gather), else the direct view - which
+    // rests on the no-barrier reasoning of binding 4 and was measured noisy.
+    ii[5].imageView = g_taa.edValid ? edBindView : g_taa.velView;
     ii[5].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     ii[5].sampler   = g_taa.samplerNearest;   // depth: no filtering across edges
     // Bindings 7/8: engine cascades and probes, dummy-bound like binding 5.
