@@ -2159,6 +2159,12 @@ static const char *formatName(VkFormat f);
 static VkImageLayout g_sceneDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 #include "mv_family_table.h"
+// ---- 12.4.4 PROBE: family-table census (distinct vertex-shader hashes seen at pipeline
+// creation, split by which table knew them). Reported every 600 presents.
+static std::mutex            g_famCensusLock;
+static std::set<uint64_t>    g_famSeen;
+static std::vector<uint64_t> g_famUnmatched;
+static size_t g_famZero = 0, g_famMasked = 0, g_famGround = 0, g_famNone = 0;
 #include "mv_target.h"
 #include "spirv_inject.h"
 #include "xpfsr_spv.h"
@@ -6783,6 +6789,21 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                 std::map<VkImageView, VkImage>::iterator va =
                     g_viewToImage.find(info->pColorAttachments[a].imageView);
                 if (va != g_viewToImage.end()) g_seenAsAttachment.insert(va->second);
+                // ---- 12.4.4 PROBE: which formats each pass shape binds (G-buffer layout).
+                if (va != g_viewToImage.end()) {
+                    std::map<VkImage, ColorTarget>::iterator ct = g_colorImages.find(va->second);
+                    const int fmt = (ct != g_colorImages.end()) ? (int)ct->second.format : -1;
+                    static std::set<uint64_t> seenShape;
+                    const uint64_t key = ((uint64_t)info->renderArea.extent.width << 44) |
+                                         ((uint64_t)info->renderArea.extent.height << 28) |
+                                         ((uint64_t)info->colorAttachmentCount << 20) |
+                                         ((uint64_t)a << 12) | (uint64_t)(fmt & 0xFFF);
+                    if (seenShape.size() < 160 && seenShape.insert(key).second)
+                        trace("PASS ATTACHMENT: pass %ux%u with %u colour(s): colour[%u] fmt=%d %s",
+                              info->renderArea.extent.width, info->renderArea.extent.height,
+                              info->colorAttachmentCount, a, fmt,
+                              info->pDepthAttachment ? "(+depth)" : "(no depth)");
+                }
             }
 
             static std::set<VkImage> seenAny;
@@ -11263,6 +11284,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 off += snprintf(line + off, sizeof(line) - off, " [%d]=%llu", i,
                                 (unsigned long long)g_mvPassDraws[i]);
         if (off) trace("MV PASS CENSUS: geometry binds per qualifying pass -%s", line);
+        {
+            std::lock_guard<std::mutex> fg(g_famCensusLock);
+            trace("FAMILY CENSUS: %zu distinct vertex shaders - zero=%zu masked=%zu ground=%zu "
+                  "UNMATCHED=%zu (the table was generated from 12.4.3's spv.zip; a large unmatched "
+                  "count means the pack changed and the table needs regenerating). Sparse queue binds: %llu",
+                  g_famSeen.size(), g_famZero, g_famMasked, g_famGround, g_famNone,
+                  (unsigned long long)vram::sparseBinds);
+            if (frames == 1200 || frames == 6000) {
+                char hl[1024]; int ho = 0;
+                for (size_t i = 0; i < g_famUnmatched.size() && ho < 990; ++i)
+                    ho += snprintf(hl + ho, sizeof(hl) - ho, " %016llx", (unsigned long long)g_famUnmatched[i]);
+                if (ho) trace("FAMILY UNMATCHED (first %zu):%s", g_famUnmatched.size(), hl);
+            }
+        }
     }
 
     // ---- CHOOSE THE WORLD PASS FROM THE FRAME JUST FINISHED.
@@ -14159,6 +14194,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     // keep their depth channel through the select blend, so
                     // AO and contact stay right on markings.
                     if (mvFamilyZero(vertHash))        wouldZero = true;
+                    // ---- 12.4.4 PROBE: how much of X-Plane's shader pack the table still knows.
+                    if (vertHash) {
+                        std::lock_guard<std::mutex> fg(g_famCensusLock);
+                        if (g_famSeen.insert(vertHash).second) {
+                            if (mvFamilyZero(vertHash))        ++g_famZero;
+                            else if (mvFamilyMasked(vertHash)) ++g_famMasked;
+                            else if (mvFamilyGround(vertHash)) ++g_famGround;
+                            else { ++g_famNone; if (g_famUnmatched.size() < 48) g_famUnmatched.push_back(vertHash); }
+                        }
+                    }
                     else if (mvFamilyMasked(vertHash)) wouldMask = true;
                     const VkPipelineColorBlendStateCreateInfo *cbF = ci[i].pColorBlendState;
                     const bool blends = cbF && cbF->attachmentCount > 0 &&
