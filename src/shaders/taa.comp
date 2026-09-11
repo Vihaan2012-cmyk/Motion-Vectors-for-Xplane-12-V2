@@ -119,7 +119,7 @@ layout(binding = 5)          uniform sampler2DArray uEngineDepth;
 // mathematics rather than being a special case.
 //
 // uReprojParams: x = the viewport Y sign (framebuffer-UV to NDC), y = 1 when
-// the matrix is valid this frame (the plugin could not always invert), zw
+// the matrix is valid this frame (the plugin could not always invert), z = taa.alpha_near (near-static history floor), w
 // unused. Read only under FLAG_DEPTH_REPROJECT.
 layout(binding = 6, std140) uniform ReprojData {
     mat4 uReproj;
@@ -316,6 +316,7 @@ const int FLAG_NORMAL_TAP     = 131072; // binding 12 carries gbuf-normal
 const int FLAG_ACCUM_EXP      = 524288; // EXPERIMENTAL taa.accum_exp: history length from a sample count, not speed
 const int FLAG_CONF_EXP       = 1048576; // EXPERIMENTAL taa.conf_exp: confidence widens the clamp box; depth mismatch resets
 const int FLAG_BOX_MOD        = 262144; // clamp box built in the modulated sample's space
+const int FLAG_SCREEN_RESET   = 2097152; // taa.screen_reset: near + screen-static + 3x3 mean changed => take the frame
 // view distance from engine depth; fb is the injected clip-w fallback so a
 // wrong identification degrades to exactly the previous behaviour.
 // Velocity reconstructed from engine depth + camera motion, in EXACTLY the
@@ -2083,6 +2084,36 @@ void main()
     // coverage either, and the mask has no evidence to act on.
     if ((pc.flags & FLAG_REACTIVE) != 0 && !unwritten && covMax < 0.5)
         a = max(a, pc.reactiveAlpha);
+
+    // ---- SCREEN RESET (taa.screen_reset). Cockpit displays are body-static text whose CONTENT
+    // changes. The variance box cannot reject the old digits: black background plus white glyphs
+    // in one 3x3 makes sigma huge, the old colour sits inside the box, `moved` stays near zero
+    // and the blend falls back to alpha - twenty frames of trail behind every changing number.
+    // Where the pixel is near (inside the near-field distance, i.e. the cockpit, never the
+    // parked world), screen-static (under half a pixel of motion) and the 3x3 MEAN of the
+    // frame differs from the 3x3 mean of the history, the content changed: take the frame.
+    // The 3x3 mean barely moves under sub-pixel jitter, so unchanged text keeps its AA.
+    if ((pc.flags & FLAG_SCREEN_RESET) != 0 && !unwritten && speedPx < 0.5 && velS.z > 0.0 &&
+        uReprojParams2.w > 0.0 && mvViewDepth(uv + S, float(layer), velS.z) < uReprojParams2.w) {
+        float cm = 0.0, hm = 0.0;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                vec2 o = vec2(dx, dy) * tsz;
+                cm += luma(tm(texture(uScene, vec3(uv + S + o, float(layer))).rgb));
+                hm += luma(tm(sampleHistory(hUv + o, float(layer), vec2(size))));
+            }
+        if (abs(cm - hm) > 9.0 * 0.06) a = 1.0;   // 0.06 tonemapped luma on the 3x3 mean
+    }
+
+    // ---- NEAR-STATIC HISTORY FLOOR (taa.alpha_near, carried in uReprojParams.z). Cockpit
+    // displays scroll and redraw on geometry that does not move: the history is spatially
+    // identical, its CONTENT is not, and neither the variance box nor the 3x3-mean reset can
+    // tell (2026-09-11: alpha=1.0 removed the trail, jitter off / varclip 1.5 / reset did not).
+    // So the accumulation is capped there: a floor of 0.35 keeps about three frames of history
+    // on near, screen-static pixels instead of twenty. The world keeps pc.alpha.
+    if (uReprojParams.z > 0.0 && !unwritten && speedPx < 0.5 && velS.z > 0.0 &&
+        uReprojParams2.w > 0.0 && mvViewDepth(uv + S, float(layer), velS.z) < uReprojParams2.w)
+        a = max(a, uReprojParams.z);
 
     // How far the clamp had to move history, in standard deviations. Edges under
     // motion should light up and flat interiors should stay black; a frame that

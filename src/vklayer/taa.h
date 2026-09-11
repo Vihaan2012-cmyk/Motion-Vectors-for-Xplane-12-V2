@@ -1993,7 +1993,12 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         memcpy(slot, snapReproj, 16 * sizeof(float));
         slot[16] = snapYSign;
         slot[17] = reprojOn ? 1.0f : 0.0f;
-        slot[18] = 0.0f;
+        // uReprojParams.z: history floor for near, screen-static pixels (taa.alpha_near, 0 = off).
+        // Cockpit displays scroll and redraw on geometry that never moves; no clamp can reject
+        // that (measured 2026-09-11: alpha=1.0 removed the trail, varclip/jitter/mean-reset did
+        // not), so the accumulation is capped there instead. Lives here because the push block
+        // is at its 128-byte ceiling.
+        slot[18] = live::f("taa.alpha_near", "TAA_ALPHA_NEAR", 0.35f);
         slot[19] = 0.0f;
         // Second param row: eye-position reconstruction for the cascade tap.
         slot[20] = snapIp[0];
