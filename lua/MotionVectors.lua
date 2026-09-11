@@ -1640,4 +1640,63 @@ create_command("FlyWithLua/MotionVectors/toggle_panel",
                "TAA for X-Plane 12: toggle panel",
                "if mv_open then mv_open() end", "", "")
 
+-- ---- SCREEN-SPACE REFLECTIONS: HELD OFF, BOTH HALVES.
+--
+-- sim/private/controls/debug/kill_ssr drops the ssr_deferred pass;
+-- kill_ssr_reproj removes SSR's own temporal reprojection - a second temporal
+-- filter running AHEAD of our resolve with its own history, and the source of
+-- the shimmer on glossy surfaces under camera motion. Re-applied every few
+-- seconds because the sim resets art controls on aircraft and scenery loads.
+-- taa.kill_ssr=0 in the live ini restores SSR without touching this file.
+function mv_hold_ssr()
+  local want = (ini_get("taa.kill_ssr", "1") ~= "0") and 1 or 0
+  set("sim/private/controls/debug/kill_ssr", want)
+  set("sim/private/controls/debug/kill_ssr_reproj", want)
+end
+mv_hold_ssr()
+do_sometimes("mv_hold_ssr()")
+
+-- ---- DAY/NIGHT SWEEP FOR TRAINING CAPTURE.
+--
+-- While the layer captures (nn.capture=1) and nn.sweep_time is not 0, the sim
+-- clock is stepped by nn.sweep_step seconds (default 1200 = 20 min) every few
+-- seconds, wrapping at midnight, so a parked camera sees the whole day: dawn,
+-- noon, dusk, night, every lighting regime the shaders have. Setting the clock
+-- dataref directly is exact and free; running physics at 3600x is neither.
+-- The panel shadows FlyWithLua's get() with one that only knows datarefs
+-- declared through try_dataref, so the clock is declared the same way.
+-- ZULU time is the writable clock in X-Plane 12; local_time_sec is derived
+-- and read-only, and declaring it writable gets the whole script QUARANTINED
+-- (FlyWithLua flags "not writeable" outside of pcall's reach). Read-only
+-- declarations only ever fail softly.
+try_dataref("sim/time/zulu_time_sec",          "writable")
+try_dataref("sim/time/local_time_sec",         "readonly")
+try_dataref("sim/time/total_running_time_sec", "readonly")
+local mv_sweep_last = -1
+local mv_burst_seen = nil
+-- Stepped per CAPTURE BURST, not per tick: the layer writes <capture_dir>/bursts.txt
+-- when a burst's last frame is on disk; this polls it once a second and steps
+-- zulu time by nn.sweep_step. Frames inside a burst therefore share their
+-- lighting (a temporal pair needs that) and every burst lands at a new hour.
+function mv_sweep_time()
+  if not have["sim/time/zulu_time_sec"] then return end
+  if ini_get("nn.capture", "0") == "0" or ini_get("nn.sweep_time", "1") == "0" then return end
+  local f = io.open((ini_get("nn.capture_dir", "D:/NNCap")) .. "/bursts.txt", "r")
+  if not f then return end
+  local n = f:read("*l"); f:close()
+  if n == nil or n == mv_burst_seen then return end
+  if mv_burst_seen == nil then mv_burst_seen = n; return end     -- first sight: sync, no step
+  mv_burst_seen = n
+  local step = tonumber(ini_get("nn.sweep_step", "1200")) or 1200
+  local z = get("sim/time/zulu_time_sec", nil)
+  if type(z) ~= "number" then return end
+  z = z + step
+  if z >= 86400 then z = z - 86400 end
+  SIM_time_zulu_time_sec = z
+  mv_sweep_last = z
+  local c = io.open((ini_get("nn.capture_dir", "D:/NNCap")) .. "/clock.log", "a")
+  if c then c:write(string.format("%.3f %.1f %.1f burst %s\n", get("sim/time/total_running_time_sec", -1), get("sim/time/local_time_sec", -1), z, n)); c:close() end
+end
+do_often("mv_sweep_time()")
+
 mv_open()
