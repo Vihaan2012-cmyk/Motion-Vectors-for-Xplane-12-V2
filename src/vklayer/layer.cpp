@@ -3315,6 +3315,11 @@ static PagerBucket g_pagerLoad, g_pagerFlight;
 static uint32_t pagerDropLevelsRaw(const VkImageCreateInfo *ci)
 {
     if (!g_pagerDropAbove) return 0;
+    // 12.4.4 puts LIT textures on sparse residency and binds their mips itself through
+    // vkQueueBindSparse; shrinking such an image here would make those binds target
+    // levels that no longer exist. Sparse images are never paged.
+    if (ci->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                     VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)) return 0;
     if (!pagerShouldEngage()) return 0;
     if (!(ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return 0;
     if (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) return 0;
@@ -4032,6 +4037,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImage(
         if (it != g_devices.end()) next = it->second.createImage;
     }
     if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    // ---- 12.4.4 PROBE: sparse-residency images (the beta moves LIT textures onto them).
+    if (ci->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) {
+        static std::atomic<uint64_t> nSparse(0);
+        const uint64_t k = ++nSparse;
+        if (k <= 8 || (k % 500) == 0)
+            trace("SPARSE IMAGE #%llu: %ux%u fmt=%d mips=%u layers=%u usage=0x%x flags=0x%x "
+                  "(sparse queue binds so far %llu) - never paged, see pagerDropLevelsRaw",
+                  (unsigned long long)k, ci->extent.width, ci->extent.height, (int)ci->format,
+                  ci->mipLevels, ci->arrayLayers, (unsigned)ci->usage, (unsigned)ci->flags,
+                  (unsigned long long)vram::sparseBinds);
+    }
 
     // Opened BEFORE the pager decision, not after, because the decision is now
     // recorded against whether a flight is running - see the load/flight split
