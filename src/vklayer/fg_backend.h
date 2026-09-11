@@ -279,6 +279,74 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
 // swapchain the interpolated frame is unavailable and it presents the real one
 // instead, which is the correct degradation; returning an error for "not ready
 // yet" would make a startup frame look like a failure.
+// ---- NEVER LEAVE THE INTERPOLATED SLOT UNWRITTEN.
+//
+// Once the swapchain config has generation enabled it presents outputs[0] on
+// every other flip no matter what this callback did. Every early return below
+// (aircraft hold, quiet window, inputs not ready, dispatch failure) used to
+// return without touching it, so the flip showed the buffer's stale or
+// uninitialised contents - the black frames seen 2026-09-10 the moment
+// generation first enabled. Copying the real frame in makes those flips a
+// repeat of the real frame instead, which is what 'presenting real frames
+// only' was always meant to be.
+inline void presentRealFrame(const FfxFrameGenerationDispatchDescription *p, const char *why)
+{
+    State &s = state();
+    if (!p || !p->commandList || !p->presentColor.resource || !p->outputs[0].resource) return;
+    PFN_vkGetDeviceProcAddr gdpa = s.vkCtx.vkDeviceProcAddr;
+    VkDevice device = s.vkCtx.vkDevice;
+    if (!gdpa || !device) return;
+    static PFN_vkCmdPipelineBarrier barrierFn = nullptr;
+    static PFN_vkCmdCopyImage copyFn = nullptr;
+    if (!barrierFn) barrierFn = (PFN_vkCmdPipelineBarrier)gdpa(device, "vkCmdPipelineBarrier");
+    if (!copyFn)    copyFn    = (PFN_vkCmdCopyImage)gdpa(device, "vkCmdCopyImage");
+    if (!barrierFn || !copyFn) return;
+    VkCommandBuffer cb = (VkCommandBuffer)p->commandList;
+    VkImage src = (VkImage)p->presentColor.resource;
+    VkImage dst = (VkImage)p->outputs[0].resource;
+    const uint32_t w = p->presentColor.description.width  < p->outputs[0].description.width
+                     ? p->presentColor.description.width  : p->outputs[0].description.width;
+    const uint32_t h = p->presentColor.description.height < p->outputs[0].description.height
+                     ? p->presentColor.description.height : p->outputs[0].description.height;
+    if (!w || !h) return;
+    VkImageMemoryBarrier b[2];
+    memset(b, 0, sizeof(b));
+    for (int i = 0; i < 2; ++i) {
+        b[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b[i].srcQueueFamilyIndex = b[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b[i].subresourceRange.levelCount = 1;
+        b[i].subresourceRange.layerCount = 1;
+    }
+    // The swapchain hands presentColor in PIXEL_COMPUTE_READ (shader-read layout)
+    // and outputs[0] in GENERAL; both go back to exactly that afterwards.
+    b[0].image = src; b[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT; b[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b[1].image = dst; b[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    b[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrierFn(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+              0, 0, nullptr, 0, nullptr, 2, b);
+    VkImageCopy rgn;
+    memset(&rgn, 0, sizeof(rgn));
+    rgn.srcSubresource.aspectMask = rgn.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    rgn.srcSubresource.layerCount = rgn.dstSubresource.layerCount = 1;
+    rgn.extent.width = w; rgn.extent.height = h; rgn.extent.depth = 1;
+    copyFn(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
+    b[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    barrierFn(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+              0, 0, nullptr, 0, nullptr, 2, b);
+    static uint64_t filled = 0;
+    if ((filled++ % 300) == 0)
+        trace("FG: interpolated slot filled with the REAL frame (%s) - %llu so far. Each one "
+              "is a repeated frame, not a black one.", why, (unsigned long long)filled);
+}
 inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription *p,
                                      void *userCtx)
 {
@@ -390,6 +458,7 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
             trace("FG: holding - aircraft swap in progress, presenting real "
                   "frames only and discarding stale interpolation inputs "
                   "(%llu frames held).", (unsigned long long)held);
+        presentRealFrame(p, "aircraft hold");
         return FFX_OK;
     }
     // ---- THE QUIET WINDOW: NO INTERPOLATED FRAMES FOR THE FIRST 12 SECONDS.
@@ -421,6 +490,7 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
                       "real frames only.",
                       (unsigned long long)(nowMs - s.quietStartMs),
                       (unsigned long long)quietMs);
+            presentRealFrame(p, "quiet window");
             return FFX_OK;
         }
     }
@@ -449,6 +519,7 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
             trace("FG: upscaler resources not ready (ready=%d) - presenting the "
                   "real frame, no interpolation yet (%llu skipped).",
                   u.ready ? 1 : 0, (unsigned long long)skipped);
+        presentRealFrame(p, "inputs not ready");
         return FFX_OK;
     }
 
@@ -566,6 +637,7 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     if (rc != FFX_OK) {
         static bool said = false;
         if (!said) { said = true; trace("FG: interpolation dispatch failed (%d)", (int)rc); }
+        presentRealFrame(p, "dispatch failed");
         return rc;
     }
     if ((s.dispatches++ % 300) == 0)
