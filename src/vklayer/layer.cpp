@@ -7251,6 +7251,28 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
     // present time instead would resolve a composited image whose HUD and panel
     // have no vectors, which is what makes UI ghost.
     if (wasScenePass) g_sceneEndsThisFrame.fetch_add(1, std::memory_order_relaxed);
+    // ---- HUD-LESS COPY for frame generation: the backbuffer after the FIRST pass
+    // that targeted it this frame (the tonemapped scene) and before the overlay
+    // passes draw the 2-D panel, popups and menus onto it. See fg::recordHudless.
+    if (swapTarget != VK_NULL_HANDLE && g_fgActive.load(std::memory_order_relaxed) && g_fgSwap.have &&
+        live::onoff("taa.fg_hudless", "TAA_FG_HUDLESS", true)) {
+        fg::State &fs = fg::state();
+        const uint64_t thisPresent = g_frameCount + 1;   // QueuePresent increments before the proxy presents
+        const uint32_t nth = ++fs.swapPassesThisFrame;
+        if (nth == 1 && fs.hudlessFrame != thisPresent) {
+            std::map<VkCommandBuffer, VkDevice>::iterator hdi = g_cbToDevice.find(cb);
+            if (hdi != g_cbToDevice.end()) {
+                std::map<void*, DeviceData>::iterator hdd = g_devices.find(dispatchKey(hdi->second));
+                if (hdd != g_devices.end()) {
+                    DeviceData &d = hdd->second;
+                    fg::recordHudless(d.device, d.phys, d.gdpa, g_getPhysMemProps,
+                                      d.cmdPipelineBarrier, d.cmdCopyImage,
+                                      cb, swapTarget, swapLayout,
+                                      g_fgSwap.dispW, g_fgSwap.dispH, g_fgSwap.dispFmt, thisPresent);
+                }
+            }
+        }
+    }
     // Why the resolve is or is not running. Two crashes have now been blamed on
     // TAA while the log showed it never initialised, which is not a diagnosis.
     if (taaEnabled()) {
@@ -9309,6 +9331,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // somewhere else would drift from this and the two would disagree in logs
     // for reasons nobody could reconstruct later.
     uint64_t frames = ++g_frameCount;
+    fg::state().presentFrame = frames;          // the HUD-less copy stamped with this index is this present's
+    fg::state().swapPassesLastFrame = fg::state().swapPassesThisFrame;
+    fg::state().swapPassesThisFrame = 0;
     oracle::tick(frames);
     nncap::poll();   // hand finished capture readbacks to the writer thread
     accumTick(g_velSnap.jitterX, g_velSnap.jitterY);

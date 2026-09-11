@@ -77,6 +77,23 @@ struct State {
     // Wall-clock start of the current quiet window: the first unheld frame
     // after startup or after an aircraft-swap hold. 0 = re-arm on next frame.
     uint64_t quietStartMs = 0;
+    // ---- HUD-LESS SOURCE. The backbuffer copied at the end of the FIRST pass that
+    // targets it each frame, i.e. after the tonemapped scene lands on it and before
+    // the 2-D panel, popups and menus are drawn. Handed to interpolation as
+    // currentBackBuffer_HUDLess: FFX interpolates from it and re-stamps every pixel
+    // where the presented frame differs (the overlays), so overlay text stays sharp
+    // on generated frames instead of being warped like scenery.
+    VkImage        hudless      = VK_NULL_HANDLE;
+    VkDeviceMemory hudlessMem   = VK_NULL_HANDLE;
+    uint32_t       hudlessW = 0, hudlessH = 0;
+    VkFormat       hudlessFmt   = VK_FORMAT_UNDEFINED;
+    bool           hudlessInit  = false;      // false until the first copy laid a layout down
+    uint64_t       hudlessFrame = 0;          // present index the last copy belongs to
+    uint64_t       presentFrame = 0;          // set by QueuePresent before the proxy presents
+    uint32_t       swapPassesThisFrame = 0;   // census: how many passes target the backbuffer
+    uint64_t       hudlessCopies = 0;
+    uint64_t       hudlessUsed   = 0;
+    uint32_t       swapPassesLastFrame = 0;   // census value captured before the present-time reset
 
     std::mutex lock;
 };
@@ -279,6 +296,112 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
 // swapchain the interpolated frame is unavailable and it presents the real one
 // instead, which is the correct degradation; returning an error for "not ready
 // yet" would make a startup frame look like a failure.
+// ---- RECORD THE HUD-LESS COPY. Called from Layer_CmdEndRendering, on X-Plane's
+// own command buffer, right after the first backbuffer-targeting pass of the frame
+// ended. The backbuffer is still in the layout the pass declared; it goes back to
+// exactly that. The copy image is ours, in the swapchain's (post-substitution,
+// UNORM) format, which is what the FI context was created with, so FFX accepts it
+// as currentBackBuffer_HUDLess without a format-group mismatch.
+inline bool recordHudless(VkDevice device, VkPhysicalDevice phys,
+                          PFN_vkGetDeviceProcAddr gdpa,
+                          PFN_vkGetPhysicalDeviceMemoryProperties getMemProps,
+                          PFN_vkCmdPipelineBarrier barrierFn, PFN_vkCmdCopyImage copyFn,
+                          VkCommandBuffer cb, VkImage swap, VkImageLayout swapLayout,
+                          uint32_t w, uint32_t h, VkFormat fmt, uint64_t frame)
+{
+    State &s = state();
+    if (!device || !gdpa || !barrierFn || !copyFn || !cb || swap == VK_NULL_HANDLE || !w || !h) return false;
+    if (s.hudless != VK_NULL_HANDLE && (s.hudlessW != w || s.hudlessH != h || s.hudlessFmt != fmt)) {
+        PFN_vkDeviceWaitIdle waitIdle = (PFN_vkDeviceWaitIdle)gdpa(device, "vkDeviceWaitIdle");
+        PFN_vkDestroyImage destroyImage = (PFN_vkDestroyImage)gdpa(device, "vkDestroyImage");
+        PFN_vkFreeMemory freeMem = (PFN_vkFreeMemory)gdpa(device, "vkFreeMemory");
+        if (waitIdle) waitIdle(device);
+        if (destroyImage) destroyImage(device, s.hudless, nullptr);
+        if (freeMem && s.hudlessMem) freeMem(device, s.hudlessMem, nullptr);
+        s.hudless = VK_NULL_HANDLE; s.hudlessMem = VK_NULL_HANDLE; s.hudlessInit = false;
+    }
+    if (s.hudless == VK_NULL_HANDLE) {
+        PFN_vkCreateImage createImage = (PFN_vkCreateImage)gdpa(device, "vkCreateImage");
+        PFN_vkGetImageMemoryRequirements getReq = (PFN_vkGetImageMemoryRequirements)gdpa(device, "vkGetImageMemoryRequirements");
+        PFN_vkAllocateMemory allocMem = (PFN_vkAllocateMemory)gdpa(device, "vkAllocateMemory");
+        PFN_vkBindImageMemory bindMem = (PFN_vkBindImageMemory)gdpa(device, "vkBindImageMemory");
+        PFN_vkDestroyImage destroyImage = (PFN_vkDestroyImage)gdpa(device, "vkDestroyImage");
+        if (!createImage || !getReq || !allocMem || !bindMem || !getMemProps) return false;
+        VkImageCreateInfo ici;
+        memset(&ici, 0, sizeof(ici));
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = fmt;
+        ici.extent.width = w; ici.extent.height = h; ici.extent.depth = 1;
+        ici.mipLevels = 1; ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage img = VK_NULL_HANDLE;
+        if (createImage(device, &ici, nullptr, &img) != VK_SUCCESS) {
+            static bool said = false;
+            if (!said) { said = true; trace("FG HUDLESS: image create failed (%ux%u fmt %d)", w, h, (int)fmt); }
+            return false;
+        }
+        VkMemoryRequirements mr; memset(&mr, 0, sizeof(mr)); getReq(device, img, &mr);
+        VkPhysicalDeviceMemoryProperties mp; memset(&mp, 0, sizeof(mp)); getMemProps(phys, &mp);
+        uint32_t ti = UINT32_MAX;
+        for (uint32_t k = 0; k < mp.memoryTypeCount; ++k)
+            if ((mr.memoryTypeBits & (1u << k)) && (mp.memoryTypes[k].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { ti = k; break; }
+        VkMemoryAllocateInfo mai; memset(&mai, 0, sizeof(mai));
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; mai.allocationSize = mr.size; mai.memoryTypeIndex = ti;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        if (ti == UINT32_MAX || allocMem(device, &mai, nullptr, &mem) != VK_SUCCESS ||
+            bindMem(device, img, mem, 0) != VK_SUCCESS) {
+            if (destroyImage) destroyImage(device, img, nullptr);
+            static bool said = false;
+            if (!said) { said = true; trace("FG HUDLESS: memory for the %ux%u copy failed", w, h); }
+            return false;
+        }
+        s.hudless = img; s.hudlessMem = mem; s.hudlessW = w; s.hudlessH = h; s.hudlessFmt = fmt;
+        s.hudlessInit = false;
+        trace("FG HUDLESS: %ux%u copy image created (fmt %d) - the backbuffer before the overlay passes "
+              "now feeds interpolation as the HUD-less source.", w, h, (int)fmt);
+    }
+    VkImageMemoryBarrier b[2];
+    memset(b, 0, sizeof(b));
+    for (int i = 0; i < 2; ++i) {
+        b[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b[i].srcQueueFamilyIndex = b[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b[i].subresourceRange.levelCount = 1;
+        b[i].subresourceRange.layerCount = 1;
+    }
+    b[0].image = swap;
+    b[0].oldLayout = swapLayout; b[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    b[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b[1].image = s.hudless;
+    b[1].oldLayout = s.hudlessInit ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    b[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrierFn(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+              0, 0, nullptr, 0, nullptr, 2, b);
+    VkImageCopy rgn; memset(&rgn, 0, sizeof(rgn));
+    rgn.srcSubresource.aspectMask = rgn.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    rgn.srcSubresource.layerCount = rgn.dstSubresource.layerCount = 1;
+    rgn.extent.width = w; rgn.extent.height = h; rgn.extent.depth = 1;
+    copyFn(cb, swap, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.hudless, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
+    b[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b[0].newLayout = swapLayout;
+    b[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    b[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrierFn(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+              0, 0, nullptr, 0, nullptr, 2, b);
+    s.hudlessInit  = true;
+    s.hudlessFrame = frame;
+    ++s.hudlessCopies;
+    return true;
+}
+
 // ---- NEVER LEAVE THE INTERPOLATED SLOT UNWRITTEN.
 //
 // Once the swapchain config has generation enabled it presents outputs[0] on
@@ -530,6 +653,28 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     fd.output             = p->outputs[0];
     fd.displaySize.width  = s.dispW;
     fd.displaySize.height = s.dispH;
+    // HUD-less source: only when this present's copy exists (same frame index) and
+    // the live switch is on. taa.fg_hudless=0 is the A/B: overlays interpolated as
+    // scenery again.
+    if (s.hudless != VK_NULL_HANDLE && s.hudlessInit && s.hudlessFrame == s.presentFrame &&
+        s.hudlessW == s.dispW && s.hudlessH == s.dispH &&
+        live::onoff("taa.fg_hudless", "TAA_FG_HUDLESS", true)) {
+        FfxResourceDescription hd;
+        memset(&hd, 0, sizeof(hd));
+        hd.type     = FFX_RESOURCE_TYPE_TEXTURE2D;
+        hd.format   = ffxGetSurfaceFormatVK(s.hudlessFmt);
+        hd.width    = s.hudlessW;
+        hd.height   = s.hudlessH;
+        hd.depth    = 1;
+        hd.mipCount = 1;
+        hd.flags    = FFX_RESOURCE_FLAGS_NONE;
+        hd.usage    = FFX_RESOURCE_USAGE_READ_ONLY;
+        fd.currentBackBuffer_HUDLess = ffxGetResourceVK(s.hudless, hd, nullptr, FFX_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+        if ((s.hudlessUsed++ % 600) == 0)
+            trace("FG HUDLESS: interpolating from the pre-overlay backbuffer (%llu dispatches so far, "
+                  "%u backbuffer passes in the last frame - the copy is taken after the first).",
+                  (unsigned long long)s.hudlessUsed, s.swapPassesLastFrame);
+    }
     // ---- RENDER SIZE MUST MATCH THE DILATED RESOURCES, NOT THE CONTEXT.
     //
     // The context was created with the DISPLAY extent as its max render size (a
