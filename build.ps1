@@ -572,7 +572,15 @@ if ($haveFfx -and (Test-Path (Join-Path $ffxObj "ffx_vk.o"))) {
 # That recursion killed the sim inside ffxGetScratchMemorySizeVK, FSR3's very
 # first call, with no output at all.
 Write-Host "Building Vulkan layer..."
-& g++ -shared -o "$out\vklayer\VkLayer_mv.dll" "$src\vklayer\layer.cpp" `
+# ---- BUILD WHILE THE SIM IS RUNNING.
+#
+# X-Plane loads build\vklayer\VkLayer_mv.dll in place (VK_LAYER_PATH), and a
+# loaded DLL cannot be overwritten - the link fails with "Permission denied"
+# and the whole script stops. MV_LAYER_OUT names a staging file instead, so a
+# fix can be compiled during a flight and swapped in at the next launch.
+$layerOut = if ($env:MV_LAYER_OUT) { $env:MV_LAYER_OUT } else { "$out\vklayer\VkLayer_mv.dll" }
+if ($env:MV_LAYER_OUT) { Write-Host "  (staging: $layerOut)" -ForegroundColor Yellow }
+& g++ -shared -o $layerOut "$src\vklayer\layer.cpp" `
   -I"$vksdk\Include" -I"$root\third_party\DLSS" -I"$root\third_party\Streamline\include" -m64 -O2 -std=c++17 -D__USE_MINGW_ANSI_STDIO=1 `
   @sdkDefines @sdkIncludes $ffxDefine `
   "-I$ffxSdk\sdk\include" @ffxObjs `
