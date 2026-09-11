@@ -38,6 +38,7 @@
 
 #include <FidelityFX/host/ffx_frameinterpolation.h>
 #include <FidelityFX/host/ffx_opticalflow.h>
+#include "fg_flags.h"   // private bits in FfxFrameInterpolationDispatchDescription::flags
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
 
 // Live isolation control, implemented in layer.cpp where the live config lives.
@@ -926,6 +927,22 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
     fd.frameTimeDelta = 16.6f;
     fd.reset   = p->reset;
     fd.frameID = p->frameID;
+    // ---- MotionVectors private flags: trust our vectors, static snap, its threshold, FFX debug view.
+    // Read per dispatch so the live ini toggles them without a relaunch (that is the A/B).
+    fd.flags = fgTrustFlags(live::onoff("taa.fg_trust",  "TAA_FG_TRUST",  true),
+                            live::onoff("taa.fg_snap",   "TAA_FG_SNAP",   true),
+                            live::f    ("taa.fg_snap_eps", "TAA_FG_SNAP_EPS", 0.25f),
+                            live::onoff("taa.fg_debug",  "TAA_FG_DEBUG",  false));
+    {
+        static uint32_t lastFlags = 0xFFFFFFFFu;
+        if (fd.flags != lastFlags) {
+            lastFlags = fd.flags;
+            trace("FG TRUST: flags=0x%08x trust=%d snap=%d eps=%.2fpx debug=%d - where our dilated .z is set the "
+                  "game vector is final (no optical flow); trusted+still pixels copy the current frame.",
+                  fd.flags, (fd.flags & kFgFlagMvTrust) ? 1 : 0, (fd.flags & kFgFlagMvSnap) ? 1 : 0,
+                  fgSnapEpsPx(fd.flags), (fd.flags & kFgFlagDebugView) ? 1 : 0);
+        }
+    }
     fd.backBufferTransferFunction = p->backBufferTransferFunction;
     fd.minMaxLuminance[0] = p->minMaxLuminance[0];
     fd.minMaxLuminance[1] = p->minMaxLuminance[1];
