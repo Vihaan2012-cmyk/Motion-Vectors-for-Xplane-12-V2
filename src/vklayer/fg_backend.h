@@ -94,6 +94,18 @@ struct State {
     uint64_t       hudlessCopies = 0;
     uint64_t       hudlessUsed   = 0;
     uint32_t       swapPassesLastFrame = 0;   // census value captured before the present-time reset
+    // ---- FG SNAP AUDIT (every 300 dispatches): row strips of our dilated vectors, the generated
+    // frame, the current frame and the HUD-less copy, compared on the CPU three dispatches later.
+    VkBuffer       audBuf[4]  = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceMemory audMem[4]  = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+    void          *audPtr[4]  = { nullptr, nullptr, nullptr, nullptr };
+    VkDeviceSize   audSize[4] = { 0, 0, 0, 0 };
+    bool           audFailed  = false;
+    bool           audPending = false;
+    bool           audHadHudless = false;
+    uint64_t       audRecordedAt = 0;
+    uint32_t       audRows = 0, audMvW = 0, audMvH = 0, audColW = 0, audColH = 0;
+    uint64_t       audCount = 0;
 
     std::mutex lock;
 };
@@ -402,6 +414,157 @@ inline bool recordHudless(VkDevice device, VkPhysicalDevice phys,
     return true;
 }
 
+// ---- FG SNAP AUDIT. The only number that settles "is the snap firing on the screens": read
+// back row strips and count. Trust and stillness come from OUR dilated vectors (.z = trust,
+// .xy = full-frame displacement in render px; the interpolator halves them, so still means
+// |mv| < 2*eps). Snap firing shows as generated pixels byte-identical to the current frame.
+// Overlays show as present != HUD-less. All copies ride the FI command list after the dispatch.
+static const uint32_t kAudRowStep = 32;
+inline bool fgAuditBuffer(State &s, int k, VkDeviceSize bytes)
+{
+    if (s.audBuf[k] != VK_NULL_HANDLE && s.audSize[k] >= bytes) return true;
+    VkDevice dev = s.vkCtx.vkDevice; PFN_vkGetDeviceProcAddr gdpa = s.vkCtx.vkDeviceProcAddr;
+    if (!dev || !gdpa || !g_getPhysMemProps) return false;
+    PFN_vkCreateBuffer createBuf = (PFN_vkCreateBuffer)gdpa(dev, "vkCreateBuffer");
+    PFN_vkGetBufferMemoryRequirements getReq = (PFN_vkGetBufferMemoryRequirements)gdpa(dev, "vkGetBufferMemoryRequirements");
+    PFN_vkAllocateMemory allocMem = (PFN_vkAllocateMemory)gdpa(dev, "vkAllocateMemory");
+    PFN_vkBindBufferMemory bindMem = (PFN_vkBindBufferMemory)gdpa(dev, "vkBindBufferMemory");
+    PFN_vkMapMemory mapMem = (PFN_vkMapMemory)gdpa(dev, "vkMapMemory");
+    if (!createBuf || !getReq || !allocMem || !bindMem || !mapMem) return false;
+    VkBufferCreateInfo bci; memset(&bci, 0, sizeof(bci));
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer b = VK_NULL_HANDLE;
+    if (createBuf(dev, &bci, nullptr, &b) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr; memset(&mr, 0, sizeof(mr)); getReq(dev, b, &mr);
+    VkPhysicalDeviceMemoryProperties mp; memset(&mp, 0, sizeof(mp)); g_getPhysMemProps(s.vkCtx.vkPhysicalDevice, &mp);
+    uint32_t ti = UINT32_MAX;
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) { ti = i; break; }
+    if (ti == UINT32_MAX) return false;
+    VkMemoryAllocateInfo mai; memset(&mai, 0, sizeof(mai));
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; mai.allocationSize = mr.size; mai.memoryTypeIndex = ti;
+    VkDeviceMemory m = VK_NULL_HANDLE; void *ptr = nullptr;
+    if (allocMem(dev, &mai, nullptr, &m) != VK_SUCCESS || bindMem(dev, b, m, 0) != VK_SUCCESS ||
+        mapMem(dev, m, 0, VK_WHOLE_SIZE, 0, &ptr) != VK_SUCCESS) return false;
+    s.audBuf[k] = b; s.audMem[k] = m; s.audPtr[k] = ptr; s.audSize[k] = bytes;
+    return true;
+}
+
+// Copy every kAudRowStep-th row of `img` into audit buffer k. Layout in/out are what the image
+// is in right now; it is returned to exactly that.
+inline void fgAuditCopyRows(State &s, VkCommandBuffer cb, PFN_vkCmdPipelineBarrier barrierFn,
+                            PFN_vkCmdCopyImageToBuffer copyFn, int k, VkImage img, VkImageLayout layout,
+                            VkAccessFlags access, uint32_t w, uint32_t h, uint32_t bpp, uint32_t rows)
+{
+    VkImageMemoryBarrier b; memset(&b, 0, sizeof(b));
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
+    b.image = img; b.oldLayout = layout; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcAccessMask = access; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrierFn(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    std::vector<VkBufferImageCopy> rg(rows);
+    for (uint32_t r = 0; r < rows; ++r) {
+        memset(&rg[r], 0, sizeof(rg[r]));
+        rg[r].bufferOffset = (VkDeviceSize)r * w * bpp;
+        rg[r].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; rg[r].imageSubresource.layerCount = 1;
+        rg[r].imageOffset.y = (int32_t)(r * kAudRowStep + kAudRowStep / 2);
+        rg[r].imageExtent.width = w; rg[r].imageExtent.height = 1; rg[r].imageExtent.depth = 1;
+    }
+    copyFn(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.audBuf[k], rows, rg.data());
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = layout;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = access;
+    barrierFn(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+inline void fgAuditRecord(State &s, const FfxFrameGenerationDispatchDescription *p,
+                          const FfxFrameInterpolationDispatchDescription &fd, bool ownInputs)
+{
+    if (s.audFailed || s.audPending || !ownInputs) return;
+    if ((s.dispatches % 300) != 5) return;
+    fgprep::State &g = fgprep::state();
+    if (g.readySlot < 0 || !g.dilMv[g.readySlot]) return;
+    VkDevice dev = s.vkCtx.vkDevice; PFN_vkGetDeviceProcAddr gdpa = s.vkCtx.vkDeviceProcAddr;
+    static PFN_vkCmdPipelineBarrier barrierFn = nullptr; static PFN_vkCmdCopyImageToBuffer copyFn = nullptr;
+    if (!barrierFn) barrierFn = (PFN_vkCmdPipelineBarrier)gdpa(dev, "vkCmdPipelineBarrier");
+    if (!copyFn)    copyFn    = (PFN_vkCmdCopyImageToBuffer)gdpa(dev, "vkCmdCopyImageToBuffer");
+    if (!barrierFn || !copyFn) { s.audFailed = true; return; }
+    const uint32_t mvW = g.w, mvH = g.h, colW = s.dispW, colH = s.dispH;
+    const uint32_t rows = (colH < mvH ? colH : mvH) / kAudRowStep;
+    if (!rows || !mvW || !colW) return;
+    if (!fgAuditBuffer(s, 0, (VkDeviceSize)rows * mvW * 8) || !fgAuditBuffer(s, 1, (VkDeviceSize)rows * colW * 4) ||
+        !fgAuditBuffer(s, 2, (VkDeviceSize)rows * colW * 4) || !fgAuditBuffer(s, 3, (VkDeviceSize)rows * colW * 4)) {
+        s.audFailed = true; trace("FG SNAP AUDIT: readback buffers failed - audit off"); return;
+    }
+    VkCommandBuffer cb = (VkCommandBuffer)p->commandList;
+    // dilated vectors: GENERAL (prep pass leaves them there, FFX registered them UNORDERED_ACCESS)
+    fgAuditCopyRows(s, cb, barrierFn, copyFn, 0, g.dilMv[g.readySlot], VK_IMAGE_LAYOUT_GENERAL,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, mvW, mvH, 8, rows);
+    // generated frame: GENERAL after the dispatch (FFX returns it to its registered state)
+    fgAuditCopyRows(s, cb, barrierFn, copyFn, 1, (VkImage)fd.output.resource, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, colW, colH, 4, rows);
+    // current (interpolation source): PIXEL_COMPUTE_READ = shader-read layout
+    fgAuditCopyRows(s, cb, barrierFn, copyFn, 2, (VkImage)fd.currentBackBuffer.resource, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_SHADER_READ_BIT, colW, colH, 4, rows);
+    s.audHadHudless = fd.currentBackBuffer_HUDLess.resource != nullptr;
+    if (s.audHadHudless)
+        fgAuditCopyRows(s, cb, barrierFn, copyFn, 3, (VkImage)fd.currentBackBuffer_HUDLess.resource, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_ACCESS_SHADER_READ_BIT, colW, colH, 4, rows);
+    s.audRows = rows; s.audMvW = mvW; s.audMvH = mvH; s.audColW = colW; s.audColH = colH;
+    s.audRecordedAt = s.dispatches; s.audPending = true;
+}
+
+static inline float fgHalfToFloat(uint16_t h)
+{
+    const uint32_t sgn = (h >> 15) & 1u, ex = (h >> 10) & 0x1Fu, mn = h & 0x3FFu;
+    float v;
+    if (ex == 0) v = (float)mn / 1024.0f / 16384.0f;
+    else if (ex == 31) v = mn ? 0.0f : 65504.0f;
+    else v = (1.0f + (float)mn / 1024.0f) * (float)pow(2.0, (int)ex - 15);
+    return sgn ? -v : v;
+}
+
+inline void fgAuditCollect(State &s)
+{
+    if (!s.audPending || s.dispatches < s.audRecordedAt + 3) return;
+    s.audPending = false;
+    const uint32_t rows = s.audRows, mvW = s.audMvW, colW = s.audColW;
+    const float epsFull = 2.0f * fgSnapEpsPx(fgTrustFlags(true, true, live::f("taa.fg_snap_eps", "TAA_FG_SNAP_EPS", 0.25f), false));
+    uint64_t n = 0, nTrust = 0, nStill = 0, nB = 0, nBTrust = 0, nBStill = 0; double sumB = 0.0;
+    const uint16_t *mv = (const uint16_t*)s.audPtr[0];
+    for (uint32_t r = 0; r < rows; ++r) {
+        const bool bottom = (r * kAudRowStep + kAudRowStep / 2) >= (s.audMvH * 2) / 3;
+        for (uint32_t x = 0; x < mvW; x += 4) {
+            const uint16_t *t = mv + ((size_t)r * mvW + x) * 4;
+            const float vx = fgHalfToFloat(t[0]), vy = fgHalfToFloat(t[1]), tz = fgHalfToFloat(t[2]);
+            const float len = sqrtf(vx * vx + vy * vy);
+            const bool trusted = tz > 0.5f, still = trusted && len < epsFull;
+            ++n; nTrust += trusted; nStill += still;
+            if (bottom) { ++nB; nBTrust += trusted; nBStill += still; if (trusted) sumB += len; }
+        }
+    }
+    uint64_t m = 0, same = 0, mB = 0, sameB = 0, ov = 0;
+    const uint32_t *out = (const uint32_t*)s.audPtr[1], *cur = (const uint32_t*)s.audPtr[2], *hud = (const uint32_t*)s.audPtr[3];
+    for (uint32_t r = 0; r < rows; ++r) {
+        const bool bottom = (r * kAudRowStep + kAudRowStep / 2) >= (s.audColH * 2) / 3;
+        for (uint32_t x = 0; x < colW; x += 2) {
+            const size_t i = (size_t)r * colW + x;
+            ++m; const bool eq = (out[i] & 0x00FFFFFFu) == (cur[i] & 0x00FFFFFFu); same += eq;   // RGB only: FFX keeps its inpainting weight in .a
+            if (bottom) { ++mB; sameB += eq; }
+            if (s.audHadHudless && (hud[i] & 0x00FFFFFFu) != (cur[i] & 0x00FFFFFFu)) ++ov;
+        }
+    }
+    ++s.audCount;
+    trace("FG SNAP AUDIT #%llu: dilated vectors trusted=%.1f%% still(|mv|<%.2fpx)=%.1f%% | bottom third: trusted=%.1f%% "
+          "still=%.1f%% mean|mv|=%.2fpx | generated==current %.1f%% of pixels (bottom third %.1f%%) | overlays (present!=hudless) %.1f%%%s",
+          (unsigned long long)s.audCount, 100.0 * nTrust / (n ? n : 1), epsFull, 100.0 * nStill / (n ? n : 1),
+          100.0 * nBTrust / (nB ? nB : 1), 100.0 * nBStill / (nB ? nB : 1), nBTrust ? sumB / nBTrust : 0.0,
+          100.0 * same / (m ? m : 1), 100.0 * sameB / (mB ? mB : 1), 100.0 * ov / (m ? m : 1),
+          s.audHadHudless ? "" : " (no hudless this frame)");
+}
+
 // ---- NEVER LEAVE THE INTERPOLATED SLOT UNWRITTEN.
 //
 // Once the swapchain config has generation enabled it presents outputs[0] on
@@ -646,6 +809,7 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
         return FFX_OK;
     }
 
+    fgAuditCollect(s);
     FfxFrameInterpolationDispatchDescription fd;
     memset(&fd, 0, sizeof(fd));
     fd.commandList        = p->commandList;
@@ -785,6 +949,7 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
         presentRealFrame(p, "dispatch failed");
         return rc;
     }
+    fgAuditRecord(s, p, fd, ownInputs);
     if ((s.dispatches++ % 300) == 0)
         trace("FG: %llu interpolated frames dispatched (%ux%u)",
               (unsigned long long)s.dispatches, s.dispW, s.dispH);
