@@ -230,7 +230,12 @@ static bool liveIniOn(const char *key)
 static void armLayer()
 {
     std::wstring dir = shimDir();
+    // Two layouts: the development tree keeps the layer in
+    // MotionVectors\build\vklayer; the drag-and-drop package puts it directly
+    // in MotionVectors\. Probe for the manifest rather than assume either.
     std::wstring layerPath = dir + L"\\MotionVectors\\build\\vklayer";
+    if (GetFileAttributesW((layerPath + L"\\VkLayer_mv.json").c_str()) == INVALID_FILE_ATTRIBUTES)
+        layerPath = dir + L"\\MotionVectors";
     SetEnvironmentVariableW(L"VK_LAYER_PATH", layerPath.c_str());
     SetEnvironmentVariableW(L"VK_INSTANCE_LAYERS", L"VK_LAYER_mv");
     SetEnvironmentVariableW(L"VK_LOADER_LAYERS_ENABLE", L"VK_LAYER_mv");
