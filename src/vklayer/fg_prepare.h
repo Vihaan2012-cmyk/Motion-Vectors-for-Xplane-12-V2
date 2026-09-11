@@ -255,7 +255,7 @@ inline bool ensure(VkDevice device, VkPhysicalDevice phys,
     for (int k = 0; k < 2; ++k) {
         if (!makeImage(device, gdpa, mp, w, h, VK_FORMAT_R32_SFLOAT,
                        &s.dilDepth[k], &s.dilDepthMem[k], &s.dilDepthView[k]) ||
-            !makeImage(device, gdpa, mp, w, h, VK_FORMAT_R16G16_SFLOAT,
+            !makeImage(device, gdpa, mp, w, h, VK_FORMAT_R16G16B16A16_SFLOAT,   // .z = trust, see fg_prepare.comp
                        &s.dilMv[k], &s.dilMvMem[k], &s.dilMvView[k]) ||
             !makeImage(device, gdpa, mp, w, h, VK_FORMAT_R32_UINT,
                        &s.prevDepth[k], &s.prevDepthMem[k], &s.prevDepthView[k])) {

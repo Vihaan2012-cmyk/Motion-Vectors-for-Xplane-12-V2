@@ -892,8 +892,12 @@ inline FfxErrorCode dispatchCallback(const FfxFrameGenerationDispatchDescription
             fd.dilatedDepth =
                 ffxGetResourceVK(g.dilDepth[r], sh.dilatedDepth.resourceDescription,
                                  nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+            // Ours is RGBA16F (.z = trust); FFX's own description says RG16F and the view it
+            // builds from the description must match the image, so override the format only.
+            FfxResourceDescription dmvDesc = sh.dilatedMotionVectors.resourceDescription;
+            dmvDesc.format = FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT;
             fd.dilatedMotionVectors =
-                ffxGetResourceVK(g.dilMv[r], sh.dilatedMotionVectors.resourceDescription,
+                ffxGetResourceVK(g.dilMv[r], dmvDesc,
                                  nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
             static bool told = false;
             if (!told) {
