@@ -2162,6 +2162,7 @@ static VkImageView   g_sceneDepthView   = VK_NULL_HANDLE;
 // ---- 12.4.4 PROBE: family-table census (distinct vertex-shader hashes seen at pipeline
 // creation, split by which table knew them). Reported every 600 presents.
 static std::mutex            g_famCensusLock;
+static std::atomic<uint64_t> g_famObjExempt{0};   // instanced OBJ pipelines kept off the ground rule
 static std::set<uint64_t>    g_famSeen;
 static std::vector<uint64_t> g_famUnmatched;
 static size_t g_famZero = 0, g_famMasked = 0, g_famGround = 0, g_famNone = 0;
@@ -11288,9 +11289,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
             std::lock_guard<std::mutex> fg(g_famCensusLock);
             trace("FAMILY CENSUS: %zu distinct vertex shaders - zero=%zu masked=%zu ground=%zu "
                   "UNMATCHED=%zu (the table was generated from 12.4.3's spv.zip; a large unmatched "
-                  "count means the pack changed and the table needs regenerating). Sparse queue binds: %llu",
+                  "count means the pack changed and the table needs regenerating). Sparse queue binds: %llu | %llu instanced OBJ pipelines exempt from the ground rule",
                   g_famSeen.size(), g_famZero, g_famMasked, g_famGround, g_famNone,
-                  (unsigned long long)vram::sparseBinds);
+                  (unsigned long long)vram::sparseBinds, (unsigned long long)g_famObjExempt.load());
             if (frames == 1200 || frames == 6000) {
                 char hl[1024]; int ho = 0;
                 for (size_t i = 0; i < g_famUnmatched.size() && ho < 990; ++i)
@@ -13651,6 +13652,28 @@ static uint64_t mvFragHash(const std::vector<uint32_t> &code)
     return h;
 }
 
+// ---- INSTANCED OBJ PERMUTATIONS ARE NOT GROUND.
+//
+// The ground rule pushes a zero near-field threshold for ground-family
+// pipelines in external views, so an apron triangle straddling the radius
+// cannot mix frames. Objects are drawn by the same terrain uber-shader
+// family and were caught by it - including the user's own airframe, which
+// therefore could never take the body slot in the chase view: the plugin's
+// body matrix was exact (datum check 2026-09-11: BODY 0.0 mNDC, WORLD -15)
+// and never applied, and every fuselage pixel carried the camera's motion.
+// OBJ permutations reference the instance_data block; plain terrain and
+// vegetation do not. Decided from the module bytes, so it holds for every
+// pack version without touching the family table.
+static bool mvCodeHasName(const std::vector<uint32_t> &code, const char *name)
+{
+    const size_t n = strlen(name);
+    const unsigned char *b = (const unsigned char*)code.data();
+    const size_t bytes = code.size() * 4;
+    for (size_t k = 0; k + n <= bytes; ++k)
+        if (b[k] == (unsigned char)name[0] && memcmp(b + k, name, n) == 0) return true;
+    return false;
+}
+
 static bool mvFragMasked(uint64_t hash)
 {
     if (!hash) return false;
@@ -14143,12 +14166,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // this catches runtime-specialised variants whose hashes are not
             // in the shipped pack (measured: the cockpit light billboards).
             // TAA_MV_PID runs disable all of it: diagnostics measure raw.
+            bool vertInstanced = false;   // OBJ permutation (instance_data): never ground
             for (uint32_t s = 0; !noPatch && s < ci[i].stageCount; ++s) {
                 if (!(ci[i].pStages[s].stage & VK_SHADER_STAGE_VERTEX_BIT)) continue;
                 std::lock_guard<std::mutex> g(g_lock);
                 std::map<VkShaderModule, std::vector<uint32_t> >::iterator mc =
                     g_moduleCode.find(ci[i].pStages[s].module);
-                if (mc != g_moduleCode.end()) vertHash = mvFragHash(mc->second);
+                if (mc != g_moduleCode.end()) {
+                    vertHash      = mvFragHash(mc->second);
+                    vertInstanced = mvCodeHasName(mc->second, "instance_data");
+                }
             }
             // In PID diagnostic runs the policy is COMPUTED but not applied,
             // so the pipeline table can still say what a normal run would do.
@@ -14347,7 +14374,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // patched vertex shader writes; pairing one with an unpatched
             // partner gives undefined inputs, which read as zero and produce a
             // velocity field of zeros that looks like working plumbing.
-            mvGroundThisCall[i]  = mvFamilyGround(vertHash) ? 1 : 0;
+            {
+                const bool ground = mvFamilyGround(vertHash);
+                if (ground && vertInstanced) ++g_famObjExempt;
+                mvGroundThisCall[i] = (ground && !vertInstanced) ? 1 : 0;
+            }
             mvPatchedThisCall[i] = (fragPatched && vertPatched);
 
             // ---- PID MODE: ONE LINE PER PIPELINE INTO THE WRITER TABLE.
@@ -16513,7 +16544,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         static uint64_t s_cbGen = ~(uint64_t)0;
         static int      s_cbVal = -1;
         const bool chaseBodyOn =
-            live::iCached("taa.chase_body", "TAA_CHASE_BODY", 0, s_cbGen, s_cbVal) != 0;
+            live::iCached("taa.chase_body", "TAA_CHASE_BODY", 1, s_cbGen, s_cbVal) != 0;
         const bool chaseView = chaseBodyOn && (g_velSnap.viewType == 1018) &&
                                g_velSnap.bodyReprojValid != 0;
         // ---- ZOOM. K encodes "this vertex did not move on screen", which is
@@ -16941,7 +16972,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
     static uint64_t s_cbGen2 = ~(uint64_t)0;
     static int      s_cbVal2 = -1;
     const bool chaseBodyOn2 =
-        live::iCached("taa.chase_body", "TAA_CHASE_BODY", 0, s_cbGen2, s_cbVal2) != 0;
+        live::iCached("taa.chase_body", "TAA_CHASE_BODY", 1, s_cbGen2, s_cbVal2) != 0;
     if (chaseBodyOn2 && nfView < 0 && g_velSnap.viewType == 1018 &&
         g_velSnap.bodyReprojValid != 0) {
         float chaseM = g_velSnap.camGap + 120.0f;
