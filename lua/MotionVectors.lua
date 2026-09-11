@@ -666,6 +666,8 @@ local SETTINGS = {
     group = "VRAM", help = "" },
   { key = "vram.hold_max_mb", label = "hold_max_mb", kind = "int", def = 512, lo = nil, hi = nil,
     group = "VRAM", help = "" },
+  { key = "vram.scale_floor", label = "scale_floor", kind = "float", def = 1.0, lo = 0.0625, hi = 1.0,
+    group = "VRAM", help = "Lowest texture-resolution scale X-Plane's pager may cut to. 1.0 = never downgrade textures (the mod's default); 0.0625 = X-Plane's own. Same as TAA_SCALE_FLOOR. Needs a restart." },
   { key = "vram.lookahead", label = "lookahead", kind = "int", def = 300, lo = nil, hi = nil,
     group = "VRAM", help = "" },
   { key = "vram.migrate", label = "migrate", kind = "int", def = 1, lo = nil, hi = nil,
