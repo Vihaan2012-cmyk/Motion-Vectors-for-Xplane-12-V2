@@ -1270,6 +1270,28 @@ static void holdArtControls()
 // what it expects.
 static float g_floorValue = 0.0625f;   // what the floor ended up being
 
+// One-shot read of the live control file the panel and the layer share
+// (%TEMP%\taa_live.ini), so a launch-time setting can be edited from the panel
+// without an environment variable or a rebuild.
+static bool liveIniFloat(const char *key, double *out)
+{
+    char tmp[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("TEMP", tmp, (DWORD)sizeof(tmp));
+    if (!n || n >= sizeof(tmp)) return false;
+    std::string path = std::string(tmp) + "\\taa_live.ini";   // two backslashes: "\t" was a TAB and the file never opened (2026-09-10)
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    const size_t kl = strlen(key);
+    char line[512]; bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        const char *q = line;
+        while (*q == ' ' || *q == '\t') ++q;
+        if (!strncmp(q, key, kl) && q[kl] == '=') { *out = atof(q + kl + 1); found = true; break; }
+    }
+    fclose(f);
+    return found;
+}
+
 static void patchTextureScaleFloor()
 {
     if (g_floorRaised) return;
@@ -1282,6 +1304,10 @@ static void patchTextureScaleFloor()
     // 1.0 is the floor because the reachable scales are powers of two - 2, 1,
     // 0.5, 0.25, 0.125, 0.0625 - so a floor of 1 means full size and no cut.
     const char *env = getenv("TAA_SCALE_FLOOR");
+    // The panel's vram.scale_floor (live ini) applies when TAA_SCALE_FLOOR is
+    // not set; read once here - the patch is launch-time.
+    double iniFloor = 0.0;
+    const bool fromIni = (!env || !env[0]) && liveIniFloat("vram.scale_floor", &iniFloor) && iniFloor > 0.0;
     if (!env || !env[0]) env = "1";
 
     // A VALUE, not a switch.
@@ -1294,7 +1320,9 @@ static void patchTextureScaleFloor()
     // being able to say directly.
     //
     // 1.0 means the pager may never cut at all.
-    float want = (float)atof(env);
+    float want = fromIni ? (float)iniFloor : (float)atof(env);
+    xlog("scale floor: %g requested by %s", (double)want,
+         fromIni ? "vram.scale_floor (panel)" : (getenv("TAA_SCALE_FLOOR") ? "TAA_SCALE_FLOOR" : "default"));
     if (!(want > 0.0f && want <= 1.0f)) {
         xlog("scale floor: %g is not in (0, 1] - refusing. The pager's own floor "
              "is 0.0625 and values above 1.0 are not scales it cuts to.",
@@ -3930,7 +3958,24 @@ static float matrixCallback(float sinceLast, float, int, void *)
                 invOk = true;
             }
         }
-        if (resolved && bodyTrusted && rigid && invOk) {
+        // ---- EXPERIMENTAL (taa.chase_exp, read once at start; env TAA_CHASE_EXP).
+        //
+        // `rigid` demands the camera-to-datum gap change by under 5 cm a frame.
+        // A chase camera in a turn swings more than that, the matrix went
+        // unpublished, the layer fell back to the world path, and the airframe
+        // carried the terrain's vector: measured 2026-09-10, -169 px/frame on a
+        // fuselage that moved 0.5 px. Bp and Bc carry their own poses, so the
+        // reprojection does not need rigidity in the chase view; only the
+        // cockpit's K-form does, and that keeps the gate.
+        static int chaseExp = -1;
+        if (chaseExp < 0) {
+            const char *e = getenv("TAA_CHASE_EXP"); double v = 0.0;
+            chaseExp = (e && e[0] && atoi(e) != 0) ? 1 : ((liveIniFloat("taa.chase_exp", &v) && v > 0.0) ? 1 : 0);
+            xlog("body frame: taa.chase_exp=%d - chase view (1018) %s the rigidity gate", chaseExp,
+                 chaseExp ? "publishes the body matrix WITHOUT" : "keeps");
+        }
+        const bool gateRigid = rigid || (chaseExp != 0 && s->viewType == 1018);
+        if (resolved && bodyTrusted && gateRigid && invOk) {
             taaMul(s->bodyReproj, Ap, invAc);
             s->bodyReprojValid = 1;
         } else {
