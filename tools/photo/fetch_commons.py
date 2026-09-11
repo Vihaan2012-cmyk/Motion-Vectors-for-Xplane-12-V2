@@ -122,7 +122,7 @@ def members(cat):
     return files, subs
 
 def infos(titles):
-    r = api(dict(action="query", prop="imageinfo", titles="|".join(titles), iiprop="url|size|mime|sha1|extmetadata", iiurlwidth="4096", iiextmetadatafilter="LicenseShortName|Artist|Credit|DateTimeOriginal|ImageDescription|LicenseUrl|Attribution"))
+    r = api(dict(action="query", prop="imageinfo", titles="|".join(titles), iiprop="url|size|mime|sha1|extmetadata", iiurlwidth="2560", iiextmetadatafilter="LicenseShortName|Artist|Credit|DateTimeOriginal|ImageDescription|LicenseUrl|Attribution"))
     out = []
     for p in (r or {}).get("query", {}).get("pages", []):
         ii = (p.get("imageinfo") or [None])[0]
@@ -174,7 +174,7 @@ def main():
     ap.add_argument("--out", default="E:/PhotoRef"); ap.add_argument("--max-gb", type=float, default=50.0)
     ap.add_argument("--depth", type=int, default=3); ap.add_argument("--min-width", type=int, default=1400)
     ap.add_argument("--min-year", type=int, default=1995)
-    ap.add_argument("--workers", type=int, default=8); ap.add_argument("--seeds", default="")
+    ap.add_argument("--workers", type=int, default=12); ap.add_argument("--seeds", default="")
     ap.add_argument("--clean", action="store_true", help="apply the domain filters to what is on disk and exit")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -223,12 +223,14 @@ def main():
                     continue
                 rec["bytes"] = n; total += n; got += 1; nok += 1; done.add(rec["pageid"])
                 man.write(json.dumps(rec, ensure_ascii=False) + "\n"); man.flush()
-        for i in range(0, len(files), 50):
+        epool = ThreadPoolExecutor(max_workers=6)     # the licence metadata is the slow call: 6 in flight
+        efuts = {epool.submit(infos, files[i:i + 50]): i for i in range(0, len(files), 50)}
+        for ef in as_completed(efuts):
             if total >= cap: break
-            try: batch = infos(files[i:i + 50])
+            i = efuts[ef]
+            try: batch = ef.result()
             except Exception as e:
                 log(logf, "imageinfo failed: %s" % e); continue
-            time.sleep(0.05)
             submitted = 0
             for pageid, title, ii in batch:
                 if pageid in done: continue
@@ -236,7 +238,7 @@ def main():
                 ok, lic = licence_ok(meta)
                 if not ok or ii.get("mime") not in OK_MIME or (ii.get("width") or 0) < a.min_width:
                     nskip += 1; continue
-                use_orig = ii.get("mime") == "image/jpeg" and (ii.get("size") or 0) <= 15_000_000
+                use_orig = ii.get("mime") == "image/jpeg" and (ii.get("size") or 0) <= 40_000_000
                 url = ii["url"] if use_orig else ii.get("thumburl") or ii["url"]
                 name = re.sub(r"[^A-Za-z0-9._-]+", "_", title[5:])[:120]
                 if not use_orig and not name.lower().endswith((".jpg", ".jpeg")): name += ".jpg"
@@ -245,13 +247,14 @@ def main():
                            licence=lic, licence_url=(meta.get("LicenseUrl", {}).get("value") or ""),
                            author=strip_html(meta.get("Artist", {}).get("value"))[:200], credit=strip_html(meta.get("Credit", {}).get("value"))[:200],
                            attribution=strip_html(meta.get("Attribution", {}).get("value"))[:200], date=(meta.get("DateTimeOriginal", {}).get("value") or "")[:40],
-                           width=ii.get("width"), height=ii.get("height"), mime=ii.get("mime"), sha1=ii.get("sha1"), file=dst, rendition="original" if use_orig else "4096px")
+                           width=ii.get("width"), height=ii.get("height"), mime=ii.get("mime"), sha1=ii.get("sha1"), file=dst, rendition="original" if use_orig else "2560px")
                 if rejected(rec, a.min_year): nskip += 1; continue
                 os.makedirs(catdir, exist_ok=True)
                 pending[pool.submit(fetch, url, dst)] = rec; submitted += 1
             drain(False)
             while len(pending) > a.workers * 4: time.sleep(0.5); drain(False)
             log(logf, "%-48s batch %3d/%-3d submitted %2d | total %5d files %.2f GB | gray dropped %d | queue %d" % (cat[:48], i // 50 + 1, (len(files) + 49) // 50, submitted, len(done), total / 1e9, ngray, len(queue)))
+        epool.shutdown(wait=False, cancel_futures=True)
         drain(True)
         log(logf, "%-48s done: fetched %d of %d files" % (cat[:48], got, len(files)))
     pool.shutdown(wait=False, cancel_futures=True)
