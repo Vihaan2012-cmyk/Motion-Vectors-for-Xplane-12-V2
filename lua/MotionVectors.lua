@@ -93,7 +93,12 @@ local MOD_VERSION      = "@MV_VERSION@"
 -- it empty and "Report a bug" still writes the debug dump and takes the shot
 -- locally in the X-Plane folder - it just does not upload.
 local BUG_WEBHOOK = "https://discord.com/api/webhooks/1541762723807891587/jPBYZvgpodrv4vPWLRjFOR3gCj44lL3ysNzGaB6eSYa3YARNV7D1lXYE79NTn8AVw8tb"
-local MAX_TESTED_XP    = "12.43.11"
+-- sim/version/xplane_internal_version is MMmmrr: 124311 = 12.4.3-r2, 124410 = 12.4.4-b1.
+-- xp_version_string() renders that as "12.43.11" / "12.44.10", so the tested maximum
+-- names a SERIES with rr = 99: every 12.4.4 build (beta, rc, release) passes the gate
+-- and 12.4.5 or 12.5.0 prompts. Verified on 12.4.4-b1 2026-09-11 (union family table).
+local MAX_TESTED_XP    = "12.44.99"
+local MAX_TESTED_LABEL = "12.4.4"
 
 -- A style push that cannot quarantine the script.
 --
@@ -441,6 +446,15 @@ local function xp_version_string()
     return string.format("%d.%d.%d", major, minor, patch)
 end
 
+-- Human form for the log: 124410 -> "12.4.4 (build 124410)".
+local function xp_version_human()
+    local v = get("sim/version/xplane_internal_version", 0)
+    if v == 0 then return "unknown" end
+    local major = math.floor(v / 10000)
+    local minor = math.floor((v % 10000) / 100)
+    return string.format("%d.%d.%d (build %d)", major, math.floor(minor / 10), minor % 10, v)
+end
+
 local function version_is_newer(a, b)
     local am, an, ap = a:match("(%d+)%.(%d+)%.(%d+)")
     local bm, bn, bp = b:match("(%d+)%.(%d+)%.(%d+)")
@@ -460,9 +474,9 @@ local function begin_prompt()
     prompt_active   = true
     prompt_resolved = false
     prompt_deadline = os.clock() + 10.0
-    logf(C_RED, "You are on X-Plane version %s, the latest compatible version is",
-         xp_version_string())
-    logf(C_RED, "X-Plane version %s! Would you like to continue?", MAX_TESTED_XP)
+    logf(C_RED, "You are on X-Plane %s, the latest tested version is",
+         xp_version_human())
+    logf(C_RED, "X-Plane %s! Would you like to continue?", MAX_TESTED_LABEL)
 end
 
 local function expire_prompt()
