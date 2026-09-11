@@ -93,6 +93,20 @@ def is_gray(path):
     except Exception:
         return False
 
+def resolve_seed(cat, logf):
+    """Return the category name as it exists on Commons, searching when the guess is wrong."""
+    r = api(dict(action="query", prop="categoryinfo", titles="Category:" + cat))
+    pages = (r or {}).get("query", {}).get("pages", [])
+    if pages and not pages[0].get("missing") and (pages[0].get("categoryinfo") or {}).get("files", 0) + (pages[0].get("categoryinfo") or {}).get("subcats", 0) > 0:
+        return cat
+    r = api(dict(action="query", list="search", srnamespace="14", srsearch=cat, srlimit="5"))
+    for hit in (r or {}).get("query", {}).get("search", []):
+        t = hit["title"][9:]
+        if "aerial" in t.lower():
+            log(logf, "seed %r -> %r" % (cat, t)); return t
+    log(logf, "seed %r not found on Commons - skipped" % cat)
+    return None
+
 def members(cat):
     files, subs, cont = [], [], {}
     while True:
@@ -104,7 +118,7 @@ def members(cat):
             elif t.startswith("Category:"): subs.append(t[9:])
         cont = r.get("continue", {})
         if not cont: break
-        time.sleep(0.2)
+        time.sleep(0.05)
     return files, subs
 
 def infos(titles):
@@ -160,7 +174,7 @@ def main():
     ap.add_argument("--out", default="E:/PhotoRef"); ap.add_argument("--max-gb", type=float, default=50.0)
     ap.add_argument("--depth", type=int, default=3); ap.add_argument("--min-width", type=int, default=1400)
     ap.add_argument("--min-year", type=int, default=1995)
-    ap.add_argument("--workers", type=int, default=4); ap.add_argument("--seeds", default="")
+    ap.add_argument("--workers", type=int, default=8); ap.add_argument("--seeds", default="")
     ap.add_argument("--clean", action="store_true", help="apply the domain filters to what is on disk and exit")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -178,7 +192,10 @@ def main():
     cap = a.max_gb * 1e9
     seeds = [s.strip() for s in a.seeds.split(";") if s.strip()] or SEEDS
     log(logf, "start: %d already fetched (%.1f GB), cap %.0f GB, %d seeds, depth %d, min year %d" % (len(done), total / 1e9, a.max_gb, len(seeds), a.depth, a.min_year))
-    seen_cat, queue = set(), [(s, 0) for s in seeds]
+    seen_cat, queue = set(), []
+    for sd in seeds:
+        r = resolve_seed(sd, logf)
+        if r and r not in [q[0] for q in queue]: queue.append((r, 0))
     nok = nskip = ngray = 0
     pool = ThreadPoolExecutor(max_workers=a.workers)
     while queue and total < cap:
@@ -193,12 +210,26 @@ def main():
                 if not SKIP_CAT.search(s) and s not in seen_cat: queue.append((s, d + 1))
         if not files: continue
         catdir = os.path.join(a.out, "commons", re.sub(r"[^A-Za-z0-9._-]+", "_", cat)[:80])
-        jobs = []
+        pending, got = {}, 0
+        def drain(block):
+            nonlocal total, got, nok, ngray
+            for fu in [f for f in list(pending) if block or f.done()]:
+                rec = pending.pop(fu); n = fu.result()
+                if n <= 0: continue
+                if is_gray(rec["file"]):
+                    ngray += 1
+                    try: os.remove(rec["file"])
+                    except Exception: pass
+                    continue
+                rec["bytes"] = n; total += n; got += 1; nok += 1; done.add(rec["pageid"])
+                man.write(json.dumps(rec, ensure_ascii=False) + "\n"); man.flush()
         for i in range(0, len(files), 50):
+            if total >= cap: break
             try: batch = infos(files[i:i + 50])
             except Exception as e:
                 log(logf, "imageinfo failed: %s" % e); continue
-            time.sleep(0.2)
+            time.sleep(0.05)
+            submitted = 0
             for pageid, title, ii in batch:
                 if pageid in done: continue
                 meta = ii.get("extmetadata", {}) or {}
@@ -216,24 +247,13 @@ def main():
                            attribution=strip_html(meta.get("Attribution", {}).get("value"))[:200], date=(meta.get("DateTimeOriginal", {}).get("value") or "")[:40],
                            width=ii.get("width"), height=ii.get("height"), mime=ii.get("mime"), sha1=ii.get("sha1"), file=dst, rendition="original" if use_orig else "4096px")
                 if rejected(rec, a.min_year): nskip += 1; continue
-                jobs.append((rec, url, dst))
-        if not jobs:
-            log(logf, "%-60s files %4d, nothing new (filtered)" % (cat[:60], len(files))); continue
-        os.makedirs(catdir, exist_ok=True)
-        futs = {pool.submit(fetch, url, dst): rec for rec, url, dst in jobs}
-        got = 0
-        for fu in as_completed(futs):
-            rec = futs[fu]; n = fu.result()
-            if n <= 0: continue
-            if is_gray(rec["file"]):
-                ngray += 1
-                try: os.remove(rec["file"])
-                except Exception: pass
-                continue
-            rec["bytes"] = n; total += n; got += 1; nok += 1; done.add(rec["pageid"])
-            man.write(json.dumps(rec, ensure_ascii=False) + "\n"); man.flush()
-            if total >= cap: break
-        log(logf, "%-60s files %4d -> fetched %3d | total %d files %.1f GB | gray dropped %d | queue %d" % (cat[:60], len(files), got, len(done), total / 1e9, ngray, len(queue)))
+                os.makedirs(catdir, exist_ok=True)
+                pending[pool.submit(fetch, url, dst)] = rec; submitted += 1
+            drain(False)
+            while len(pending) > a.workers * 4: time.sleep(0.5); drain(False)
+            log(logf, "%-48s batch %3d/%-3d submitted %2d | total %5d files %.2f GB | gray dropped %d | queue %d" % (cat[:48], i // 50 + 1, (len(files) + 49) // 50, submitted, len(done), total / 1e9, ngray, len(queue)))
+        drain(True)
+        log(logf, "%-48s done: fetched %d of %d files" % (cat[:48], got, len(files)))
     pool.shutdown(wait=False, cancel_futures=True)
     log(logf, "done: %d files on disk, %.1f GB, %d skipped by licence/size/date/HAER, %d grayscale dropped, %d categories" % (len(done), total / 1e9, nskip, ngray, len(seen_cat)))
 
