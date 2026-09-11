@@ -48,3 +48,7 @@ gpuav_lite/val_log.txt*
 beta/
 streamline/
 v1_sl_leftovers_backup/
+
+# training checkpoints, logs and preview renders never belong in the repo
+tools/nn/ckpt/
+tools/nn/out/
