@@ -1,0 +1,828 @@
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation.h
+index ccf2e23..ce9ab05 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation.h
+@@ -92,6 +92,17 @@ void computeInterpolatedColor(FfxUInt32x2 iPxPos, out FfxFloat32x3 fInterpolated
+     VectorFieldEntry gameMv;
+     LoadInpaintedGameFieldMv(fUvInInterpolationRect, gameMv);
+ 
++    // ---- MotionVectors: is OUR vector final here? (.z of the dilated vectors, same render-res
++    // texel the game field was built from). docs/superpowers/specs/2026-09-10-fg-trusted-vectors-design.md
++    FfxBoolean bTrust = false;
++#ifdef FFX_FRAMEINTERPOLATION_BIND_SRV_DILATED_MOTION_VECTORS
++    if ((GetDispatchFlags() & FFX_FI_FLAG_MV_TRUST) != 0u)
++    {
++        const FfxInt32x2 iTrustPx = FfxInt32x2(fUvInInterpolationRect * FfxFloat32x2(RenderSize()));
++        bTrust = LoadDilatedTrust(iTrustPx) > 0.5;
++    }
++#endif
++
+     // OF is done on the back buffers which already have black bars
+     VectorFieldEntry ofMv;
+     SampleOpticalFlowMotionVectorField(fUvInScreenSpace, ofMv);
+@@ -102,8 +113,14 @@ void computeInterpolatedColor(FfxUInt32x2 iPxPos, out FfxFloat32x3 fInterpolated
+     InterpolationSourceColor fPrevColorGame = SampleTextureBilinear(false, fUvInScreenSpace, +gameMv.fMotionVector * fUvLetterBoxScale, DisplaySize()); // Get in previous frame buffer, the color of interpolated pixel
+     InterpolationSourceColor fCurrColorGame = SampleTextureBilinear(true, fUvInScreenSpace, -gameMv.fMotionVector * fUvLetterBoxScale, DisplaySize()); // Get color in current framebuffer, of color of interpolated pixel
+ 
+-    InterpolationSourceColor fPrevColorOF = SampleTextureBilinear(false, fUvInScreenSpace, +ofMv.fMotionVector * fUvLetterBoxScale, DisplaySize());
+-    InterpolationSourceColor fCurrColorOF = SampleTextureBilinear(true, fUvInScreenSpace, -ofMv.fMotionVector * fUvLetterBoxScale, DisplaySize());
++    // Optical-flow candidates are only needed where our vector is NOT final.
++    InterpolationSourceColor fPrevColorOF = NewInterpolationSourceColor();
++    InterpolationSourceColor fCurrColorOF = NewInterpolationSourceColor();
++    if (!bTrust)
++    {
++        fPrevColorOF = SampleTextureBilinear(false, fUvInScreenSpace, +ofMv.fMotionVector * fUvLetterBoxScale, DisplaySize());
++        fCurrColorOF = SampleTextureBilinear(true, fUvInScreenSpace, -ofMv.fMotionVector * fUvLetterBoxScale, DisplaySize());
++    }
+ 
+     FfxFloat32 fDisoccludedFactor = 0.0f;
+ 
+@@ -136,6 +153,27 @@ void computeInterpolatedColor(FfxUInt32x2 iPxPos, out FfxFloat32x3 fInterpolated
+         }
+     }
+ 
++    // ---- MotionVectors: static snap. Trusted, not moving, nothing disoccluded, both warps in
++    // bounds => the pixel IS the current frame's texel. No blend, so screen text on generated
++    // flips is pixel-identical to the real frame instead of a crossfade of two states.
++#ifdef FFX_FRAMEINTERPOLATION_BIND_SRV_DILATED_MOTION_VECTORS
++    if (bTrust && (GetDispatchFlags() & FFX_FI_FLAG_MV_SNAP) != 0u)
++    {
++        const FfxFloat32 fHalfStepPx = length(gameMv.fMotionVector * FfxFloat32x2(InterpolationRectSize()));
++        const FfxBoolean bStill = (fHalfStepPx < SnapEpsPx())
++                               && (fDisocclusionFactor.x == 1.0) && (fDisocclusionFactor.y == 1.0)
++                               && !gameMv.bPosOutside && !gameMv.bNegOutside
++                               && (fPrevColorGame.fBilinearWeightSum > 0.0) && (fCurrColorGame.fBilinearWeightSum > 0.0);
++        if (bStill)
++        {
++            fInterpolatedColor = LoadCurrentBackbuffer(FfxInt32x2(iPxPos));
++        }
++    }
++#endif
++
++    // ---- Stock optical-flow blend, only where our vector is not final. Trusted pixels keep the
++    // game result: fGameMvBias would be 1 by construction, so the block is skipped outright.
++    if (!bTrust)
+     {
+ 
+         FfxFloat32 ofT = 0.5f;
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h
+index 20c5c29..baf76d2 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h
+@@ -148,6 +148,19 @@
+         return cbFI.dispatchFlags;
+     }
+ 
++    // ---- MotionVectors private dispatch flags. Same values as the host enum
++    // FFX_FRAMEINTERPOLATION_DISPATCH_MV_* and src/vklayer/fg_flags.h.
++    #define FFX_FI_FLAG_MV_TRUST (1u << 16)
++    #define FFX_FI_FLAG_MV_SNAP  (1u << 17)
++
++    // Static-snap threshold on the HALF-frame displacement, display pixels. Bits 24..31,
++    // 1/32 px units; a zero byte means the 0.25 px default.
++    FfxFloat32 SnapEpsPx()
++    {
++        const FfxUInt32 e = (GetDispatchFlags() >> 24u) & 0xFFu;
++        return (e == 0u) ? FfxFloat32(0.25) : FfxFloat32(e) / FfxFloat32(32.0);
++    }
++
+     FfxInt32x2 GetMaxRenderSize()
+     {
+         return cbFI.maxRenderSize;
+@@ -254,6 +267,13 @@ layout (set = 0, binding = 1000) uniform sampler s_LinearClamp;
+     {
+         return texelFetch(r_dilated_motion_vectors, iPxPos, 0).xy;
+     }
++
++    // MotionVectors: .z of our dilated vectors is 1 where a real draw wrote the velocity
++    // texel and 0 where the target still held its "unwritten" sentinel (src/shaders/fg_prepare.comp).
++    FfxFloat32 LoadDilatedTrust(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
++    {
++        return texelFetch(r_dilated_motion_vectors, iPxPos, 0).z;
++    }
+ #endif
+ 
+ #ifdef FFX_FRAMEINTERPOLATION_BIND_SRV_DILATED_DEPTH
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_hlsl.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_hlsl.h
+index a58743d..ec9e017 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_hlsl.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_hlsl.h
+@@ -160,6 +160,15 @@
+         return dispatchFlags;
+     }
+ 
++    // ---- MotionVectors private dispatch flags (mirror of the GLSL callbacks; not compiled by MotionVectors).
++    #define FFX_FI_FLAG_MV_TRUST (1u << 16)
++    #define FFX_FI_FLAG_MV_SNAP  (1u << 17)
++    FfxFloat32 SnapEpsPx()
++    {
++        const FfxUInt32 e = (GetDispatchFlags() >> 24u) & 0xFFu;
++        return (e == 0u) ? FfxFloat32(0.25) : FfxFloat32(e) / FfxFloat32(32.0);
++    }
++
+     FfxInt32x2 GetMaxRenderSize()
+     {
+         return maxRenderSize;
+@@ -293,6 +302,11 @@ SamplerState s_LinearClamp : register(s0);
+     {
+         return r_dilated_motion_vectors[iPxPos].xy;
+     }
++
++    FfxFloat32 LoadDilatedTrust(FfxInt32x2 iPxPos)
++    {
++        return r_dilated_motion_vectors[iPxPos].z;
++    }
+ #endif
+ 
+ #ifdef FFX_FRAMEINTERPOLATION_BIND_SRV_DILATED_DEPTH
+diff --git a/sdk/include/FidelityFX/gpu/fsr3upscaler/ffx_fsr3upscaler_callbacks_glsl.h b/sdk/include/FidelityFX/gpu/fsr3upscaler/ffx_fsr3upscaler_callbacks_glsl.h
+index d0cbf9d..c5bbbfc 100644
+--- a/sdk/include/FidelityFX/gpu/fsr3upscaler/ffx_fsr3upscaler_callbacks_glsl.h
++++ b/sdk/include/FidelityFX/gpu/fsr3upscaler/ffx_fsr3upscaler_callbacks_glsl.h
+@@ -395,7 +395,7 @@ FfxFloat32x4 SampleHistory(FfxFloat32x2 fUV)
+ #endif
+ 
+ #if defined(FSR3UPSCALER_BIND_UAV_LUMA_HISTORY)
+-layout (set = 0, binding = FSR3UPSCALER_BIND_UAV_LUMA_HISTORY, rgba8) uniform image2D  rw_luma_history;
++layout (set = 0, binding = FSR3UPSCALER_BIND_UAV_LUMA_HISTORY, rgba16f) uniform image2D  rw_luma_history;
+ 
+ void StoreLumaHistory(FfxInt32x2 iPxPos, FfxFloat32x4 fLumaHistory)
+ {
+diff --git a/sdk/include/FidelityFX/host/ffx_frameinterpolation.h b/sdk/include/FidelityFX/host/ffx_frameinterpolation.h
+index 2340d04..1085144 100644
+--- a/sdk/include/FidelityFX/host/ffx_frameinterpolation.h
++++ b/sdk/include/FidelityFX/host/ffx_frameinterpolation.h
+@@ -242,6 +242,11 @@ typedef enum FfxFrameInterpolationDispatchFlags
+     FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_PACING_LINES     = (1 << 3),  ///< A bit indicating that the debug pacing lines will be drawn to the generated output.
+     FFX_FRAMEINTERPOLATION_DISPATCH_RESERVED_1 = (1 << 4),
+     FFX_FRAMEINTERPOLATION_DISPATCH_RESERVED_2 = (1 << 5), 
++    // ---- MotionVectors private bits. Mirrored in gpu/frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h
++    // (FFX_FI_FLAG_*) and in src/vklayer/fg_flags.h. Bits 24..31 carry the static-snap threshold in 1/32 px.
++    FFX_FRAMEINTERPOLATION_DISPATCH_MV_TRUST       = (1 << 16), ///< game vector is final where our dilated .z is set (no optical flow)
++    FFX_FRAMEINTERPOLATION_DISPATCH_MV_SNAP        = (1 << 17), ///< trusted and still (< eps): output the current frame's texel, no blend
++    FFX_FRAMEINTERPOLATION_DISPATCH_SNAP_EPS_SHIFT = 24,        ///< not a bit: shift of the 8-bit eps field (0 => 0.25 px)
+ } FfxFrameInterpolationDispatchFlags;
+ 
+ typedef struct FfxFrameInterpolationDispatchDescription {
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+index 5c47b25..8f489d4 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+@@ -660,7 +660,10 @@ FfxErrorCode ffxConfigureFrameInterpolationSwapchainVK(FfxSwapchain gameSwapChai
+         switch (key)
+         {
+             case FFX_FI_SWAPCHAIN_CONFIGURE_KEY_WAITCALLBACK:
+-                pSwapChainVK->setWaitCallback(static_cast<FfxWaitCallbackFunc>(valuePtr));
++                // MV: static_cast cannot convert void* to a function pointer in ISO C++;
++                // MSVC accepts it, GCC does not. reinterpret_cast is the
++                // conversion actually intended here.
++                pSwapChainVK->setWaitCallback(reinterpret_cast<FfxWaitCallbackFunc>(valuePtr));
+             break;
+             case FFX_FI_SWAPCHAIN_CONFIGURE_KEY_FRAMEPACINGTUNING:
+                 if (valuePtr != nullptr)
+@@ -1184,7 +1187,12 @@ DWORD WINAPI composeAndPresent_presenterThread(LPVOID pParam)
+                     // if no frame was presented, we still need to update the semaphore
+                     if (toWait.count > 0)
+                     {
+-                        presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, SubmissionSemaphores());
++                        // MV: submit() takes SubmissionSemaphores& (non-const), and a
++                        // temporary cannot bind to one in ISO C++. A named empty
++                        // local has the same meaning - nothing to signal - and is
++                        // discarded at the end of the block exactly as before.
++                        SubmissionSemaphores noSignal;
++                        presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, noSignal);
+                     }
+ 
+                     numFramesSentForPresentation = entry.numFramesSentForPresentationBase + entry.numFramesToPresent;
+@@ -1658,7 +1666,26 @@ VkResult FrameInterpolationSwapChainVK::init(const VkSwapchainCreateInfoKHR* pCr
+     VkImageCreateInfo info = {};
+     info.sType             = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+     info.pNext             = nullptr;
+-    info.flags             = 0;
++    // MV: MUTABLE_FORMAT is REQUIRED here - it is the frame-generation crash fix.
++    //
++    // The layer substitutes the UNORM twin of X-Plane's sRGB swapchain so these
++    // images can carry STORAGE (no _SRGB format can be a storage image). But
++    // X-Plane never saw that substitution: it still believes the swapchain is
++    // sRGB and creates an sRGB VIEW of this UNORM image. Without MUTABLE_FORMAT
++    // that view is illegal (VUID-VkImageViewCreateInfo-image-12397), fails, and
++    // X-Plane binds the resulting null view - the compute pass that samples it
++    // then reads virtual address 0x0 and the device is lost. That is the crash.
++    //
++    // The old worry that this flag would flip the description to sRGB via
++    // ffx_vk.cpp's "if mutable, assume sRGB" path does NOT apply: that path is
++    // in ffxGetImageResourceDescriptionVK, which has NO callers in the SDK and
++    // is never run on these backbuffers - createImage sets their description
++    // explicitly, as UNORM. So image and description stay UNORM; only the flag
++    // is added, which merely WIDENS which view formats are legal. The remaining
++    // half - an sRGB view must not inherit the image's STORAGE usage
++    // (VUID-...-02275) - is handled in the layer's Layer_CreateImageView, which
++    // narrows exactly those views.
++    info.flags             = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+     info.imageType         = VK_IMAGE_TYPE_2D;
+     info.format            = pCreateInfo->imageFormat;
+     info.extent.width      = pCreateInfo->imageExtent.width;
+@@ -2823,7 +2850,9 @@ VkResult FrameInterpolationSwapChainVK::submitCompositionOnGameQueue(const Pacin
+         // if no frame was presented, we still need to update the semaphore
+         if (toWait.count > 0)
+         {
+-            res = presentInfo.gameQueue.submit(VK_NULL_HANDLE, toWait, SubmissionSemaphores());
++            // MV: same non-const-reference fix as above.
++            SubmissionSemaphores noSignal;
++            res = presentInfo.gameQueue.submit(VK_NULL_HANDLE, toWait, noSignal);
+         }
+     }
+ 
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_UiComposition.cpp b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_UiComposition.cpp
+index eb88430..5aaad76 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_UiComposition.cpp
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_UiComposition.cpp
+@@ -605,13 +605,65 @@ FFX_API FfxErrorCode ffxFrameInterpolationUiComposition(const FfxPresentCallback
+             vkDestroyImageView(device, s_uiCompositionImageViews[viewIndex], pAllocator);
+             s_uiCompositionImageViews[viewIndex] = VK_NULL_HANDLE;
+ 
++            // MV: NARROW THE USAGE, OR AN sRGB VIEW INHERITS STORAGE.
++            //
++            // A view with no VkImageViewUsageCreateInfo inherits every usage
++            // the IMAGE was created with. The frame-interpolation swapchain
++            // creates its replacement backbuffers with
++            // VK_IMAGE_USAGE_STORAGE_BIT unconditionally, and no _SRGB format
++            // supports VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT - so on an sRGB
++            // surface every view made here was rejected:
++            //
++            //   vkCreateImageView(): format VK_FORMAT_B8G8R8A8_SRGB ... doesn't
++            //   support VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT
++            //   Objects: VkImage [AMD FSR Replacement BackBuffer 0]
++            //
++            // These views are bound as VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE at
++            // SHADER_READ_ONLY_OPTIMAL, and one of the three is the render
++            // target - so STORAGE is the only bit that has to go. Dropping to
++            // SAMPLED alone would have taken COLOR_ATTACHMENT with it.
++            VkImageViewUsageCreateInfo viewUsage           = {};
++            viewUsage.sType                                = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
++            viewUsage.pNext                                = nullptr;
++            viewUsage.usage                                = VK_IMAGE_USAGE_SAMPLED_BIT |
++                                                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                                                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                                                             VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++
+             VkImageViewCreateInfo viewCreateInfo           = {};
+             viewCreateInfo.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+-            viewCreateInfo.pNext                           = nullptr;
++            viewCreateInfo.pNext                           = &viewUsage;
+             viewCreateInfo.flags                           = 0;
+             viewCreateInfo.image                           = image;
+             viewCreateInfo.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
+-            viewCreateInfo.format                          = ffxGetVkFormatFromSurfaceFormat(format);
++            // MV: STRIP GAMMA - THE VIEW MUST MATCH THE IMAGE IT VIEWS.
++            //
++            // These images carry VK_IMAGE_USAGE_STORAGE_BIT, so on a surface
++            // whose format is sRGB the layer substitutes the UNORM twin - no
++            // _SRGB format can be a storage image. The description that reaches
++            // here can still say sRGB, and a view whose format differs from its
++            // image is invalid without VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT:
++            //
++            //   vkCreateImageView(): format VK_FORMAT_B8G8R8A8_SRGB is different
++            //   from VkImage [AMD FSR Replacement BackBuffer 0] format
++            //   (VK_FORMAT_B8G8R8A8_UNORM)
++            //
++            // Setting that flag is NOT the fix - ffx_vk.cpp reads it as "the
++            // real format is sRGB" and converts the description back, which
++            // recreates this exact mismatch. See the note at info.flags in
++            // FrameInterpolationSwapchainVK.cpp.
++            //
++            // ffxGetSurfaceFormatFromGamma is FFX's own sRGB -> UNORM mapping
++            // and is the identity for everything else, so a genuinely non-sRGB
++            // surface is unaffected.
++            // ffxGetSurfaceFormatFromGamma lives in ffx_vk.cpp and is not
++            // declared in any header this file sees, so the two cases are
++            // inlined rather than adding a cross-translation-unit dependency
++            // to vendored source.
++            FfxSurfaceFormat viewFormat = format;
++            if (viewFormat == FFX_SURFACE_FORMAT_B8G8R8A8_SRGB)      viewFormat = FFX_SURFACE_FORMAT_B8G8R8A8_UNORM;
++            else if (viewFormat == FFX_SURFACE_FORMAT_R8G8B8A8_SRGB) viewFormat = FFX_SURFACE_FORMAT_R8G8B8A8_UNORM;
++            viewCreateInfo.format                          = ffxGetVkFormatFromSurfaceFormat(viewFormat);
+             viewCreateInfo.components.r                    = VK_COMPONENT_SWIZZLE_IDENTITY;
+             viewCreateInfo.components.g                    = VK_COMPONENT_SWIZZLE_IDENTITY;
+             viewCreateInfo.components.b                    = VK_COMPONENT_SWIZZLE_IDENTITY;
+diff --git a/sdk/src/backends/vk/ffx_vk.cpp b/sdk/src/backends/vk/ffx_vk.cpp
+index d914479..c8a2bb4 100644
+--- a/sdk/src/backends/vk/ffx_vk.cpp
++++ b/sdk/src/backends/vk/ffx_vk.cpp
+@@ -20,6 +20,7 @@
+ // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ // THE SOFTWARE.
+ 
++extern "C" void mvFgTrace(const char *fmt, ...);
+ #include <FidelityFX/host/ffx_interface.h>
+ #include <FidelityFX/host/ffx_util.h>
+ #include <FidelityFX/host/ffx_assert.h>
+@@ -1072,12 +1073,36 @@ VkImageLayout getVKImageLayoutFromResourceState(FfxResourceStates state)
+ 
+ void addMutableViewForSRV(VkImageViewCreateInfo& imageViewCreateInfo, VkImageViewUsageCreateInfo& imageViewUsageCreateInfo, FfxResourceDescription resourceDescription)
+ {
+-    if (ffxIsSurfaceFormatSRGB(resourceDescription.format) && FFX_CONTAINS_FLAG(resourceDescription.usage, FFX_RESOURCE_USAGE_UAV))
++    // MV: the UAV condition was dropped, and the narrowed set is derived rather
++    // than forced to READ_ONLY.
++    //
++    // An sRGB VIEW can never carry VK_IMAGE_USAGE_STORAGE_BIT - no _SRGB format
++    // supports VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT - and a view with no
++    // VkImageViewUsageCreateInfo inherits ALL of the image's usage. So the
++    // narrowing has to depend on the VIEW's format, not on what the resource
++    // description happens to declare.
++    //
++    // That distinction is what broke the frame-interpolation swapchain against
++    // an sRGB surface. FrameInterpolationSwapchainVK.cpp gives its replacement
++    // backbuffers VK_IMAGE_USAGE_STORAGE_BIT unconditionally, while their
++    // description does not declare FFX_RESOURCE_USAGE_UAV - so this test was
++    // false, nothing was narrowed, and the sRGB view inherited a storage usage
++    // it cannot have:
++    //
++    //   vkCreateImageView(): format VK_FORMAT_B8G8R8A8_SRGB ... doesn't support
++    //   VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT
++    //   Objects: VkImage [AMD FSR Replacement BackBuffer 0]
++    //
++    // Deriving from the description minus UAV keeps RENDERTARGET and the rest
++    // intact, and removes only the one bit sRGB cannot support. Forcing
++    // READ_ONLY would have dropped COLOR_ATTACHMENT from anything that needed
++    // it.
++    if (ffxIsSurfaceFormatSRGB(resourceDescription.format))
+     {
+-        // mutable is only for sRGB textures that will need a storage
+         imageViewUsageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+         imageViewUsageCreateInfo.pNext = nullptr;
+-        imageViewUsageCreateInfo.usage = getVKImageUsageFlagsFromResourceUsage(FFX_RESOURCE_USAGE_READ_ONLY);  // we can assume that SRV is enough
++        imageViewUsageCreateInfo.usage = getVKImageUsageFlagsFromResourceUsage(
++            (FfxResourceUsage)(resourceDescription.usage & ~FFX_RESOURCE_USAGE_UAV));
+         imageViewCreateInfo.pNext      = &imageViewUsageCreateInfo;
+     }
+ }
+@@ -1382,6 +1407,14 @@ FfxErrorCode GetEffectGpuMemoryUsageVK(FfxInterface* backendInterface, FfxUInt32
+     return FFX_OK;
+ }
+ 
++// TEMPORARY INSTRUMENTATION (MotionVectors). Flushed per line because
++// the fault takes the thread with it.
++#include <stdio.h>
++#define MV_MARK(n) do { \
++    FILE *mvf = fopen("C:/Users/bansa/AppData/Local/Temp/fsr3_mark.txt", "a"); \
++    if (mvf) { fprintf(mvf, "    CBC stage %d%c", n, 10); fflush(mvf); fclose(mvf); } \
++} while (0)
++
+ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect effect, FfxEffectBindlessConfig* bindlessConfig, FfxUInt32* effectContextId)
+ {
+     VkDeviceContext* vkDeviceContext = reinterpret_cast<VkDeviceContext*>(backendInterface->device);
+@@ -1407,6 +1440,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, sizeof(uint32_t));
+         uint32_t pipelineArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), sizeof(uint32_t));
+         uint32_t resourceArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), sizeof(uint32_t));
++    MV_MARK(1);
+         uint32_t contextArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * sizeof(BackendContext_VK::EffectContext), sizeof(uint32_t));
+         uint8_t* pMem = (uint8_t*)((BackendContext_VK*)(backendContext + 1));
+ 
+@@ -1419,6 +1453,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         backendContext->pResourceViews = (BackendContext_VK::VkResourceView*)(pMem);
+         memset(backendContext->pResourceViews, 0, resourceViewArraySize);
+         pMem += resourceViewArraySize;
++    MV_MARK(2);
+ 
+         // Map the staging ring buffer array
+         backendContext->pStagingRingBuffer = (uint8_t*)pMem;
+@@ -1443,6 +1478,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         // Map context array
+         backendContext->pEffectContexts = (BackendContext_VK::EffectContext*)pMem;
+         memset(backendContext->pEffectContexts, 0, contextArraySize);
++    MV_MARK(3);
+         pMem += contextArraySize;
+ 
+         // Map extension array
+@@ -1467,6 +1503,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         backendContext->vkFunctionTable.vkCreateSampler = (PFN_vkCreateSampler)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCreateSampler");
+         backendContext->vkFunctionTable.vkCreateDescriptorSetLayout = (PFN_vkCreateDescriptorSetLayout)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCreateDescriptorSetLayout");
+         backendContext->vkFunctionTable.vkCreateBuffer = (PFN_vkCreateBuffer)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCreateBuffer");
++    MV_MARK(4);
+         backendContext->vkFunctionTable.vkCreateBufferView = (PFN_vkCreateBufferView)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCreateBufferView");
+         backendContext->vkFunctionTable.vkCreateImage = (PFN_vkCreateImage)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCreateImage");
+         backendContext->vkFunctionTable.vkCreateImageView = (PFN_vkCreateImageView)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCreateImageView");
+@@ -1479,6 +1516,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         backendContext->vkFunctionTable.vkDestroyImageView = (PFN_vkDestroyImageView)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkDestroyImageView");
+         backendContext->vkFunctionTable.vkDestroyBuffer = (PFN_vkDestroyBuffer)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkDestroyBuffer");
+         backendContext->vkFunctionTable.vkDestroyBufferView = (PFN_vkDestroyBufferView)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkDestroyBufferView");
++    MV_MARK(5);
+         backendContext->vkFunctionTable.vkDestroyDescriptorSetLayout = (PFN_vkDestroyDescriptorSetLayout)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkDestroyDescriptorSetLayout");
+         backendContext->vkFunctionTable.vkDestroyDescriptorPool = (PFN_vkDestroyDescriptorPool)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkDestroyDescriptorPool");
+         backendContext->vkFunctionTable.vkDestroySampler = (PFN_vkDestroySampler)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkDestroySampler");
+@@ -1491,6 +1529,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         backendContext->vkFunctionTable.vkAllocateMemory = (PFN_vkAllocateMemory)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkAllocateMemory");
+         backendContext->vkFunctionTable.vkFreeMemory = (PFN_vkFreeMemory)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkFreeMemory");
+         backendContext->vkFunctionTable.vkMapMemory = (PFN_vkMapMemory)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkMapMemory");
++    MV_MARK(6);
+         backendContext->vkFunctionTable.vkUnmapMemory = (PFN_vkUnmapMemory)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkUnmapMemory");
+         backendContext->vkFunctionTable.vkBindBufferMemory = (PFN_vkBindBufferMemory)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkBindBufferMemory");
+         backendContext->vkFunctionTable.vkBindImageMemory = (PFN_vkBindImageMemory)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkBindImageMemory");
+@@ -1503,6 +1542,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         backendContext->vkFunctionTable.vkCmdCopyBuffer = (PFN_vkCmdCopyBuffer)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCmdCopyBuffer");
+         backendContext->vkFunctionTable.vkCmdCopyImage = (PFN_vkCmdCopyImage)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCmdCopyImage");
+         backendContext->vkFunctionTable.vkCmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCmdCopyBufferToImage");
++    MV_MARK(7);
+         backendContext->vkFunctionTable.vkCmdClearColorImage = (PFN_vkCmdClearColorImage)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCmdClearColorImage");
+         backendContext->vkFunctionTable.vkCmdFillBuffer = (PFN_vkCmdFillBuffer)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCmdFillBuffer");
+         backendContext->vkFunctionTable.vkCmdWriteBufferMarkerAMD = (PFN_vkCmdWriteBufferMarkerAMD)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkCmdWriteBufferMarkerAMD");
+@@ -1527,6 +1567,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+         };
+ 
+         descriptorPoolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    MV_MARK(8);
+         descriptorPoolCreateInfo.pNext = nullptr;
+         descriptorPoolCreateInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+         descriptorPoolCreateInfo.poolSizeCount = 5;
+@@ -1539,6 +1580,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+ 
+         // set bindless resource view to base
+         backendContext->bindlessBase = (backendContext->maxEffectContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2);
++    MV_MARK(9);
+ 
+         // allocate dynamic uniform buffer
+         {
+@@ -1551,6 +1593,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+                 FFX_ALIGN_UP(FFX_BUFFER_SIZE, backendContext->uniformBufferAlignment) * backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES;
+ 
+             VkBufferCreateInfo bufferInfo = {};
++    MV_MARK(10);
+             bufferInfo.sType              = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+             bufferInfo.size               = static_cast<VkDeviceSize>(backendContext->uniformBufferSize);
+             bufferInfo.usage              = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+@@ -1563,6 +1606,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+ 
+             // allocate memory block for all uniform buffers
+             VkMemoryRequirements memRequirements = {};
++    MV_MARK(11);
+             backendContext->vkFunctionTable.vkGetBufferMemoryRequirements(backendContext->device, backendContext->uniformBuffer, &memRequirements);
+ 
+             // this is the real alignment
+@@ -1575,6 +1619,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+             allocInfo.allocationSize = backendContext->uniformBufferSize;
+             allocInfo.memoryTypeIndex =
+                 findMemoryTypeIndex(backendContext->physicalDevice, memRequirements, requiredMemoryProperties, backendContext->uniformBufferMemoryProperties);
++    MV_MARK(12);
+ 
+             if (allocInfo.memoryTypeIndex == UINT32_MAX)
+             {
+@@ -1599,6 +1644,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+                     return FFX_ERROR_OUT_OF_MEMORY;
+                 default:
+                     return FFX_ERROR_BACKEND_API_ERROR;
++    MV_MARK(13);
+                 }
+             }
+ 
+@@ -1635,6 +1681,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+             bufferInfo.pQueueFamilyIndices = nullptr;
+ 
+             VkBuffer testBuffer = VK_NULL_HANDLE;
++    MV_MARK(14);
+             if (vkCreateBuffer(backendContext->device, &bufferInfo, nullptr, &testBuffer) != VK_SUCCESS)
+             {
+                 FFX_ASSERT_FAIL("Cannot create test Breadcrumbs buffer to find memory requirements!");
+@@ -1647,6 +1694,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+             {
+                 // Decide whether use dedicated memory or not
+                 VkBufferMemoryRequirementsInfo2 bufferReq = {};
++    MV_MARK(15);
+                 bufferReq.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2;
+                 bufferReq.pNext = nullptr;
+                 bufferReq.buffer = testBuffer;
+@@ -1659,6 +1707,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+                 VkMemoryRequirements2 memoryReq2 = {};
+                 memoryReq2.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+                 memoryReq2.pNext = &dedicatedMemoryReq;
++    MV_MARK(16);
+ 
+                 backendContext->vkFunctionTable.vkGetBufferMemoryRequirements2KHR(backendContext->device, &bufferReq, &memoryReq2);
+                 if (dedicatedMemoryReq.requiresDedicatedAllocation)
+@@ -1707,6 +1756,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+             if (backendContext->breadcrumbsMemoryIndex == UINT32_MAX)
+             {
+                 FFX_ASSERT_FAIL("No memory that satisfies requirements requested by Breadcrumbs buffer type!");
++    MV_MARK(17);
+                 return FFX_ERROR_BACKEND_API_ERROR;
+             }
+ 
+@@ -1731,54 +1781,79 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+             // Reset everything accordingly
+             BackendContext_VK::EffectContext& effectContext = backendContext->pEffectContexts[i];
+             effectContext.active = true;
++    MV_MARK(18);
+             effectContext.effectId = effect;
++            MV_MARK(1800 + 1);
+ 
+             effectContext.nextStaticResource = (i * FFX_MAX_RESOURCE_COUNT) + 1;
++            MV_MARK(1800 + 2);
+             effectContext.nextDynamicResource = getDynamicResourcesStartIndex(i);
++            MV_MARK(1800 + 3);
+             effectContext.nextStaticResourceView = (i * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2);
++            MV_MARK(1800 + 4);
+             for (uint32_t frameIndex = 0; frameIndex < FFX_MAX_QUEUED_FRAMES; ++frameIndex)
+             {
+                 effectContext.nextDynamicResourceView[frameIndex] = getDynamicResourceViewsStartIndex(i, frameIndex);
++                MV_MARK(1800 + 5);
+             }
+             effectContext.nextPipelineLayout = (i * FFX_MAX_PASS_COUNT);
++            MV_MARK(1800 + 6);
+             effectContext.frameIndex = 0;
++            MV_MARK(1800 + 7);
+ 
+             if (bindlessConfig)
+             {
+                 effectContext.bindlessTextureSrvHeapStart = backendContext->bindlessBase;
++                MV_MARK(1800 + 8);
+                 effectContext.bindlessTextureSrvHeapSize  = bindlessConfig->maxTextureSrvs;
++                MV_MARK(1800 + 9);
+ 
+                 backendContext->bindlessBase += bindlessConfig->maxTextureSrvs;
++                MV_MARK(1800 + 10);
+ 
+                 effectContext.bindlessBufferSrvHeapSize  = bindlessConfig->maxBufferSrvs;
++                MV_MARK(1800 + 11);
+ 
+                 effectContext.bindlessTextureUavHeapStart = backendContext->bindlessBase;
++                MV_MARK(1800 + 12);
+                 effectContext.bindlessTextureUavHeapSize  = bindlessConfig->maxTextureUavs;
++                MV_MARK(1800 + 13);
+ 
+                 backendContext->bindlessBase += bindlessConfig->maxTextureUavs;
++                MV_MARK(1800 + 14);
+ 
+                 effectContext.bindlessBufferUavHeapSize  = bindlessConfig->maxBufferUavs;
++                MV_MARK(1800 + 15);
+ 
+                 
+                 // create a bindless descriptor pool local to the current effect
+                 VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {};
++                MV_MARK(1800 + 16);
+                 VkDescriptorPoolSize       poolSizes[3];
++                MV_MARK(1800 + 17);
+ 
+                 uint32_t poolSizeCount = 0;
++                MV_MARK(1800 + 18);
+ 
+                 if (bindlessConfig->maxTextureSrvs > 0)
+                 {
+                     VkDescriptorPoolSize& poolSize = poolSizes[poolSizeCount++];
++                    MV_MARK(1800 + 19);
+ 
+                     poolSize.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
++                    MV_MARK(1800 + 20);
+                     poolSize.descriptorCount = bindlessConfig->maxTextureSrvs;
++                    MV_MARK(1800 + 21);
+                 }
+ 
+                 if (bindlessConfig->maxTextureUavs > 0)
+                 {
+                     VkDescriptorPoolSize& poolSize = poolSizes[poolSizeCount++];
++                    MV_MARK(1800 + 22);
+ 
+                     poolSize.type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++                    MV_MARK(1800 + 23);
++    MV_MARK(19);
+                     poolSize.descriptorCount = bindlessConfig->maxTextureUavs;
+                 }
+ 
+@@ -1791,6 +1866,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+                 }
+ 
+                 descriptorPoolCreateInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    MV_MARK(20);
+                 descriptorPoolCreateInfo.pNext         = nullptr;
+                 descriptorPoolCreateInfo.flags         = 0;
+                 descriptorPoolCreateInfo.poolSizeCount = poolSizeCount;
+@@ -1815,6 +1891,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+ 
+                     setLayoutBindingFlags.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+                     setLayoutBindingFlags.bindingCount  = 1;
++    MV_MARK(21);
+                     setLayoutBindingFlags.pBindingFlags = bindingFlags;
+ 
+                     VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+@@ -1839,6 +1916,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+ 
+                     backendContext->vkFunctionTable.vkAllocateDescriptorSets(
+                         backendContext->device, &setAllocateInfo, &effectContext.bindlessTextureSrvDescriptorSet);
++    MV_MARK(22);
+                 }
+ 
+                 // create the descriptor layout for bindless buffer srv buffers
+@@ -1887,6 +1965,7 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+                     VkDescriptorBindingFlags bindingFlags[] = {VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT};
+ 
+                     VkDescriptorSetLayoutBindingFlagsCreateInfo setLayoutBindingFlags = {};
++    MV_MARK(23);
+ 
+                     setLayoutBindingFlags.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+                     setLayoutBindingFlags.bindingCount  = 1;
+@@ -1947,26 +2026,39 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
+                     setAllocateInfo.descriptorPool              = effectContext.bindlessDescriptorPool;
+                     setAllocateInfo.descriptorSetCount          = 1;
+                     setAllocateInfo.pSetLayouts                 = &effectContext.bindlessBufferUavDescriptorSetLayout;
++    MV_MARK(24);
+ 
+                     backendContext->vkFunctionTable.vkAllocateDescriptorSets(
+                         backendContext->device, &setAllocateInfo, &effectContext.bindlessBufferUavDescriptorSet);
++                        MV_MARK(3000 + 1);
+                 }
+             }
+             else
+             {
+                 effectContext.bindlessTextureSrvHeapStart = 0;
++                MV_MARK(3000 + 2);
+                 effectContext.bindlessTextureSrvHeapSize  = 0;
++                MV_MARK(3000 + 3);
+                 effectContext.bindlessBufferSrvHeapSize   = 0;
++                MV_MARK(3000 + 4);
+                 effectContext.bindlessTextureUavHeapStart = 0;
++                MV_MARK(3000 + 5);
+                 effectContext.bindlessTextureUavHeapSize  = 0;
++                MV_MARK(3000 + 6);
++    MV_MARK(25);
+                 effectContext.bindlessBufferUavHeapSize   = 0;
++                MV_MARK(3000 + 7);
+             }   
+ 
+             break;
++            MV_MARK(3000 + 8);
++            MV_MARK(2000 + 1);
+         }
+     }
+ 
+     return FFX_OK;
++    MV_MARK(3000 + 9);
++    MV_MARK(2000 + 2);
+ }
+ 
+ FfxErrorCode GetDeviceCapabilitiesVK(FfxInterface* backendInterface, FfxDeviceCapabilities* deviceCapabilities)
+@@ -2017,7 +2109,32 @@ FfxErrorCode GetDeviceCapabilitiesVK(FfxInterface* backendInterface, FfxDeviceCa
+ 
+             vkGetPhysicalDeviceFeatures2(context->physicalDevice, &physicalDeviceFeatures2);
+ 
+-            deviceCapabilities->fp16Supported = (bool)shaderFloat18Int8Features.shaderFloat16;
++            // ---- WHAT THE GPU CAN DO IS NOT WHAT THE DEVICE ENABLED.
++            //
++            // MOTIONVECTORS: forced off. This query asks the PHYSICAL device
++            // what it supports; the shaders run on X-PLANE'S LOGICAL DEVICE,
++            // and X-Plane creates it without shaderFloat16 or shaderInt16. We
++            // are a layer - vkCreateDevice has long since returned, so those
++            // features cannot be added retroactively.
++            //
++            // Left true, FFX selects its _16bit permutations and we hand the
++            // driver SPIR-V declaring the Float16 and Int16 capabilities on a
++            // device where neither is enabled. The validation layer says so
++            // outright:
++            //
++            //   SPIR-V Capability Float16 was declared, but ... shaderFloat16
++            //   SPIR-V Capability Int16 was declared, but ... shaderInt16
++            //
++            // The result is undefined 16-bit arithmetic: integer addressing
++            // still resolves, so the geometry lands correctly, while the values
++            // wrap into saturated bands and never converge. That was the
++            // corruption on screen - not the colour input, not the depth view,
++            // not the motion vectors, and not the output image.
++            //
++            // The non-16-bit permutations are always built and always correct;
++            // this costs a little fp16 throughput and nothing else.
++            deviceCapabilities->fp16Supported = false;
++            (void)shaderFloat18Int8Features.shaderFloat16;
+         }
+         else if (strcmp(backendContext->extensionProperties[i].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0)
+         {
+@@ -3242,6 +3359,7 @@ FfxErrorCode CreatePipelineVK(FfxInterface* backendInterface,
+     FFX_ASSERT(NULL != pipelineDescription);
+ 
+     BackendContext_VK* backendContext = (BackendContext_VK*)backendInterface->scratchBuffer;
++    mvFgTrace("MV PIPE: effect=%d pass=%d ctx=%u nextLayout(pre)", (int)effect, (int)pass, (unsigned)effectContextId);
+     BackendContext_VK::EffectContext& effectContext = backendContext->pEffectContexts[effectContextId];
+ 
+     // start by fetching the shader blob
+@@ -3299,7 +3417,11 @@ FfxErrorCode CreatePipelineVK(FfxInterface* backendInterface,
+             break;
+         }
+ 
+-        if (backendContext->vkFunctionTable.vkCreateSampler(backendContext->device, &createInfo, nullptr, &pPipelineLayout->samplers[currentSamplerIndex]) != VK_SUCCESS) {
++        VkResult _sres = backendContext->vkFunctionTable.vkCreateSampler(backendContext->device, &createInfo, nullptr, &pPipelineLayout->samplers[currentSamplerIndex]);
++        mvFgTrace("MV SAMPLER: idx=%u vkCreateSampler=%d handle=%p (fn=%p device=%p)",
++                  currentSamplerIndex, (int)_sres, (void*)pPipelineLayout->samplers[currentSamplerIndex],
++                  (void*)backendContext->vkFunctionTable.vkCreateSampler, (void*)backendContext->device);
++        if (_sres != VK_SUCCESS) {
+             return FFX_ERROR_BACKEND_API_ERROR;
+         }
+     }
+@@ -3411,6 +3533,12 @@ FfxErrorCode CreatePipelineVK(FfxInterface* backendInterface,
+     layoutInfo.bindingCount = numLayoutBindings;
+     layoutInfo.pBindings = layoutBindings;
+ 
++    mvFgTrace("MV PIPE: before vkCreateDescriptorSetLayout, bindingCount=%u", (unsigned)layoutInfo.bindingCount);
++    for (uint32_t _b = 0; _b < numLayoutBindings; ++_b)
++        mvFgTrace("MV PIPE:   binding[%u] = { binding=%u type=%d count=%u stage=0x%x pImmSamp=%p }",
++                  _b, layoutBindings[_b].binding, (int)layoutBindings[_b].descriptorType,
++                  layoutBindings[_b].descriptorCount, (unsigned)layoutBindings[_b].stageFlags,
++                  (void*)layoutBindings[_b].pImmutableSamplers);
+     if (backendContext->vkFunctionTable.vkCreateDescriptorSetLayout(backendContext->device, &layoutInfo, nullptr, &pPipelineLayout->descriptorSetLayout) != VK_SUCCESS) {
+         return FFX_ERROR_BACKEND_API_ERROR;
+     }
+@@ -3639,6 +3767,7 @@ FfxErrorCode CreatePipelineVK(FfxInterface* backendInterface,
+     pipelineCreateInfo.layout = pPipelineLayout->pipelineLayout;
+ 
+     VkPipeline computePipeline = VK_NULL_HANDLE;
++    mvFgTrace("MV PIPE: before vkCreateComputePipelines");
+     if (backendContext->vkFunctionTable.vkCreateComputePipelines(backendContext->device, nullptr, 1, &pipelineCreateInfo, nullptr, &computePipeline) != VK_SUCCESS) {
+         return FFX_ERROR_BACKEND_API_ERROR;
+     }
+@@ -3725,6 +3854,31 @@ FfxErrorCode ScheduleGpuJobVK(FfxInterface* backendInterface, const FfxGpuJobDes
+     return FFX_OK;
+ }
+ 
++// MV diagnostic: names an optical-flow / interpolation pass that is handed a
++// NULL resource for a texture binding its shader reads. FFX silently skips
++// binding such a resource (the internalIndex==0 "continue" below), leaving the
++// descriptor unwritten - and the shader then reads an unbound descriptor, which
++// on this GPU is the "virtual address 0x0, Type: Compute" device-lost. This
++// turns that blind fault into the exact pass and binding name. Budget-capped so
++// it cannot flood; the crash lands within a handful of frames anyway.
++static void mvFgLogNullBind(const wchar_t* label, const char* kind, const wchar_t* name)
++{
++    static int budget = 80;
++    if (budget <= 0) return;
++    char l[96] = {0}, n[96] = {0};
++    for (int i = 0; i < 95 && label && label[i]; ++i) l[i] = (char)label[i];
++    for (int i = 0; i < 95 && name  && name[i];  ++i) n[i] = (char)name[i];
++    // Optical-flow dispatch labels are "OF ..."; interpolation "...nterpolation".
++    const bool isView = strstr(kind, "view") != nullptr;
++    const bool offi   = strstr(l, "OF ") || strstr(l, "ptical") || strstr(l, "nterpolation");
++    // A null VIEW is always a defect - log for any pass. A skipped null resource
++    // is normal/optional in the upscaler - only flag it for OF / interpolation.
++    if (!isView && !offi) return;
++    --budget;
++    mvFgTrace("FG NULL BIND: pass '%s' %s binding '%s' is NULL - the shader reads 0x0.",
++              l, kind, n);
++}
++
+ static FfxErrorCode executeGpuJobCompute(BackendContext_VK*    backendContext,
+                                          FfxGpuJobDescription* job,
+                                          VkCommandBuffer       vkCommandBuffer,
+@@ -3754,8 +3908,11 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_VK*    backendContext,
+         FfxTextureUAV& textureUAV = job->computeJobDescriptor.uavTextures[currentPipelineUavIndex];
+ 
+         // continue if this is a null resource.
+-        if (job->computeJobDescriptor.uavTextures[currentPipelineUavIndex].resource.internalIndex == 0)
++        if (job->computeJobDescriptor.uavTextures[currentPipelineUavIndex].resource.internalIndex == 0) {
++            mvFgLogNullBind(job->jobLabel, "UAV",
++                job->computeJobDescriptor.pipeline.uavTextureBindings[currentPipelineUavIndex].name);
+             continue;
++        }
+ 
+         addBarrier(backendContext, &textureUAV.resource, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+ 
+@@ -3783,6 +3940,8 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_VK*    backendContext,
+         imageDescriptorInfos[imageDescriptorIndex]             = {};
+         imageDescriptorInfos[imageDescriptorIndex].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+         imageDescriptorInfos[imageDescriptorIndex].imageView   = backendContext->pResourceViews[uavViewIndex].imageView;
++        if (backendContext->pResourceViews[uavViewIndex].imageView == VK_NULL_HANDLE)
++            mvFgLogNullBind(job->jobLabel, "UAV-view", binding.name);
+ 
+         imageDescriptorIndex++;
+         descriptorWriteIndex++;
+@@ -3831,8 +3990,11 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_VK*    backendContext,
+         FfxTextureSRV& textureSRV = job->computeJobDescriptor.srvTextures[currentPipelineSrvIndex];
+ 
+         // continue if this is a null resource.
+-        if (job->computeJobDescriptor.srvTextures[currentPipelineSrvIndex].resource.internalIndex == 0)
++        if (job->computeJobDescriptor.srvTextures[currentPipelineSrvIndex].resource.internalIndex == 0) {
++            mvFgLogNullBind(job->jobLabel, "SRV",
++                job->computeJobDescriptor.pipeline.srvTextureBindings[currentPipelineSrvIndex].name);
+             continue;
++        }
+ 
+         addBarrier(backendContext, &textureSRV.resource, FFX_RESOURCE_STATE_COMPUTE_READ);
+ 
+@@ -3856,6 +4018,8 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_VK*    backendContext,
+         imageDescriptorInfos[imageDescriptorIndex]             = {};
+         imageDescriptorInfos[imageDescriptorIndex].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+         imageDescriptorInfos[imageDescriptorIndex].imageView   = backendContext->pResourceViews[srvViewIndex].imageView;
++        if (backendContext->pResourceViews[srvViewIndex].imageView == VK_NULL_HANDLE)
++            mvFgLogNullBind(job->jobLabel, "SRV-view", binding.name);
+ 
+         imageDescriptorIndex++;
+         descriptorWriteIndex++;
+diff --git a/sdk/src/backends/vk/shaders/frameinterpolation/ffx_frameinterpolation_pass.glsl b/sdk/src/backends/vk/shaders/frameinterpolation/ffx_frameinterpolation_pass.glsl
+index 733bd39..bf61b27 100644
+--- a/sdk/src/backends/vk/shaders/frameinterpolation/ffx_frameinterpolation_pass.glsl
++++ b/sdk/src/backends/vk/shaders/frameinterpolation/ffx_frameinterpolation_pass.glsl
+@@ -40,6 +40,9 @@
+ #define FFX_FRAMEINTERPOLATION_BIND_UAV_OUTPUT                                  9
+ 
+ #define FFX_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION                       10
++// MotionVectors: the main pass reads our dilated vectors' .z (trust). Binding 11 is unused here;
++// the component binds it by the reflected name r_dilated_motion_vectors (srvResourceBindingTable).
++#define FFX_FRAMEINTERPOLATION_BIND_SRV_DILATED_MOTION_VECTORS                 11
+ 
+ #include "frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h"
+ #include "frameinterpolation/ffx_frameinterpolation_common.h"
