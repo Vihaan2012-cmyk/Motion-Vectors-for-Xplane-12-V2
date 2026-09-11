@@ -1776,6 +1776,65 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // sampling an image in a layout it does not have - invalid, and the kind
     // of invalid a driver may honour on one machine and not another.
     //
+    // ---- THE ENGINE DEPTH IS READ THROUGH OUR OWN COPY, NOT DIRECTLY.
+    //
+    // Binding 5 used to be a view straight onto X-Plane's D32S8 depth image:
+    // no barrier of ours, and a descriptor that names SHADER_READ_ONLY while
+    // the sim still holds the image as a (read-only) depth attachment. Those
+    // reads were not stable frame to frame on a STILL scene. Measured
+    // 2026-09-08 with the metrics pass, mean |delta| on static pixels per
+    // 200-frame window: direct read 0.000416 floor with bursts to 0.0016
+    // every 20-30 s; the injected clip-w instead 0.000302 and flat for 130 s;
+    // the direct read again and the bursts were back within one window. The
+    // contact march's bias is RELATIVE, so that noise flipped whole bands of
+    // a curved fuselage across it: the periodic black dots. AO's absolute
+    // range tolerated the same noise, which is why only contact showed it.
+    //
+    // depthcopy::record already does the right thing for FSR3: an execution
+    // dependency on the fragment tests that wrote the depth, a transition to
+    // a sampled layout, a compute copy into an R32 image that is OURS, and
+    // the sim's depth put back exactly as it was lent. The resolve and the
+    // gather now read that copy. Same values, same shaders, one full-screen
+    // copy per frame. Only when the copy was built over the very image the
+    // name listener identified, at the resolve's own size; otherwise the
+    // direct read stays, and the trace says so.
+    const bool copyOk = g_taa.edValid && g_taa.layers == 1 &&
+                        depthcopy::state().ready && !depthcopy::state().failed &&
+                        depthcopy::state().srcImage == g_taa.edImage &&
+                        depthcopy::state().w == g_taa.w &&
+                        depthcopy::state().h == g_taa.h &&
+                        depthcopy::state().arrayView != VK_NULL_HANDLE;
+    const bool edCopy   = taaPosHarvest() && copyOk;
+    // The capture harness wants the depth plane whether or not the resolve
+    // reads it (taa.pos_harvest=0 is the clean setting for contact shadows).
+    const bool capDepth = copyOk && nncap::captureArmed();
+    {
+        static int last = -1;
+        const int now = edCopy ? 1 : ((taaPosHarvest() && g_taa.edValid) ? 0 : 2);
+        if (now != last) {
+            last = now;
+            if (now == 1)
+                trace("TAA DEPTH: engine depth is read through the barriered R32 "
+                      "copy (%ux%u) - contact/AO see a stable depth.",
+                      g_taa.w, g_taa.h);
+            else if (now == 0)
+                trace("TAA DEPTH: engine depth is read DIRECTLY - copy unavailable "
+                      "(ready=%d failed=%d srcMatch=%d size=%ux%u vs %ux%u "
+                      "layers=%u). Expect contact-shadow speckle until it is.",
+                      depthcopy::state().ready ? 1 : 0,
+                      depthcopy::state().failed ? 1 : 0,
+                      depthcopy::state().srcImage == g_taa.edImage ? 1 : 0,
+                      depthcopy::state().w, depthcopy::state().h,
+                      g_taa.w, g_taa.h, g_taa.layers);
+        }
+    }
+    if (edCopy || capDepth)
+        depthcopy::record(dd.cmdBindPipeline, dd.cmdBindDescriptorSets,
+                          dd.cmdDispatch, dd.cmdPipelineBarrier,
+                          cb, g_sceneDepthLayout);
+    const VkImageView edBindView = edCopy ? depthcopy::state().arrayView
+                                          : g_taa.edView;
+
     // Still ahead of the resolve's own dispatch, so the result is composited
     // in the same frame, with the gather's trailing barrier ordering it.
     gi::record(dd, g_taa.device, cb, g_taa.sceneView, g_taa.velView,
@@ -2254,6 +2313,24 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
 
     // z = layers, matching gl_GlobalInvocationID.z in the shader.
     dd.cmdDispatch(cb, (g_taa.w + 7) / 8, (g_taa.h + 7) / 8, g_taa.layers);
+
+    // ---- TRAINING-DATA CAPTURE (nn.capture=1). Right here every input is in
+    // a known layout: scene SHADER_READ_ONLY (bar[0]), velocity SHADER_READ_ONLY
+    // (bar[2], put back below), the depth copy SHADER_READ_ONLY, and the history
+    // just written is GENERAL. Each plane is transitioned out and back by the
+    // harness itself, so the copy-back and the end transitions below see what
+    // they expect.
+    {
+        nncap::ResolvePlanes rp;
+        rp.scene = g_taa.sceneImage;
+        rp.velocity = g_mv.image;            rp.velocityFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        rp.depth = (edCopy || capDepth) ? depthcopy::state().image : VK_NULL_HANDLE;
+        rp.normal = g_taa.normValid ? g_taa.normImage : VK_NULL_HANDLE;
+        rp.normalFormat = g_taa.normFormat;
+        rp.resolved = g_taa.history[hw_];    rp.resolvedFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        rp.w = g_taa.w; rp.h = g_taa.h; rp.layers = g_taa.layers;
+        nncap::recordFromResolve(dd, cb, rp);
+    }
 
     // ---- OPTIONAL SHARPEN PASS (MODE_SHARPEN) ON A DEDICATED BUFFER.
     //

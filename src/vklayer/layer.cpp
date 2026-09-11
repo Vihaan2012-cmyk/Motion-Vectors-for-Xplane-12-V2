@@ -2742,6 +2742,7 @@ static std::map<VkBuffer, uint64_t>     g_allBuffers;   // size in bytes
 #include "gi_gather_spv.h"
 #include "gi_denoise_spv.h"
 #include "gi.h"
+#include "nn_capture_fwd.h"   // capture harness interface; definitions follow the globals it reads
 #include "dlssd.h"   // DLSS-D Ray Reconstruction (feature 1001), honest Streamline path
 #include "taa.h"
 #include "mv_nr_probe.h"   // THROWAWAY SPIKE: TAA_NR_PROBE=1
@@ -6315,6 +6316,8 @@ static bool spirvIsXpFsr(const uint32_t *code, size_t words)
     return false;
 }
 
+#include "nn_capture.h"   // needs g_velSnap, g_colorImages, g_viewToImage, isSceneSized - all above
+
 static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
     VkCommandBuffer cb, const VkRenderingInfo *info)
 {
@@ -6357,6 +6360,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
                 g_cbInScenePass[cb] = true;
                 g_cbSawScenePass[cb] = true;   // the resolve boundary needs this
                 ++g_cbScenePassCount[cb];
+                nncap::noteScenePass(cb, info);   // g_lock held: the G-buffer pass's attachments
 
                 // Body-frame reprojection applies only to the cockpit pass, and
                 // only when a pass index has been measured and configured.
@@ -7225,6 +7229,13 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
         }
     }
     if (g_nextCmdEndRendering) g_nextCmdEndRendering(cb);
+    if (wasScenePass && nncap::captureArmed()) {   // G-buffer planes are read here, while the pass's layout still holds
+        std::map<VkCommandBuffer, VkDevice>::iterator sdi = g_cbToDevice.find(cb);
+        if (sdi != g_cbToDevice.end()) {
+            std::map<void*, DeviceData>::iterator sdd = g_devices.find(dispatchKey(sdi->second));
+            if (sdd != g_devices.end()) nncap::noteScenePassEnd(sdd->second, cb);
+        }
+    }
 
     // ---- TAA RESOLVE, AFTER THE PASS HAS ACTUALLY ENDED.
     //
@@ -9299,6 +9310,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // for reasons nobody could reconstruct later.
     uint64_t frames = ++g_frameCount;
     oracle::tick(frames);
+    nncap::poll();   // hand finished capture readbacks to the writer thread
     accumTick(g_velSnap.jitterX, g_velSnap.jitterY);
 
     // ---- DID THE RESOLVE WRITE THE IMAGE THE SCREEN ACTUALLY READ?
