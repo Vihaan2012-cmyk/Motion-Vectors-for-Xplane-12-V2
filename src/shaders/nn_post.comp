@@ -24,6 +24,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(binding = 0, rgba16f) uniform readonly image2DArray uR;      // last conv output, layer 0
 layout(binding = 1, rgba16f) uniform readonly image2DArray uIn;     // the net input map (base in layer 4, shading in layer 5)
 layout(binding = 2, rgba16f) uniform image2DArray uHist;            // the resolve's history/output image, this frame's write side
+layout(binding = 3, rgba16f) uniform writeonly image2DArray uFin;   // the delivered frame (no-feedback mode): net left, resolve right
 
 layout(push_constant) uniform P {
     ivec2 size;
@@ -31,6 +32,7 @@ layout(push_constant) uniform P {
     int   viz;
     float split;
     float blend;      // 1 = net output, 0 = resolve (a live dial)
+    int   feedback;   // 1: write the history (the net recurs on itself); 0: write uFin only, history stays the resolve's
 } pc;
 
 void main()
@@ -39,7 +41,16 @@ void main()
     if (px.x >= pc.size.x || px.y >= pc.size.y) return;
 
     vec4 prev = imageLoad(uHist, ivec3(px, pc.layer));
-    if (float(px.x) >= pc.split * float(pc.size.x) && pc.viz == 0) return;
+    const bool netSide = float(px.x) < pc.split * float(pc.size.x);
+    // ---- NO FEEDBACK BY DEFAULT. The net was trained on three-step unrolls; recurring on its
+    // own output for thousands of frames grew a diagonal hatch on grass that halved with the
+    // blend (first working flight, 2026-09-12). With feedback off the history stays the
+    // resolve's - the input the net saw at step 0 of every training window - and the net's
+    // frame goes to the screen only, through the sharpen and the copy-out.
+    if (!netSide && pc.viz == 0) {
+        if (pc.feedback == 0) imageStore(uFin, ivec3(px, pc.layer), prev);
+        return;
+    }
 
     vec3 r    = imageLoad(uR,  ivec3(px, 0)).rgb;
     vec3 base = imageLoad(uIn, ivec3(px, 4)).yzw;
@@ -74,10 +85,11 @@ void main()
         o = ct / max(1.0 - lt, 1e-4);
     }
 
-    if (pc.viz == 1) {
-        imageStore(uHist, ivec3(px, pc.layer), vec4(abs(o - prev.rgb) * 8.0, prev.a));
-        return;
+    vec4 res = (pc.viz == 1) ? vec4(abs(o - prev.rgb) * 8.0, prev.a)
+             : (netSide ? vec4(mix(prev.rgb, o, clamp(pc.blend, 0.0, 1.0)), prev.a) : prev);
+    if (pc.feedback != 0) {
+        if (netSide || pc.viz == 1) imageStore(uHist, ivec3(px, pc.layer), res);
+    } else {
+        imageStore(uFin, ivec3(px, pc.layer), res);
     }
-    if (float(px.x) >= pc.split * float(pc.size.x)) return;
-    imageStore(uHist, ivec3(px, pc.layer), vec4(mix(prev.rgb, o, clamp(pc.blend, 0.0, 1.0)), prev.a));
 }

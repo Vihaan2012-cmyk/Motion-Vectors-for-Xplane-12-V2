@@ -2425,6 +2425,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // the sharpen and the copy-out see the net's output exactly as they see the
     // resolve's.
     if (nnView != VK_NULL_HANDLE) nnaa::record(dd, cb, g_taa.historyView[hw_], g_taa.history[hw_], 0);
+    // In the default no-feedback mode the net delivered its frame to its own image: the sharpen
+    // samples that and the copy-out copies it; history[hw_] stays the resolve's own.
+    const VkImageView nnFinView = nnView != VK_NULL_HANDLE ? nnaa::finalView() : VK_NULL_HANDLE;
+    const VkImage     nnFinImg  = nnView != VK_NULL_HANDLE ? nnaa::finalImage() : VK_NULL_HANDLE;
 
     // ---- OPTIONAL SHARPEN PASS (MODE_SHARPEN) ON A DEDICATED BUFFER.
     //
@@ -2475,7 +2479,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         si[0] = ii[0];
         si[1].imageView = g_taa.sharpView; si[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         si[2] = ii[2];
-        si[3].imageView = g_taa.historyView[hw_];
+        si[3].imageView = nnFinView != VK_NULL_HANDLE ? nnFinView : g_taa.historyView[hw_];
         si[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         si[3].sampler   = g_taa.sampler;
         si[4] = ii[4];
@@ -2524,7 +2528,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         // The sharpen wrote g_taa.sharpImage; copy THAT to screen and leave the
         // resolved history[hw_] untouched (it stays pristine as next frame's
         // sample source). Without the sharpen, copy history[hw_] as before.
-        VkImage copySrc = doSharpen ? g_taa.sharpImage : g_taa.history[hw_];
+        VkImage copySrc = doSharpen ? g_taa.sharpImage : (nnFinImg != VK_NULL_HANDLE ? nnFinImg : g_taa.history[hw_]);
 
         VkImageMemoryBarrier pre[2];
         pre[0] = bar[0];

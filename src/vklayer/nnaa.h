@@ -89,6 +89,8 @@ struct State {
     std::string weightsPath;
 
     Map in, a, b, g, out, c, d, h, e, f;
+    Map fin;                 // the delivered frame in no-feedback mode (sampled by the sharpen, copied out)
+    bool finLive = false;    // fin holds this frame's delivery
     uint32_t w = 0, hh = 0;
     uint64_t frame = 0, dispatches = 0;
     bool announced = false, sizeWarned = false;
@@ -135,9 +137,10 @@ inline uint16_t f2h(float f)
 struct PostPush {
     int32_t w, h, layer, viz;
     float   split, blend;
+    int32_t feedback;
 };
 static_assert(sizeof(ConvPush) == 56, "nn_conv.comp push block mismatch");
-static_assert(sizeof(PostPush) == 24, "nn_post.comp push block mismatch");
+static_assert(sizeof(PostPush) == 28, "nn_post.comp push block mismatch");
 
 // ---------------------------------------------------------------- resources
 inline void freeMap(State &s, DeviceData &dd, Map &m)
@@ -345,7 +348,7 @@ inline bool init(State &s, DeviceData &dd)
     dl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dl.bindingCount = 4; dl.pBindings = b;
     if (dd.createDescriptorSetLayout(s.dev, &dl, nullptr, &s.dslConv) != VK_SUCCESS) return false;
-    dl.bindingCount = 3;
+    dl.bindingCount = 4;   // r, input map, history (read), delivered frame (write)
     if (dd.createDescriptorSetLayout(s.dev, &dl, nullptr, &s.dslPost) != VK_SUCCESS) return false;
 
     VkPushConstantRange pr; pr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; pr.offset = 0; pr.size = sizeof(ConvPush);
@@ -401,7 +404,7 @@ inline bool init(State &s, DeviceData &dd)
     }
 
     VkDescriptorPoolSize ps[2];
-    ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  ps[0].descriptorCount = 3 * State::kSets;
+    ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  ps[0].descriptorCount = 4 * State::kSets;
     ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; ps[1].descriptorCount = 2 * State::kSets;
     VkDescriptorPoolCreateInfo dp; memset(&dp, 0, sizeof(dp));
     dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -456,11 +459,12 @@ inline bool ensureMaps(State &s, DeviceData &dd, VkCommandBuffer cb)
     const uint32_t w = s.w, h = s.hh, w2 = w / 2, h2 = h / 2, w4 = w / 4, h4 = h / 4;
     bool ok = makeMap(s, dd, s.a, w, h, groups(s.ch0)) && makeMap(s, dd, s.b, w, h, groups(s.ch0)) &&
               makeMap(s, dd, s.g, w, h, groups(s.ch0)) && makeMap(s, dd, s.out, w, h, 1) &&
+              makeMap(s, dd, s.fin, w, h, 1, VK_IMAGE_USAGE_SAMPLED_BIT) &&
               makeMap(s, dd, s.c, w2, h2, groups(s.ch1)) && makeMap(s, dd, s.d, w2, h2, groups(s.ch1)) &&
               makeMap(s, dd, s.h, w2, h2, groups(s.ch1)) &&
               makeMap(s, dd, s.e, w4, h4, groups(s.ch2)) && makeMap(s, dd, s.f, w4, h4, groups(s.ch2));
     if (!ok) return false;
-    Map *all[] = { &s.a, &s.b, &s.g, &s.out, &s.c, &s.d, &s.h, &s.e, &s.f };
+    Map *all[] = { &s.a, &s.b, &s.g, &s.out, &s.c, &s.d, &s.h, &s.e, &s.f, &s.fin };
     for (Map *m : all) layoutMap(dd, cb, *m);
     return true;
 }
@@ -559,7 +563,7 @@ inline void dumpBegin(State &s, DeviceData &dd, VkCommandBuffer cb, VkImage hist
     r.bufferOffset = plane * 6; r.imageSubresource.baseArrayLayer = 0;
     dd.cmdCopyImageToBuffer(cb, s.out.img, VK_IMAGE_LAYOUT_GENERAL, s.dbuf, 1, &r);
     r.bufferOffset = plane * 7;
-    dd.cmdCopyImageToBuffer(cb, histImg, VK_IMAGE_LAYOUT_GENERAL, s.dbuf, 1, &r);
+    dd.cmdCopyImageToBuffer(cb, s.finLive ? s.fin.img : histImg, VK_IMAGE_LAYOUT_GENERAL, s.dbuf, 1, &r);
     mb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     s.dumpFrame = s.frame; s.dumpState = 1;
@@ -626,21 +630,24 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
 
     // post: base + tanh(r) * (0.5 + |base|) into the history image
     VkDescriptorSet set = takeSet(s, 2);
-    VkDescriptorImageInfo ii[3]; memset(ii, 0, sizeof(ii));
+    VkDescriptorImageInfo ii[4]; memset(ii, 0, sizeof(ii));
     ii[0].imageView = s.out.view; ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[1].imageView = s.in.view;  ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[2].imageView = histView;   ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkWriteDescriptorSet wr[3]; memset(wr, 0, sizeof(wr));
-    for (int k = 0; k < 3; ++k) {
+    ii[3].imageView = s.fin.view; ii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet wr[4]; memset(wr, 0, sizeof(wr));
+    for (int k = 0; k < 4; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[k].dstSet = set; wr[k].dstBinding = (uint32_t)k;
         wr[k].descriptorCount = 1; wr[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[k].pImageInfo = &ii[k];
     }
-    dd.updateDescriptorSets(s.dev, 3, wr, 0, nullptr);
+    dd.updateDescriptorSets(s.dev, 4, wr, 0, nullptr);
     PostPush p;
     p.w = (int32_t)s.w; p.h = (int32_t)s.hh; p.layer = (int32_t)histLayer;
     p.viz   = live::i("taa.nn_viz", "TAA_NN_VIZ", 0);
     p.split = live::f("taa.nn_split", "TAA_NN_SPLIT", 0.5f);
     p.blend = live::f("taa.nn_blend", "TAA_NN_BLEND", 1.0f);
+    p.feedback = live::onoff("taa.nn_feedback", "TAA_NN_FEEDBACK", false) ? 1 : 0;
+    s.finLive = (p.feedback == 0);
     gpuTimeMark(dd, cb, "post");
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipePost);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.plPost, 0, 1, &set, 0, nullptr);
@@ -722,6 +729,10 @@ inline void dumpScene(DeviceData &dd, VkCommandBuffer cb, VkImage scene)
     trace("NNAA: dump also holds the scene target after the copy-out");
 }
 
+// The delivered frame (no-feedback mode) for the sharpen and the copy-out; null when the net wrote the history instead.
+inline VkImageView finalView()  { State &s = state(); return s.finLive ? s.fin.view : VK_NULL_HANDLE; }
+inline VkImage     finalImage() { State &s = state(); return s.finLive ? s.fin.img  : VK_NULL_HANDLE; }
+
 // The snapshot view for the resolve's normal binding this frame, or null (then the resolve keeps its own).
 inline VkImageView normalView(uint64_t frame)
 {
@@ -736,7 +747,7 @@ inline void shutdown(DeviceData &dd)
     if (s.dptr) { dd.unmapMemory(s.dev, s.dmem); s.dptr = nullptr; }
     if (s.dbuf) dd.destroyBuffer(s.dev, s.dbuf, nullptr);
     if (s.dmem) dd.freeMemory(s.dev, s.dmem, nullptr);
-    Map *all[] = { &s.in, &s.a, &s.b, &s.g, &s.out, &s.c, &s.d, &s.h, &s.e, &s.f, &s.norm };
+    Map *all[] = { &s.in, &s.a, &s.b, &s.g, &s.out, &s.c, &s.d, &s.h, &s.e, &s.f, &s.norm, &s.fin };
     for (Map *m : all) freeMap(s, dd, *m);
     if (s.wbuf) dd.destroyBuffer(s.dev, s.wbuf, nullptr);
     if (s.wmem) dd.freeMemory(s.dev, s.wmem, nullptr);
