@@ -189,10 +189,10 @@ void main()
 
     if (row < 8) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h0 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc0);
-        coopMatStore(h0, tile, (row * 2 + 0) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(h0, tile, (row * nNb + 0) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
         if (nNb > 1) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h1 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc1);
-            coopMatStore(h1, tile, (row * 2 + 1) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatStore(h1, tile, (row * nNb + 1) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
         }
     }
     barrier();
@@ -208,7 +208,7 @@ void main()
         for (int j = 0; j < 4; ++j) {
             int co = g * 4 + j;
             if (co >= pc.cout) break;
-            float v = float(tile[(row * 2 + co / 16) * 256 + px * 16 + (co & 15)]) + uBias.b[pc.bOff + co];
+            float v = float(tile[(row * nNb + co / 16) * 256 + px * 16 + (co & 15)]) + uBias.b[pc.bOff + co];
             if (pc.act == 1) v = (v > 0.0) ? v : 0.1 * v;
             o[j] = v;
         }
