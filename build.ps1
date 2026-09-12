@@ -344,6 +344,33 @@ for ($i = 0; $i -lt $npowords.Count; $i += 8) {
 [IO.File]::WriteAllText("$src/vklayer/nn_post_spv.h", $nposb.ToString())
 Write-Host ("  nn_post_spv.h: {0} words" -f $npowords.Count)
 
+Write-Host "Compiling nn_conv_cm shader..."
+$ncmTmp = Join-Path $env:TEMP "nn_conv_cm.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/nn_conv_cm.comp" -o $ncmTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "nn_conv_cm.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $ncmTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "nn_conv_cm.comp failed spirv-val" }
+}
+$ncmbytes = [System.IO.File]::ReadAllBytes($ncmTmp)
+$ncmwords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $ncmbytes.Length; $i += 4) {
+    $ncmwords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($ncmbytes, $i)))
+}
+$ncmsb = New-Object System.Text.StringBuilder
+[void]$ncmsb.AppendLine("// Generated from src/shaders/nn_conv_cm.comp by build.ps1 - do not edit.")
+[void]$ncmsb.AppendLine("#pragma once")
+[void]$ncmsb.AppendLine("#include <stdint.h>")
+[void]$ncmsb.AppendLine("")
+[void]$ncmsb.AppendLine("static const uint32_t kNnConvCmSpv[] = {")
+for ($i = 0; $i -lt $ncmwords.Count; $i += 8) {
+    $n = [Math]::Min(8, $ncmwords.Count - $i)
+    [void]$ncmsb.AppendLine("    " + (($ncmwords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$ncmsb.AppendLine("};")
+[IO.File]::WriteAllText("$src/vklayer/nn_conv_cm_spv.h", $ncmsb.ToString())
+Write-Host ("  nn_conv_cm_spv.h: {0} words" -f $ncmwords.Count)
+
 Write-Host "Compiling metrics shader..."
 $mtTmp = Join-Path $env:TEMP "metrics.spv"
 & $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/metrics.comp" -o $mtTmp | Out-Null

@@ -737,6 +737,8 @@ static PFN_vkEnumerateDeviceExtensionProperties g_nextEnumDeviceExt = nullptr;
 // calls by name so they go DOWN the chain instead of re-entering the loader.
 static PFN_vkGetPhysicalDeviceProperties2 g_getPhysProps2 = nullptr;
 static PFN_vkGetPhysicalDeviceFeatures2   g_getPhysFeat2  = nullptr;
+// taa.nn: VK_KHR_cooperative_matrix and its features were enabled on this device (see TAA_CreateDevice).
+static bool g_nnCoopmat = false;
 static PFN_vkGetPhysicalDeviceFeatures    g_getPhysFeat   = nullptr;
 // Written once at device creation, read without a lock by the FidelityFX
 // forwarders. FFX asks for function addresses constantly while building its
@@ -17733,6 +17735,105 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
                   "engine can re-rank live blocks");
         }
 
+
+        // ---- COOPERATIVE MATRIX FOR THE AA NET (taa.nn). Enabled only when the
+        // driver advertises the extension, the 16x16x16 fp16->fp32 subgroup shape,
+        // a 32-wide subgroup and every feature the shader needs; nnaa.h then picks
+        // nn_conv_cm.comp over the fp32 kernel. TAA_NN_NO_COOPMAT=1 forces the
+        // fallback for an A/B. Feature structs are static for the same lifetime
+        // reason as the others; a struct X-Plane already chains is edited in
+        // place rather than duplicated, which the spec forbids.
+        g_nnCoopmat = false;
+        {
+            const char *no = getenv("TAA_NN_NO_COOPMAT");
+            bool supported = false;
+            for (size_t i = 0; i < have.size(); ++i)
+                if (!strcmp(have[i].extensionName, "VK_KHR_cooperative_matrix")) { supported = true; break; }
+            if (supported && !(no && atoi(no) != 0) && g_getPhysFeat2 && g_getPhysProps2 && g_appGipa) {
+                VkPhysicalDeviceCooperativeMatrixFeaturesKHR qcm; memset(&qcm, 0, sizeof(qcm));
+                VkPhysicalDeviceShaderFloat16Int8Features qf16; memset(&qf16, 0, sizeof(qf16));
+                VkPhysicalDevice16BitStorageFeatures q16; memset(&q16, 0, sizeof(q16));
+                VkPhysicalDeviceVulkanMemoryModelFeatures qvmm; memset(&qvmm, 0, sizeof(qvmm));
+                qcm.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR; qcm.pNext = &qf16;
+                qf16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;     qf16.pNext = &q16;
+                q16.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;           q16.pNext = &qvmm;
+                qvmm.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
+                VkPhysicalDeviceFeatures2 q2; memset(&q2, 0, sizeof(q2));
+                q2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2; q2.pNext = &qcm;
+                g_getPhysFeat2(phys, &q2);
+                VkPhysicalDeviceSubgroupProperties sgp; memset(&sgp, 0, sizeof(sgp));
+                sgp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+                VkPhysicalDeviceProperties2 p2; memset(&p2, 0, sizeof(p2));
+                p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2; p2.pNext = &sgp;
+                g_getPhysProps2(phys, &p2);
+                bool shape = false;
+                PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR getCm =
+                    (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)g_appGipa(g_appInstance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+                if (getCm) {
+                    uint32_t n = 0; getCm(phys, &n, nullptr);
+                    std::vector<VkCooperativeMatrixPropertiesKHR> props(n);
+                    for (uint32_t i = 0; i < n; ++i) { memset(&props[i], 0, sizeof(props[i])); props[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR; }
+                    getCm(phys, &n, props.data());
+                    for (uint32_t i = 0; i < n; ++i)
+                        if (props[i].MSize == 16 && props[i].NSize == 16 && props[i].KSize == 16 &&
+                            props[i].AType == VK_COMPONENT_TYPE_FLOAT16_KHR && props[i].BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                            props[i].CType == VK_COMPONENT_TYPE_FLOAT32_KHR && props[i].ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                            props[i].scope == VK_SCOPE_SUBGROUP_KHR) { shape = true; break; }
+                }
+                trace("DEVICE: cooperative matrix - ext %d feature %d shaderFloat16 %d storage16 %d memoryModel %d "
+                      "16x16x16 f16->f32 %d subgroup %u",
+                      supported ? 1 : 0, qcm.cooperativeMatrix ? 1 : 0, qf16.shaderFloat16 ? 1 : 0,
+                      q16.storageBuffer16BitAccess ? 1 : 0, qvmm.vulkanMemoryModel ? 1 : 0, shape ? 1 : 0, sgp.subgroupSize);
+                if (qcm.cooperativeMatrix && qf16.shaderFloat16 && q16.storageBuffer16BitAccess && qvmm.vulkanMemoryModel && shape && sgp.subgroupSize == 32) {
+                    static VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmFeat;
+                    static VkPhysicalDeviceShaderFloat16Int8Features f16Feat;
+                    static VkPhysicalDevice16BitStorageFeatures s16Feat;
+                    static VkPhysicalDeviceVulkanMemoryModelFeatures vmmFeat;
+                    bool has12 = false, has11 = false, hasF16 = false, has16 = false, hasVmm = false, hasCm = false;
+                    for (VkBaseOutStructure *pn = (VkBaseOutStructure*)ci2.pNext; pn; pn = pn->pNext) {
+                        switch ((int)pn->sType) {
+                        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+                            ((VkPhysicalDeviceVulkan12Features*)pn)->shaderFloat16 = VK_TRUE;
+                            ((VkPhysicalDeviceVulkan12Features*)pn)->vulkanMemoryModel = VK_TRUE; has12 = true; break;
+                        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
+                            ((VkPhysicalDeviceVulkan11Features*)pn)->storageBuffer16BitAccess = VK_TRUE; has11 = true; break;
+                        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES:
+                            ((VkPhysicalDeviceShaderFloat16Int8Features*)pn)->shaderFloat16 = VK_TRUE; hasF16 = true; break;
+                        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES:
+                            ((VkPhysicalDevice16BitStorageFeatures*)pn)->storageBuffer16BitAccess = VK_TRUE; has16 = true; break;
+                        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES:
+                            ((VkPhysicalDeviceVulkanMemoryModelFeatures*)pn)->vulkanMemoryModel = VK_TRUE; hasVmm = true; break;
+                        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR:
+                            ((VkPhysicalDeviceCooperativeMatrixFeaturesKHR*)pn)->cooperativeMatrix = VK_TRUE; hasCm = true; break;
+                        default: break;
+                        }
+                    }
+                    if (!has12 && !hasF16) {
+                        memset(&f16Feat, 0, sizeof(f16Feat)); f16Feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+                        f16Feat.shaderFloat16 = VK_TRUE; f16Feat.pNext = (void*)ci2.pNext; ci2.pNext = &f16Feat;
+                    }
+                    if (!has12 && !hasVmm) {
+                        memset(&vmmFeat, 0, sizeof(vmmFeat)); vmmFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
+                        vmmFeat.vulkanMemoryModel = VK_TRUE; vmmFeat.pNext = (void*)ci2.pNext; ci2.pNext = &vmmFeat;
+                    }
+                    if (!has11 && !has16) {
+                        memset(&s16Feat, 0, sizeof(s16Feat)); s16Feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+                        s16Feat.storageBuffer16BitAccess = VK_TRUE; s16Feat.pNext = (void*)ci2.pNext; ci2.pNext = &s16Feat;
+                    }
+                    if (!hasCm) {
+                        memset(&cmFeat, 0, sizeof(cmFeat)); cmFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+                        cmFeat.cooperativeMatrix = VK_TRUE; cmFeat.pNext = (void*)ci2.pNext; ci2.pNext = &cmFeat;
+                    }
+                    bool already = false;
+                    for (size_t i = 0; i < exts.size(); ++i) if (!strcmp(exts[i], "VK_KHR_cooperative_matrix")) already = true;
+                    if (!already) exts.push_back("VK_KHR_cooperative_matrix");
+                    g_nnCoopmat = true;
+                    trace("DEVICE: cooperative matrix enabled for the AA net (vulkan12 struct %s, vulkan11 struct %s)",
+                          has12 ? "edited" : "absent", has11 ? "edited" : "absent");
+                }
+            }
+        }
+
         ci2.enabledExtensionCount   = (uint32_t)exts.size();
         ci2.ppEnabledExtensionNames = exts.data();
     }
@@ -17941,6 +18042,7 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
     if (r != VK_SUCCESS) {
         trace("DEVICE: creation with added extensions failed (%d) - retrying "
               "with the application's original list", (int)r);
+        g_nnCoopmat = false;
         r = nextCreate(phys, ci, alloc, out);
     }
     if (r != VK_SUCCESS) return r;

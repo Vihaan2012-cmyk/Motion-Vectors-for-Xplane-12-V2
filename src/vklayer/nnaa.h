@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 #include "nn_conv_spv.h"
+#include "nn_conv_cm_spv.h"
 #include "nn_post_spv.h"
 
 namespace nnaa {
@@ -49,15 +50,18 @@ struct Map {
     bool laidOut = false;
 };
 
-struct Layer { int cout = 0, cin = 0, ksize = 3; uint32_t wOff = 0, bOff = 0; };
+struct Layer { int cout = 0, cin = 0, ksize = 3; uint32_t wOff = 0, bOff = 0; int cinPad = 0, nPad = 0; uint32_t cmOff = 0; };
 
 struct State {
     bool tried = false, ready = false;
     VkDevice dev = VK_NULL_HANDLE;
-    VkShaderModule smConv = VK_NULL_HANDLE, smPost = VK_NULL_HANDLE;
-    VkDescriptorSetLayout dslConv = VK_NULL_HANDLE, dslPost = VK_NULL_HANDLE;
-    VkPipelineLayout plConv = VK_NULL_HANDLE, plPost = VK_NULL_HANDLE;
-    VkPipeline pipeConv = VK_NULL_HANDLE, pipePost = VK_NULL_HANDLE;
+    VkShaderModule smConv = VK_NULL_HANDLE, smPost = VK_NULL_HANDLE, smCm = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dslConv = VK_NULL_HANDLE, dslPost = VK_NULL_HANDLE, dslCm = VK_NULL_HANDLE;
+    VkPipelineLayout plConv = VK_NULL_HANDLE, plPost = VK_NULL_HANDLE, plCm = VK_NULL_HANDLE;
+    VkPipeline pipeConv = VK_NULL_HANDLE, pipePost = VK_NULL_HANDLE, pipeCm = VK_NULL_HANDLE;
+    bool cm = false;                     // tensor-core path built and usable
+    VkBuffer       cmbuf = VK_NULL_HANDLE;   // fp16 weights, coopmat layout
+    VkDeviceMemory cmmem = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     static const uint32_t kSets = 96;    // 12 dispatches per frame, several frames in flight
     VkDescriptorSet sets[kSets];
@@ -90,6 +94,30 @@ struct ConvPush {
     int32_t outW, outH, aW, aH, bW, bH;
     int32_t cinA, cinB, cout, wOff, bOff, modeA, modeB, act;
 };
+struct CmPush {
+    int32_t outW, outH, aW, aH, bW, bH;
+    int32_t cinA, cinB, cinPad, cout, nPad, wOff, bOff, modeA, modeB, act;
+};
+static_assert(sizeof(CmPush) == 64, "nn_conv_cm.comp push block mismatch");
+
+// IEEE half, round to nearest even - for the coopmat weight buffer.
+inline uint16_t f2h(float f)
+{
+    uint32_t x; memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u; int32_t e = (int32_t)((x >> 23) & 0xFF) - 127 + 15; uint32_t m = x & 0x7FFFFFu;
+    if (((x >> 23) & 0xFF) == 0xFF) return (uint16_t)(sign | 0x7C00u | (m ? 0x200u : 0));
+    if (e >= 31) return (uint16_t)(sign | 0x7C00u);
+    if (e <= 0) {
+        if (e < -10) return (uint16_t)sign;
+        m |= 0x800000u; uint32_t shift = (uint32_t)(14 - e); uint32_t r = m >> shift; uint32_t rem = m & ((1u << shift) - 1u), halfway = 1u << (shift - 1);
+        if (rem > halfway || (rem == halfway && (r & 1u))) ++r;
+        return (uint16_t)(sign | r);
+    }
+    uint32_t r = (uint32_t)(e << 10) | (m >> 13); uint32_t rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1u))) ++r;
+    return (uint16_t)(sign | r);
+}
+
 struct PostPush {
     int32_t w, h, layer, viz;
     float   split, blend;
@@ -238,6 +266,39 @@ inline bool loadWeights(State &s, DeviceData &dd)
     }
     memcpy(p, w.data(), bc.size);
     dd.unmapMemory(s.dev, s.wmem);
+    // ---- the tensor-core layout: per layer, per (offset k, 16-channel block cb), a row-major
+    // [16 x nPad] fp16 matrix B(ci, co) = W[co][cb*16+ci][ky][kx], zero beyond cin / cout.
+    if (g_nnCoopmat) {
+        std::vector<uint16_t> h;
+        for (size_t i = 0; i < s.layers.size(); ++i) {
+            Layer &L = s.layers[i];
+            L.cinPad = (L.cin + 15) / 16 * 16; L.nPad = (L.cout + 15) / 16 * 16; L.cmOff = (uint32_t)h.size();
+            const int nCb = L.cinPad / 16;
+            for (int k = 0; k < 9; ++k)
+                for (int cb = 0; cb < nCb; ++cb)
+                    for (int ci = 0; ci < 16; ++ci)
+                        for (int co = 0; co < L.nPad; ++co) {
+                            const int c = cb * 16 + ci;
+                            float v = 0.0f;
+                            if (c < L.cin && co < L.cout) v = w[L.wOff + ((size_t)co * L.cin + c) * 9 + k];
+                            h.push_back(f2h(v));
+                        }
+        }
+        VkBufferCreateInfo hc; memset(&hc, 0, sizeof(hc));
+        hc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; hc.size = (VkDeviceSize)h.size() * 2;
+        hc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT; hc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        void *hp = nullptr; VkMemoryRequirements hmr; VkMemoryAllocateInfo hma; memset(&hma, 0, sizeof(hma));
+        if (dd.createBuffer(s.dev, &hc, nullptr, &s.cmbuf) == VK_SUCCESS) {
+            dd.getBufferMemReq(s.dev, s.cmbuf, &hmr);
+            hma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; hma.allocationSize = hmr.size;
+            hma.memoryTypeIndex = taaFindMemory(dd, hmr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (hma.memoryTypeIndex != UINT32_MAX && dd.allocateMemory(s.dev, &hma, nullptr, &s.cmmem) == VK_SUCCESS &&
+                dd.bindBufferMemory(s.dev, s.cmbuf, s.cmmem, 0) == VK_SUCCESS && dd.mapMemory(s.dev, s.cmmem, 0, hc.size, 0, &hp) == VK_SUCCESS) {
+                memcpy(hp, h.data(), hc.size); dd.unmapMemory(s.dev, s.cmmem);
+                trace("NNAA: tensor-core weight layout packed - %u halfs", (unsigned)h.size());
+            } else { trace("NNAA: coopmat weight memory failed - fp32 kernel"); }
+        } else { s.cmbuf = VK_NULL_HANDLE; trace("NNAA: coopmat weight buffer failed - fp32 kernel"); }
+    }
     s.weightsOk = true;
     trace("NNAA: loaded %s - 11 layers, channels (%d,%d,%d), %u floats", s.weightsPath.c_str(), s.ch0, s.ch1, s.ch2, off);
     return true;
@@ -285,17 +346,40 @@ inline bool init(State &s, DeviceData &dd)
     if (dd.createComputePipelines(s.dev, VK_NULL_HANDLE, 1, &cp, nullptr, &s.pipeConv) != VK_SUCCESS) return false;
     cp.stage.module = s.smPost; cp.layout = s.plPost;
     if (dd.createComputePipelines(s.dev, VK_NULL_HANDLE, 1, &cp, nullptr, &s.pipePost) != VK_SUCCESS) return false;
+    // ---- the tensor-core kernel: 3 images + fp16 weights + fp32 biases
+    s.cm = false;
+    if (g_nnCoopmat && !(getenv("TAA_NN_NO_COOPMAT") && atoi(getenv("TAA_NN_NO_COOPMAT")) != 0)) {
+        sm.codeSize = sizeof(kNnConvCmSpv); sm.pCode = kNnConvCmSpv;
+        VkDescriptorSetLayoutBinding cb5[5]; memset(cb5, 0, sizeof(cb5));
+        for (int i = 0; i < 5; ++i) { cb5[i].binding = (uint32_t)i; cb5[i].descriptorCount = 1; cb5[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; cb5[i].descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; }
+        VkDescriptorSetLayoutCreateInfo cdl; memset(&cdl, 0, sizeof(cdl));
+        cdl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; cdl.bindingCount = 5; cdl.pBindings = cb5;
+        VkPushConstantRange cpr; cpr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; cpr.offset = 0; cpr.size = sizeof(CmPush);
+        VkPipelineLayoutCreateInfo cpl; memset(&cpl, 0, sizeof(cpl));
+        cpl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO; cpl.setLayoutCount = 1; cpl.pushConstantRangeCount = 1; cpl.pPushConstantRanges = &cpr;
+        if (dd.createShaderModule(s.dev, &sm, nullptr, &s.smCm) == VK_SUCCESS &&
+            dd.createDescriptorSetLayout(s.dev, &cdl, nullptr, &s.dslCm) == VK_SUCCESS) {
+            cpl.pSetLayouts = &s.dslCm;
+            if (dd.createPipelineLayout(s.dev, &cpl, nullptr, &s.plCm) == VK_SUCCESS) {
+                cp.stage.module = s.smCm; cp.layout = s.plCm;
+                if (dd.createComputePipelines(s.dev, VK_NULL_HANDLE, 1, &cp, nullptr, &s.pipeCm) == VK_SUCCESS) s.cm = true;
+            }
+        }
+        trace("NNAA: tensor-core kernel %s", s.cm ? "ready" : "FAILED to build - fp32 kernel");
+    }
 
     VkDescriptorPoolSize ps[2];
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  ps[0].descriptorCount = 3 * State::kSets;
-    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; ps[1].descriptorCount = 1 * State::kSets;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; ps[1].descriptorCount = 2 * State::kSets;
     VkDescriptorPoolCreateInfo dp; memset(&dp, 0, sizeof(dp));
     dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dp.maxSets = State::kSets; dp.poolSizeCount = 2; dp.pPoolSizes = ps;
     if (dd.createDescriptorPool(s.dev, &dp, nullptr, &s.pool) != VK_SUCCESS) return false;
     // Half the ring is conv sets, half post sets: alternate layouts by index parity.
     VkDescriptorSetLayout lays[State::kSets];
-    for (uint32_t i = 0; i < State::kSets; ++i) lays[i] = (i % 2 == 0) ? s.dslConv : s.dslPost;
+    // three slot classes, i % 3: 0 fp32 conv, 1 tensor-core conv (or fp32 again when absent), 2 post -
+    // so every kernel always finds a set of its own layout whatever the weight packing decided later
+    for (uint32_t i = 0; i < State::kSets; ++i) lays[i] = (i % 3 == 0) ? s.dslConv : (i % 3 == 1) ? (s.cm ? s.dslCm : s.dslConv) : s.dslPost;
     VkDescriptorSetAllocateInfo da; memset(&da, 0, sizeof(da));
     da.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     da.descriptorPool = s.pool; da.descriptorSetCount = State::kSets; da.pSetLayouts = lays;
@@ -305,12 +389,11 @@ inline bool init(State &s, DeviceData &dd)
     return true;
 }
 
-inline VkDescriptorSet takeSet(State &s, bool conv)
+inline VkDescriptorSet takeSet(State &s, int kind)   // 0 fp32 conv, 1 tensor-core conv, 2 post
 {
-    // even indices hold conv layouts, odd hold post layouts
     for (int tries = 0; tries < (int)State::kSets; ++tries) {
         uint32_t i = s.nextSet; s.nextSet = (s.nextSet + 1) % State::kSets;
-        if ((i % 2 == 0) == conv) return s.sets[i];
+        if ((int)(i % 3) == kind) return s.sets[i];
     }
     return VK_NULL_HANDLE;
 }
@@ -353,12 +436,35 @@ inline bool ensureMaps(State &s, DeviceData &dd, VkCommandBuffer cb)
 inline void conv(State &s, DeviceData &dd, VkCommandBuffer cb, const Layer &L,
                  Map &A, int modeA, int cinA, Map *B, int cinB, Map &out, int act)
 {
-    VkDescriptorSet set = takeSet(s, true);
+    const bool useCm = s.cm && s.cmbuf != VK_NULL_HANDLE;
+    VkDescriptorSet set = takeSet(s, useCm ? 1 : 0);
     VkDescriptorImageInfo ii[3]; memset(ii, 0, sizeof(ii));
     ii[0].imageView = A.view; ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[1].imageView = B ? B->view : A.view; ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[2].imageView = out.view; ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     VkDescriptorBufferInfo bi; bi.buffer = s.wbuf; bi.offset = 0; bi.range = VK_WHOLE_SIZE;
+    if (useCm) {
+        VkDescriptorBufferInfo hbi; hbi.buffer = s.cmbuf; hbi.offset = 0; hbi.range = VK_WHOLE_SIZE;
+        VkWriteDescriptorSet cw[5]; memset(cw, 0, sizeof(cw));
+        for (int k = 0; k < 5; ++k) {
+            cw[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; cw[k].dstSet = set; cw[k].dstBinding = (uint32_t)k; cw[k].descriptorCount = 1;
+            cw[k].descriptorType = k < 3 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            if (k < 3) cw[k].pImageInfo = &ii[k]; else cw[k].pBufferInfo = (k == 3) ? &hbi : &bi;
+        }
+        dd.updateDescriptorSets(s.dev, 5, cw, 0, nullptr);
+        CmPush q;
+        q.outW = (int32_t)out.w; q.outH = (int32_t)out.h; q.aW = (int32_t)A.w; q.aH = (int32_t)A.h;
+        q.bW = B ? (int32_t)B->w : (int32_t)A.w; q.bH = B ? (int32_t)B->h : (int32_t)A.h;
+        q.cinA = cinA; q.cinB = B ? cinB : 0; q.cinPad = L.cinPad; q.cout = L.cout; q.nPad = L.nPad;
+        q.wOff = (int32_t)L.cmOff; q.bOff = (int32_t)L.bOff; q.modeA = modeA; q.modeB = 0; q.act = act;
+        dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeCm);
+        dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.plCm, 0, 1, &set, 0, nullptr);
+        dd.cmdPushConstants(cb, s.plCm, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(q), &q);
+        dd.cmdDispatch(cb, (out.w + 15) / 16, (out.h + 7) / 8, 1);
+        computeBarrier(dd, cb);
+        ++s.dispatches;
+        return;
+    }
     VkWriteDescriptorSet wr[4]; memset(wr, 0, sizeof(wr));
     for (int k = 0; k < 4; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[k].dstSet = set; wr[k].dstBinding = (uint32_t)k;
@@ -453,8 +559,8 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
         s.announced = true;
         double mb = 0; Map *all[] = { &s.in, &s.a, &s.b, &s.g, &s.out, &s.c, &s.d, &s.h, &s.e, &s.f };
         for (Map *m : all) mb += (double)m->w * m->h * m->layers * 8.0 / 1048576.0;
-        trace("NNAA: running the AA net at %ux%u - channels (%d,%d,%d), %.0f MB of feature maps, split %.2f",
-              s.w, s.hh, s.ch0, s.ch1, s.ch2, mb, live::f("taa.nn_split", "TAA_NN_SPLIT", 0.5f));
+        trace("NNAA: running the AA net at %ux%u - channels (%d,%d,%d), %.0f MB of feature maps, split %.2f, kernel %s",
+              s.w, s.hh, s.ch0, s.ch1, s.ch2, mb, live::f("taa.nn_split", "TAA_NN_SPLIT", 0.5f), (s.cm && s.cmbuf) ? "tensor-core fp16" : "fp32");
     }
     computeBarrier(dd, cb);   // the resolve's writes to the input map
     const Layer *L = s.layers.data();
@@ -471,7 +577,7 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
     conv(s, dd, cb, L[10], s.g,  0, s.ch0,  nullptr, 0,     s.out, 0);   // out (no activation)
 
     // post: base + tanh(r) * (0.5 + |base|) into the history image
-    VkDescriptorSet set = takeSet(s, false);
+    VkDescriptorSet set = takeSet(s, 2);
     VkDescriptorImageInfo ii[3]; memset(ii, 0, sizeof(ii));
     ii[0].imageView = s.out.view; ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[1].imageView = s.in.view;  ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -514,6 +620,12 @@ inline void shutdown(DeviceData &dd)
     for (Map *m : all) freeMap(s, dd, *m);
     if (s.wbuf) dd.destroyBuffer(s.dev, s.wbuf, nullptr);
     if (s.wmem) dd.freeMemory(s.dev, s.wmem, nullptr);
+    if (s.cmbuf) dd.destroyBuffer(s.dev, s.cmbuf, nullptr);
+    if (s.cmmem) dd.freeMemory(s.dev, s.cmmem, nullptr);
+    if (s.pipeCm) dd.destroyPipeline(s.dev, s.pipeCm, nullptr);
+    if (s.plCm) dd.destroyPipelineLayout(s.dev, s.plCm, nullptr);
+    if (s.dslCm) dd.destroyDescriptorSetLayout(s.dev, s.dslCm, nullptr);
+    if (s.smCm) dd.destroyShaderModule(s.dev, s.smCm, nullptr);
     if (s.pipeConv) dd.destroyPipeline(s.dev, s.pipeConv, nullptr);
     if (s.pipePost) dd.destroyPipeline(s.dev, s.pipePost, nullptr);
     if (s.plConv) dd.destroyPipelineLayout(s.dev, s.plConv, nullptr);

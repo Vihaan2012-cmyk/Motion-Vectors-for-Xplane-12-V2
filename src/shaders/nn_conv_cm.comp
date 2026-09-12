@@ -1,0 +1,179 @@
+#version 450
+// ================================================================ NN CONV 3x3, TENSOR CORES
+//
+// The same layer as nn_conv.comp - 3x3 convolution, zero padding, optional
+// leaky-ReLU, pooling / x2 upsampling folded into the input read - computed
+// as matrix multiplies on the cooperative-matrix hardware.
+//
+// A workgroup owns a 16x8 pixel tile. Its input, with a one-pixel halo, is
+// staged in shared memory as fp16 planes [channel][y][x]. For one kernel
+// offset (ky, kx) and one block of 16 input channels, the 16 pixels of a tile
+// row form a 16x16 matrix A whose element (pixel, channel) sits at
+// plane(channel) + (row + ky) * HW + (pixel + kx): consecutive pixels are one
+// element apart and consecutive channels one plane apart, which is exactly a
+// COLUMN-MAJOR load with stride HH*HW. No im2col copy is ever made.
+//
+// The weights arrive pre-arranged by nnaa.h as, per (offset, channel block),
+// a row-major [16 x Npad] fp16 matrix B(channel, output), zero padded to 16 on
+// both axes. Eight subgroups (one per tile row) each keep Npad/16 fp32
+// accumulators and walk 9 x (cinPad/16) products; the result goes through
+// shared memory once for the bias, the activation and the rgba16f store.
+//
+// Padding to multiples of 16 costs extra multiplies (17 -> 32 for the first
+// layer) that the tensor cores absorb; the fp32 path is still the fallback
+// on devices without VK_KHR_cooperative_matrix (nnaa.h decides at init).
+//
+// Copyright (C) 2026 MotionVectors contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;   // 8 subgroups of 32
+
+layout(binding = 0, rgba16f) uniform readonly  image2DArray uA;
+layout(binding = 1, rgba16f) uniform readonly  image2DArray uB;
+layout(binding = 2, rgba16f) uniform writeonly image2DArray uOut;
+layout(binding = 3, std430) readonly buffer W16  { float16_t w[]; } uW;    // packed, see nnaa.h
+layout(binding = 4, std430) readonly buffer Bias { float b[]; } uBias;     // the fp32 blob (biases only)
+
+layout(push_constant) uniform P {
+    ivec2 outSize;
+    ivec2 sizeA;
+    ivec2 sizeB;
+    int   cinA;
+    int   cinB;       // 0 = no B
+    int   cinPad;     // cinA + cinB rounded up to 16
+    int   cout;
+    int   nPad;       // cout rounded up to 16 (16 or 32)
+    int   wOff;       // in halfs, into uW
+    int   bOff;       // in floats, into uBias
+    int   modeA;      // 0 direct, 1 pool, 2 up
+    int   modeB;
+    int   act;
+} pc;
+
+const int TW = 16, TH = 8;
+const int HW = TW + 2, HH = TH + 2;      // haloed tile
+const int MAXCIN = 48;                   // largest padded input (the d1 concat: 24 + 16 -> 48)
+
+shared float16_t tile[MAXCIN * HH * HW];
+shared float     cbuf[8 * 2 * 256];      // per subgroup, per N block: a 16x16 fp32 result
+
+// One channel group (4 channels) of a map at conv-input pixel q (output-res coords). Zero outside.
+vec4 readGroup(int which, int mode, ivec2 sz, ivec2 q, int g)
+{
+    if (q.x < 0 || q.y < 0 || q.x >= pc.outSize.x || q.y >= pc.outSize.y) return vec4(0.0);
+    if (mode == 1) {
+        ivec2 b = q * 2;
+        vec4 s = vec4(0.0);
+        for (int y = 0; y < 2; ++y)
+            for (int x = 0; x < 2; ++x) {
+                ivec2 t = min(b + ivec2(x, y), sz - 1);
+                s += (which == 0) ? imageLoad(uA, ivec3(t, g)) : imageLoad(uB, ivec3(t, g));
+            }
+        return s * 0.25;
+    }
+    if (mode == 2) {
+        vec2 src = max((vec2(q) + 0.5) * 0.5 - 0.5, vec2(0.0));
+        ivec2 i0 = ivec2(floor(src));
+        vec2  f  = src - vec2(i0);
+        ivec2 i1 = min(i0 + 1, sz - 1);
+        i0 = min(i0, sz - 1);
+        vec4 a00, a10, a01, a11;
+        if (which == 0) {
+            a00 = imageLoad(uA, ivec3(i0.x, i0.y, g)); a10 = imageLoad(uA, ivec3(i1.x, i0.y, g));
+            a01 = imageLoad(uA, ivec3(i0.x, i1.y, g)); a11 = imageLoad(uA, ivec3(i1.x, i1.y, g));
+        } else {
+            a00 = imageLoad(uB, ivec3(i0.x, i0.y, g)); a10 = imageLoad(uB, ivec3(i1.x, i0.y, g));
+            a01 = imageLoad(uB, ivec3(i0.x, i1.y, g)); a11 = imageLoad(uB, ivec3(i1.x, i1.y, g));
+        }
+        return mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y);
+    }
+    return (which == 0) ? imageLoad(uA, ivec3(q, g)) : imageLoad(uB, ivec3(q, g));
+}
+
+// Tile channels c..c+3 (c a multiple of 4) at q, spanning the A/B concat boundary if needed.
+vec4 readTileGroup(int c, ivec2 q)
+{
+    if (c + 3 < pc.cinA)                 return readGroup(0, pc.modeA, pc.sizeA, q, c / 4);
+    if (c >= pc.cinA && (c - pc.cinA) % 4 == 0 && c - pc.cinA + 3 < pc.cinB) return readGroup(1, pc.modeB, pc.sizeB, q, (c - pc.cinA) / 4);
+    vec4 o = vec4(0.0);
+    for (int j = 0; j < 4; ++j) {
+        int ch = c + j;
+        if (ch < pc.cinA) o[j] = readGroup(0, pc.modeA, pc.sizeA, q, ch / 4)[ch % 4];
+        else if (ch - pc.cinA < pc.cinB) { int k = ch - pc.cinA; o[j] = readGroup(1, pc.modeB, pc.sizeB, q, k / 4)[k % 4]; }
+    }
+    return o;
+}
+
+void main()
+{
+    const ivec2 tile0 = ivec2(gl_WorkGroupID.xy) * ivec2(TW, TH);
+    const int tid = int(gl_LocalInvocationIndex);
+
+    // ---- stage the haloed tile: nGroups x HH x HW vec4 reads across 256 threads
+    const int nGroups = pc.cinPad / 4;
+    const int items = nGroups * HH * HW;
+    for (int i = tid; i < items; i += 256) {
+        int g  = i / (HH * HW);
+        int r  = i - g * (HH * HW);
+        int ty = r / HW, tx = r - ty * HW;
+        ivec2 q = tile0 + ivec2(tx - 1, ty - 1);
+        vec4 v = readTileGroup(g * 4, q);
+        int base = (g * 4) * (HH * HW) + ty * HW + tx;
+        tile[base]                 = float16_t(v.x);
+        tile[base + HH * HW]       = float16_t(v.y);
+        tile[base + 2 * HH * HW]   = float16_t(v.z);
+        tile[base + 3 * HH * HW]   = float16_t(v.w);
+    }
+    barrier();
+
+    // ---- one subgroup per tile row
+    const int row = int(gl_SubgroupID);
+    const int nCb = pc.cinPad / 16;
+    const int nNb = pc.nPad / 16;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    if (row < 8) {
+        for (int k = 0; k < 9; ++k) {
+            const int ky = k / 3, kx = k - ky * 3;
+            for (int cb = 0; cb < nCb; ++cb) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopMatLoad(A, tile, (cb * 16) * (HH * HW) + (row + ky) * HW + kx, HH * HW, gl_CooperativeMatrixLayoutColumnMajor);
+                const int wb = pc.wOff + (k * nCb + cb) * 16 * pc.nPad;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B0;
+                coopMatLoad(B0, uW.w, wb, pc.nPad, gl_CooperativeMatrixLayoutRowMajor);
+                acc0 = coopMatMulAdd(A, B0, acc0);
+                if (nNb > 1) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B1;
+                    coopMatLoad(B1, uW.w, wb + 16, pc.nPad, gl_CooperativeMatrixLayoutRowMajor);
+                    acc1 = coopMatMulAdd(A, B1, acc1);
+                }
+            }
+        }
+        coopMatStore(acc0, cbuf, (row * 2 + 0) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        if (nNb > 1) coopMatStore(acc1, cbuf, (row * 2 + 1) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    // ---- bias, activation, store: each thread handles half the channel groups of one pixel
+    const int lane = int(gl_SubgroupInvocationID);
+    const int px = lane / 2, par = lane & 1;
+    const ivec2 gp = tile0 + ivec2(px, row);
+    if (gp.x >= pc.outSize.x || gp.y >= pc.outSize.y) return;
+    const int nG = (pc.cout + 3) / 4;
+    for (int g = par; g < nG; g += 2) {
+        vec4 o = vec4(0.0);
+        for (int j = 0; j < 4; ++j) {
+            int co = g * 4 + j;
+            if (co >= pc.cout) break;
+            float v = cbuf[(row * 2 + co / 16) * 256 + px * 16 + (co & 15)] + uBias.b[pc.bOff + co];
+            if (pc.act == 1) v = (v > 0.0) ? v : 0.1 * v;
+            o[j] = v;
+        }
+        imageStore(uOut, ivec3(gp, g), o);
+    }
+}
