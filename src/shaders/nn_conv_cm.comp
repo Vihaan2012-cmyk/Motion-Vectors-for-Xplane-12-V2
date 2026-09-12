@@ -6,12 +6,16 @@
 // as matrix multiplies on the cooperative-matrix hardware.
 //
 // A workgroup owns a 16x8 pixel tile. Its input, with a one-pixel halo, is
-// staged in shared memory as fp16 planes [channel][y][x]. For one kernel
-// offset (ky, kx) and one block of 16 input channels, the 16 pixels of a tile
-// row form a 16x16 matrix A whose element (pixel, channel) sits at
-// plane(channel) + (row + ky) * HW + (pixel + kx): consecutive pixels are one
-// element apart and consecutive channels one plane apart, which is exactly a
-// COLUMN-MAJOR load with stride HH*HW. No im2col copy is ever made.
+// staged in shared memory CHANNEL-INTERLEAVED: [y][x][channel], cinPad
+// channels per texel. For one kernel offset (ky, kx) and one block of 16
+// input channels, the 16 pixels of a tile row form a 16x16 matrix A whose
+// element (pixel, channel) sits at ((row + ky) * HW + pixel + kx) * cinPad +
+// block * 16 + channel: rows are 16 CONTIGUOUS halfs (32 bytes, aligned) at a
+// stride of cinPad - a plain row-major load the hardware does in one shot.
+// The first version kept planes [channel][y][x] and loaded A column-major
+// with a 360-byte stride; that path ran at 5-8 ms per full-resolution layer
+// on the 4060, the same whatever the channel count, i.e. bound by the strided
+// shared-memory gather, not by the tensor cores. No im2col copy is made.
 //
 // The weights arrive pre-arranged by nnaa.h as, per (offset, channel block),
 // a row-major [16 x Npad] fp16 matrix B(channel, output), zero padded to 16 on
@@ -114,20 +118,21 @@ void main()
     const ivec2 tile0 = ivec2(gl_WorkGroupID.xy) * ivec2(TW, TH);
     const int tid = int(gl_LocalInvocationIndex);
 
-    // ---- stage the haloed tile: nGroups x HH x HW vec4 reads across 256 threads
+    // ---- stage the haloed tile: HH x HW x nGroups vec4 reads across 256 threads, channel
+    // group fastest so consecutive threads write consecutive 8-byte runs of shared memory
     const int nGroups = pc.cinPad / 4;
     const int items = nGroups * HH * HW;
     for (int i = tid; i < items; i += 256) {
-        int g  = i / (HH * HW);
-        int r  = i - g * (HH * HW);
+        int g  = i % nGroups;
+        int r  = i / nGroups;
         int ty = r / HW, tx = r - ty * HW;
         ivec2 q = tile0 + ivec2(tx - 1, ty - 1);
         vec4 v = readTileGroup(g * 4, q);
-        int base = (g * 4) * (HH * HW) + ty * HW + tx;
-        tile[base]                 = float16_t(v.x);
-        tile[base + HH * HW]       = float16_t(v.y);
-        tile[base + 2 * HH * HW]   = float16_t(v.z);
-        tile[base + 3 * HH * HW]   = float16_t(v.w);
+        int base = (ty * HW + tx) * pc.cinPad + g * 4;
+        tile[base]     = float16_t(v.x);
+        tile[base + 1] = float16_t(v.y);
+        tile[base + 2] = float16_t(v.z);
+        tile[base + 3] = float16_t(v.w);
     }
     barrier();
 
@@ -142,7 +147,7 @@ void main()
             const int ky = k / 3, kx = k - ky * 3;
             for (int cb = 0; cb < nCb; ++cb) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
-                coopMatLoad(A, tile, (cb * 16) * (HH * HW) + (row + ky) * HW + kx, HH * HW, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(A, tile, ((row + ky) * HW + kx) * pc.cinPad + cb * 16, pc.cinPad, gl_CooperativeMatrixLayoutRowMajor);
                 const int wb = pc.wOff + (k * nCb + cb) * 16 * pc.nPad;
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B0;
                 coopMatLoad(B0, uW.w, wb, pc.nPad, gl_CooperativeMatrixLayoutRowMajor);
