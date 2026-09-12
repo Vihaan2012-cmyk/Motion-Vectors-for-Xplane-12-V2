@@ -59,6 +59,9 @@ struct State {
     VkDescriptorSetLayout dslConv = VK_NULL_HANDLE, dslPost = VK_NULL_HANDLE, dslCm = VK_NULL_HANDLE;
     VkPipelineLayout plConv = VK_NULL_HANDLE, plPost = VK_NULL_HANDLE, plCm = VK_NULL_HANDLE;
     VkPipeline pipeConv = VK_NULL_HANDLE, pipePost = VK_NULL_HANDLE, pipeCm = VK_NULL_HANDLE;
+    // tensor-core pipelines specialised per (cinPad, nPad); pipeCm stays the (16,16) default
+    static const int kCmShapes = 8;
+    int cmCin[kCmShapes]; int cmN[kCmShapes]; VkPipeline cmPipe[kCmShapes]; int cmCount = 0;
     bool cm = false;                     // tensor-core path built and usable
     VkBuffer       cmbuf = VK_NULL_HANDLE;   // fp16 weights, coopmat layout (device local)
     VkDeviceMemory cmmem = VK_NULL_HANDLE;
@@ -377,7 +380,21 @@ inline bool init(State &s, DeviceData &dd)
             cpl.pSetLayouts = &s.dslCm;
             if (dd.createPipelineLayout(s.dev, &cpl, nullptr, &s.plCm) == VK_SUCCESS) {
                 cp.stage.module = s.smCm; cp.layout = s.plCm;
-                if (dd.createComputePipelines(s.dev, VK_NULL_HANDLE, 1, &cp, nullptr, &s.pipeCm) == VK_SUCCESS) s.cm = true;
+                // one pipeline per shape this net uses: (cinPad, nPad) in {16,32,48} x {16,32}
+                static const int shapes[5][2] = { {16, 16}, {32, 16}, {48, 16}, {16, 32}, {32, 32} };
+                s.cmCount = 0;
+                for (int i = 0; i < 5; ++i) {
+                    int32_t vals[2] = { shapes[i][0], shapes[i][1] };
+                    VkSpecializationMapEntry me[2] = { { 0, 0, 4 }, { 1, 4, 4 } };
+                    VkSpecializationInfo si; si.mapEntryCount = 2; si.pMapEntries = me; si.dataSize = 8; si.pData = vals;
+                    cp.stage.pSpecializationInfo = &si;
+                    VkPipeline pipe = VK_NULL_HANDLE;
+                    if (dd.createComputePipelines(s.dev, VK_NULL_HANDLE, 1, &cp, nullptr, &pipe) == VK_SUCCESS) {
+                        s.cmCin[s.cmCount] = shapes[i][0]; s.cmN[s.cmCount] = shapes[i][1]; s.cmPipe[s.cmCount] = pipe; ++s.cmCount;
+                    }
+                }
+                cp.stage.pSpecializationInfo = nullptr;
+                if (s.cmCount == 5) { s.cm = true; s.pipeCm = s.cmPipe[0]; }
             }
         }
         trace("NNAA: tensor-core kernel %s", s.cm ? "ready" : "FAILED to build - fp32 kernel");
@@ -458,7 +475,9 @@ inline void conv(State &s, DeviceData &dd, VkCommandBuffer cb, const Layer &L,
     ii[1].imageView = B ? B->view : A.view; ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[2].imageView = out.view; ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     VkDescriptorBufferInfo bi; bi.buffer = s.wbuf; bi.offset = 0; bi.range = VK_WHOLE_SIZE;
-    if (useCm && 9 * (L.cinPad / 16) * 16 * L.nPad <= 9216) {
+    bool haveShape = false;
+    for (int i = 0; i < s.cmCount; ++i) if (s.cmCin[i] == L.cinPad && s.cmN[i] == L.nPad) haveShape = true;
+    if (useCm && haveShape && 9 * (L.cinPad / 16) * 16 * L.nPad <= 9216) {
         VkDescriptorBufferInfo hbi; hbi.buffer = s.cmbuf; hbi.offset = 0; hbi.range = VK_WHOLE_SIZE;
         VkWriteDescriptorSet cw[5]; memset(cw, 0, sizeof(cw));
         for (int k = 0; k < 5; ++k) {
@@ -472,7 +491,9 @@ inline void conv(State &s, DeviceData &dd, VkCommandBuffer cb, const Layer &L,
         q.bW = B ? (int32_t)B->w : (int32_t)A.w; q.bH = B ? (int32_t)B->h : (int32_t)A.h;
         q.cinA = cinA; q.cinB = B ? cinB : 0; q.cinPad = L.cinPad; q.cout = L.cout; q.nPad = L.nPad;
         q.wOff = (int32_t)L.cmOff; q.bOff = (int32_t)L.bOff; q.modeA = modeA; q.modeB = 0; q.act = act;
-        dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeCm);
+        VkPipeline pipe = VK_NULL_HANDLE;
+        for (int i = 0; i < s.cmCount; ++i) if (s.cmCin[i] == L.cinPad && s.cmN[i] == L.nPad) pipe = s.cmPipe[i];
+        dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
         dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.plCm, 0, 1, &set, 0, nullptr);
         dd.cmdPushConstants(cb, s.plCm, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(q), &q);
         gpuTimeMark(dd, cb, label);
@@ -725,7 +746,8 @@ inline void shutdown(DeviceData &dd)
     if (s.cmstageMem) dd.freeMemory(s.dev, s.cmstageMem, nullptr);
     if (s.cmbuf) dd.destroyBuffer(s.dev, s.cmbuf, nullptr);
     if (s.cmmem) dd.freeMemory(s.dev, s.cmmem, nullptr);
-    if (s.pipeCm) dd.destroyPipeline(s.dev, s.pipeCm, nullptr);
+    for (int i = 0; i < s.cmCount; ++i) if (s.cmPipe[i]) dd.destroyPipeline(s.dev, s.cmPipe[i], nullptr);
+    s.cmCount = 0; s.pipeCm = VK_NULL_HANDLE;
     if (s.plCm) dd.destroyPipelineLayout(s.dev, s.plCm, nullptr);
     if (s.dslCm) dd.destroyDescriptorSetLayout(s.dev, s.dslCm, nullptr);
     if (s.smCm) dd.destroyShaderModule(s.dev, s.smCm, nullptr);

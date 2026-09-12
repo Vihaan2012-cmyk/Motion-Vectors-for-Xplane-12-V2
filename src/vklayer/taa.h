@@ -2496,8 +2496,15 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         sw[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         dd.updateDescriptorSets(g_taa.device, 5, sw, 0, nullptr);
 
-        // Pipeline is still bound from the resolve; only the set and the push
-        // constant's mode change.
+        // ---- RE-BIND THE RESOLVE PIPELINE. This used to say "still bound from
+        // the resolve; only the set and the push constant's mode change" - true
+        // until the AA net (taa.nn) recorded twelve dispatches of its own
+        // pipelines in between. The sharpen then ran on the net's post pipeline
+        // with the resolve's descriptors and push block, wrote nothing, and the
+        // copy-out delivered a zeroed sharpen target: the whole screen black
+        // whenever the net was on (2026-09-12, proven by dumping the scene
+        // target: zero with sharpen on at any blend, the history with it off).
+        dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
         dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                                  g_taa.pipeLayout, 0, 1, &sset, 0, nullptr);
         TaaPush spc = pcv;

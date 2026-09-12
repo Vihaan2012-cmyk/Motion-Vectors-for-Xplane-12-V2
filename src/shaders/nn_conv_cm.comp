@@ -60,6 +60,12 @@ layout(push_constant) uniform P {
     int   act;
 } pc;
 
+// The padded channel widths are SPECIALISATION constants, one pipeline per shape: the
+// cooperative-matrix loads take their fast path only with a compile-time stride, and with
+// the stride in a push constant every load was emulated element by element (4-9 ms per
+// full-resolution layer, tracking the channel count exactly).
+layout(constant_id = 0) const int CINPAD = 16;
+layout(constant_id = 1) const int NPAD = 16;
 const int TW = 16, TH = 8;
 const int HW = TW + 2, HH = TH + 2;      // haloed tile
 const int MAXCIN = 48;                   // largest padded input (the d1 concat: 24 + 16 -> 48)
@@ -122,7 +128,7 @@ void stage(int i, int nGroups, ivec2 tile0)
     int ty = r / HW, tx = r - ty * HW;
     ivec2 q = tile0 + ivec2(tx - 1, ty - 1);
     vec4 v = readTileGroup(g * 4, q);
-    int base = (ty * HW + tx) * pc.cinPad + g * 4;
+    int base = (ty * HW + tx) * CINPAD + g * 4;
     tile[base]     = float16_t(v.x);
     tile[base + 1] = float16_t(v.y);
     tile[base + 2] = float16_t(v.z);
@@ -133,17 +139,17 @@ void main()
 {
     const ivec2 tile0 = ivec2(gl_WorkGroupID.xy) * ivec2(TW, TH);
     const int tid = int(gl_LocalInvocationIndex);
-    const int nCb = pc.cinPad / 16;
-    const int nNb = pc.nPad / 16;
+    const int nCb = CINPAD / 16;
+    const int nNb = NPAD / 16;
 
     // ---- stage the layer's weights once per workgroup
-    const int nW = 9 * nCb * 16 * pc.nPad;
+    const int nW = 9 * nCb * 16 * NPAD;
     for (int i = tid; i < nW; i += 256) wsh[i] = uW.w[pc.wOff + i];
 
     // ---- stage the haloed tile: HH x HW x nGroups vec4 reads across 256 threads, channel
     // group fastest so consecutive threads write consecutive 8-byte runs of shared memory.
     // Two items per iteration so their image loads are in flight together.
-    const int nGroups = pc.cinPad / 4;
+    const int nGroups = CINPAD / 4;
     const int items = nGroups * HH * HW;
     int i = tid;
     for (; i + 256 < items; i += 512) { stage(i, nGroups, tile0); stage(i + 256, nGroups, tile0); }
@@ -157,17 +163,17 @@ void main()
     if (row < 8) {
         for (int k = 0; k < 9; ++k) {
             const int ky = k / 3, kx = k - ky * 3;
-            const int abase = ((row + ky) * HW + kx) * pc.cinPad;
+            const int abase = ((row + ky) * HW + kx) * CINPAD;
             for (int cb = 0; cb < nCb; ++cb) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
-                coopMatLoad(A, tile, abase + cb * 16, pc.cinPad, gl_CooperativeMatrixLayoutRowMajor);
-                const int wb = (k * nCb + cb) * 16 * pc.nPad;
+                coopMatLoad(A, tile, abase + cb * 16, CINPAD, gl_CooperativeMatrixLayoutRowMajor);
+                const int wb = (k * nCb + cb) * 16 * NPAD;
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B0;
-                coopMatLoad(B0, wsh, wb, pc.nPad, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B0, wsh, wb, NPAD, gl_CooperativeMatrixLayoutRowMajor);
                 acc0 = coopMatMulAdd(A, B0, acc0);
                 if (nNb > 1) {
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B1;
-                    coopMatLoad(B1, wsh, wb + 16, pc.nPad, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(B1, wsh, wb + 16, NPAD, gl_CooperativeMatrixLayoutRowMajor);
                     acc1 = coopMatMulAdd(A, B1, acc1);
                 }
             }
