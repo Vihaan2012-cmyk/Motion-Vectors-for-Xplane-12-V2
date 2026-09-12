@@ -16699,8 +16699,28 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         // zoom frames wrote zero (measured black in viz=2) and body_zero=0 did
         // nothing in the cockpit. The decision is a named bool now; the K
         // rationale below stays as a comment.
+        // ---- CHASE VIEW: K, NOT THE BODY MATRIX (taa.chase_k, default ON).
+        //
+        // MEASURED 2026-09-12 (E:\NNCap\2026-09-12_161920_extsmear, 777 chase
+        // view, consecutive burst frames, history fetched along the vector and
+        // compared with the frame that followed): the terrain's vectors are
+        // right (error 0.035 vs 0.071 for zero), the airframe's are WRONG -
+        // 1.5 to 2.5 px on the tail and centre, near zero on the nose, and in
+        // every frame a ZERO vector lands the livery's history closer than the
+        // written one (0.058 vs 0.099, 0.087 vs 0.107, 0.097 vs 0.109). The
+        // truth by search was under 1.5 px, and the written field's negation
+        // fit better than the field itself in three of four frames: the body
+        // matrix carries the camera's relative motion with the wrong sign or a
+        // frame late. That is "the livery smears on itself" on every aircraft.
+        // Until the plugin's body path is draw-synchronised, the airframe gets
+        // K - exactly stationary - which the search says is within a pixel of
+        // the truth; a zoom still takes the body matrix (K cannot say radial).
+        static uint64_t s_ckGen = ~(uint64_t)0;
+        static int      s_ckVal = -1;
+        const bool chaseK =
+            live::iCached("taa.chase_k", "TAA_CHASE_K", 1, s_ckGen, s_ckVal) != 0;
         const bool useBodyMatrix =
-            (!bodyZero || chaseView || projChanged) && g_velSnap.bodyReprojValid;
+            (!bodyZero || (chaseView && !chaseK) || projChanged) && g_velSnap.bodyReprojValid;
         if (useBodyMatrix) taaMul(bodyView, g_velSnap.bodyReproj, K);
         else               memcpy(bodyView, K, sizeof(bodyView));
         // ---- BODY SLOT RECEIPT: the exact numbers the shader multiplies with.
