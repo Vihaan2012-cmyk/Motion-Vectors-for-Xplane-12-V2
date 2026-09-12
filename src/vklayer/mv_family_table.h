@@ -2,7 +2,7 @@
 // (Resources/shaders/bin/spv.zip, hashed with the injection's FNV-1a-64).
 // Regenerate after an X-Plane update changes the shader pack.
 // Policy and reasoning live in the generator's header comment.
-// Packs merged: spv.zip, spv.zip
+// Packs merged: spv, spv.zip
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -1025,6 +1025,22 @@ static const uint64_t kMvMaskedVert[] = {
     0xfafb0aaba0145c34ull, // debug_0.spv
 };
 static const size_t kMvMaskedVertCount = sizeof(kMvMaskedVert) / sizeof(kMvMaskedVert[0]);
+
+static const uint64_t kMvScreenVert[] = {
+    0x119d2c3fba224273ull, // debug_38.spv
+    0x143f8483eb09b30bull, // debug_10.spv
+    0x239ebf5a72948f9aull, // debug_10.spv
+    0x5baf2254bda37c50ull, // debug_114.spv
+    0x74ebc20648d80e41ull, // debug_0.spv
+    0x807a7063203057edull, // debug_39.spv
+    0x865f300366ea6965ull, // debug_76.spv
+    0xa9001b6ddc865a62ull, // debug_39.spv
+    0xaadb947ff5a9483eull, // debug_115.spv
+    0xc69b710013317c54ull, // debug_38.spv
+    0xed9b3afa24d24c6full, // debug_86.spv
+    0xfafb0aaba0145c34ull, // debug_0.spv
+};
+static const size_t kMvScreenVertCount = sizeof(kMvScreenVert) / sizeof(kMvScreenVert[0]);
 // Sorted array; one binary search per pipeline creation.
 static inline bool mvFamilyMasked(uint64_t vertHash)
 {
@@ -1054,6 +1070,18 @@ static inline bool mvFamilyZero(uint64_t vertHash)
 {
     if (!vertHash) return false;
     const uint64_t *lo = kMvZeroVert, *hi = lo + kMvZeroVertCount;
+    while (lo < hi) {
+        const uint64_t *m = lo + (hi - lo) / 2;
+        if (*m == vertHash) return true;
+        if (*m < vertHash) lo = m + 1; else hi = m;
+    }
+    return false;
+}
+
+static inline bool mvFamilyScreen(uint64_t vertHash)
+{
+    if (!vertHash) return false;
+    const uint64_t *lo = kMvScreenVert, *hi = lo + kMvScreenVertCount;
     while (lo < hi) {
         const uint64_t *m = lo + (hi - lo) / 2;
         if (*m == vertHash) return true;

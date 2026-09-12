@@ -1066,7 +1066,7 @@ static bool spirvPullsVertices(const std::vector<uint32_t> &w)
 // gets a real coverage gate. Without this the first one to arrive would
 // hand its variant to the other.
 typedef std::pair<VkShaderModule, uint32_t> FragModKey;
-typedef std::pair<FragModKey, int> FragKey;   // bit 0: alphaBlended, bit 1: zero-velocity, bit 2: PID tag +0.5 (no depth write)
+typedef std::pair<FragModKey, int> FragKey;   // bit 0: alphaBlended, bit 1: zero-velocity, bit 2: PID tag +0.5 (no depth write), bit 3: screen class
 static std::map<FragKey, VkShaderModule> g_fragVariant;
 // Patched vertex variant -> the pid its injected code stamps (TAA_MV_PID), so
 // a pipeline can be logged with the tag its draws will carry. Under g_lock;
@@ -13343,7 +13343,10 @@ static uint64_t g_pushCount = 0;
 //
 // Keyed on the module alone, unlike the fragment variants: the vertex locations
 // are fixed device-wide, so one patched copy serves every pipeline.
-static std::map<VkShaderModule, VkShaderModule> g_vertVariant;
+// Keyed on the module AND whether the variant jitters: the screen class draws
+// its quads unjittered, and the same module can serve both.
+typedef std::pair<VkShaderModule, bool> VertKey;
+static std::map<VertKey, VkShaderModule> g_vertVariant;
 // The patched handles themselves, so a pipeline stage can be recognised as
 // carrying injected code whether it names the original (about to be
 // substituted) or the substituted module. Used only by the layout-mismatch
@@ -13544,12 +13547,12 @@ static void mvMaybeDumpSpirv(const std::vector<uint32_t> &code, const char *what
     trace("SPIRV INJECT: wrote patched %s module to %s", what, path);
 }
 
-static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
+static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig, bool jitter)
 {
     mvPickLocationsOnce();
     {
         std::lock_guard<std::mutex> g(g_lock);
-        std::map<VkShaderModule, VkShaderModule>::iterator it = g_vertVariant.find(orig);
+        std::map<VertKey, VkShaderModule>::iterator it = g_vertVariant.find(VertKey(orig, jitter));
         if (it != g_vertVariant.end()) return it->second;
     }
 
@@ -13565,7 +13568,7 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
     std::vector<uint32_t> patched;
     uint32_t loc = 0, vsPid = 0;
     VkShaderModule out = VK_NULL_HANDLE;
-    spvinj::Result ir = spvinj::inject(src.data(), src.size() * 4, patched, &loc, &vsPid);
+    spvinj::Result ir = spvinj::inject(src.data(), src.size() * 4, patched, &loc, &vsPid, jitter);
     mvNoteInjectReason(ir);
     if (ir == spvinj::INJ_OK) mvMaybeDumpSpirv(patched, "vert");
     if (ir == spvinj::INJ_OK) {
@@ -13580,7 +13583,7 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
     }
 
     std::lock_guard<std::mutex> g(g_lock);
-    g_vertVariant[orig] = out;
+    g_vertVariant[VertKey(orig, jitter)] = out;
     g_patchedVertModules.insert(out);
     if (out != VK_NULL_HANDLE) g_vertVariantPid[out] = vsPid;
     if (out == VK_NULL_HANDLE) {
@@ -13604,10 +13607,10 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig)
 // same module thousands of times.
 static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
                                       uint32_t attachmentIndex, bool alphaBlended,
-                                      bool zeroVel, bool tagHalf)
+                                      bool zeroVel, bool tagHalf, bool screen)
 {
     FragKey key(FragModKey(orig, attachmentIndex),
-                (alphaBlended ? 1 : 0) | (zeroVel ? 2 : 0) | (tagHalf ? 4 : 0));
+                (alphaBlended ? 1 : 0) | (zeroVel ? 2 : 0) | (tagHalf ? 4 : 0) | (screen ? 8 : 0));
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<FragKey, VkShaderModule>::iterator it = g_fragVariant.find(key);
@@ -13626,7 +13629,7 @@ static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
     std::vector<uint32_t> patched;
     spvinj::Result fr = spvinj::injectFragment(src.data(), src.size() * 4, patched,
                                                attachmentIndex, alphaBlended, zeroVel,
-                                               tagHalf);
+                                               tagHalf, screen);
     // The VERTEX module's Location decorations were verified from a dump - 30
     // and 31, both stored. The FRAGMENT module's INPUT locations never were,
     // and a mismatch there would deliver zeros through a varying that looks
@@ -13805,7 +13808,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     VkShaderModule m = ci[i].pStages[s].module;
                     // Either the original that is about to be substituted, or
                     // the substituted handle itself.
-                    if (g_vertVariant.count(m) || g_patchedVertModules.count(m))
+                    if (g_vertVariant.count(VertKey(m, true)) ||
+                        g_vertVariant.count(VertKey(m, false)) || g_patchedVertModules.count(m))
                         patchedVert = true;
                 }
                 if (!patchedVert) continue;
@@ -14197,6 +14201,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             bool     famMasked = false; // policy says: do not write velocity
             bool     famDepthOnly = false; // ...but keep the depth channel (blended decals)
             bool     zeroVelClass = false; // screen-fixed overlay: writes vel = (0,0)
+            bool     screenClass  = false; // plugin-drawn display face: coverage 0.5, exact texel at the resolve
+            bool     screenFamily = false; // ...and its vertex variant is unjittered, policy on or off
             stages[i].assign(ci[i].pStages, ci[i].pStages + ci[i].stageCount);
             bool vertPatched = false;
 
@@ -14238,7 +14244,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             }
             // In PID diagnostic runs the policy is COMPUTED but not applied,
             // so the pipeline table can still say what a normal run would do.
-            bool wouldMask = false, wouldZero = false;
+            bool wouldMask = false, wouldZero = false, wouldScreen = false;
             {
                 // TAA_MV_PID_POLICY=1 keeps the policy APPLIED in a readback
                 // run: without it an additive full-screen overlay (cockpit,
@@ -14314,13 +14320,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     const bool drapedLayer = blends && !additive && dsF &&
                                              dsF->depthWriteEnable == VK_FALSE;
                     if (!wouldZero && drapedLayer) wouldMask = true;
+                    // ---- SCREEN CLASS: the opaque face of a plugin-drawn display.
+                    //
+                    // X-Plane's immediate-mode textured quad (kMvScreenVert, the
+                    // `debug` family's a_texcoord0 permutations) is how a plugin
+                    // puts a rendered display texture on the panel: the FF 777's
+                    // PFD, ND, EICAS and CDU faces are all debug_76, 23% of the
+                    // cockpit frame (pid capture 2026-09-12). The geometry is
+                    // static, the content scrolls, and no history clamp can tell
+                    // (the speed tape smeared under the 0.35 near floor). So the
+                    // opaque permutation writes its vector with coverage 0.5 - a
+                    // marker the resolve reads as "take the exact current texel"
+                    // (taa.alpha_screen) - and its vertex variant does not jitter,
+                    // because a pixel-exact texture has nothing to integrate. The
+                    // blended permutations (glyph decals over the face) stay
+                    // masked, so the marker beneath them survives.
+                    screenFamily = mvFamilyScreen(vertHash);
+                    if (screenFamily && !blends) { wouldScreen = true; wouldMask = false; }
                     wouldDepthOnly = wouldMask && blends && !additive;
                     if (!off) {
                         famMasked    = wouldMask;
                         famDepthOnly = wouldDepthOnly;
                         zeroVelClass = wouldZero;
+                        screenClass  = wouldScreen;
                     }
-                    if (famMasked || zeroVelClass) {
+                    if (famMasked || zeroVelClass || screenClass) {
                         static std::atomic<uint64_t> nPol(0);
                         const uint64_t n = ++nPol;
                         if (n <= 5 || (n % 2000) == 0)
@@ -14329,6 +14353,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                                   (unsigned long long)n,
                                   (unsigned long long)vertHash,
                                   famMasked ? "no velocity write"
+                                            : screenClass ? "screen class (coverage 0.5, unjittered)"
                                             : "zero-velocity variant");
                     }
                 }
@@ -14415,13 +14440,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     const bool tagHalf = pidTag && dsT && dsT->depthWriteEnable == VK_FALSE;
                     VkShaderModule use = mvPatchFragment(
                         device, ci[i].pStages[s].module, mvIndex, alphaBlended,
-                        zeroVelClass, tagHalf);
+                        zeroVelClass, tagHalf, screenClass);
                     if (use != VK_NULL_HANDLE) {
                         stages[i][s].module = use;
                         fragPatched = true;
                     }
                 } else if (ci[i].pStages[s].stage & VK_SHADER_STAGE_VERTEX_BIT) {
-                    VkShaderModule use = mvPatchVertex(device, ci[i].pStages[s].module);
+                    VkShaderModule use = mvPatchVertex(device, ci[i].pStages[s].module, !screenFamily);
                     if (use != VK_NULL_HANDLE) {
                         stages[i][s].module = use;
                         vertPatched = true;
@@ -14485,7 +14510,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                                    famMasked ? (famDepthOnly ? " [MASKED depth-only]"
                                                                    : " [FAMILY MASKED]")
                                              : zeroVelClass ? " [ZERO-VEL]"
+                                             : screenClass ? " [SCREEN]"
                                              : wouldMask ? " [policy: would-mask]"
+                                             : wouldScreen ? " [policy: would-screen]"
                                              : wouldZero ? " [policy: would-zero]"
                                              : maskVelocity ? " [VELOCITY MASKED]" : "");
                 }

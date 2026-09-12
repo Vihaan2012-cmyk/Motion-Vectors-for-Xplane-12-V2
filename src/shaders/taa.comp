@@ -2160,6 +2160,22 @@ void main()
         uReprojParams2.w > 0.0 && mvViewDepth(uv + S, float(layer), velS.z) < uReprojParams2.w)
         a = max(a, uReprojParams.z);
 
+    // ---- SCREEN CLASS (taa.alpha_screen, carried in uReprojParams.w). A plugin-drawn display
+    // face - the 777's PFD/ND/EICAS/CDU, X-Plane's immediate-mode quad shader, kMvScreenVert in
+    // the family table - is static geometry whose CONTENT scrolls; the near floor above still
+    // left three frames of the old speed tape behind the new one. The injector draws the face
+    // unjittered and stamps its coverage 0.5 instead of 1, so it reads apart from the panel it
+    // sits on. Here the weight floors at alpha_screen and, at 1, the current sample is the raw
+    // texel rather than the un-jittered resample - the face was rendered pixel-exact, so a
+    // half-texel filter would only soften its text. texelFetch, not texture: the marker must
+    // not be diluted by a filtered neighbour at the face's edge, and the raster there is
+    // unjittered so the integer pixel IS the sample.
+    if (uReprojParams.w > 0.0 && !unwritten &&
+        abs(texelFetch(uVelocity, ivec3(px, layer), 0).w - 0.5) < 0.02) {
+        a = max(a, uReprojParams.w);
+        if (uReprojParams.w >= 1.0) currA = curr;
+    }
+
     // How far the clamp had to move history, in standard deviations. Edges under
     // motion should light up and flat interiors should stay black; a frame that
     // is bright everywhere means the box is too tight, and one that is black

@@ -605,9 +605,12 @@ enum Result {
 
 // Returns INJ_OK and fills `out` on success. `location` receives the varying
 // location chosen, which the paired fragment shader has to read from.
+// jitter = false leaves gl_Position exactly where the shader put it: the screen
+// class (plugin-drawn display faces) is rendered pixel-exact and the resolve takes
+// its raw texel, so a sub-pixel offset there would only shimmer the text.
 inline Result inject(const uint32_t *code, size_t sizeBytes,
                      std::vector<uint32_t> &out, uint32_t *location,
-                     uint32_t *vsPidOut = nullptr)
+                     uint32_t *vsPidOut = nullptr, bool jitter = true)
 {
     if (!code || sizeBytes < 20) return INJ_MALFORMED;
     std::vector<uint32_t> w(code, code + sizeBytes / 4);
@@ -1377,6 +1380,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     //
     // idPosX/Y/Z/W are the ORIGINAL components extracted above. idNegY is the
     // flipped copy that went to the varyings and is not touched here.
+    if (jitter) {
     body.push_back(head(OpAccessChain, 5)); body.push_back(idPtrPCV4); body.push_back(idChainJit); body.push_back(idPCVar); body.push_back(idConst1);
     body.push_back(head(OpLoad, 4));        body.push_back(idV4);      body.push_back(idJit);      body.push_back(idChainJit);
     body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idJitX); body.push_back(idJit); body.push_back(0);
@@ -1388,6 +1392,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
     body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idJittered); body.push_back(idJitPosX); body.push_back(idJitPosY); body.push_back(idPosZ); body.push_back(idPosW);
     // Through OUR pointer, for the same dominance reason as the load above.
     body.push_back(head(OpStore, 3)); body.push_back(idPosPtr); body.push_back(idJittered);
+    }
 
     out.clear();
     out.reserve(w.size() + annos.size() + globals.size() + body.size() + 4);
@@ -1496,7 +1501,7 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
                              std::vector<uint32_t> &out, uint32_t attachmentIndex,
                              bool alphaBlended, bool zeroVel = false,
-                             bool tagHalf = false)
+                             bool tagHalf = false, bool screen = false)
 {
     if (!code || sizeBytes < 20) return INJ_MALFORMED;
     std::vector<uint32_t> w(code, code + sizeBytes / 4);
@@ -1917,7 +1922,11 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     // transparent surface is treated temporally, which is what happened before
     // the mask existed at all. The mask is for the propeller disc; it should
     // fire where coverage is KNOWN low, not where it is unknown.
-    uint32_t idCh3 = wantRGBA ? idPw : idConstOneF;
+    // screen: the plugin-drawn display class stamps coverage 0.5 instead of 1.
+    // The resolve reads that as "content changes on static geometry" and takes
+    // the exact current texel (taa.alpha_screen); everything else that reads
+    // coverage treats 0.5 as written and opaque, which it is.
+    uint32_t idCh3 = wantRGBA ? idPw : (screen ? idConstHalf : idConstOneF);
     uint32_t idMatCz = 0, idMatPz = 0;
     if (matDump || rawClip) {
         idMatCz = bound++; idMatPz = bound++;

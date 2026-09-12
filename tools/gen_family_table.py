@@ -6,6 +6,11 @@ shader up in three sorted hash tables (mv_family_table.h):
     kMvZeroVert    screen-fixed overlays: write velocity = (0,0)   (font, manipulators, rain, legacy 2-D)
     kMvGroundVert  ground families: bind with a ZERO near-field threshold (never take the body frame)
     kMvMaskedVert  write no velocity at all (post passes, blits, debug views, particles, ...)
+    kMvScreenVert  plugin-drawn textured quads (X-Plane's immediate-mode quad shader, the `debug`
+                   family's a_texcoord0 permutations): static geometry whose CONTENT changes -
+                   cockpit display faces. Drawn unjittered, coverage stamped 0.5 so the resolve
+                   takes the exact current texel there (taa.alpha_screen). Blended permutations
+                   stay masked (glyph decals keep the marker of the opaque face beneath).
 A module can be in more than one table (line3d is ground AND masked). Membership is by FAMILY,
 the .xsa archive name inside spv.zip; every vertex-stage module of a member family is listed,
 deduplicated by hash (terrain has thousands of permutations that share a few hundred vertex
@@ -43,6 +48,13 @@ MASKED = {"acf_map_icon", "airport_raster", "atmosphere", "background_blur", "bl
 # world geometry.
 MASKED |= {"device_hang", "light_spill_compact", "mixed_reality", "shading_rate",
            "shading_rate_vis", "vr_depth_copy"}
+# The screen class is decided by CONTENT, not by name: the `debug` archive's vertex modules that
+# take a texture coordinate are the textured-quad shaders XPLM immediate-mode drawing goes
+# through (12.4.4: debug_0/10/38/39/76/86/114/115, ~995 words each). FlightFactor's 777 draws
+# every display face with debug_76 (pid capture 2026-09-12: 23% of the cockpit frame).
+SCREEN_FAMILIES = {"debug"}
+def is_screen(fam, data):
+    return fam in SCREEN_FAMILIES and b"a_texcoord0" in data and b"u_immediate_data" in data
 
 FNV_OFFSET, FNV_PRIME, MASK64 = 1469598103934665603, 1099511628211, (1 << 64) - 1
 
@@ -89,7 +101,7 @@ def iter_pack(pack):
 
 def collect(packs):
     """{table: {hash: representative name}}, plus per-family stats."""
-    tables = {"kMvZeroVert": {}, "kMvGroundVert": {}, "kMvMaskedVert": {}}
+    tables = {"kMvZeroVert": {}, "kMvGroundVert": {}, "kMvMaskedVert": {}, "kMvScreenVert": {}}
     stats = {}
     for pack in packs:
         for fam, name, data in iter_pack(pack):
@@ -103,13 +115,15 @@ def collect(packs):
             if fam in ZERO:   tables["kMvZeroVert"].setdefault(h, name)
             if fam in GROUND: tables["kMvGroundVert"].setdefault(h, name)
             if fam in MASKED: tables["kMvMaskedVert"].setdefault(h, name)
+            if is_screen(fam, data): tables["kMvScreenVert"].setdefault(h, name)
     return tables, stats
 
 def read_existing(path):
     s = open(path, encoding="utf-8").read()
     out = {}
-    for arr in ("kMvZeroVert", "kMvGroundVert", "kMvMaskedVert"):
-        body = re.search(r"static const uint64_t %s\[\] = \{(.*?)\};" % arr, s, re.S).group(1)
+    for arr in ("kMvZeroVert", "kMvGroundVert", "kMvMaskedVert", "kMvScreenVert"):
+        m = re.search(r"static const uint64_t %s\[\] = \{(.*?)\};" % arr, s, re.S)
+        body = m.group(1) if m else ""
         out[arr] = {int(h, 16): n for h, n in re.findall(r"(0x[0-9a-f]+)ull,\s*//\s*(\S+)", body)}
     helpers = s[s.index("// Sorted array; one binary search per pipeline creation."):]
     return out, helpers
@@ -121,13 +135,28 @@ def write_header(path, tables, helpers, packs):
              "// Policy and reasoning live in the generator's header comment.",
              "// Packs merged: " + ", ".join(os.path.basename(p.rstrip("/\\")) for p in packs),
              "#pragma once", "#include <cstdint>", "#include <cstddef>", ""]
-    for arr in ("kMvZeroVert", "kMvGroundVert", "kMvMaskedVert"):
+    for arr in ("kMvZeroVert", "kMvGroundVert", "kMvMaskedVert", "kMvScreenVert"):
         lines.append("static const uint64_t %s[] = {" % arr)
         for h in sorted(tables[arr]):
             lines.append("    0x%016xull, // %s" % (h, tables[arr][h]))
         lines.append("};")
         lines.append("static const size_t %sCount = sizeof(%s) / sizeof(%s[0]);" % (arr, arr, arr))
         lines.append("")
+    if "mvFamilyScreen" not in helpers:
+        helpers = helpers.rstrip("\n") + '''
+
+static inline bool mvFamilyScreen(uint64_t vertHash)
+{
+    if (!vertHash) return false;
+    const uint64_t *lo = kMvScreenVert, *hi = lo + kMvScreenVertCount;
+    while (lo < hi) {
+        const uint64_t *m = lo + (hi - lo) / 2;
+        if (*m == vertHash) return true;
+        if (*m < vertHash) lo = m + 1; else hi = m;
+    }
+    return false;
+}
+'''
     open(path, "w", encoding="utf-8", newline="\n").write("\n".join(lines) + helpers)
 
 def main():
@@ -137,6 +166,8 @@ def main():
     ap.add_argument("--existing", default=os.path.join(os.path.dirname(__file__), "..", "src", "vklayer", "mv_family_table.h"))
     ap.add_argument("--out")
     ap.add_argument("--unpack", help="also write every .spv to <dir>/<family>/ for inject_test")
+    ap.add_argument("--merge", action="store_true",
+                    help="keep every hash the existing header already lists (a pack that is no longer on disk)")
     a = ap.parse_args()
     if a.unpack:
         for pack in a.packs:
@@ -146,9 +177,12 @@ def main():
         print("unpacked into", a.unpack)
     tables, stats = collect(a.packs)
     for fam in sorted(stats):
-        t = [n[3:-4] for n in tables if any(fam == f for f in (fam,)) and fam in {"kMvZeroVert": ZERO, "kMvGroundVert": GROUND, "kMvMaskedVert": MASKED}[n]]
+        t = [n[3:-4] for n in tables if fam in {"kMvZeroVert": ZERO, "kMvGroundVert": GROUND, "kMvMaskedVert": MASKED, "kMvScreenVert": SCREEN_FAMILIES}[n]]
         print("  %-28s modules=%-5d vertex=%-4d unique=%-4d %s" % (fam, stats[fam][0], stats[fam][1], len(stats[fam][2]), "/".join(t) or "-"))
     existing, helpers = read_existing(a.existing)
+    if a.merge:
+        for arr in tables:
+            for h, n in existing[arr].items(): tables[arr].setdefault(h, n)
     for arr in tables:
         new, old = set(tables[arr]), set(existing[arr])
         print("%-14s generated=%-4d existing=%-4d missing_from_generated=%-3d extra_in_generated=%d"

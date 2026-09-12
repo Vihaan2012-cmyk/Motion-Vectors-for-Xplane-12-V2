@@ -2008,7 +2008,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         // not), so the accumulation is capped there instead. Lives here because the push block
         // is at its 128-byte ceiling.
         slot[18] = live::f("taa.alpha_near", "TAA_ALPHA_NEAR", 0.35f);
-        slot[19] = 0.0f;
+        // uReprojParams.w: history weight on the screen class - plugin-drawn display faces
+        // stamped with coverage 0.5 by the injector (kMvScreenVert). 1 = the exact current
+        // texel every frame (the face is rendered pixel-exact and unjittered, nothing to
+        // integrate); lower keeps that much history; 0 = off (the near floor alone).
+        slot[19] = live::f("taa.alpha_screen", "TAA_ALPHA_SCREEN", 1.0f);
         // Second param row: eye-position reconstruction for the cascade tap.
         slot[20] = snapIp[0];
         slot[21] = snapIp[1];
