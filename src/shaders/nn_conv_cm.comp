@@ -41,7 +41,7 @@ layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;   // 8 subgrou
 layout(binding = 0, rgba16f) uniform readonly  image2DArray uA;
 layout(binding = 1, rgba16f) uniform readonly  image2DArray uB;
 layout(binding = 2, rgba16f) uniform writeonly image2DArray uOut;
-layout(binding = 3, std430) readonly buffer W16  { float16_t w[]; } uW;    // packed, see nnaa.h
+layout(binding = 3, std430) readonly buffer W16  { uvec4 w4[]; } uW;       // packed halfs, see nnaa.h; read 8 at a time
 layout(binding = 4, std430) readonly buffer Bias { float b[]; } uBias;     // the fp32 blob (biases only)
 
 layout(push_constant) uniform P {
@@ -71,8 +71,13 @@ const int HW = TW + 2, HH = TH + 2;      // haloed tile
 const int MAXCIN = 48;                   // largest padded input (the d1 concat: 24 + 16 -> 48)
 const int MAXW = 9216;                   // largest weight set: 9 offsets x 2 blocks x 16 x 32 (the e2 layers)
 
-shared float16_t tile[MAXCIN * HH * HW];   // 8640 halfs; reused for the fp16 results after the MMA loop
-shared float16_t wsh[MAXW];                // the layer's packed weights
+// Shared arrays sized by the shape: a (16,16) layer needs 10 KB, not 36, and the SM then
+// holds four or more workgroups instead of two - the latency hiding this kernel lives on.
+// The tile doubles as the fp16 result store after the MMA loop (8 rows x nNb x 256 halfs).
+const int TILE_N = CINPAD * HH * HW;
+const int RES_N  = 8 * (NPAD / 16) * 256;
+shared float16_t tile[TILE_N > RES_N ? TILE_N : RES_N];
+shared uvec4     wsh4[9 * (CINPAD / 16) * 16 * NPAD / 8];   // the layer's packed weights, 8 halfs per element
 
 // One channel group (4 channels) of a map at conv-input pixel q (output-res coords). Zero outside.
 vec4 readGroup(int which, int mode, ivec2 sz, ivec2 q, int g)
@@ -143,8 +148,9 @@ void main()
     const int nNb = NPAD / 16;
 
     // ---- stage the layer's weights once per workgroup
-    const int nW = 9 * nCb * 16 * NPAD;
-    for (int i = tid; i < nW; i += 256) wsh[i] = uW.w[pc.wOff + i];
+    const int nW4 = 9 * nCb * 16 * NPAD / 8;
+    const int w0 = pc.wOff / 8;
+    for (int i = tid; i < nW4; i += 256) wsh4[i] = uW.w4[w0 + i];
 
     // ---- stage the haloed tile: HH x HW x nGroups vec4 reads across 256 threads, channel
     // group fastest so consecutive threads write consecutive 8-byte runs of shared memory.
@@ -169,11 +175,11 @@ void main()
                 coopMatLoad(A, tile, abase + cb * 16, CINPAD, gl_CooperativeMatrixLayoutRowMajor);
                 const int wb = (k * nCb + cb) * 16 * NPAD;
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B0;
-                coopMatLoad(B0, wsh, wb, NPAD, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B0, wsh4, wb / 8, NPAD / 8, gl_CooperativeMatrixLayoutRowMajor);
                 acc0 = coopMatMulAdd(A, B0, acc0);
                 if (nNb > 1) {
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B1;
-                    coopMatLoad(B1, wsh, wb + 16, NPAD, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(B1, wsh4, wb / 8 + 2, NPAD / 8, gl_CooperativeMatrixLayoutRowMajor);
                     acc1 = coopMatMulAdd(A, B1, acc1);
                 }
             }
