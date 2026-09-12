@@ -2543,6 +2543,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         cp.extent.width = g_taa.w; cp.extent.height = g_taa.h; cp.extent.depth = 1;
         dd.cmdCopyImage(cb, copySrc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         g_taa.sceneImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        if (nnView != VK_NULL_HANDLE) nnaa::dumpScene(dd, cb, g_taa.sceneImage);   // taa.nn_dump: what X-Plane sees
 
         VkImageMemoryBarrier post = pre[1];
         post.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;

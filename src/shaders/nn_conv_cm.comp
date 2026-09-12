@@ -10,18 +10,19 @@
 // channels per texel. For one kernel offset (ky, kx) and one block of 16
 // input channels, the 16 pixels of a tile row form a 16x16 matrix A whose
 // element (pixel, channel) sits at ((row + ky) * HW + pixel + kx) * cinPad +
-// block * 16 + channel: rows are 16 CONTIGUOUS halfs (32 bytes, aligned) at a
-// stride of cinPad - a plain row-major load the hardware does in one shot.
-// The first version kept planes [channel][y][x] and loaded A column-major
-// with a 360-byte stride; that path ran at 5-8 ms per full-resolution layer
-// on the 4060, the same whatever the channel count, i.e. bound by the strided
-// shared-memory gather, not by the tensor cores. No im2col copy is made.
+// block * 16 + channel: rows are 16 contiguous, aligned halfs at a stride of
+// cinPad - a plain row-major load. No im2col copy is made.
 //
-// The weights arrive pre-arranged by nnaa.h as, per (offset, channel block),
-// a row-major [16 x Npad] fp16 matrix B(channel, output), zero padded to 16 on
-// both axes. Eight subgroups (one per tile row) each keep Npad/16 fp32
-// accumulators and walk 9 x (cinPad/16) products; the result goes through
-// shared memory once for the bias, the activation and the rgba16f store.
+// The layer's whole weight set - per (offset, channel block) a row-major
+// [16 x Npad] fp16 matrix B(channel, output), packed by nnaa.h - is staged in
+// shared memory ONCE per workgroup and read by all eight subgroups. The
+// first versions loaded B from the storage buffer inside the loop: with two
+// workgroups resident per SM that was a chain of 18-27 dependent global
+// loads per subgroup and cost 5-10 ms per full-resolution layer, the same
+// whatever the tile layout. Everything the MMA loop touches is now in shared
+// memory. After the loop the tile is dead, so the fp32 accumulators are
+// converted to fp16 and parked in it for the bias / activation / store step -
+// the maps are fp16 anyway, and it keeps the shared footprint at ~36 KB.
 //
 // Padding to multiples of 16 costs extra multiplies (17 -> 32 for the first
 // layer) that the tensor cores absorb; the fp32 path is still the fallback
@@ -62,9 +63,10 @@ layout(push_constant) uniform P {
 const int TW = 16, TH = 8;
 const int HW = TW + 2, HH = TH + 2;      // haloed tile
 const int MAXCIN = 48;                   // largest padded input (the d1 concat: 24 + 16 -> 48)
+const int MAXW = 9216;                   // largest weight set: 9 offsets x 2 blocks x 16 x 32 (the e2 layers)
 
-shared float16_t tile[MAXCIN * HH * HW];
-shared float     cbuf[8 * 2 * 256];      // per subgroup, per N block: a 16x16 fp32 result
+shared float16_t tile[MAXCIN * HH * HW];   // 8640 halfs; reused for the fp16 results after the MMA loop
+shared float16_t wsh[MAXW];                // the layer's packed weights
 
 // One channel group (4 channels) of a map at conv-input pixel q (output-res coords). Zero outside.
 vec4 readGroup(int which, int mode, ivec2 sz, ivec2 q, int g)
@@ -113,54 +115,73 @@ vec4 readTileGroup(int c, ivec2 q)
     return o;
 }
 
+void stage(int i, int nGroups, ivec2 tile0)
+{
+    int g  = i % nGroups;
+    int r  = i / nGroups;
+    int ty = r / HW, tx = r - ty * HW;
+    ivec2 q = tile0 + ivec2(tx - 1, ty - 1);
+    vec4 v = readTileGroup(g * 4, q);
+    int base = (ty * HW + tx) * pc.cinPad + g * 4;
+    tile[base]     = float16_t(v.x);
+    tile[base + 1] = float16_t(v.y);
+    tile[base + 2] = float16_t(v.z);
+    tile[base + 3] = float16_t(v.w);
+}
+
 void main()
 {
     const ivec2 tile0 = ivec2(gl_WorkGroupID.xy) * ivec2(TW, TH);
     const int tid = int(gl_LocalInvocationIndex);
-
-    // ---- stage the haloed tile: HH x HW x nGroups vec4 reads across 256 threads, channel
-    // group fastest so consecutive threads write consecutive 8-byte runs of shared memory
-    const int nGroups = pc.cinPad / 4;
-    const int items = nGroups * HH * HW;
-    for (int i = tid; i < items; i += 256) {
-        int g  = i % nGroups;
-        int r  = i / nGroups;
-        int ty = r / HW, tx = r - ty * HW;
-        ivec2 q = tile0 + ivec2(tx - 1, ty - 1);
-        vec4 v = readTileGroup(g * 4, q);
-        int base = (ty * HW + tx) * pc.cinPad + g * 4;
-        tile[base]     = float16_t(v.x);
-        tile[base + 1] = float16_t(v.y);
-        tile[base + 2] = float16_t(v.z);
-        tile[base + 3] = float16_t(v.w);
-    }
-    barrier();
-
-    // ---- one subgroup per tile row
-    const int row = int(gl_SubgroupID);
     const int nCb = pc.cinPad / 16;
     const int nNb = pc.nPad / 16;
+
+    // ---- stage the layer's weights once per workgroup
+    const int nW = 9 * nCb * 16 * pc.nPad;
+    for (int i = tid; i < nW; i += 256) wsh[i] = uW.w[pc.wOff + i];
+
+    // ---- stage the haloed tile: HH x HW x nGroups vec4 reads across 256 threads, channel
+    // group fastest so consecutive threads write consecutive 8-byte runs of shared memory.
+    // Two items per iteration so their image loads are in flight together.
+    const int nGroups = pc.cinPad / 4;
+    const int items = nGroups * HH * HW;
+    int i = tid;
+    for (; i + 256 < items; i += 512) { stage(i, nGroups, tile0); stage(i + 256, nGroups, tile0); }
+    if (i < items) stage(i, nGroups, tile0);
+    barrier();
+
+    // ---- one subgroup per tile row: 9 offsets x nCb blocks, everything from shared memory
+    const int row = int(gl_SubgroupID);
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     if (row < 8) {
         for (int k = 0; k < 9; ++k) {
             const int ky = k / 3, kx = k - ky * 3;
+            const int abase = ((row + ky) * HW + kx) * pc.cinPad;
             for (int cb = 0; cb < nCb; ++cb) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
-                coopMatLoad(A, tile, ((row + ky) * HW + kx) * pc.cinPad + cb * 16, pc.cinPad, gl_CooperativeMatrixLayoutRowMajor);
-                const int wb = pc.wOff + (k * nCb + cb) * 16 * pc.nPad;
+                coopMatLoad(A, tile, abase + cb * 16, pc.cinPad, gl_CooperativeMatrixLayoutRowMajor);
+                const int wb = (k * nCb + cb) * 16 * pc.nPad;
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B0;
-                coopMatLoad(B0, uW.w, wb, pc.nPad, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B0, wsh, wb, pc.nPad, gl_CooperativeMatrixLayoutRowMajor);
                 acc0 = coopMatMulAdd(A, B0, acc0);
                 if (nNb > 1) {
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B1;
-                    coopMatLoad(B1, uW.w, wb + 16, pc.nPad, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(B1, wsh, wb + 16, pc.nPad, gl_CooperativeMatrixLayoutRowMajor);
                     acc1 = coopMatMulAdd(A, B1, acc1);
                 }
             }
         }
-        coopMatStore(acc0, cbuf, (row * 2 + 0) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
-        if (nNb > 1) coopMatStore(acc1, cbuf, (row * 2 + 1) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();   // every subgroup is done reading the tile: it becomes the result store
+
+    if (row < 8) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h0 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc0);
+        coopMatStore(h0, tile, (row * 2 + 0) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        if (nNb > 1) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h1 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc1);
+            coopMatStore(h1, tile, (row * 2 + 1) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        }
     }
     barrier();
 
@@ -175,7 +196,7 @@ void main()
         for (int j = 0; j < 4; ++j) {
             int co = g * 4 + j;
             if (co >= pc.cout) break;
-            float v = cbuf[(row * 2 + co / 16) * 256 + px * 16 + (co & 15)] + uBias.b[pc.bOff + co];
+            float v = float(tile[(row * 2 + co / 16) * 256 + px * 16 + (co & 15)]) + uBias.b[pc.bOff + co];
             if (pc.act == 1) v = (v > 0.0) ? v : 0.1 * v;
             o[j] = v;
         }

@@ -458,7 +458,7 @@ inline void conv(State &s, DeviceData &dd, VkCommandBuffer cb, const Layer &L,
     ii[1].imageView = B ? B->view : A.view; ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[2].imageView = out.view; ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     VkDescriptorBufferInfo bi; bi.buffer = s.wbuf; bi.offset = 0; bi.range = VK_WHOLE_SIZE;
-    if (useCm) {
+    if (useCm && 9 * (L.cinPad / 16) * 16 * L.nPad <= 9216) {
         VkDescriptorBufferInfo hbi; hbi.buffer = s.cmbuf; hbi.offset = 0; hbi.range = VK_WHOLE_SIZE;
         VkWriteDescriptorSet cw[5]; memset(cw, 0, sizeof(cw));
         for (int k = 0; k < 5; ++k) {
@@ -475,9 +475,9 @@ inline void conv(State &s, DeviceData &dd, VkCommandBuffer cb, const Layer &L,
         dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeCm);
         dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.plCm, 0, 1, &set, 0, nullptr);
         dd.cmdPushConstants(cb, s.plCm, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(q), &q);
+        gpuTimeMark(dd, cb, label);
         dd.cmdDispatch(cb, (out.w + 15) / 16, (out.h + 7) / 8, 1);
         computeBarrier(dd, cb);
-        gpuTimeMark(dd, cb, label);
         ++s.dispatches;
         return;
     }
@@ -499,16 +499,16 @@ inline void conv(State &s, DeviceData &dd, VkCommandBuffer cb, const Layer &L,
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeConv);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.plConv, 0, 1, &set, 0, nullptr);
     dd.cmdPushConstants(cb, s.plConv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+    gpuTimeMark(dd, cb, label);
     dd.cmdDispatch(cb, (out.w + 7) / 8, (out.h + 7) / 8, 1);
     computeBarrier(dd, cb);
-    gpuTimeMark(dd, cb, label);
     ++s.dispatches;
 }
 
 // ---------------------------------------------------------------- dump
 inline void dumpBegin(State &s, DeviceData &dd, VkCommandBuffer cb, VkImage histImg)
 {
-    const uint32_t planes = 8;                                // in[0..5], out, history
+    const uint32_t planes = 9;                                // in[0..5], out, history, scene after copy-out
     const VkDeviceSize plane = (VkDeviceSize)s.w * s.hh * 8;  // rgba16f
     s.dbytes = plane * planes;
     VkBufferCreateInfo bc; memset(&bc, 0, sizeof(bc));
@@ -551,7 +551,7 @@ inline void dumpFinish(State &s, DeviceData &dd)
     std::string path = std::string(t ? t : ".") + "\\nn_aa_dump.bin";
     FILE *f = fopen(path.c_str(), "wb");
     if (f) {
-        uint32_t hdr[4] = { 0x444E564Du /* 'MVND' */, s.w, s.hh, 8u };
+        uint32_t hdr[4] = { 0x444E564Du /* 'MVND' */, s.w, s.hh, 9u };
         fwrite(hdr, 4, 4, f);
         fwrite(s.dptr, 1, (size_t)s.dbytes, f);
         fclose(f);
@@ -588,7 +588,7 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
         dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ub, 0, nullptr, 0, nullptr);
         s.uploaded = true;
     }
-    gpuTimeBegin(dd, cb); gpuTimeMark(dd, cb, "nn");
+    gpuTimeBegin(dd, cb);
     computeBarrier(dd, cb);   // the resolve's writes to the input map
     const Layer *L = s.layers.data();
     conv(s, dd, cb, L[0],  s.in, 0, s.inCh, nullptr, 0,     s.a,   1, "e0a");   // e0.c1
@@ -620,13 +620,14 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
     p.viz   = live::i("taa.nn_viz", "TAA_NN_VIZ", 0);
     p.split = live::f("taa.nn_split", "TAA_NN_SPLIT", 0.5f);
     p.blend = live::f("taa.nn_blend", "TAA_NN_BLEND", 1.0f);
+    gpuTimeMark(dd, cb, "post");
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipePost);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s.plPost, 0, 1, &set, 0, nullptr);
     dd.cmdPushConstants(cb, s.plPost, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     dd.cmdDispatch(cb, (s.w + 7) / 8, (s.hh + 7) / 8, 1);
     computeBarrier(dd, cb);
     ++s.dispatches;
-    gpuTimeMark(dd, cb, "post");
+    gpuTimeMark(dd, cb, "end");
 
     const bool wantDump = live::onoff("taa.nn_dump", "TAA_NN_DUMP", false);
     if (!wantDump && s.dumpState == 2) s.dumpState = 0;            // re-arm when the key is turned off
@@ -672,6 +673,32 @@ inline void snapNormal(DeviceData &dd, VkCommandBuffer cb, VkImage img, VkFormat
     VkImageMemoryBarrier post[2] = { b, d };
     dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, post);
     s.normFrame = frame;
+}
+
+// Called from the resolve right after it copied its result into the scene target (still
+// TRANSFER_DST): on a dump frame, the ninth plane is what X-Plane's post chain will actually see.
+inline void dumpScene(DeviceData &dd, VkCommandBuffer cb, VkImage scene)
+{
+    State &s = state();
+    if (s.dumpState != 1 || s.dumpFrame != s.frame || s.dbuf == VK_NULL_HANDLE || scene == VK_NULL_HANDLE) return;
+    const VkDeviceSize plane = (VkDeviceSize)s.w * s.hh * 8;
+    VkImageMemoryBarrier b; memset(&b, 0, sizeof(b));
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = scene; b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkBufferImageCopy r; memset(&r, 0, sizeof(r));
+    r.bufferOffset = plane * 8;
+    r.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; r.imageSubresource.layerCount = 1;
+    r.imageExtent.width = s.w; r.imageExtent.height = s.hh; r.imageExtent.depth = 1;
+    dd.cmdCopyImageToBuffer(cb, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.dbuf, 1, &r);
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    trace("NNAA: dump also holds the scene target after the copy-out");
 }
 
 // The snapshot view for the resolve's normal binding this frame, or null (then the resolve keeps its own).
