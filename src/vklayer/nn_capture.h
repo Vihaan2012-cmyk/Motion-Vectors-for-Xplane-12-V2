@@ -329,6 +329,10 @@ inline std::string manifest(const std::vector<PlaneDesc> &planes, uint32_t w, ui
     o += "  "; jarr(o, "proj", sn.proj, 16); o += ",\n";
     o += "  "; jarr(o, "world", sn.world, 16); o += ",\n";
     o += "  "; jarr(o, "reproj", sn.reproj, 16); o += ",\n";
+    o += "  "; jarr(o, "body", sn.bodyReproj, 16); o += ",\n";
+    snprintf(b, sizeof(b), "  \"body_valid\": %d, \"bypass\": %d, \"near_field_m\": %.4g, \"cockpit_pass\": %d, \"pid_mode\": %d,\n",
+             (int)sn.bodyReprojValid, mvBypassed() ? 1 : 0, (double)g_nearFieldM, g_cockpitPassIndex, getenv("TAA_MV_PID") ? 1 : 0);
+    o += b;
     snprintf(b, sizeof(b), "  \"cam\": {\"x\": %.9g, \"y\": %.9g, \"z\": %.9g},\n  \"fov_deg\": %.6g, \"near\": %.9g, \"far\": %.9g, "
              "\"reverse_z\": %d, \"view_type\": %d,\n", (double)sn.camX, (double)sn.camY, (double)sn.camZ,
              (double)sn.fovDeg, (double)sn.nearClip, (double)sn.farClip, sn.reverseZ, sn.viewType);

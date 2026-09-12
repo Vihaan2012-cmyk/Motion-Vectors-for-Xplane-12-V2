@@ -880,6 +880,44 @@ static std::atomic<bool> g_mvClearedAtPresent(false);
 // Declared here, ahead of vkCreateShaderModule, because that is where the
 // original words are stored - and ahead of vkCreateGraphicsPipelines, which is
 // where they are finally patched.
+static uint64_t mvFragHash(const std::vector<uint32_t> &code);   // defined with the injector, below
+
+// ---- TAA_DUMP_SHADERS=<dir>: the shader census as files. Every shader module
+// X-Plane creates is written once as <fnv-1a-64>.spv (the same hash the family
+// table and the pid table use), modules.txt lists them, and pipelines.csv - rewritten
+// every 600 frames - names each pipeline's vertex/fragment module, its pid (TAA_MV_PID
+// runs), whether the injector patched it, its ground-family verdict, and how many
+// times it was bound this session. With a capture and a pid table beside it, a
+// pixel's writer resolves to a file on disk: tools/nn/diag777.py does the joining.
+static const char *mvDumpDir()
+{
+    static std::string d; static bool init = false;
+    if (!init) {
+        init = true;
+        const char *e = getenv("TAA_DUMP_SHADERS");
+        if (e && *e && strcmp(e, "0") != 0) { d = e; _mkdir(d.c_str()); }
+    }
+    return d.empty() ? nullptr : d.c_str();
+}
+static void mvDumpModule(const uint32_t *code, size_t bytes)
+{
+    const char *dir = mvDumpDir();
+    if (!dir || !code || bytes < 20) return;
+    std::vector<uint32_t> w(code, code + bytes / 4);
+    const uint64_t h = mvFragHash(w);
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\%016llx.spv", dir, (unsigned long long)h);
+    FILE *f = fopen(path, "rb");
+    if (f) { fclose(f); return; }
+    f = fopen(path, "wb"); if (!f) return;
+    fwrite(code, 1, bytes, f); fclose(f);
+    snprintf(path, sizeof(path), "%s\\modules.txt", dir);
+    f = fopen(path, "a"); if (f) { fprintf(f, "%016llx %zu\n", (unsigned long long)h, bytes / 4); fclose(f); }
+}
+struct MvPipeIdent { uint32_t vsPid = 0; uint64_t vert = 0, frag = 0; bool patched = false, ground = false, geometry = false; uint64_t binds = 0; };
+static std::mutex g_pipeIdentLock;
+static std::map<VkPipeline, MvPipeIdent> g_pipeIdent;
+
 static std::map<VkShaderModule, std::vector<uint32_t> > g_moduleCode;
 
 // ---- DOES THIS VERTEX SHADER PULL ITS VERTICES FROM MEMORY?
@@ -11287,6 +11325,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
                 off += snprintf(line + off, sizeof(line) - off, " [%d]=%llu", i,
                                 (unsigned long long)g_mvPassDraws[i]);
         if (off) trace("MV PASS CENSUS: geometry binds per qualifying pass -%s", line);
+        if (const char *ddir = mvDumpDir()) {
+            char path[MAX_PATH]; snprintf(path, sizeof(path), "%s\\pipelines.csv", ddir);
+            FILE *f = fopen(path, "w");
+            if (f) {
+                fprintf(f, "pipeline,vs_pid,vert_hash,frag_hash,patched,ground,geometry,binds\n");
+                std::lock_guard<std::mutex> pl(g_pipeIdentLock);
+                for (std::map<VkPipeline, MvPipeIdent>::const_iterator it = g_pipeIdent.begin(); it != g_pipeIdent.end(); ++it)
+                    fprintf(f, "%p,%u,%016llx,%016llx,%d,%d,%d,%llu\n", (void*)it->first, it->second.vsPid,
+                            (unsigned long long)it->second.vert, (unsigned long long)it->second.frag,
+                            it->second.patched ? 1 : 0, it->second.ground ? 1 : 0, it->second.geometry ? 1 : 0,
+                            (unsigned long long)it->second.binds);
+                fclose(f);
+            }
+        }
         {
             std::lock_guard<std::mutex> fg(g_famCensusLock);
             trace("FAMILY CENSUS: %zu distinct vertex shaders - zero=%zu masked=%zu ground=%zu "
@@ -12844,6 +12896,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateShaderModule(
         if (rr == VK_SUCCESS && out) {
             std::lock_guard<std::mutex> g(g_lock);
             g_moduleCode[*out].assign(ci->pCode, ci->pCode + ci->codeSize / 4);
+            mvDumpModule(ci->pCode, ci->codeSize);
             if (isXpFsr) g_xpFsrModules.insert(*out);
             // Remember WHICH module got our code, so the probe can wait
             // for the dispatch that actually writes the sentinel.
@@ -13791,9 +13844,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
     std::vector<std::vector<VkPipelineShaderStageCreateInfo> > stages;
     std::vector<char> mvPatchedThisCall;
     std::vector<char> mvGroundThisCall;   // world-static family, per pipeline
+    std::vector<uint64_t> vertHashThisCall, fragHashThisCall; std::vector<uint32_t> vsPidThisCall;   // TAA_DUMP_SHADERS identity per pipeline
 
     if (ci && count) mvPatchedThisCall.assign(count, 0);
     if (ci && count) mvGroundThisCall.assign(count, 0);
+    if (ci && count) { vertHashThisCall.assign(count, 0); fragHashThisCall.assign(count, 0); vsPidThisCall.assign(count, 0); }
 
     if (g_spirvLive && ci && count) {
         ci2.assign(ci, ci + count);
@@ -14382,6 +14437,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 mvGroundThisCall[i] = (ground && !vertInstanced) ? 1 : 0;
             }
             mvPatchedThisCall[i] = (fragPatched && vertPatched);
+            vertHashThisCall[i] = vertHash; fragHashThisCall[i] = fragHash;
 
             // ---- PID MODE: ONE LINE PER PIPELINE INTO THE WRITER TABLE.
             //
@@ -14408,6 +14464,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                             g_layoutHasOurPC.find(ci[i].layout);
                         layoutPC = (lt != g_layoutHasOurPC.end() && lt->second);
                     }
+                    vsPidThisCall[i] = vsPidThis;
                     const VkPipelineColorBlendStateCreateInfo *cbp = ci[i].pColorBlendState;
                     const bool b0 = cbp && cbp->attachmentCount > 0 &&
                                     cbp->pAttachments[0].blendEnable == VK_TRUE;
@@ -14854,6 +14911,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             // than fifty patched ones drawing cockpit switches.
             g_pipelineMvPatched[out[i]] =
                 (i < mvPatchedThisCall.size()) && mvPatchedThisCall[i] != 0;
+            if (mvDumpDir() && i < vertHashThisCall.size()) {
+                std::lock_guard<std::mutex> pl(g_pipeIdentLock);
+                MvPipeIdent &pi = g_pipeIdent[out[i]];
+                pi.vsPid = vsPidThisCall[i]; pi.vert = vertHashThisCall[i]; pi.frag = fragHashThisCall[i];
+                pi.patched = mvPatchedThisCall[i] != 0; pi.ground = mvGroundThisCall[i] != 0; pi.geometry = hasAttribs;
+            }
             if (hasAttribs) ++g_pipeGeometry; else ++g_pipeFullscreen;
         }
     }
@@ -16271,6 +16334,11 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
         g_cbFsrOurs[(void*)cb] = (g_xpFsrOurPipelines.count(pipeline) != 0);
     }
 
+    if (mvDumpDir() && bind == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        std::lock_guard<std::mutex> pl(g_pipeIdentLock);
+        std::map<VkPipeline, MvPipeIdent>::iterator pi = g_pipeIdent.find(pipeline);
+        if (pi != g_pipeIdent.end()) ++pi->second.binds;
+    }
     if (!g_spirvInject || bind != VK_PIPELINE_BIND_POINT_GRAPHICS) return;
     if (!g_nextCmdPushConstants) return;
 
