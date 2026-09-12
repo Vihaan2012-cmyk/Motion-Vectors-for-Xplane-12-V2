@@ -46,6 +46,13 @@ void main()
     vec3 shade = imageLoad(uIn, ivec3(px, 5)).xyz;
     vec3 o = base + tanh(r) * (0.5 + abs(base));
     o = max(o * shade, vec3(0.0));
+    // ---- BOUNDED, ALWAYS. The history is rgba16f and X-Plane's auto-exposure averages the
+    // frame: one pixel pushed past 65504 by base * shade on the sun disk becomes +inf, the
+    // exposure follows it and the WHOLE screen goes black (first flight, 2026-09-12). The net
+    // may not brighten beyond twice what the resolve would show, and never produces inf/NaN.
+    o = min(o, max(prev.rgb, base) * 2.0 + 1.0);
+    o = min(o, vec3(30000.0));
+    if (any(isnan(o)) || any(isinf(o))) o = prev.rgb;
 
     if (pc.viz == 1) {
         imageStore(uHist, ivec3(px, pc.layer), vec4(abs(o - prev.rgb) * 8.0, prev.a));

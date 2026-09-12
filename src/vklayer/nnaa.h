@@ -449,9 +449,9 @@ inline bool ensureMaps(State &s, DeviceData &dd, VkCommandBuffer cb)
 }
 
 inline void conv(State &s, DeviceData &dd, VkCommandBuffer cb, const Layer &L,
-                 Map &A, int modeA, int cinA, Map *B, int cinB, Map &out, int act)
+                 Map &A, int modeA, int cinA, Map *B, int cinB, Map &out, int act, const char *label)
 {
-    const bool useCm = s.cm && s.cmbuf != VK_NULL_HANDLE;
+    const bool useCm = s.cm && s.cmbuf != VK_NULL_HANDLE && live::onoff("taa.nn_cm", "TAA_NN_CM", true);
     VkDescriptorSet set = takeSet(s, useCm ? 1 : 0);
     VkDescriptorImageInfo ii[3]; memset(ii, 0, sizeof(ii));
     ii[0].imageView = A.view; ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -477,6 +477,7 @@ inline void conv(State &s, DeviceData &dd, VkCommandBuffer cb, const Layer &L,
         dd.cmdPushConstants(cb, s.plCm, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(q), &q);
         dd.cmdDispatch(cb, (out.w + 15) / 16, (out.h + 7) / 8, 1);
         computeBarrier(dd, cb);
+        gpuTimeMark(dd, cb, label);
         ++s.dispatches;
         return;
     }
@@ -500,6 +501,7 @@ inline void conv(State &s, DeviceData &dd, VkCommandBuffer cb, const Layer &L,
     dd.cmdPushConstants(cb, s.plConv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     dd.cmdDispatch(cb, (out.w + 7) / 8, (out.h + 7) / 8, 1);
     computeBarrier(dd, cb);
+    gpuTimeMark(dd, cb, label);
     ++s.dispatches;
 }
 
@@ -589,17 +591,17 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
     gpuTimeBegin(dd, cb); gpuTimeMark(dd, cb, "nn");
     computeBarrier(dd, cb);   // the resolve's writes to the input map
     const Layer *L = s.layers.data();
-    conv(s, dd, cb, L[0],  s.in, 0, s.inCh, nullptr, 0,     s.a,   1);   // e0.c1
-    conv(s, dd, cb, L[1],  s.a,  0, s.ch0,  nullptr, 0,     s.b,   1);   // e0.c2   (skip for d0)
-    conv(s, dd, cb, L[2],  s.b,  1, s.ch0,  nullptr, 0,     s.c,   1);   // e1.c1 on pool(e0)
-    conv(s, dd, cb, L[3],  s.c,  0, s.ch1,  nullptr, 0,     s.d,   1);   // e1.c2   (skip for d1)
-    conv(s, dd, cb, L[4],  s.d,  1, s.ch1,  nullptr, 0,     s.e,   1);   // e2.c1 on pool(e1)
-    conv(s, dd, cb, L[5],  s.e,  0, s.ch2,  nullptr, 0,     s.f,   1);   // e2.c2
-    conv(s, dd, cb, L[6],  s.f,  2, s.ch2,  &s.d,    s.ch1, s.c,   1);   // d1.c1 on cat(up(e2), e1)
-    conv(s, dd, cb, L[7],  s.c,  0, s.ch1,  nullptr, 0,     s.h,   1);   // d1.c2
-    conv(s, dd, cb, L[8],  s.h,  2, s.ch1,  &s.b,    s.ch0, s.a,   1);   // d0.c1 on cat(up(d1), e0)
-    conv(s, dd, cb, L[9],  s.a,  0, s.ch0,  nullptr, 0,     s.g,   1);   // d0.c2
-    conv(s, dd, cb, L[10], s.g,  0, s.ch0,  nullptr, 0,     s.out, 0);   // out (no activation)
+    conv(s, dd, cb, L[0],  s.in, 0, s.inCh, nullptr, 0,     s.a,   1, "e0a");   // e0.c1
+    conv(s, dd, cb, L[1],  s.a,  0, s.ch0,  nullptr, 0,     s.b,   1, "e0b");   // e0.c2   (skip for d0)
+    conv(s, dd, cb, L[2],  s.b,  1, s.ch0,  nullptr, 0,     s.c,   1, "e1a");   // e1.c1 on pool(e0)
+    conv(s, dd, cb, L[3],  s.c,  0, s.ch1,  nullptr, 0,     s.d,   1, "e1b");   // e1.c2   (skip for d1)
+    conv(s, dd, cb, L[4],  s.d,  1, s.ch1,  nullptr, 0,     s.e,   1, "e2a");   // e2.c1 on pool(e1)
+    conv(s, dd, cb, L[5],  s.e,  0, s.ch2,  nullptr, 0,     s.f,   1, "e2b");   // e2.c2
+    conv(s, dd, cb, L[6],  s.f,  2, s.ch2,  &s.d,    s.ch1, s.c,   1, "d1a");   // d1.c1 on cat(up(e2), e1)
+    conv(s, dd, cb, L[7],  s.c,  0, s.ch1,  nullptr, 0,     s.h,   1, "d1b");   // d1.c2
+    conv(s, dd, cb, L[8],  s.h,  2, s.ch1,  &s.b,    s.ch0, s.a,   1, "d0a");   // d0.c1 on cat(up(d1), e0)
+    conv(s, dd, cb, L[9],  s.a,  0, s.ch0,  nullptr, 0,     s.g,   1, "d0b");   // d0.c2
+    conv(s, dd, cb, L[10], s.g,  0, s.ch0,  nullptr, 0,     s.out, 0, "out");   // out (no activation)
 
     // post: base + tanh(r) * (0.5 + |base|) into the history image
     VkDescriptorSet set = takeSet(s, 2);
@@ -624,7 +626,7 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
     dd.cmdDispatch(cb, (s.w + 7) / 8, (s.hh + 7) / 8, 1);
     computeBarrier(dd, cb);
     ++s.dispatches;
-    gpuTimeMark(dd, cb, "nn end");
+    gpuTimeMark(dd, cb, "post");
 
     const bool wantDump = live::onoff("taa.nn_dump", "TAA_NN_DUMP", false);
     if (!wantDump && s.dumpState == 2) s.dumpState = 0;            // re-arm when the key is turned off
