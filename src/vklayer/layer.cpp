@@ -7269,7 +7269,7 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer cb)
         }
     }
     if (g_nextCmdEndRendering) g_nextCmdEndRendering(cb);
-    if (wasScenePass && nncap::captureArmed()) {   // G-buffer planes are read here, while the pass's layout still holds
+    if (wasScenePass && (nncap::captureArmed() || nnaa::enabled())) {   // G-buffer planes are read here, while the pass layout still holds; the AA net wants the normal every frame
         std::map<VkCommandBuffer, VkDevice>::iterator sdi = g_cbToDevice.find(cb);
         if (sdi != g_cbToDevice.end()) {
             std::map<void*, DeviceData>::iterator sdd = g_devices.find(dispatchKey(sdi->second));

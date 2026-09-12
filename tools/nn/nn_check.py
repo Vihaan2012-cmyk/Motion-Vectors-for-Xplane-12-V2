@@ -27,7 +27,7 @@ def main():
     a = ap.parse_args()
     raw = open(a.dump, "rb").read()
     magic, w, h, planes = struct.unpack("<IIII", raw[:16])
-    assert magic == 0x444E564D and planes == 8, "not an nnaa dump"
+    assert magic == 0x444E564D and planes >= 8, "not an nnaa dump"
     px = np.frombuffer(raw[16:], dtype=np.float16).reshape(planes, h, w, 4).astype(np.float32)
     L = [px[i] for i in range(6)]; r_gpu = px[6][..., :3]; final = px[7][..., :3]
     # the 17 net channels in nnaa.h order

@@ -53,6 +53,26 @@ void main()
     o = min(o, max(prev.rgb, base) * 2.0 + 1.0);
     o = min(o, vec3(30000.0));
     if (any(isnan(o)) || any(isinf(o))) o = prev.rgb;
+    // ---- THE SAME RANGE THE TRUTH WAS BUILT WITH. pack_aa.py accepted a warped sample only
+    // inside the current raster's 3x3 tonemapped range +- 0.03, so the target never left that
+    // box; at run time the net recurs on its own output for thousands of frames (trained on
+    // three), and a pattern that crept outside the box would feed on itself. Clamping the
+    // tonemapped output to the box the truth lived in costs eight loads and removes nothing
+    // the training could have asked for.
+    if (pc.viz != 2) {
+        vec3 lo = vec3(1e30), hi = vec3(-1e30);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 q = clamp(px + ivec2(dx, dy), ivec2(0), pc.size - 1);
+                vec3 b = imageLoad(uIn, ivec3(q, 4)).yzw;
+                vec3 t = b / (1.0 + dot(b, vec3(0.2126, 0.7152, 0.0722)));
+                lo = min(lo, t); hi = max(hi, t);
+            }
+        vec3 ot = o / (1.0 + dot(o, vec3(0.2126, 0.7152, 0.0722)));
+        vec3 ct = clamp(ot, lo - 0.03, hi + 0.03);
+        float lt = dot(ct, vec3(0.2126, 0.7152, 0.0722));
+        o = ct / max(1.0 - lt, 1e-4);
+    }
 
     if (pc.viz == 1) {
         imageStore(uHist, ivec3(px, pc.layer), vec4(abs(o - prev.rgb) * 8.0, prev.a));
