@@ -332,6 +332,7 @@ enum {
     kTaaFlagAccumExp      = 1 << 19,  // EXPERIMENTAL taa.accum_exp: sample-count history length
     kTaaFlagConfExp       = 1 << 20,  // EXPERIMENTAL taa.conf_exp: confidence-widened box + depth-consistency reset
     kTaaFlagScreenReset   = 1 << 21,  // taa.screen_reset: near + screen-static + 3x3 mean changed => take the frame
+    kTaaFlagNn            = 1 << 22,  // taa.nn: binding 15 is the AA net's input map; write it and the depth history
 };
 
 // ---- EVERY KNOB IS LIVE. NONE OF THESE ARE CACHED.
@@ -516,6 +517,7 @@ static uint32_t taaFindMemory(DeviceData &dd, uint32_t typeBits, VkMemoryPropert
             return i;
     return UINT32_MAX;
 }
+#include "nnaa.h"   // the AA net: needs DeviceData, live::, trace and taaFindMemory, all above
 
 // Destroy a parked state's objects for real. Only ever called on states that
 // left service N presents ago - nothing in flight can still reference them.
@@ -605,7 +607,7 @@ static uint64_t g_taaGraveNow = 0;
 
 static void taaDestroy(DeviceData &dd)
 {
-    (void)dd;
+    nnaa::shutdown(dd);
     if (g_taa.ready || g_taa.pool) {
         TaaGrave gr; gr.s = g_taa; gr.frame = g_taaGraveNow;
         g_taaGraves.push_back(gr);
@@ -908,7 +910,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
                   "override stays off");
     }
 
-    VkDescriptorSetLayoutBinding b[15];
+    VkDescriptorSetLayoutBinding b[16];
     memset(b, 0, sizeof(b));
     // Binding 0 is a SAMPLER now, not a storage image: the dispatch only reads
     // the scene. That is what lets the scene target keep X-Plane's own usage
@@ -948,14 +950,15 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
     b[12].binding = 12; b[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     b[13].binding = 13; b[13].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;   // depth history, read
     b[14].binding = 14; b[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            // depth history, write
-    for (int i = 0; i < 15; ++i) {
+    b[15].binding = 15; b[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            // taa.nn: the net's input map (dummy: this frame's history)
+    for (int i = 0; i < 16; ++i) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci;
     memset(&dlci, 0, sizeof(dlci));
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 15; dlci.pBindings = b;
+    dlci.bindingCount = 16; dlci.pBindings = b;
     if (dd.createDescriptorSetLayout(dev, &dlci, nullptr, &g_taa.setLayout) != VK_SUCCESS) return false;
 
     VkPushConstantRange pcr;
@@ -1008,7 +1011,7 @@ static bool taaInit(DeviceData &dd, VkDevice dev, VkImage scene, VkFormat fmt,
 
     VkDescriptorPoolSize ps[3];
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    ps[0].descriptorCount = 2 * TaaState::kSets;   // history write + depth history write
+    ps[0].descriptorCount = 3 * TaaState::kSets;   // history write + depth history write + nn input
     ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     ps[1].descriptorCount = 10 * TaaState::kSets;  // + sun cascades, env probes, GI, normals, depth history
     ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -1753,6 +1756,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
 
     const uint32_t hw_ = g_taa.historyWrite;         // written this frame
     const uint32_t hr_ = hw_ ^ 1u;                    // read this frame
+    // taa.nn: the AA net's input map, created before the descriptor write names it.
+    // The net's dz plane needs the depth history, so no depth history = no net.
+    VkImageView nnView = nnaa::prepareInput(dd, cb, g_taa.w, g_taa.h, g_taa.layers);
+    if (!(g_taa.hdepthView[0] && g_taa.hdepthView[1])) nnView = VK_NULL_HANDLE;
     bar[1].image = g_taa.history[hw_];
     bar[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     bar[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -2233,11 +2240,17 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         wrhd[k].dstBinding = 13u + (uint32_t)k; wrhd[k].descriptorCount = 1; wrhd[k].pImageInfo = &hdi[k];
         wrhd[k].descriptorType = k == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     }
-    VkWriteDescriptorSet wrAll[15];
+    VkDescriptorImageInfo nni; memset(&nni, 0, sizeof(nni));
+    nni.imageView = nnView != VK_NULL_HANDLE ? nnView : g_taa.historyView[hw_];   // dummy when off: never stored to without the flag
+    nni.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet wrnn; memset(&wrnn, 0, sizeof(wrnn));
+    wrnn.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wrnn.dstSet = set; wrnn.dstBinding = 15;
+    wrnn.descriptorCount = 1; wrnn.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wrnn.pImageInfo = &nni;
+    VkWriteDescriptorSet wrAll[16];
     for (int k = 0; k < 8; ++k) wrAll[k] = wr[k];
     wrAll[8] = wru; wrAll[9] = wrs; wrAll[10] = wrg; wrAll[11] = wrgi;
-    wrAll[12] = wrn; wrAll[13] = wrhd[0]; wrAll[14] = wrhd[1];
-    dd.updateDescriptorSets(g_taa.device, 15, wrAll, 0, nullptr);
+    wrAll[12] = wrn; wrAll[13] = wrhd[0]; wrAll[14] = wrhd[1]; wrAll[15] = wrnn;
+    dd.updateDescriptorSets(g_taa.device, 16, wrAll, 0, nullptr);
 
     dd.cmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeline);
     dd.cmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa.pipeLayout,
@@ -2329,6 +2342,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         pcv.flags     &= ~kTaaFlagGi;   // GI strength lives in the UBO slot
     }
     pcv.flags    = (pcReset             ? kTaaFlagReset         : 0)
+                 | (nnView != VK_NULL_HANDLE ? kTaaFlagNn : 0)
                  | (cameraMoved        ? kTaaFlagCameraMoved   : 0)
                  | ((taaPosHarvest() && g_taa.edValid) ? kTaaFlagEngineDepth : 0)
                  | (reprojOn            ? kTaaFlagDepthReproject : 0)
@@ -2401,6 +2415,12 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         rp.w = g_taa.w; rp.h = g_taa.h; rp.layers = g_taa.layers;
         nncap::recordFromResolve(dd, cb, rp);
     }
+
+    // ---- THE AA NET (taa.nn): eleven convolutions and a post pass that rewrites
+    // history[hw_] for the left taa.nn_split of the frame. Before the sharpen, so
+    // the sharpen and the copy-out see the net's output exactly as they see the
+    // resolve's.
+    if (nnView != VK_NULL_HANDLE) nnaa::record(dd, cb, g_taa.historyView[hw_], g_taa.history[hw_], 0);
 
     // ---- OPTIONAL SHARPEN PASS (MODE_SHARPEN) ON A DEDICATED BUFFER.
     //

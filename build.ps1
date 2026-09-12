@@ -290,6 +290,60 @@ for ($i = 0; $i -lt $tuwords.Count; $i += 8) {
 [IO.File]::WriteAllText("$src/vklayer/taau_spv.h", $tusb.ToString())
 Write-Host ("  taau_spv.h: {0} words" -f $tuwords.Count)
 
+Write-Host "Compiling nn_conv shader..."
+$ncTmp = Join-Path $env:TEMP "nn_conv.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/nn_conv.comp" -o $ncTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "nn_conv.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $ncTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "nn_conv.comp failed spirv-val" }
+}
+$ncbytes = [System.IO.File]::ReadAllBytes($ncTmp)
+$ncwords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $ncbytes.Length; $i += 4) {
+    $ncwords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($ncbytes, $i)))
+}
+$ncsb = New-Object System.Text.StringBuilder
+[void]$ncsb.AppendLine("// Generated from src/shaders/nn_conv.comp by build.ps1 - do not edit.")
+[void]$ncsb.AppendLine("#pragma once")
+[void]$ncsb.AppendLine("#include <stdint.h>")
+[void]$ncsb.AppendLine("")
+[void]$ncsb.AppendLine("static const uint32_t kNnConvSpv[] = {")
+for ($i = 0; $i -lt $ncwords.Count; $i += 8) {
+    $n = [Math]::Min(8, $ncwords.Count - $i)
+    [void]$ncsb.AppendLine("    " + (($ncwords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$ncsb.AppendLine("};")
+[IO.File]::WriteAllText("$src/vklayer/nn_conv_spv.h", $ncsb.ToString())
+Write-Host ("  nn_conv_spv.h: {0} words" -f $ncwords.Count)
+
+Write-Host "Compiling nn_post shader..."
+$npoTmp = Join-Path $env:TEMP "nn_post.spv"
+& $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/nn_post.comp" -o $npoTmp | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "nn_post.comp failed to compile" }
+if (Test-Path $spvval) {
+    & $spvval $npoTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "nn_post.comp failed spirv-val" }
+}
+$npobytes = [System.IO.File]::ReadAllBytes($npoTmp)
+$npowords = New-Object System.Collections.Generic.List[string]
+for ($i = 0; $i -lt $npobytes.Length; $i += 4) {
+    $npowords.Add(("0x{0:x8}u" -f [System.BitConverter]::ToUInt32($npobytes, $i)))
+}
+$nposb = New-Object System.Text.StringBuilder
+[void]$nposb.AppendLine("// Generated from src/shaders/nn_post.comp by build.ps1 - do not edit.")
+[void]$nposb.AppendLine("#pragma once")
+[void]$nposb.AppendLine("#include <stdint.h>")
+[void]$nposb.AppendLine("")
+[void]$nposb.AppendLine("static const uint32_t kNnPostSpv[] = {")
+for ($i = 0; $i -lt $npowords.Count; $i += 8) {
+    $n = [Math]::Min(8, $npowords.Count - $i)
+    [void]$nposb.AppendLine("    " + (($npowords.GetRange($i, $n)) -join ",") + ",")
+}
+[void]$nposb.AppendLine("};")
+[IO.File]::WriteAllText("$src/vklayer/nn_post_spv.h", $nposb.ToString())
+Write-Host ("  nn_post_spv.h: {0} words" -f $npowords.Count)
+
 Write-Host "Compiling metrics shader..."
 $mtTmp = Join-Path $env:TEMP "metrics.spv"
 & $glslang -V --target-env vulkan1.2 -S comp "$src/shaders/metrics.comp" -o $mtTmp | Out-Null
@@ -587,6 +641,8 @@ if ($env:MV_LAYER_OUT) { Write-Host "  (staging: $layerOut)" -ForegroundColor Ye
   -static -static-libgcc -static-libstdc++
 if ($LASTEXITCODE -ne 0) { throw "layer build failed" }
 Copy-Item "$src\vklayer\VkLayer_mv.json" "$out\vklayer" -Force
+# The AA net weights ride beside the layer DLL (nnaa.h looks there first).
+if (Test-Path "$root\config\nn_aa.bin") { Copy-Item "$root\config\nn_aa.bin" "$out\vklayer" -Force }
 
 Write-Host "Building Vulkan shim (vulkan-1.dll)..."
 # The forwarding vulkan-1.dll shim: installs beside X-Plane.exe, forwards the

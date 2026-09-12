@@ -1,0 +1,134 @@
+#version 450
+// ================================================================ NN CONV 3x3
+//
+// One layer of the AA net: a 3x3 convolution (zero padding, stride 1) with an
+// optional leaky-ReLU, over feature maps stored as rgba16f image arrays with
+// four channels per layer. Channel c of a map lives in layer c/4, component
+// c%4 - so a 17-channel input is five layers and an 8-channel map is two.
+//
+// The net's pooling and upsampling are folded into the READ of the input map
+// rather than being passes of their own:
+//   modeA = 0  read the map as it is (same resolution as the output)
+//   modeA = 1  read avg_pool2d(map, 2): the map is twice the output size
+//   modeA = 2  read a bilinear x2 upsample of the map (torch align_corners=false):
+//              the map is half the output size
+// A second input map B (the U-Net skip) is concatenated AFTER A's channels,
+// which is torch.cat([up(x), skip], 1) - the order the weights were trained in.
+//
+// Weights are a flat float buffer in torch's [cout][cin][ky][kx] order, biases
+// right after; pc.wOff / pc.bOff are float offsets into that buffer. One
+// thread computes every output channel of one pixel: the taps are read once
+// and reused across cout, which is what makes a tiny net cheap here.
+//
+// Copyright (C) 2026 MotionVectors contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly  image2DArray uA;
+layout(binding = 1, rgba16f) uniform readonly  image2DArray uB;
+layout(binding = 2, rgba16f) uniform writeonly image2DArray uOut;
+layout(binding = 3, std430) readonly buffer Weights { float w[]; } uW;
+
+layout(push_constant) uniform P {
+    ivec2 outSize;
+    ivec2 sizeA;      // the stored size of map A
+    ivec2 sizeB;      // the stored size of map B
+    int   cinA;
+    int   cinB;       // 0 = no B
+    int   cout;       // <= 24
+    int   wOff;
+    int   bOff;
+    int   modeA;      // 0 direct, 1 pool, 2 up
+    int   modeB;      // same meaning; B is always direct in this net
+    int   act;        // 1 = leaky relu 0.1
+} pc;
+
+const int MAXC = 24;
+
+// Channel group g (channels 4g..4g+3) of a map at conv-input pixel q, where q
+// is in OUTPUT-resolution coordinates. Outside [0, outSize) is the zero pad.
+vec4 readGroup(int which, int mode, ivec2 sz, ivec2 q, int g)
+{
+    if (q.x < 0 || q.y < 0 || q.x >= pc.outSize.x || q.y >= pc.outSize.y) return vec4(0.0);
+    if (mode == 1) {
+        // avg_pool2d(2): the four stored texels under this output pixel
+        ivec2 b = q * 2;
+        vec4 s = vec4(0.0);
+        for (int y = 0; y < 2; ++y)
+            for (int x = 0; x < 2; ++x) {
+                ivec2 t = min(b + ivec2(x, y), sz - 1);
+                s += (which == 0) ? imageLoad(uA, ivec3(t, g)) : imageLoad(uB, ivec3(t, g));
+            }
+        return s * 0.25;
+    }
+    if (mode == 2) {
+        // torch bilinear x2, align_corners=false: src = max((q + 0.5) * 0.5 - 0.5, 0)
+        vec2 src = max((vec2(q) + 0.5) * 0.5 - 0.5, vec2(0.0));
+        ivec2 i0 = ivec2(floor(src));
+        vec2  f  = src - vec2(i0);
+        ivec2 i1 = min(i0 + 1, sz - 1);
+        i0 = min(i0, sz - 1);
+        vec4 a00, a10, a01, a11;
+        if (which == 0) {
+            a00 = imageLoad(uA, ivec3(i0.x, i0.y, g)); a10 = imageLoad(uA, ivec3(i1.x, i0.y, g));
+            a01 = imageLoad(uA, ivec3(i0.x, i1.y, g)); a11 = imageLoad(uA, ivec3(i1.x, i1.y, g));
+        } else {
+            a00 = imageLoad(uB, ivec3(i0.x, i0.y, g)); a10 = imageLoad(uB, ivec3(i1.x, i0.y, g));
+            a01 = imageLoad(uB, ivec3(i0.x, i1.y, g)); a11 = imageLoad(uB, ivec3(i1.x, i1.y, g));
+        }
+        return mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y);
+    }
+    return (which == 0) ? imageLoad(uA, ivec3(q, g)) : imageLoad(uB, ivec3(q, g));
+}
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= pc.outSize.x || px.y >= pc.outSize.y) return;
+
+    const int cin = pc.cinA + pc.cinB;
+    float acc[MAXC];
+    for (int co = 0; co < pc.cout; ++co) acc[co] = uW.w[pc.bOff + co];
+
+    for (int ky = 0; ky < 3; ++ky)
+        for (int kx = 0; kx < 3; ++kx) {
+            ivec2 q = px + ivec2(kx - 1, ky - 1);
+            // ---- map A
+            for (int g = 0; g * 4 < pc.cinA; ++g) {
+                vec4 v = readGroup(0, pc.modeA, pc.sizeA, q, g);
+                int n = min(4, pc.cinA - g * 4);
+                for (int k = 0; k < n; ++k) {
+                    int ci = g * 4 + k;
+                    float x = v[k];
+                    int base = pc.wOff + (ci * 3 + ky) * 3 + kx;
+                    for (int co = 0; co < pc.cout; ++co)
+                        acc[co] += x * uW.w[base + co * cin * 9];
+                }
+            }
+            // ---- map B (the skip), channels after A's
+            for (int g = 0; g * 4 < pc.cinB; ++g) {
+                vec4 v = readGroup(1, pc.modeB, pc.sizeB, q, g);
+                int n = min(4, pc.cinB - g * 4);
+                for (int k = 0; k < n; ++k) {
+                    int ci = pc.cinA + g * 4 + k;
+                    float x = v[k];
+                    int base = pc.wOff + (ci * 3 + ky) * 3 + kx;
+                    for (int co = 0; co < pc.cout; ++co)
+                        acc[co] += x * uW.w[base + co * cin * 9];
+                }
+            }
+        }
+
+    for (int g = 0; g * 4 < pc.cout; ++g) {
+        vec4 o = vec4(0.0);
+        for (int k = 0; k < 4; ++k) {
+            int co = g * 4 + k;
+            if (co >= pc.cout) break;
+            float v = acc[co];
+            if (pc.act == 1) v = (v > 0.0) ? v : 0.1 * v;
+            o[k] = v;
+        }
+        imageStore(uOut, ivec3(px, g), o);
+    }
+}

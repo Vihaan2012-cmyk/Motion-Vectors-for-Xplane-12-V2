@@ -1,0 +1,56 @@
+#version 450
+// ================================================================ NN POST
+//
+// The AA net's output stage: out = base + tanh(r) * (0.5 + |base|), the
+// bounded residual the net was trained with (quick_train.ResidualSR). `r` is
+// the last conv's pre-activation (map uR, layer 0, rgb); `base` is the
+// unjittered current-frame fetch the resolve stored in the input map's layer 4
+// (yzw), BEFORE its AO / contact-shadow modulation. Layer 5 holds that
+// modulation as a per-channel factor so the net's output gets the same shading
+// the resolve's own output got.
+//
+// The result replaces the resolve's output in the history image for x < split
+// of the width; the rest of the frame stays the resolve's, which is the live
+// A/B seam. Alpha (the resolve's confidence) is kept as written.
+//
+// viz 1 draws |net - resolve| * 8, so the seam and the residual are visible
+// without a screenshot diff.
+//
+// Copyright (C) 2026 MotionVectors contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2DArray uR;      // last conv output, layer 0
+layout(binding = 1, rgba16f) uniform readonly image2DArray uIn;     // the net input map (base in layer 4, shading in layer 5)
+layout(binding = 2, rgba16f) uniform image2DArray uHist;            // the resolve's history/output image, this frame's write side
+
+layout(push_constant) uniform P {
+    ivec2 size;
+    int   layer;      // history array layer
+    int   viz;
+    float split;
+    float blend;      // 1 = net output, 0 = resolve (a live dial)
+} pc;
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= pc.size.x || px.y >= pc.size.y) return;
+
+    vec4 prev = imageLoad(uHist, ivec3(px, pc.layer));
+    if (float(px.x) >= pc.split * float(pc.size.x) && pc.viz == 0) return;
+
+    vec3 r    = imageLoad(uR,  ivec3(px, 0)).rgb;
+    vec3 base = imageLoad(uIn, ivec3(px, 4)).yzw;
+    vec3 shade = imageLoad(uIn, ivec3(px, 5)).xyz;
+    vec3 o = base + tanh(r) * (0.5 + abs(base));
+    o = max(o * shade, vec3(0.0));
+
+    if (pc.viz == 1) {
+        imageStore(uHist, ivec3(px, pc.layer), vec4(abs(o - prev.rgb) * 8.0, prev.a));
+        return;
+    }
+    if (float(px.x) >= pc.split * float(pc.size.x)) return;
+    imageStore(uHist, ivec3(px, pc.layer), vec4(mix(prev.rgb, o, clamp(pc.blend, 0.0, 1.0)), prev.a));
+}

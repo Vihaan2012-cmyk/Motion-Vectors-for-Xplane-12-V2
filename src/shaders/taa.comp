@@ -156,6 +156,7 @@ layout(binding = 11) uniform sampler2DArray uGi;
 layout(binding = 12) uniform sampler2DArray uNormal;
 layout(binding = 13)          uniform sampler2DArray uHistDepthPrev;  // EXPERIMENTAL taa.conf_exp: last frame's clip-w
 layout(binding = 14, rgba16f) uniform image2DArray  uHistDepthOut;   // this frame's clip-w and vector, read next frame
+layout(binding = 15, rgba16f) uniform writeonly image2DArray uNnIn;  // taa.nn: the AA net's input map, six layers (see nnEmit)
 
 layout(binding = 10, std140) uniform EngineGbuf {
     vec4 gViewportSize;        // xy = size, zw = 1/size
@@ -317,6 +318,7 @@ const int FLAG_ACCUM_EXP      = 524288; // EXPERIMENTAL taa.accum_exp: history l
 const int FLAG_CONF_EXP       = 1048576; // EXPERIMENTAL taa.conf_exp: confidence widens the clamp box; depth mismatch resets
 const int FLAG_BOX_MOD        = 262144; // clamp box built in the modulated sample's space
 const int FLAG_SCREEN_RESET   = 2097152; // taa.screen_reset: near + screen-static + 3x3 mean changed => take the frame
+const int FLAG_NN             = 4194304; // taa.nn: write the AA net's input map (binding 15) and the depth history
 // view distance from engine depth; fb is the injected clip-w fallback so a
 // wrong identification degrades to exactly the previous behaviour.
 // Velocity reconstructed from engine depth + camera motion, in EXACTLY the
@@ -845,6 +847,44 @@ vec3 sharpenCurrent(vec3 c, vec2 uv, float layer, vec2 invSz)
     return clamp(s, lo, hi);
 }
 
+// ---- THE AA NET'S INPUT (taa.nn). Written by the resolve because every plane
+// the net was trained on is already in hand here: the unjittered current fetch,
+// the real jitter, clip-w depth, the G-buffer normal, the vector and its
+// coverage, and the warped history. Channel order and encodings are
+// tools/nn/pack_aa.py + train_recurrent.seq_tensors, byte for byte:
+//   L0 (tm(base).rgb, jitter.x px)   L1 (jitter.y px, ratio-1.5, depth, nrm.x)
+//   L2 (nrm.y, |vel|*50, vector valid, coverage)   L3 (dz, tm(hist).rgb * hvalid)
+//   L4 (hvalid, base.rgb linear)     L5 (final/raw shading factor, 0)
+// L4/L5 are for the post pass, not the net. Depth is also written to the depth
+// history so next frame's dz has something to compare against.
+vec3 nnTm(vec3 c) { return c / (1.0 + dot(c, vec3(0.2126, 0.7152, 0.0722))); }
+float nnDepth(float w) { return clamp(1.0 - log(1.0 + clamp(w, 0.0, 65504.0)) / log(20001.0), 0.0, 1.0); }
+void nnEmit(ivec2 px, int layer, ivec2 size, vec2 uv, vec3 base, vec3 shaded, vec2 S,
+            vec4 velS, vec2 hUv, vec3 hist, float hvalid)
+{
+    const float lay = float(layer);
+    bool vvalid = abs(velS.x) <= 0.05 && abs(velS.y) <= 0.05;     // the packer's VEL_SENTINEL test
+    float jx = S.x * float(size.x), jy = S.y * float(size.y);
+    float d  = nnDepth(velS.z);
+    vec2 nrm = (pc.flags & FLAG_NORMAL_TAP) != 0 ? clamp(texture(uNormal, vec3(uv + S, lay)).xy, -1.0, 1.0) : vec2(0.0);
+    float vmag = vvalid ? clamp(length(velS.xy) * 50.0, 0.0, 1.0) : 1.0;
+    float cov  = clamp(velS.w, 0.0, 1.0);
+    float hv   = hvalid * (vvalid ? 1.0 : 0.0);
+    float dPrev = nnDepth(texture(uHistDepthPrev, vec3(hUv, lay)).r);
+    float dz   = abs(d - dPrev) * hv;
+    vec3 htm   = nnTm(hist) * hv;
+    vec3 shade = shaded / max(base, vec3(1e-4));
+    shade = clamp(mix(vec3(1.0), shade, step(vec3(1e-4), base)), vec3(0.0), vec3(4.0));
+    vec3 btm = nnTm(base);
+    imageStore(uNnIn, ivec3(px, 0), vec4(btm, jx));
+    imageStore(uNnIn, ivec3(px, 1), vec4(jy, -0.5, d, nrm.x));
+    imageStore(uNnIn, ivec3(px, 2), vec4(nrm.y, vmag, vvalid ? 1.0 : 0.0, cov));
+    imageStore(uNnIn, ivec3(px, 3), vec4(dz, htm));
+    imageStore(uNnIn, ivec3(px, 4), vec4(hv, base));
+    imageStore(uNnIn, ivec3(px, 5), vec4(shade, 0.0));
+    imageStore(uHistDepthOut, ivec3(px, layer), vec4(velS.z, velS.x, velS.y, 0.0));
+}
+
 void main()
 {
     ivec2 px    = ivec2(gl_GlobalInvocationID.xy);
@@ -1296,6 +1336,7 @@ void main()
     vec3 currA = (pc.flags & FLAG_CR_UNJITTER) != 0
                ? sampleSceneCR(uv + S, float(layer), vec2(size))
                : texture(uScene, vec3(uv + S, float(layer))).rgb;
+    const vec3 nnBase = currA;   // the net's base: the bare unjittered fetch, as pack_aa.py's raw
 
     // Put back what the resample could not preserve. Applied here, to the
     // current sample, so it is applied exactly once per sample rather than
@@ -1675,11 +1716,15 @@ void main()
     }
 
     if ((pc.flags & FLAG_RESET) != 0 || !valid || noVector) {
+        if ((pc.flags & FLAG_NN) != 0)
+            nnEmit(px, layer, size, uv, nnBase, nnBase * (currA / max(currRaw, vec3(1e-4))), S, velS, hUv, vec3(0.0), 0.0);
         imageStore(uHistory, ivec3(px, layer), vec4(currA, 1.0));
         return;
     }
 
     vec3 hist = sampleHistory(hUv, float(layer), vec2(size));
+    if ((pc.flags & FLAG_NN) != 0)
+        nnEmit(px, layer, size, uv, nnBase, nnBase * (currA / max(currRaw, vec3(1e-4))), S, velS, hUv, hist, 1.0);
     // ---- EXPERIMENTAL (taa.conf_exp): how many samples does this history hold, and is
     // it still the same surface? The count is the reciprocal of last frame's blend
     // weight (history alpha at the reprojected position). The surface test compares
