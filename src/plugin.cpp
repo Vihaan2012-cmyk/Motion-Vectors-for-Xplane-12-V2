@@ -173,6 +173,10 @@ static TaaShare *g_share       = nullptr;
 // Re-checked on every aircraft load, so switching away turns the mod back on.
 // TAA_KEEP_ON_777=1 overrides for debugging.
 static bool g_is777 = false;
+// The blanket stand-down is OFF by default since 2026-09-12: the 12.4.4 crash test passed
+// (8 min live, clean exit) and the windshield smear is a see-through glass vector claim fixed
+// in the injector (spvinj::alphaSelect). bypass_777=1 in the plugin settings re-arms it.
+static bool g_bypass777 = false;
 // ---- HOLD FRAME GENERATION ACROSS AN AIRCRAFT SWAP.
 //
 // Loading an aircraft is the peak memory moment of a session, and it is where
@@ -204,7 +208,7 @@ static void mvRefreshAircraft()
     g_is777 = (std::string(fn).find("777") != std::string::npos);
     if (g_is777 != was)
         xlog("aircraft '%s' -> MotionVectors %s", fn,
-             g_is777 ? "OFF (777 airframe - layer stands down)" : "ON");
+             (g_is777 && g_bypass777) ? "OFF (777 airframe - layer stands down, bypass_777=1)" : "ON");
 }
 
 // projection_matrix is whatever the LAST render pass set, which from a flight
@@ -4264,7 +4268,7 @@ static float matrixCallback(float sinceLast, float, int, void *)
     // after. Not seqlock-protected data - a single word the layer reads directly.
     static bool s_acftChecked = false;
     if (!s_acftChecked) { mvRefreshAircraft(); s_acftChecked = true; }
-    s->bypass = g_is777 ? 1u : 0u;
+    s->bypass = (g_is777 && g_bypass777) ? 1u : 0u;
 
     // frame and valid go LAST. The layer reads this without a lock, using the
     // frame counter as a seqlock, so the counter must never advertise data that
@@ -4562,6 +4566,7 @@ static bool loadConfig(const std::string &path)
         if      (!strcmp(key, "lod_bias"))       g_lodBias      = (float)val;
         else if (!strcmp(key, "render_scale"))   g_renderScale  = (float)val;
         else if (!strcmp(key, "jitter_phases"))  g_jitterPhases = (int)val;
+        else if (!strcmp(key, "bypass_777"))     g_bypass777 = (val != 0);
         else if (!strcmp(key, "moving_objects")) g_objectsOn    = (val != 0);
         else if (!strcmp(key, "traffic_radius")) g_trafficRadius= (float)val;
         else if (!strcmp(key, "diag_log"))       g_diagLog      = (val != 0);

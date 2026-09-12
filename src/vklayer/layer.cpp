@@ -13842,6 +13842,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
     std::vector<VkPipelineColorBlendStateCreateInfo> blends;
     std::vector<std::vector<VkPipelineColorBlendAttachmentState> > blendAtt;
     std::vector<std::vector<VkPipelineShaderStageCreateInfo> > stages;
+    // The blended-draw alpha select threshold, once per session (see spvinj::alphaSelect).
+    { static bool selRead = false; if (!selRead) { selRead = true; spvinj::alphaSelect() = live::f("taa.mv_alpha_select", "TAA_MV_ALPHA_SELECT", 0.9f); } }
     std::vector<char> mvPatchedThisCall;
     std::vector<char> mvGroundThisCall;   // world-static family, per pipeline
     std::vector<uint64_t> vertHashThisCall, fragHashThisCall; std::vector<uint32_t> vsPidThisCall;   // TAA_DUMP_SHADERS identity per pipeline

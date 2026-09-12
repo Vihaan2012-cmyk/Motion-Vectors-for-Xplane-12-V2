@@ -66,6 +66,22 @@
 
 namespace spvinj {
 
+// ---- HOW OPAQUE A BLENDED FRAGMENT MUST BE TO CLAIM THE PIXEL'S VECTOR.
+//
+// The velocity attachment of an alpha-blended pipeline is written through a
+// 0-or-1 select on the fragment's alpha: at or above this value the draw
+// replaces the vector beneath, below it the vector beneath survives. It was a
+// fixed 0.5. The FlightFactor 777's windshield (two blended glass pipelines,
+// terrain_2240 permutations, one writing depth) has alpha well above that, so
+// the terrain seen through it inherited the pane's own vector - zero in the
+// body frame - and smeared in fast, low flight (pid capture 2026-09-12: 590k
+// windshield pixels per frame carried |v| = 0 from those two pipelines). A
+// see-through surface must not own the motion of what is behind it unless it
+// is nearly opaque, so the default is now 0.9. Read once per session by the
+// layer (taa.mv_alpha_select): pipelines are patched at load, a change needs
+// a relaunch.
+inline float &alphaSelect() { static float v = 0.9f; return v; }
+
 
 // ---- THE WRITER TABLE, IN ITS OWN FILE.
 //
@@ -1716,6 +1732,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     if (!idPtrOutV4)  { newPtrOutV4 = bound++; idPtrOutV4  = newPtrOutV4; }
     if (!idPtrInV4)   { newPtrInV4  = bound++; idPtrInV4   = newPtrInV4; }
     if (!idConstHalf) { newHalf     = bound++; idConstHalf = newHalf; }
+    const uint32_t idConstSel = bound++;   // the alpha select threshold, alphaSelect()
     if (!idConstZero) { newZero     = bound++; idConstZero = newZero; }
     if (!idBool)      { newBool     = bound++; idBool      = newBool; }
     if (!idConstOneF) { newOneF     = bound++; idConstOneF = newOneF; }
@@ -1745,6 +1762,8 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     if (newPtrInV4)  { globals.push_back(head(OpTypePointer, 4)); globals.push_back(newPtrInV4);  globals.push_back(SC_Input);  globals.push_back(idV4); }
     if (newHalf)     { uint32_t bits; float h = 0.5f; memcpy(&bits, &h, 4);
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newHalf); globals.push_back(bits); }
+    { uint32_t bits; float sv = alphaSelect(); memcpy(&bits, &sv, 4);
+      globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(idConstSel); globals.push_back(bits); }
     if (newBool)     { globals.push_back(head(OpTypeBool, 2)); globals.push_back(newBool); }
     if (newOneF)     { uint32_t bits; float o = 1.0f; memcpy(&bits, &o, 4);
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newOneF); globals.push_back(bits); }
@@ -1979,7 +1998,7 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
             const uint32_t idGE = bound++, idGate = bound++;
             body.push_back(head(OpLoad, 4)); body.push_back(idV4); body.push_back(idA); body.push_back(idOut0Var);
             body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idAw); body.push_back(idA); body.push_back(3);
-            body.push_back(head(OpFOrdGreaterThanEqual, 5)); body.push_back(idBool); body.push_back(idGE); body.push_back(idAw); body.push_back(idConstHalf);
+            body.push_back(head(OpFOrdGreaterThanEqual, 5)); body.push_back(idBool); body.push_back(idGE); body.push_back(idAw); body.push_back(idConstSel);
             body.push_back(head(OpSelect, 6)); body.push_back(idFloat); body.push_back(idGate); body.push_back(idGE); body.push_back(idConstOneF); body.push_back(idConstZero);
             idCh3 = idGate;
         }
