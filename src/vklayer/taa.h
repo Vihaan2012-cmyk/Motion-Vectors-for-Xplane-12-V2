@@ -517,6 +517,8 @@ static uint32_t taaFindMemory(DeviceData &dd, uint32_t typeBits, VkMemoryPropert
             return i;
     return UINT32_MAX;
 }
+static void gpuTimeBegin(DeviceData &dd, VkCommandBuffer cb);                     // layer.cpp, TAA_GPU_TIMING=1
+static void gpuTimeMark(DeviceData &dd, VkCommandBuffer cb, const char *label);
 #include "nnaa.h"   // the AA net: needs DeviceData, live::, trace and taaFindMemory, all above
 
 // Destroy a parked state's objects for real. Only ever called on states that
@@ -2207,10 +2209,12 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // sampled - it exists because a descriptor set must be complete.
     VkDescriptorImageInfo nii;
     memset(&nii, 0, sizeof(nii));
-    const bool normTap = g_taa.normValid && g_taa.normView != VK_NULL_HANDLE;
+    // taa.nn: the pass-end snapshot replaces the resolve-time engine read, which is scrambled by now
+    const VkImageView nnNorm = nnView != VK_NULL_HANDLE ? nnaa::normalView(g_frameCount) : VK_NULL_HANDLE;
+    const bool normTap = nnNorm != VK_NULL_HANDLE || (g_taa.normValid && g_taa.normView != VK_NULL_HANDLE);
     nii.sampler = g_taa.sampler;
-    nii.imageView = normTap ? g_taa.normView : g_taa.velView;
-    nii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    nii.imageView = nnNorm != VK_NULL_HANDLE ? nnNorm : (normTap ? g_taa.normView : g_taa.velView);
+    nii.imageLayout = nnNorm != VK_NULL_HANDLE ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkWriteDescriptorSet wrn;
     memset(&wrn, 0, sizeof(wrn));
     wrn.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

@@ -60,8 +60,19 @@ struct State {
     VkPipelineLayout plConv = VK_NULL_HANDLE, plPost = VK_NULL_HANDLE, plCm = VK_NULL_HANDLE;
     VkPipeline pipeConv = VK_NULL_HANDLE, pipePost = VK_NULL_HANDLE, pipeCm = VK_NULL_HANDLE;
     bool cm = false;                     // tensor-core path built and usable
-    VkBuffer       cmbuf = VK_NULL_HANDLE;   // fp16 weights, coopmat layout
+    VkBuffer       cmbuf = VK_NULL_HANDLE;   // fp16 weights, coopmat layout (device local)
     VkDeviceMemory cmmem = VK_NULL_HANDLE;
+    // ---- WEIGHTS ARE DEVICE LOCAL. The first build put them in host-visible memory and every
+    // subgroup re-read its matrices over PCIe: 16 fps. They are uploaded once through staging.
+    VkBuffer       wstage = VK_NULL_HANDLE, cmstage = VK_NULL_HANDLE;
+    VkDeviceMemory wstageMem = VK_NULL_HANDLE, cmstageMem = VK_NULL_HANDLE;
+    VkDeviceSize   wbytes = 0, cmbytes = 0;
+    bool uploaded = false;
+    PFN_vkCmdCopyBuffer cmdCopyBuffer = nullptr;
+    // ---- THE NORMAL, SNAPSHOTTED AT PASS END. The resolve-time G-buffer read is scrambled
+    // (measured 2026-09-09 and again 2026-09-12: 1.0 in both channels); the net was trained on the
+    // pass-end copy, so it gets one here too.
+    Map norm; VkFormat normFmt = VK_FORMAT_UNDEFINED; uint64_t normFrame = 0;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     static const uint32_t kSets = 96;    // 12 dispatches per frame, several frames in flight
     VkDescriptorSet sets[kSets];
@@ -134,14 +145,14 @@ inline void freeMap(State &s, DeviceData &dd, Map &m)
     m = Map();
 }
 
-inline bool makeMap(State &s, DeviceData &dd, Map &m, uint32_t w, uint32_t h, uint32_t layers, VkImageUsageFlags extra = 0)
+inline bool makeMap(State &s, DeviceData &dd, Map &m, uint32_t w, uint32_t h, uint32_t layers, VkImageUsageFlags extra = 0, VkFormat fmt = VK_FORMAT_R16G16B16A16_SFLOAT)
 {
     if (m.img && m.w == w && m.h == h && m.layers == layers) return true;
     freeMap(s, dd, m);
     VkImageCreateInfo ic; memset(&ic, 0, sizeof(ic));
     ic.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ic.imageType = VK_IMAGE_TYPE_2D;
-    ic.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    ic.format = fmt;
     ic.extent.width = w; ic.extent.height = h; ic.extent.depth = 1;
     ic.mipLevels = 1; ic.arrayLayers = layers;
     ic.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -190,6 +201,23 @@ inline void computeBarrier(DeviceData &dd, VkCommandBuffer cb)
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
+// ---------------------------------------------------------------- buffers
+inline bool makeBuf(State &s, DeviceData &dd, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
+                    VkBuffer &buf, VkDeviceMemory &mem, void **map)
+{
+    VkBufferCreateInfo bc; memset(&bc, 0, sizeof(bc));
+    bc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bc.size = size; bc.usage = usage; bc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (dd.createBuffer(s.dev, &bc, nullptr, &buf) != VK_SUCCESS) { buf = VK_NULL_HANDLE; return false; }
+    VkMemoryRequirements mr; dd.getBufferMemReq(s.dev, buf, &mr);
+    VkMemoryAllocateInfo ma; memset(&ma, 0, sizeof(ma));
+    ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ma.allocationSize = mr.size;
+    ma.memoryTypeIndex = taaFindMemory(dd, mr.memoryTypeBits, props);
+    if (ma.memoryTypeIndex == UINT32_MAX || dd.allocateMemory(s.dev, &ma, nullptr, &mem) != VK_SUCCESS ||
+        dd.bindBufferMemory(s.dev, buf, mem, 0) != VK_SUCCESS) { dd.destroyBuffer(s.dev, buf, nullptr); buf = VK_NULL_HANDLE; mem = VK_NULL_HANDLE; return false; }
+    if (map && dd.mapMemory(s.dev, mem, 0, size, 0, map) != VK_SUCCESS) { dd.destroyBuffer(s.dev, buf, nullptr); dd.freeMemory(s.dev, mem, nullptr); buf = VK_NULL_HANDLE; mem = VK_NULL_HANDLE; return false; }
+    return true;
 }
 
 // ---------------------------------------------------------------- weights
@@ -250,22 +278,14 @@ inline bool loadWeights(State &s, DeviceData &dd)
         L[10].cin == s.ch0 && L[10].cout == 3;
     if (!shapeOk) { trace("NNAA: blob layer shapes do not form the expected U-Net (ch %d,%d,%d)", s.ch0, s.ch1, s.ch2); return false; }
 
-    VkBufferCreateInfo bc; memset(&bc, 0, sizeof(bc));
-    bc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bc.size = (VkDeviceSize)off * 4; bc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    bc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (dd.createBuffer(s.dev, &bc, nullptr, &s.wbuf) != VK_SUCCESS) { trace("NNAA: weight buffer creation failed"); return false; }
-    VkMemoryRequirements mr; dd.getBufferMemReq(s.dev, s.wbuf, &mr);
-    VkMemoryAllocateInfo ma; memset(&ma, 0, sizeof(ma));
-    ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ma.allocationSize = mr.size;
-    ma.memoryTypeIndex = taaFindMemory(dd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    s.wbytes = (VkDeviceSize)off * 4;
     void *p = nullptr;
-    if (ma.memoryTypeIndex == UINT32_MAX || dd.allocateMemory(s.dev, &ma, nullptr, &s.wmem) != VK_SUCCESS ||
-        dd.bindBufferMemory(s.dev, s.wbuf, s.wmem, 0) != VK_SUCCESS || dd.mapMemory(s.dev, s.wmem, 0, bc.size, 0, &p) != VK_SUCCESS) {
-        trace("NNAA: weight memory failed"); return false;
+    if (!makeBuf(s, dd, s.wbytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, s.wstage, s.wstageMem, &p) ||
+        !makeBuf(s, dd, s.wbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s.wbuf, s.wmem, nullptr)) {
+        trace("NNAA: weight buffers failed"); return false;
     }
-    memcpy(p, w.data(), bc.size);
-    dd.unmapMemory(s.dev, s.wmem);
+    memcpy(p, w.data(), (size_t)s.wbytes);
+    dd.unmapMemory(s.dev, s.wstageMem);
     // ---- the tensor-core layout: per layer, per (offset k, 16-channel block cb), a row-major
     // [16 x nPad] fp16 matrix B(ci, co) = W[co][cb*16+ci][ky][kx], zero beyond cin / cout.
     if (g_nnCoopmat) {
@@ -284,20 +304,13 @@ inline bool loadWeights(State &s, DeviceData &dd)
                             h.push_back(f2h(v));
                         }
         }
-        VkBufferCreateInfo hc; memset(&hc, 0, sizeof(hc));
-        hc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; hc.size = (VkDeviceSize)h.size() * 2;
-        hc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT; hc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        void *hp = nullptr; VkMemoryRequirements hmr; VkMemoryAllocateInfo hma; memset(&hma, 0, sizeof(hma));
-        if (dd.createBuffer(s.dev, &hc, nullptr, &s.cmbuf) == VK_SUCCESS) {
-            dd.getBufferMemReq(s.dev, s.cmbuf, &hmr);
-            hma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; hma.allocationSize = hmr.size;
-            hma.memoryTypeIndex = taaFindMemory(dd, hmr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (hma.memoryTypeIndex != UINT32_MAX && dd.allocateMemory(s.dev, &hma, nullptr, &s.cmmem) == VK_SUCCESS &&
-                dd.bindBufferMemory(s.dev, s.cmbuf, s.cmmem, 0) == VK_SUCCESS && dd.mapMemory(s.dev, s.cmmem, 0, hc.size, 0, &hp) == VK_SUCCESS) {
-                memcpy(hp, h.data(), hc.size); dd.unmapMemory(s.dev, s.cmmem);
-                trace("NNAA: tensor-core weight layout packed - %u halfs", (unsigned)h.size());
-            } else { trace("NNAA: coopmat weight memory failed - fp32 kernel"); }
-        } else { s.cmbuf = VK_NULL_HANDLE; trace("NNAA: coopmat weight buffer failed - fp32 kernel"); }
+        s.cmbytes = (VkDeviceSize)h.size() * 2;
+        void *hp = nullptr;
+        if (makeBuf(s, dd, s.cmbytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, s.cmstage, s.cmstageMem, &hp) &&
+            makeBuf(s, dd, s.cmbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s.cmbuf, s.cmmem, nullptr)) {
+            memcpy(hp, h.data(), (size_t)s.cmbytes); dd.unmapMemory(s.dev, s.cmstageMem);
+            trace("NNAA: tensor-core weight layout packed - %u halfs, device local", (unsigned)h.size());
+        } else { s.cmbuf = VK_NULL_HANDLE; trace("NNAA: coopmat weight buffers failed - fp32 kernel"); }
     }
     s.weightsOk = true;
     trace("NNAA: loaded %s - 11 layers, channels (%d,%d,%d), %u floats", s.weightsPath.c_str(), s.ch0, s.ch1, s.ch2, off);
@@ -311,6 +324,8 @@ inline bool init(State &s, DeviceData &dd)
     s.tried = true;
     s.dev = dd.device;
     for (uint32_t i = 0; i < State::kSets; ++i) s.sets[i] = VK_NULL_HANDLE;
+    s.cmdCopyBuffer = (PFN_vkCmdCopyBuffer)dd.gdpa(dd.device, "vkCmdCopyBuffer");
+    if (!s.cmdCopyBuffer) { trace("NNAA: vkCmdCopyBuffer unresolved"); return false; }
 
     VkShaderModuleCreateInfo sm; memset(&sm, 0, sizeof(sm));
     sm.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -562,6 +577,16 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
         trace("NNAA: running the AA net at %ux%u - channels (%d,%d,%d), %.0f MB of feature maps, split %.2f, kernel %s",
               s.w, s.hh, s.ch0, s.ch1, s.ch2, mb, live::f("taa.nn_split", "TAA_NN_SPLIT", 0.5f), (s.cm && s.cmbuf) ? "tensor-core fp16" : "fp32");
     }
+    if (!s.uploaded) {
+        VkBufferCopy rg; rg.srcOffset = 0; rg.dstOffset = 0;
+        rg.size = s.wbytes;  s.cmdCopyBuffer(cb, s.wstage, s.wbuf, 1, &rg);
+        if (s.cmbuf) { rg.size = s.cmbytes; s.cmdCopyBuffer(cb, s.cmstage, s.cmbuf, 1, &rg); }
+        VkMemoryBarrier ub; memset(&ub, 0, sizeof(ub));
+        ub.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; ub.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; ub.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ub, 0, nullptr, 0, nullptr);
+        s.uploaded = true;
+    }
+    gpuTimeBegin(dd, cb); gpuTimeMark(dd, cb, "nn");
     computeBarrier(dd, cb);   // the resolve's writes to the input map
     const Layer *L = s.layers.data();
     conv(s, dd, cb, L[0],  s.in, 0, s.inCh, nullptr, 0,     s.a,   1);   // e0.c1
@@ -599,6 +624,7 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
     dd.cmdDispatch(cb, (s.w + 7) / 8, (s.hh + 7) / 8, 1);
     computeBarrier(dd, cb);
     ++s.dispatches;
+    gpuTimeMark(dd, cb, "nn end");
 
     const bool wantDump = live::onoff("taa.nn_dump", "TAA_NN_DUMP", false);
     if (!wantDump && s.dumpState == 2) s.dumpState = 0;            // re-arm when the key is turned off
@@ -609,6 +635,50 @@ inline void record(DeviceData &dd, VkCommandBuffer cb, VkImageView histView, VkI
         trace("NNAA: frame %llu, %llu dispatches so far", (unsigned long long)s.frame, (unsigned long long)s.dispatches);
 }
 
+// Called from the capture harness at the end of the G-buffer pass with the engine's normal
+// attachment as the pass declared it. Copies it into our own image (GENERAL) for the resolve.
+inline void snapNormal(DeviceData &dd, VkCommandBuffer cb, VkImage img, VkFormat fmt, uint32_t w, uint32_t h, VkImageLayout layout, uint64_t frame)
+{
+    State &s = state();
+    if (!enabled() || !s.ready || img == VK_NULL_HANDLE || !dd.cmdCopyImage) return;
+    if (s.norm.img && (s.normFmt != fmt || s.norm.w != w || s.norm.h != h)) freeMap(s, dd, s.norm);
+    if (!s.norm.img) {
+        if (!makeMap(s, dd, s.norm, w, h, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, fmt)) { trace("NNAA: normal snapshot allocation failed"); return; }
+        s.normFmt = fmt;
+        trace("NNAA: normal snapshot %ux%u fmt %d at pass end", w, h, (int)fmt);
+    }
+    layoutMap(dd, cb, s.norm);
+    VkImageMemoryBarrier b; memset(&b, 0, sizeof(b));
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img; b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1; b.subresourceRange.layerCount = 1;
+    b.oldLayout = layout; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    VkImageMemoryBarrier d = b; d.image = s.norm.img; d.oldLayout = VK_IMAGE_LAYOUT_GENERAL; d.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    d.srcAccessMask = VK_ACCESS_SHADER_READ_BIT; d.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    VkImageMemoryBarrier pre[2] = { b, d };
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, pre);
+    VkImageCopy rc; memset(&rc, 0, sizeof(rc));
+    rc.srcSubresource.aspectMask = rc.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    rc.srcSubresource.layerCount = rc.dstSubresource.layerCount = 1;
+    rc.extent.width = w; rc.extent.height = h; rc.extent.depth = 1;
+    dd.cmdCopyImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.norm.img, VK_IMAGE_LAYOUT_GENERAL, 1, &rc);
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = layout;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    d.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; d.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    VkImageMemoryBarrier post[2] = { b, d };
+    dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, post);
+    s.normFrame = frame;
+}
+
+// The snapshot view for the resolve's normal binding this frame, or null (then the resolve keeps its own).
+inline VkImageView normalView(uint64_t frame)
+{
+    State &s = state();
+    return (s.norm.view != VK_NULL_HANDLE && s.normFrame == frame) ? s.norm.view : VK_NULL_HANDLE;
+}
+
 inline void shutdown(DeviceData &dd)
 {
     State &s = state();
@@ -616,10 +686,14 @@ inline void shutdown(DeviceData &dd)
     if (s.dptr) { dd.unmapMemory(s.dev, s.dmem); s.dptr = nullptr; }
     if (s.dbuf) dd.destroyBuffer(s.dev, s.dbuf, nullptr);
     if (s.dmem) dd.freeMemory(s.dev, s.dmem, nullptr);
-    Map *all[] = { &s.in, &s.a, &s.b, &s.g, &s.out, &s.c, &s.d, &s.h, &s.e, &s.f };
+    Map *all[] = { &s.in, &s.a, &s.b, &s.g, &s.out, &s.c, &s.d, &s.h, &s.e, &s.f, &s.norm };
     for (Map *m : all) freeMap(s, dd, *m);
     if (s.wbuf) dd.destroyBuffer(s.dev, s.wbuf, nullptr);
     if (s.wmem) dd.freeMemory(s.dev, s.wmem, nullptr);
+    if (s.wstage) dd.destroyBuffer(s.dev, s.wstage, nullptr);
+    if (s.wstageMem) dd.freeMemory(s.dev, s.wstageMem, nullptr);
+    if (s.cmstage) dd.destroyBuffer(s.dev, s.cmstage, nullptr);
+    if (s.cmstageMem) dd.freeMemory(s.dev, s.cmstageMem, nullptr);
     if (s.cmbuf) dd.destroyBuffer(s.dev, s.cmbuf, nullptr);
     if (s.cmmem) dd.freeMemory(s.dev, s.cmmem, nullptr);
     if (s.pipeCm) dd.destroyPipeline(s.dev, s.pipeCm, nullptr);

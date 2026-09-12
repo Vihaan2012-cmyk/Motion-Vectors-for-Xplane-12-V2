@@ -380,6 +380,14 @@ inline bool willCapture()
 inline void noteScenePassEndImpl(DeviceData &dd, VkCommandBuffer cb)
 {
     State &s = state();
+    // taa.nn: the net wants the normal as the pass wrote it, every frame, capture armed or not.
+    if (nnaa::enabled()) {
+        Gbuf gn;
+        { std::lock_guard<std::mutex> g(g_lock); gn = s.gbuf; }
+        if (gn.frame == g_frameCount && gn.cb == cb)
+            for (uint32_t i = 0; i < gn.count; ++i)
+                if (gn.image[i] == g_taa.normImage) { nnaa::snapNormal(dd, cb, gn.image[i], gn.format[i], gn.w, gn.h, gn.layout[i], g_frameCount); break; }
+    }
     if (!gbufWanted() || !willCapture()) return;
     Gbuf gb;
     { std::lock_guard<std::mutex> g(g_lock); gb = s.gbuf; }
