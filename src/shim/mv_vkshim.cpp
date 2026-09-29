@@ -206,14 +206,30 @@ static std::wstring slDir()
     return shimDir() + L"\\MotionVectors\\streamline";
 }
 
+// The live ini, or - when Windows' temp cleanup has deleted it - the packaged copy
+// the layer is about to seed it from (MotionVectors\taa_live.ini in the package,
+// MotionVectors\config\taa_live.ini in the dev tree). The shim reads BEFORE the
+// layer exists, so without this a wiped ini meant taa.backend/taa.dlssd were
+// silently off for the first launch after the wipe.
+static FILE *openLiveIni()
+{
+    char path[MAX_PATH]; DWORD n = GetTempPathA(MAX_PATH, path);
+    if (n) {
+        snprintf(path + n, sizeof(path) - n, "taa_live.ini");
+        if (FILE *f = fopen(path, "rb")) return f;
+    }
+    const std::wstring cands[2] = { shimDir() + L"\\MotionVectors\\taa_live.ini",
+                                    shimDir() + L"\\MotionVectors\\config\\taa_live.ini" };
+    for (int i = 0; i < 2; ++i)
+        if (FILE *f = _wfopen(cands[i].c_str(), L"rb")) return f;
+    return nullptr;
+}
+
 // The launcher may not set anything - the user just starts X-Plane. Honour the
 // same live ini the layer reads so taa.dlssd=1 is enough to arm Streamline.
 static bool liveIniOn(const char *key)
 {
-    char path[MAX_PATH]; DWORD n = GetTempPathA(MAX_PATH, path);
-    if (!n) return false;
-    snprintf(path + n, sizeof(path) - n, "taa_live.ini");
-    FILE *f = fopen(path, "rb"); if (!f) return false;
+    FILE *f = openLiveIni(); if (!f) return false;
     char line[512]; bool on = false;
     const size_t klen = strlen(key);
     while (fgets(line, sizeof(line), f)) {
@@ -235,10 +251,7 @@ static bool liveIniOn(const char *key)
 // The last value of a key in %TEMP%\taa_live.ini, trimmed; empty when absent.
 static std::string liveIniStr(const char *key)
 {
-    char path[MAX_PATH]; DWORD n = GetTempPathA(MAX_PATH, path);
-    if (!n) return std::string();
-    snprintf(path + n, sizeof(path) - n, "taa_live.ini");
-    FILE *f = fopen(path, "rb"); if (!f) return std::string();
+    FILE *f = openLiveIni(); if (!f) return std::string();
     char line[512]; std::string val;
     const size_t klen = strlen(key);
     while (fgets(line, sizeof(line), f)) {
@@ -408,6 +421,13 @@ static void dumpModules(const char *when)
 
 static void lockProbe(const char *where)
 {
+    // DEBUG ONLY (TAA_SL_LOCKPROBE=1). Asked before the device exists,
+    // slGetFeatureRequirements throws inside sl.interposer, which catches it,
+    // writes a minidump (211 of them in ProgramData by 2026-09-17) and answers 24
+    // - the same swallowed-throw path that has leaked its lock before. A
+    // diagnostic that can cause the fault it measures stays off by default.
+    static const bool on = getenv("TAA_SL_LOCKPROBE") != nullptr;
+    if (!on) return;
     if (!g_slOn || !slReqFn) return;
     sl::FeatureRequirements q{};
     sl::Result r = slReqFn(g_slFeature, q);

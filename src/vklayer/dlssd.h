@@ -151,6 +151,7 @@ static const char *rc(sl::Result r)
         case sl::Result::eErrorMissingInputParameter: return "eErrorMissingInputParameter";
         case sl::Result::eErrorMissingConstants: return "eErrorMissingConstants";
         case sl::Result::eErrorMissingResourceState: return "eErrorMissingResourceState";
+        case sl::Result::eWarnOutOfVRAM: return "eWarnOutOfVRAM";
         default: return "eError(other)";
     }
 }

@@ -34,6 +34,19 @@ static const sl::Feature kDLSS = sl::kFeatureDLSS;   // 0
 
 typedef sl::Result (*PFN_slDLSSSetOptions)(const sl::ViewportHandle &, const sl::DLSSOptions &);
 
+// eWarnOutOfVRAM is a WARNING: Streamline still evaluated and the output is valid. The
+// first DLAA flight (2026-09-17) counted 30 of them as failures and switched itself
+// off at OMDB with the A380 loaded; every one matched an "Exceeded VRAM budget" line.
+inline bool slOk(sl::Result r) { return r == sl::Result::eOk || r == sl::Result::eWarnOutOfVRAM; }
+inline void noteVramWarn(sl::Result r, const char *where)
+{
+    if (r != sl::Result::eWarnOutOfVRAM) return;
+    static uint64_t n = 0;
+    if ((n++ % 600) == 0)
+        trace("DLAA: %s -> eWarnOutOfVRAM (%llu so far) - over the VRAM budget, still evaluating",
+              where, (unsigned long long)n);
+}
+
 // taa.backend, read live. Anything but "dlaa"/"dlss" is the built-in TAA.
 inline bool wanted()
 {
@@ -176,7 +189,7 @@ static VkImage evaluate(DeviceData &dd, const Inputs &in)
         sl::Result r = s.SetOptions(vp, opt);
         trace("DLAA: slDLSSSetOptions(DLAA %ux%u, preset %d, HDR, auto exposure) -> %s",
               in.w, in.h, presetKey, mvdlssd::rc(r));
-        if (r != sl::Result::eOk) { if (++s.fails >= 30) s.failed = true; return VK_NULL_HANDLE; }
+        if (!slOk(r)) { if (++s.fails >= 30) s.failed = true; return VK_NULL_HANDLE; }
         s.optW = in.w; s.optH = in.h; s.optPreset = presetKey;
     }
 
@@ -199,7 +212,7 @@ static VkImage evaluate(DeviceData &dd, const Inputs &in)
     c.orthographicProjection = sl::Boolean::eFalse;
     c.reset = in.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     sl::Result cr = sl.SetConstants(c, *tok, vp);
-    if (cr != sl::Result::eOk) { trace("DLAA: slSetConstants -> %s", mvdlssd::rc(cr)); return VK_NULL_HANDLE; }
+    if (!slOk(cr)) { trace("DLAA: slSetConstants -> %s", mvdlssd::rc(cr)); return VK_NULL_HANDLE; }
 
     sl::Resource colIn = mvdlssd::mkRes(in.sceneImg, in.sceneView, in.sceneFmt, in.sceneLayout, in.w, in.h);
     sl::Resource depth = mvdlssd::mkRes(in.depthImg, in.depthView, in.depthFmt, in.depthLayout, in.w, in.h);
@@ -214,15 +227,18 @@ static VkImage evaluate(DeviceData &dd, const Inputs &in)
     if (in.biasImg != VK_NULL_HANDLE && live::onoff("taa.dlss_bias_mask", nullptr, true))
         tags.push_back(sl::ResourceTag(&bias, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilEvaluate));
     sl::Result tr = sl.SetTag(vp, tags.data(), (uint32_t)tags.size(), (sl::CommandBuffer *)in.cb);
-    if (tr != sl::Result::eOk) { trace("DLAA: slSetTag(%zu) -> %s", tags.size(), mvdlssd::rc(tr)); if (++s.fails >= 30) s.failed = true; return VK_NULL_HANDLE; }
+    if (!slOk(tr)) { trace("DLAA: slSetTag(%zu) -> %s", tags.size(), mvdlssd::rc(tr)); if (++s.fails >= 30) s.failed = true; return VK_NULL_HANDLE; }
+    noteVramWarn(tr, "slSetTag");
 
     const sl::BaseStructure *inputs[1] = { &vp };
     sl::Result er = sl.EvaluateFeature(kDLSS, *tok, inputs, 1, (sl::CommandBuffer *)in.cb);
-    if (er != sl::Result::eOk) {
+    if (!slOk(er)) {
         trace("DLAA: slEvaluateFeature(kFeatureDLSS) -> %s", mvdlssd::rc(er));
-        if (++s.fails >= 30) { s.failed = true; trace("DLAA: 30 failures - falling back to TAA for this session"); }
+        if (++s.fails >= 30) { s.failed = true; trace("DLAA: 30 consecutive failures - falling back to TAA for this session"); }
         return VK_NULL_HANDLE;
     }
+    noteVramWarn(er, "slEvaluateFeature");
+    s.fails = 0;   // the limit is for a backend that never works, not for scattered hiccups
     if (!s.announced) {
         s.announced = true;
         trace("DLAA: RUNNING - %ux%u, tags colour/depth/mvec/out%s, mvecScale (%.2f, %.2f), jitter sign (%.0f, %.0f), "
