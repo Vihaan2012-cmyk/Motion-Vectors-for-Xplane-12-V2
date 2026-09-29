@@ -2541,9 +2541,12 @@ static void autoStartTick(float dt)
 // all - that is why the first attempt at this silently did nothing, and why
 // --load_acf/--load_apt/--go_to_apt were not enough either: X-Plane parses all
 // three (they appear in Log.txt) but they only pre-fill the screen.
+static void mvDrawPublishTick(void);   // taa.mv_draw_exp - defined above XPluginStart
+
 static int autoStartDrawCb(XPLMDrawingPhase, int, void *)
 {
     autoStartTick(0.02f);
+    mvDrawPublishTick();
     return 1;
 }
 
@@ -2563,6 +2566,12 @@ static void taaPublish(void)
     g_share->pubIdx = nxt;
 }
 
+static float matrixPublish(void);
+static bool  mvDrawExp(void);
+static int   g_drawPubCycle = -1000000;   // sim cycle of the last draw-time publish (taa.mv_draw_exp)
+static float g_lastDrawWorld[16];
+static bool  g_haveDrawWorld = false;
+
 static float matrixCallback(float sinceLast, float, int, void *)
 {
     // Real elapsed time, not a guessed constant - the delay before placing the
@@ -2570,6 +2579,31 @@ static float matrixCallback(float sinceLast, float, int, void *)
     autoStartTick(sinceLast);
     autoSelfTestTick(sinceLast);
 
+    // taa.mv_draw_exp: while the window-phase draw callback is publishing, the flight
+    // loop stands aside. Two cycles of grace; after that it publishes again, so a sim
+    // state with no 2-D drawing never starves the layer.
+    if (mvDrawExp()) {
+        // The evidence line: is what the flight loop reads simply the matrix the last
+        // draw left behind? Logged for the first few frames only.
+        static int cmp = 0;
+        if (cmp < 5 && g_refsResolved && g_drWorld && g_haveDrawWorld) {
+            float w[16]; XPLMGetDatavf(g_drWorld, w, 0, 16);
+            float d = 0.0f;
+            for (int i = 0; i < 16; ++i) d = fmaxf(d, fabsf(w[i] - g_lastDrawWorld[i]));
+            xlog("matrix sampling: the flight loop sees world_matrix %s the last draw-time one (max |diff| %.6f)",
+                 d < 1e-6f ? "IDENTICAL to" : "DIFFERENT from", (double)d);
+            ++cmp;
+        }
+        if (XPLMGetCycleNumber() - g_drawPubCycle <= 2) return -1.0f;
+    }
+    return matrixPublish();
+}
+
+// Everything that reads the camera and publishes the frame. Called once per sim cycle -
+// from the flight loop (legacy) or, under taa.mv_draw_exp, from the window-phase draw
+// callback, before the frame is presented.
+static float matrixPublish(void)
+{
     if (!g_refsResolved) {
         g_refsResolved = true;
         g_drProj     = taaFind("sim/graphics/view/projection_matrix");
@@ -4589,6 +4623,70 @@ static bool loadConfig(const std::string &path)
          "diagLog=%d", g_lodBias, g_renderScale, g_jitterPhases,
          g_objectsOn ? 1 : 0, g_diagLog ? 1 : 0);
     return true;
+}
+
+// ---- taa.mv_draw_exp - EXPERIMENTAL, OFF BY DEFAULT (env TAA_MV_DRAW_EXP overrides).
+//
+// The camera matrices were read in the flight loop, and DataRefs.txt documents
+// world_matrix and projection_matrix as "valid only during draw callbacks". The layer
+// snapshots the share at present, so what it paired was frame N-1 against N-2 and it
+// used that for frame N+1: vectors two frames stale. Right at a steady frame time,
+// wrong by the ratio of time steps otherwise - measured 2026-09-12 as a best-fit
+// vector scale of 0.30-1.78 per frame pair under X-Plane's 0.022-0.050 s pacing, the
+// real cause of the motion smear that alpha_moving has been hiding.
+//
+// With this on, the window-phase draw callback publishes: it runs inside frame N,
+// before present N, so the snapshot holds frame N's own matrices and the lag drops by
+// one frame. Re-read every ~2 s, so it can be flipped mid-flight.
+static bool mvDrawExp(void)
+{
+    static int val = -1, tick = 0;
+    if (val < 0 || ++tick >= 120) {
+        tick = 0;
+        const char *e = getenv("TAA_MV_DRAW_EXP");
+        double v = 0.0;
+        const int nv = (e && e[0]) ? (atoi(e) != 0 ? 1 : 0)
+                                   : ((liveIniFloat("taa.mv_draw_exp", &v) && v > 0.0) ? 1 : 0);
+        if (nv != val)
+            xlog("matrix sampling: taa.mv_draw_exp=%d - camera matrices published from %s", nv,
+                 nv ? "the window-phase draw callback, where DataRefs.txt says they are valid"
+                    : "the flight loop (legacy timing)");
+        val = nv;
+    }
+    return val == 1;
+}
+
+static void mvDrawPublishTick(void)
+{
+    if (!mvDrawExp() || !g_refsResolved || !g_share || !g_drProj3d || !g_drWorld) return;
+    const int cyc = XPLMGetCycleNumber();
+    if (cyc == g_drawPubCycle) return;   // the window phase can run more than once per frame
+    // Only if the 3-D matrices really are what this phase holds: a perspective
+    // projection and an orthonormal camera rotation. Otherwise the flight loop keeps
+    // publishing, and the log says why.
+    float pm[16], wm[16];
+    XPLMGetDatavf(g_drProj3d, pm, 0, 16);
+    XPLMGetDatavf(g_drWorld, wm, 0, 16);
+    const bool persp = fabsf(pm[11] + 1.0f) < 0.05f && fabsf(pm[15]) < 0.05f;
+    bool ortho = true;
+    for (int c = 0; c < 3; ++c) {
+        const float n = sqrtf(wm[c * 4] * wm[c * 4] + wm[c * 4 + 1] * wm[c * 4 + 1] + wm[c * 4 + 2] * wm[c * 4 + 2]);
+        if (fabsf(n - 1.0f) > 0.02f) ortho = false;
+    }
+    if (!persp || !ortho) {
+        static int bad = 0;
+        if (++bad <= 3)
+            xlog("matrix sampling: draw-time matrices do not look like a 3-D view (perspective=%d "
+                 "orthonormal=%d) - the flight loop keeps publishing", persp ? 1 : 0, ortho ? 1 : 0);
+        return;
+    }
+    memcpy(g_lastDrawWorld, wm, sizeof(wm));
+    g_haveDrawWorld = true;
+    g_drawPubCycle = cyc;
+    static unsigned long long n = 0;
+    if (++n <= 2 || (n % 3600) == 0)
+        xlog("matrix sampling: draw-time publish #%llu (sim cycle %d)", n, cyc);
+    matrixPublish();
 }
 
 PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
