@@ -1501,7 +1501,8 @@ inline Result inject(const uint32_t *code, size_t sizeBytes,
 inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
                              std::vector<uint32_t> &out, uint32_t attachmentIndex,
                              bool alphaBlended, bool zeroVel = false,
-                             bool tagHalf = false, bool screen = false)
+                             bool tagHalf = false, bool screen = false,
+                             int light = 0)
 {
     if (!code || sizeBytes < 20) return INJ_MALFORMED;
     std::vector<uint32_t> w(code, code + sizeBytes / 4);
@@ -1743,6 +1744,11 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
     if (!idConstOneF) { newOneF     = bound++; idConstOneF = newOneF; }
     uint32_t idConstPid = 0;
     if (getenv("TAA_MV_PID")) { newPid = bound++; idConstPid = newPid; }
+    // Light class constants: the 2.0 marker base, the "write nothing" value a MAX blend can
+    // never pick over a real texel, and the visibility floor.
+    const uint32_t idConstTwo = light ? bound++ : 0;
+    const uint32_t idConstNeg = light ? bound++ : 0;
+    const uint32_t idConstEps = light ? bound++ : 0;
 
     uint32_t idInCurr  = bound++, idInPrev = bound++, idOutMV = bound++;
     uint32_t idLc = bound++, idLp = bound++;
@@ -1776,6 +1782,14 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newZero); globals.push_back(bits); }
     if (newPid)      { uint32_t bits; float pv = (float)myPid; memcpy(&bits, &pv, 4);
                        globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(newPid); globals.push_back(bits); }
+    if (light) {
+        const float lv[3] = { 2.0f, -65000.0f, 1e-4f };
+        const uint32_t li[3] = { idConstTwo, idConstNeg, idConstEps };
+        for (int k = 0; k < 3; ++k) {
+            uint32_t bits; memcpy(&bits, &lv[k], 4);
+            globals.push_back(head(OpConstant, 4)); globals.push_back(idFloat); globals.push_back(li[k]); globals.push_back(bits);
+        }
+    }
     // A tag is only useful if it names something. Hash the incoming module so a
     // pid in the report can be matched back to the exact shader and dumped.
     if (newPid) {
@@ -2010,6 +2024,43 @@ inline Result injectFragment(const uint32_t *code, size_t sizeBytes,
             body.push_back(head(OpFOrdGreaterThanEqual, 5)); body.push_back(idBool); body.push_back(idGE); body.push_back(idAw); body.push_back(idConstSel);
             body.push_back(head(OpSelect, 6)); body.push_back(idFloat); body.push_back(idGate); body.push_back(idGE); body.push_back(idConstOneF); body.push_back(idConstZero);
             idCh3 = idGate;
+        }
+        // ---- LIGHT CLASS: 2 + this fragment's own additive contribution, or "nothing".
+        //
+        // The layer MAX-blends only the alpha lane for these pipelines, so the brightest
+        // light over a pixel leaves its marker and every other lane - the vector and depth
+        // of the surface underneath - is untouched. max(r,g,b), times alpha when the
+        // pipeline adds src*SRC_ALPHA: what this draw actually puts into the pixel. Below
+        // the visibility floor the -65000 loses every MAX, so a billboard's transparent
+        // corners mark nothing. OpFOrdLessThan with swapped operands: the opcode table has
+        // no GreaterThan.
+        if (light && !anyDebug) {
+            if (idOut0Var) {
+                const uint32_t idC = bound++, idR = bound++, idG = bound++, idB = bound++, idAl = bound++;
+                const uint32_t idL1 = bound++, idM1 = bound++, idL2 = bound++, idM = bound++;
+                const uint32_t idCon = light == 2 ? bound++ : 0;
+                const uint32_t idVis = bound++, idMk = bound++, idSel = bound++;
+                body.push_back(head(OpLoad, 4)); body.push_back(idV4); body.push_back(idC); body.push_back(idOut0Var);
+                body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idR);  body.push_back(idC); body.push_back(0);
+                body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idG);  body.push_back(idC); body.push_back(1);
+                body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idB);  body.push_back(idC); body.push_back(2);
+                body.push_back(head(OpCompositeExtract, 5)); body.push_back(idFloat); body.push_back(idAl); body.push_back(idC); body.push_back(3);
+                body.push_back(head(OpFOrdLessThan, 5)); body.push_back(idBool); body.push_back(idL1); body.push_back(idG); body.push_back(idR);
+                body.push_back(head(OpSelect, 6)); body.push_back(idFloat); body.push_back(idM1); body.push_back(idL1); body.push_back(idR); body.push_back(idG);
+                body.push_back(head(OpFOrdLessThan, 5)); body.push_back(idBool); body.push_back(idL2); body.push_back(idB); body.push_back(idM1);
+                body.push_back(head(OpSelect, 6)); body.push_back(idFloat); body.push_back(idM); body.push_back(idL2); body.push_back(idM1); body.push_back(idB);
+                uint32_t idContrib = idM;
+                if (light == 2) {
+                    body.push_back(head(OpFMul, 5)); body.push_back(idFloat); body.push_back(idCon); body.push_back(idM); body.push_back(idAl);
+                    idContrib = idCon;
+                }
+                body.push_back(head(OpFOrdLessThan, 5)); body.push_back(idBool); body.push_back(idVis); body.push_back(idConstEps); body.push_back(idContrib);
+                body.push_back(head(OpFAdd, 5)); body.push_back(idFloat); body.push_back(idMk); body.push_back(idContrib); body.push_back(idConstTwo);
+                body.push_back(head(OpSelect, 6)); body.push_back(idFloat); body.push_back(idSel); body.push_back(idVis); body.push_back(idMk); body.push_back(idConstNeg);
+                idCh3 = idSel;
+            } else {
+                idCh3 = idConstNeg;   // no colour output to read: mark nothing
+            }
         }
     }
     body.push_back(head(OpCompositeConstruct, 7)); body.push_back(idV4); body.push_back(idResult);

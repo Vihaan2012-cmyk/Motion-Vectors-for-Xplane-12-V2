@@ -129,6 +129,10 @@ layout(binding = 6, std140) uniform ReprojData {
     //    block is full to its 128-byte guaranteed ceiling, with a
     //    static_assert standing over it; this slot uses 96 of 2048.
     vec4 uReprojParams2;
+    // x: light class on (taa.light_class), y: dominance threshold (taa.light_dom)
+    vec4 uReprojParams3;
+    // x: DLSS prep mode (taa.backend=dlaa), y: bias-mask the light class too (taa.dlss_bias_lights)
+    vec4 uReprojParams4;
 };
 
 // ---- THE ENGINE'S SUN, ASKED DIRECTLY.
@@ -1158,6 +1162,21 @@ void main()
     if ((pc.flags & FLAG_NO_MOTION) != 0) vel = vec2(0.0);
     vec2 hUv  = uv + vec2(vel.x, pc.velYSign * vel.y);
 
+    // ---- DLSS PREP MODE (taa.backend=dlaa, uReprojParams4.x). DLSS is fed the vector this
+    // resolve would have used - dilated, reconstructed from depth where nothing wrote, with
+    // the cockpit near-field rule - so every fix to the vector path reaches it too. The
+    // history target receives (prevUV - currUV) in UV orientation instead of a colour, and
+    // the depth-history target receives the bias-current-colour mask: 1 on the cockpit
+    // screen class (coverage 0.5, content changes on static geometry), and on light-class
+    // pixels when uReprojParams4.y is set. No colour work is done in this mode.
+    if (uReprojParams4.x > 0.5) {
+        float mw = texelFetch(uVelocity, ivec3(px, layer), 0).w;
+        float bias = (abs(mw - 0.5) < 0.02 || (uReprojParams4.y > 0.5 && mw >= 1.5)) ? 1.0 : 0.0;
+        imageStore(uHistory, ivec3(px, layer), vec4(hUv - uv, 0.0, 1.0));
+        imageStore(uHistDepthOut, ivec3(px, layer), vec4(bias, 0.0, 0.0, 1.0));
+        return;
+    }
+
     // ---- THE VIEWS THAT DO NOT DEPEND ON HISTORY.
     //
     // Drawn before any rejection so they describe the FIELD rather than what
@@ -1212,6 +1231,16 @@ void main()
         vec2 px2 = vec2(vel.x, pc.velYSign * vel.y) * vec2(size);
         vec3 c = vec3(0.5) + vec3(px2.x, px2.y, 0.0) * 0.02 * pc.vizScale;
         imageStore(uHistory, ivec3(px, layer), vec4(c, 0.0));
+        return;
+    }
+    // taa.viz=12: the light-class marker (velocity .w >= 1.5, MAX-blended by additive
+    // pipelines) as RED over a darkened scene. No red at the lights = the marker never
+    // reaches the resolve's velocity target.
+    if (pc.viz == 12) {
+        float lw = texelFetch(uVelocity, ivec3(px, layer), 0).w;
+        vec3 base = tm(texelFetch(uScene, ivec3(px, layer), 0).rgb) * 0.3;
+        imageStore(uHistory, ivec3(px, layer),
+                   lw >= 1.5 ? vec4(1.0, 0.1, 0.1, 1.0) : vec4(base, 1.0));
         return;
     }
     if (pc.viz == VIZ_WRITTEN) {
@@ -2174,6 +2203,20 @@ void main()
         abs(texelFetch(uVelocity, ivec3(px, layer), 0).w - 0.5) < 0.02) {
         a = max(a, uReprojParams.w);
         if (uReprojParams.w >= 1.0) currA = curr;
+    }
+
+    // ---- LIGHT CLASS (taa.light_class / taa.light_dom, uReprojParams3). Additive pipelines -
+    // light billboards, runway and city lights - are drawn unjittered and MAX-blend 2 + their
+    // own contribution into the velocity alpha (anything below 1.5 is ordinary coverage). The
+    // un-jittered resample above spreads a one-pixel light over its neighbours and swings its
+    // peak with the jitter: dim and pulsing, gone with jitter_scale=0, untouched by varclip 4
+    // (2026-09-13). Where the light supplies at least light_dom of the pixel, the raw texel IS
+    // the sample - it was rasterised unjittered. History still accumulates as usual. Not gated
+    // on `unwritten`: a light against the sky has no vector underneath and still needs this.
+    if (uReprojParams3.x > 0.0) {
+        float lw = texelFetch(uVelocity, ivec3(px, layer), 0).w;
+        if (lw >= 1.5 && (lw - 2.0) >= uReprojParams3.y * luma(curr))
+            currA = curr;
     }
 
     // How far the clamp had to move history, in standard deviations. Edges under

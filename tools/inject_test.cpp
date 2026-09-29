@@ -211,8 +211,12 @@ int main(int argc, char **argv)
             // corpus of bare modules cannot know. false is the conservative
             // choice: it exercises the same injection path without claiming a
             // transparency gate the module itself does not carry.
+            // INJECT_TEST_LIGHT=1|2 exercises the light-class emission (additive
+            // pipelines: 1 = src ONE, 2 = src SRC_ALPHA) on a blended pipeline.
+            static const int lightMode = getenv("INJECT_TEST_LIGHT") ? atoi(getenv("INJECT_TEST_LIGHT")) : 0;
             spvinj::Result fr = spvinj::injectFragment(in.data(), in.size() * 4,
-                                                       fout, maxLoc, false);
+                                                       fout, maxLoc, lightMode != 0,
+                                                       false, false, false, lightMode);
             if (fr != spvinj::INJ_OK) continue;
             ++nFragPatched;
             fs::path o = tmp / ("f_" + p.filename().string());

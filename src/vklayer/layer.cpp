@@ -877,6 +877,33 @@ static std::atomic<bool> g_mvClearedThisFrame(false);
 // very first frames; after it, every scene pass LOADs and nothing has to decide.
 static std::atomic<bool> g_mvClearedAtPresent(false);
 
+// ---- THE CLEAR IN SUBMISSION ORDER (taa.mv_submit_clear, default on).
+//
+// The two flags above still pick the clearing pass by RECORDING order, and X-Plane
+// records on several threads. Measured 2026-09-12 (777, cockpit view): frames alternate
+// between 0% and 25-33% of the screen unwritten, and the missing vectors are exactly the
+// world seen through the windows - the G-buffer terrain pass - while the cockpit, glass
+// and display draws of the one-colour forward pass always survive. That is the cockpit
+// pass's buffer being recorded first, taking the CLEAR, and executing AFTER the terrain
+// pass that LOADed: the clear wipes the world. Through the windshield the terminal then
+// has no history and shows the raw jittered frame (user report: "the airport terminal
+// looks aliased from the cockpit").
+//
+// Submission order is execution order on the queue, so the clear moves there: once per
+// frame (re-armed at present) a pre-recorded command buffer that clears the target is
+// submitted immediately ahead of the first buffer holding a velocity pass, and every
+// scene pass LOADs. Until that buffer exists the in-pass clear stays in charge.
+static std::atomic<bool> g_mvSubmitNeedClear(true);    // re-armed by every present
+static std::atomic<bool> g_mvSubmitClearReady(false);  // the clear buffer exists and has run once
+static std::set<VkCommandBuffer> g_cbWroteMv;           // buffers with a BOUND velocity pass; under g_lock
+struct MvSubmitClear {
+    VkDevice dev = VK_NULL_HANDLE; uint32_t family = ~0u; VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cb = VK_NULL_HANDLE; VkImage image = VK_NULL_HANDLE; bool failed = false;
+};
+static MvSubmitClear g_mvsc;                            // under g_lock
+static uint64_t g_mvSubmitClears = 0;
+static bool mvSubmitClearArmed();
+
 // Declared here, ahead of vkCreateShaderModule, because that is where the
 // original words are stored - and ahead of vkCreateGraphicsPipelines, which is
 // where they are finally patched.
@@ -917,6 +944,8 @@ static void mvDumpModule(const uint32_t *code, size_t bytes)
 struct MvPipeIdent { uint32_t vsPid = 0; uint64_t vert = 0, frag = 0; bool patched = false, ground = false, geometry = false; uint64_t binds = 0; };
 static std::mutex g_pipeIdentLock;
 static std::map<VkPipeline, MvPipeIdent> g_pipeIdent;
+// Light-class pipelines (additive, unjittered, MAX marker in velocity .w). Under g_lock.
+static std::set<VkPipeline> g_lightPipes;
 
 static std::map<VkShaderModule, std::vector<uint32_t> > g_moduleCode;
 
@@ -1773,6 +1802,9 @@ static void noteSubmitOrder(uint32_t count, const VkCommandBuffer *cbs)
     }
 }
 
+static bool mvSubmitClearInsert(VkQueue, uint32_t, const VkSubmitInfo *, std::vector<VkSubmitInfo> &,
+                                std::vector<std::vector<VkCommandBuffer> > &);   // defined with the pass hook
+
 static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueueSubmit(
     VkQueue queue, uint32_t count, const VkSubmitInfo *submits, VkFence fence)
 {
@@ -1786,6 +1818,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueueSubmit(
             trace("QUEUE: app submits on %p (%u distinct so far)",
                   (void*)queue, (unsigned)g_submitQueues.size());
     }
+    // The frame's velocity clear, ahead of the first buffer that writes velocity.
+    // The rebuilt array and its buffer list must outlive the forward below.
+    std::vector<VkSubmitInfo> mvSubs;
+    std::vector<std::vector<VkCommandBuffer> > mvLists;
+    if (mvSubmitClearInsert(queue, count, submits, mvSubs, mvLists)) submits = mvSubs.data();
+
     // The upload governor. It handles the call entirely when the queue is the
     // transfer-only family - pacing under pressure, holding whole submissions
     // FIFO - and it also flushes anything held whose signals this submission
@@ -2791,6 +2829,7 @@ static std::map<VkBuffer, uint64_t>     g_allBuffers;   // size in bytes
 #include "gi.h"
 #include "nn_capture_fwd.h"   // capture harness interface; definitions follow the globals it reads
 #include "dlssd.h"   // DLSS-D Ray Reconstruction (feature 1001), honest Streamline path
+#include "dlaa.h"    // DLAA / DLSS Super Resolution backend (taa.backend=dlaa), same Streamline context
 #include "taa.h"
 #include "mv_nr_probe.h"   // THROWAWAY SPIKE: TAA_NR_PROBE=1
 #include "mv_sl_probe.h"   // THROWAWAY SPIKE: TAA_SL_PROBE=1 (Streamline path)
@@ -5544,6 +5583,15 @@ static bool g_jitterArmed = false;
 // crawl, a consumer with no jitter averages identical samples and cannot
 // antialias anything.
 static float g_jitterScale = 0.0f;
+// taa.jitter_pulled (default on): also jitter PATCHED pipelines with no vertex
+// attributes - geometry pulled from storage buffers (X-Plane's night lights,
+// ground_lights/light_2; 200 of 200 light binds had no vertex buffers). They
+// were never jittered while the terrain and its depth were, so every ground light
+// was depth-tested against a surface that moved under it by a sub-pixel each
+// frame: the light itself flickered and averaged dim (2026-09-13, OMDB - the
+// viz=12 marker, written from the light's own colour, flickered too). Full-screen
+// passes are never patched, so they stay unjittered. Read at present.
+static bool g_jitterPulled = true;
 // The NDC offsets actually pushed this frame - what the resolve must be told,
 // as opposed to g_velSnap.jitterX/Y, which is the plugin's REQUEST in units of
 // pixels. The resolve was told the request for a while, believing it was NDC:
@@ -6183,7 +6231,7 @@ static bool mvAppendAttachment(const VkRenderingInfo *info,
         // Once the present-time clear is running, no pass clears: the target
         // was zeroed after FSR2 consumed it last frame, so LOAD is correct and
         // no thread has to win a race to decide it.
-        bool first = !g_mvClearedAtPresent.load() &&
+        bool first = !g_mvClearedAtPresent.load() && !mvSubmitClearArmed() &&
                      !g_mvClearedThisFrame.exchange(true);
         mv.loadOp  = first ? VK_ATTACHMENT_LOAD_OP_CLEAR
                            : VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -6380,6 +6428,135 @@ static bool spirvIsXpFsr(const uint32_t *code, size_t words)
 }
 
 #include "nn_capture.h"   // needs g_velSnap, g_colorImages, g_viewToImage, isSceneSized - all above
+
+// ---- SUBMIT-TIME VELOCITY CLEAR - see g_mvSubmitNeedClear.
+static bool mvSubmitClearArmed()
+{
+    return g_mvSubmitClearReady.load() &&
+           live::onoff("taa.mv_submit_clear", "TAA_MV_SUBMIT_CLEAR", true);
+}
+
+// Records the clear once per velocity image (under g_lock). A fresh buffer per image:
+// one that may still be pending cannot be re-recorded, and resizes are rare enough that
+// the old buffer simply stays in the pool. SIMULTANEOUS_USE lets the same buffer go into
+// every frame's submission without waiting for the last one.
+static bool mvSubmitClearRecord(VkDevice dev, uint32_t family)
+{
+    std::map<void*, DeviceData>::iterator it = g_devices.find(dispatchKey(dev));
+    if (it == g_devices.end()) return false;
+    DeviceData &d = it->second;
+    if (!d.createCommandPool || !d.allocateCommandBuffers || !d.beginCommandBuffer ||
+        !d.endCommandBuffer || !d.cmdPipelineBarrier || !d.cmdClearColorImage) return false;
+    if (g_mvsc.pool == VK_NULL_HANDLE || g_mvsc.dev != dev || g_mvsc.family != family) {
+        VkCommandPoolCreateInfo pci; memset(&pci, 0, sizeof(pci));
+        pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pci.queueFamilyIndex = family;
+        VkCommandPool pool = VK_NULL_HANDLE;
+        if (d.createCommandPool(dev, &pci, nullptr, &pool) != VK_SUCCESS) return false;
+        g_mvsc.pool = pool; g_mvsc.dev = dev; g_mvsc.family = family;
+        g_mvsc.cb = VK_NULL_HANDLE; g_mvsc.image = VK_NULL_HANDLE;
+    }
+    VkCommandBufferAllocateInfo ai; memset(&ai, 0, sizeof(ai));
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = g_mvsc.pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (d.allocateCommandBuffers(dev, &ai, &cb) != VK_SUCCESS) return false;
+    // Allocated below the loader's trampoline, so the loader never wrote its dispatch
+    // pointer into the handle; layers beneath us key on it. Same value the loader writes.
+    *reinterpret_cast<void**>(cb) = *reinterpret_cast<void**>(dev);
+    VkCommandBufferBeginInfo bi; memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    if (d.beginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
+    VkImageMemoryBarrier b; memset(&b, 0, sizeof(b));
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = g_mv.image;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+    // UNDEFINED is legal from any layout and the whole image is overwritten; ALL_COMMANDS
+    // orders the clear after the previous frame's resolve and every other reader.
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    d.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+    VkClearColorValue cv; memset(&cv, 0, sizeof(cv));
+    cv.float32[0] = kMvUnwritten;
+    cv.float32[1] = kMvUnwritten;
+    d.cmdClearColorImage(cb, g_mv.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &b.subresourceRange);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                      VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;   // what every scene pass expects
+    d.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+    if (d.endCommandBuffer(cb) != VK_SUCCESS) return false;
+    g_mvsc.cb = cb;
+    g_mvsc.image = g_mv.image;
+    return true;
+}
+
+// Called from vkQueueSubmit. Returns true when `outSubs` (backed by `lists`) should be
+// submitted instead of the caller's array: identical, except the clear buffer sits
+// directly ahead of the first buffer that holds a bound velocity pass.
+static bool mvSubmitClearInsert(VkQueue queue, uint32_t count, const VkSubmitInfo *submits,
+                                std::vector<VkSubmitInfo> &outSubs,
+                                std::vector<std::vector<VkCommandBuffer> > &lists)
+{
+    (void)queue;
+    if (!submits || !count || !g_mvSubmitNeedClear.load()) return false;
+    if (!live::onoff("taa.mv_submit_clear", "TAA_MV_SUBMIT_CLEAR", true)) return false;
+    std::lock_guard<std::mutex> g(g_lock);
+    if (g_mvsc.failed || !g_mv.ready || g_mv.image == VK_NULL_HANDLE || g_cbWroteMv.empty()) return false;
+    for (uint32_t si = 0; si < count; ++si) {
+        const VkSubmitInfo &sub = submits[si];
+        for (uint32_t ci = 0; ci < sub.commandBufferCount && sub.pCommandBuffers; ++ci) {
+            VkCommandBuffer c = sub.pCommandBuffers[ci];
+            if (!g_cbWroteMv.count(c)) continue;
+            // Device-group submits carry a device mask per buffer; inserting one would
+            // misalign them. X-Plane does not use them - leave such a call untouched.
+            for (const VkBaseInStructure *pn = (const VkBaseInStructure *)sub.pNext; pn; pn = pn->pNext)
+                if (pn->sType == VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO) return false;
+            std::map<VkCommandBuffer, VkDevice>::iterator dv = g_cbToDevice.find(c);
+            std::map<VkCommandBuffer, uint32_t>::iterator fm = g_cbFamily.find(c);
+            if (dv == g_cbToDevice.end() || fm == g_cbFamily.end()) return false;
+            if (g_mvsc.cb == VK_NULL_HANDLE || g_mvsc.image != g_mv.image ||
+                g_mvsc.dev != dv->second || g_mvsc.family != fm->second) {
+                if (!mvSubmitClearRecord(dv->second, fm->second)) {
+                    g_mvsc.failed = true;
+                    trace("MV CLEAR: could not build the submit-time clear - the in-pass clear stays in charge");
+                    return false;
+                }
+            }
+            outSubs.assign(submits, submits + count);
+            lists.assign(1, std::vector<VkCommandBuffer>());
+            lists[0].reserve(sub.commandBufferCount + 1);
+            lists[0].insert(lists[0].end(), sub.pCommandBuffers, sub.pCommandBuffers + ci);
+            lists[0].push_back(g_mvsc.cb);
+            lists[0].insert(lists[0].end(), sub.pCommandBuffers + ci, sub.pCommandBuffers + sub.commandBufferCount);
+            outSubs[si].commandBufferCount = (uint32_t)lists[0].size();
+            outSubs[si].pCommandBuffers = lists[0].data();
+            g_mvSubmitNeedClear.store(false);
+            const bool armedNow = !g_mvSubmitClearReady.exchange(true);
+            ++g_mvSubmitClears;
+            if (armedNow || g_mvSubmitClears <= 3 || (g_mvSubmitClears % 3600) == 0)
+                trace("MV CLEAR: submit-time clear #%llu ahead of buffer %u of submit %u (%u submit(s) in the call)%s",
+                      (unsigned long long)g_mvSubmitClears, ci, si, count,
+                      armedNow ? " - ARMED: from the next recorded frame every scene pass LOADs" : "");
+            return true;
+        }
+    }
+    return false;
+}
 
 static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
     VkCommandBuffer cb, const VkRenderingInfo *info)
@@ -7060,7 +7237,8 @@ static VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(
     if (mvAppendAttachment(info, mvAtts, info2)) {
         // The velocity target is attached to THIS pass on THIS command buffer.
         // Recorded here rather than inside the helper, which has no cb.
-        { std::lock_guard<std::mutex> g(g_lock); g_cbMvBoundPass[cb] = true; }
+        { std::lock_guard<std::mutex> g(g_lock); g_cbMvBoundPass[cb] = true;
+          if (mvAtts.back().imageView) g_cbWroteMv.insert(cb); }
         static uint64_t nlog = 0;
         if (++nlog <= 3 || (nlog % 100000) == 0)
             trace("MV: pass with %u colour attachments -> %u (velocity %s)",
@@ -11235,6 +11413,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     // already running. Without jitter TAA can only stabilise; it cannot
     // anti-alias, which is most of the point.
     g_jitterScale = live::f("taa.jitter_scale", "TAA_JITTER_SCALE", 1.0f);
+    g_jitterPulled = live::f("taa.jitter_pulled", "TAA_JITTER_PULLED", 1.0f) > 0.5f;
     // Belt and braces with the disarm above: zero AMPLITUDE as well, so even a
     // push path that ignores g_jitterArmed cannot displace a vertex while the
     // layer is standing down.
@@ -11464,6 +11643,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
     g_mvPassOrdinal        = -1;
 
     g_mvClearedThisFrame.store(false);
+    g_mvSubmitNeedClear.store(true);   // the next velocity pass in submission order gets a clear first
     g_depthFreshThisFrame  = false;   // must be re-proven every frame
 
     // Retire this frame's depth bindings and start the next frame's list empty,
@@ -12170,7 +12350,7 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateInstance(
     // empty and never attached, so X-Plane's 1.1 request stood and Streamline
     // threw on the missing 1.3 entry points. Only when a Streamline path is
     // armed (DLSS-D or the SL probe), so the shipped TAA path is untouched.
-    if (mvdlssd::enabled() || slProbeEnabled()) {
+    if (mvdlssd::enabled() || mvdlaa::wanted() || slProbeEnabled()) {
         if (ci->pApplicationInfo) appInfo = *ci->pApplicationInfo;
         else { appInfo.apiVersion = VK_API_VERSION_1_0; appInfo.pApplicationName = nullptr; appInfo.pEngineName = nullptr; }
         const uint32_t want = VK_API_VERSION_1_3;
@@ -13607,10 +13787,11 @@ static VkShaderModule mvPatchVertex(VkDevice device, VkShaderModule orig, bool j
 // same module thousands of times.
 static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
                                       uint32_t attachmentIndex, bool alphaBlended,
-                                      bool zeroVel, bool tagHalf, bool screen)
+                                      bool zeroVel, bool tagHalf, bool screen, int light)
 {
     FragKey key(FragModKey(orig, attachmentIndex),
-                (alphaBlended ? 1 : 0) | (zeroVel ? 2 : 0) | (tagHalf ? 4 : 0) | (screen ? 8 : 0));
+                (alphaBlended ? 1 : 0) | (zeroVel ? 2 : 0) | (tagHalf ? 4 : 0) | (screen ? 8 : 0) |
+                ((light & 3) << 4));
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::map<FragKey, VkShaderModule>::iterator it = g_fragVariant.find(key);
@@ -13629,7 +13810,7 @@ static VkShaderModule mvPatchFragment(VkDevice device, VkShaderModule orig,
     std::vector<uint32_t> patched;
     spvinj::Result fr = spvinj::injectFragment(src.data(), src.size() * 4, patched,
                                                attachmentIndex, alphaBlended, zeroVel,
-                                               tagHalf, screen);
+                                               tagHalf, screen, light);
     // The VERTEX module's Location decorations were verified from a dump - 30
     // and 31, both stored. The FRAGMENT module's INPUT locations never were,
     // and a mismatch there would deliver zeros through a varying that looks
@@ -13850,10 +14031,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
     { static bool selRead = false; if (!selRead) { selRead = true; spvinj::alphaSelect() = live::f("taa.mv_alpha_select", "TAA_MV_ALPHA_SELECT", 0.9f); } }
     std::vector<char> mvPatchedThisCall;
     std::vector<char> mvGroundThisCall;   // world-static family, per pipeline
+    std::vector<char> mvLightThisCall;    // light class (additive), per pipeline
     std::vector<uint64_t> vertHashThisCall, fragHashThisCall; std::vector<uint32_t> vsPidThisCall;   // TAA_DUMP_SHADERS identity per pipeline
 
     if (ci && count) mvPatchedThisCall.assign(count, 0);
     if (ci && count) mvGroundThisCall.assign(count, 0);
+    if (ci && count) mvLightThisCall.assign(count, 0);
     if (ci && count) { vertHashThisCall.assign(count, 0); fragHashThisCall.assign(count, 0); vsPidThisCall.assign(count, 0); }
 
     if (g_spirvLive && ci && count) {
@@ -14203,6 +14386,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             bool     zeroVelClass = false; // screen-fixed overlay: writes vel = (0,0)
             bool     screenClass  = false; // plugin-drawn display face: coverage 0.5, exact texel at the resolve
             bool     screenFamily = false; // ...and its vertex variant is unjittered, policy on or off
+            int      lightMode    = 0;     // additive light class: 1 = src ONE, 2 = src SRC_ALPHA
+            bool     lightClass   = false; // ...applied (not a PID readback run)
             stages[i].assign(ci[i].pStages, ci[i].pStages + ci[i].stageCount);
             bool vertPatched = false;
 
@@ -14337,12 +14522,37 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     // masked, so the marker beneath them survives.
                     screenFamily = mvFamilyScreen(vertHash);
                     if (screenFamily && !blends) { wouldScreen = true; wouldMask = false; }
+                    // ---- LIGHT CLASS: every additive pipeline (dst = ONE).
+                    //
+                    // Light billboards, runway/city lights and glows. Keyed on the blend,
+                    // not a hash table, because the cockpit light billboards are runtime
+                    // variants that are not in the shipped pack (see the additive rule
+                    // above). The vertex variant is unjittered and the fragment MAX-blends
+                    // 2 + its contribution into the velocity alpha; the resolve takes the
+                    // raw texel where that light dominates. Measured 2026-09-13 at OMDB:
+                    // jitter_scale=0 restored dim, pulsing night lights, varclip 4 did
+                    // nothing. Velocity stays masked - a glow does not occlude.
+                    // TAA_NO_LIGHT_CLASS=1 turns it off at launch.
+                    static const bool lightOff = getenv("TAA_NO_LIGHT_CLASS") != nullptr;
+                    if (!lightOff && additive && !wouldZero && !screenFamily)
+                        lightMode = (cbF->pAttachments[0].srcColorBlendFactor ==
+                                     VK_BLEND_FACTOR_SRC_ALPHA) ? 2 : 1;
                     wouldDepthOnly = wouldMask && blends && !additive;
                     if (!off) {
                         famMasked    = wouldMask;
                         famDepthOnly = wouldDepthOnly;
                         zeroVelClass = wouldZero;
                         screenClass  = wouldScreen;
+                        lightClass   = lightMode != 0;
+                    }
+                    if (lightClass) {
+                        static std::atomic<uint64_t> nLight(0);
+                        const uint64_t n = ++nLight;
+                        if (n <= 3 || (n % 500) == 0)
+                            trace("LIGHT CLASS: %llu additive pipelines so far drawn unjittered with "
+                                  "the light marker (this one: vert %016llx, src factor %s)",
+                                  (unsigned long long)n, (unsigned long long)vertHash,
+                                  lightMode == 2 ? "SRC_ALPHA" : "other");
                     }
                     if (famMasked || zeroVelClass || screenClass) {
                         static std::atomic<uint64_t> nPol(0);
@@ -14440,12 +14650,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     const bool tagHalf = pidTag && dsT && dsT->depthWriteEnable == VK_FALSE;
                     VkShaderModule use = mvPatchFragment(
                         device, ci[i].pStages[s].module, mvIndex, alphaBlended,
-                        zeroVelClass, tagHalf, screenClass);
+                        zeroVelClass, tagHalf, screenClass, lightClass ? lightMode : 0);
                     if (use != VK_NULL_HANDLE) {
                         stages[i][s].module = use;
                         fragPatched = true;
                     }
                 } else if (ci[i].pStages[s].stage & VK_SHADER_STAGE_VERTEX_BIT) {
+                    // Lights keep the jitter code: they must move with the jittered depth
+                    // they are tested against (taa.jitter_pulled), not stay put.
                     VkShaderModule use = mvPatchVertex(device, ci[i].pStages[s].module, !screenFamily);
                     if (use != VK_NULL_HANDLE) {
                         stages[i][s].module = use;
@@ -14462,6 +14674,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                 const bool ground = mvFamilyGround(vertHash);
                 if (ground && vertInstanced) ++g_famObjExempt;
                 mvGroundThisCall[i] = (ground && !vertInstanced) ? 1 : 0;
+                mvLightThisCall[i]  = lightClass ? 1 : 0;
             }
             mvPatchedThisCall[i] = (fragPatched && vertPatched);
             vertHashThisCall[i] = vertHash; fragHashThisCall[i] = fragHash;
@@ -14805,6 +15018,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
                     mvBlend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
                     mvBlend.alphaBlendOp        = VK_BLEND_OP_ADD;
                 }
+                // ---- LIGHT CLASS: the alpha lane only, MAX-blended.
+                //
+                // The fragment writes 2 + its contribution (or -65000 where it is
+                // invisible) into .w; MAX keeps the brightest light over the pixel and
+                // leaves coverage (<= 1) and the unwritten sentinel alone where no light
+                // lands. R, G and B stay masked: the vector and depth belong to the
+                // surface underneath. Needs independentBlend, which this layer enables.
+                if (lightClass && fragPatched && !maskVelocity && !debugChannels) {
+                    mvBlend.blendEnable         = VK_TRUE;
+                    mvBlend.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+                    mvBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+                    mvBlend.colorBlendOp        = VK_BLEND_OP_ADD;
+                    mvBlend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                    mvBlend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                    mvBlend.alphaBlendOp        = VK_BLEND_OP_MAX;
+                    mvBlend.colorWriteMask      = VK_COLOR_COMPONENT_A_BIT;
+                }
             }
             blendAtt[i].push_back(mvBlend);
 
@@ -14934,6 +15164,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateGraphicsPipelines(
             bool hasAttribs = ci[i].pVertexInputState &&
                               ci[i].pVertexInputState->vertexAttributeDescriptionCount > 0;
             g_pipelineIsGeometry[out[i]] = hasAttribs;
+            if (i < mvLightThisCall.size() && mvLightThisCall[i]) g_lightPipes.insert(out[i]);
+            else                                                   g_lightPipes.erase(out[i]);   // handle reuse
             // Whether THIS pipeline ended up writing motion vectors. Module
             // counts cannot answer the question that matters - a module is not
             // a pixel. One unpatched pipeline drawing the terrain matters more
@@ -16373,6 +16605,7 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
 
     VkPipelineLayout layout = VK_NULL_HANDLE;
     bool isGeometry = false, inScene = false, inCockpit = false;
+    bool pulledGeom = false;   // patched, no vertex attributes: jittered under taa.jitter_pulled
     bool groundPipe = false;   // world-static family: near-field select disarmed
     {
         std::lock_guard<std::mutex> g(g_lock);
@@ -16390,6 +16623,22 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
             bool inScene0 = (st0 != g_cbInScenePass.end() && st0->second);
             std::map<VkPipeline, bool>::iterator gt0 = g_pipelineIsGeometry.find(pipeline);
             bool isGeom0 = (gt0 != g_pipelineIsGeometry.end() && gt0->second);
+            // ---- WHERE DO THE LIGHTS DRAW? The light marker can only reach the resolve
+            // from a pass that has the velocity target attached. Counted per bind.
+            if (g_lightPipes.count(pipeline)) {
+                static uint64_t nL = 0, nLScene = 0, nLMv = 0, nLGeom = 0;
+                ++nL;
+                if (inScene0) ++nLScene;
+                if (isGeom0) ++nLGeom;
+                std::map<VkCommandBuffer, bool>::iterator mb0 = g_cbMvBoundPass.find(cb);
+                if (mb0 != g_cbMvBoundPass.end() && mb0->second) ++nLMv;
+                if (nL == 200 || (nL % 20000) == 0)
+                    trace("LIGHT BINDS: %llu light-class binds - %llu inside a scene pass, %llu inside "
+                          "a pass with the velocity target bound, %llu geometry (vertex buffers). "
+                          "Binds outside a bound pass cannot leave the marker.",
+                          (unsigned long long)nL, (unsigned long long)nLScene,
+                          (unsigned long long)nLMv, (unsigned long long)nLGeom);
+            }
             if (inScene0 && isGeom0) {
                 std::map<VkPipeline, bool>::iterator pt = g_pipelineMvPatched.find(pipeline);
                 bool patched = (pt != g_pipelineMvPatched.end() && pt->second);
@@ -16427,6 +16676,12 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
 
         std::map<VkPipeline, bool>::iterator gt = g_pipelineIsGeometry.find(pipeline);
         isGeometry = (gt != g_pipelineIsGeometry.end() && gt->second);
+        // Pulled geometry: patched (so NOT a full-screen pass, those are declined)
+        // but drawn with no vertex buffers. Jitter only - see g_jitterPulled.
+        if (!isGeometry && g_jitterPulled) {
+            std::map<VkPipeline, bool>::iterator pp = g_pipelineMvPatched.find(pipeline);
+            pulledGeom = (pp != g_pipelineMvPatched.end() && pp->second);
+        }
         std::map<VkCommandBuffer, bool>::iterator st = g_cbInScenePass.find(cb);
         inScene = (st != g_cbInScenePass.end() && st->second);
         std::map<VkCommandBuffer, bool>::iterator ck = g_cbInCockpitPass.find(cb);
@@ -16888,7 +17143,14 @@ static VKAPI_ATTR void VKAPI_CALL TAA_CmdBindPipeline(
               (unsigned long long)nGeom, (unsigned long long)nBoth,
               g_jitterArmed ? 1 : 0);
 
-    if (g_jitterArmed && inScene && isGeometry) {
+    if (pulledGeom) {
+        static uint64_t nPulled = 0;
+        if ((++nPulled % 50000) == 1)
+            trace("JITTER PULLED: %llu binds of patched pipelines with no vertex buffers "
+                  "(night lights, pulled geometry) %s", (unsigned long long)nPulled,
+                  inScene ? "jittered with the scene (taa.jitter_pulled=1)" : "outside a scene pass - not jittered");
+    }
+    if (g_jitterArmed && inScene && (isGeometry || pulledGeom)) {
         // The RENDER resolution, not the window. Converting a pixel offset to
         // NDC against the display size would scale the jitter by 0.769 when
         // X-Plane's FSR is on - a wrong jitter rather than none, which is
@@ -17644,7 +17906,7 @@ extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL TAA_CreateDevice(
         // TAA_DLSS_EXT=1 re-arms them for whoever takes the DLSS-G path up.
         const bool wantDlssExt = (getenv("TAA_DLSS_EXT") &&
                                   atoi(getenv("TAA_DLSS_EXT")) != 0) ||
-                                 mvdlssd::enabled() || slProbeEnabled();
+                                 mvdlssd::enabled() || mvdlaa::wanted() || slProbeEnabled();
         for (size_t k = 0; k < sizeof(kWanted)/sizeof(kWanted[0]); ++k) {
             if (!wantLowLatency &&
                 (!strcmp(kWanted[k], "VK_NV_low_latency2") ||
@@ -19076,6 +19338,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_BeginCommandBuffer(
                         d2->second.gdpa(d2->second.device, "vkBeginCommandBuffer");
         g_cbShadowRegion.erase(cb);
         g_cbGbufRegion.erase(cb);
+        g_cbWroteMv.erase(cb);   // re-recorded: whether it writes velocity is decided afresh
     }
     // VK_SUCCESS-without-forwarding would leave the caller recording into a
     // never-begun buffer; a hard error is honest and immediately visible.
@@ -19400,6 +19663,7 @@ static void cbForgetRecording(VkCommandBuffer c)
     g_cbInScenePass.erase(c);
     g_cbInSwapPass.erase(c);
     g_cbMvBoundPass.erase(c);
+    g_cbWroteMv.erase(c);
     g_cbPassInfo.erase(c);
     g_cbPassLog.erase(c);
     g_cbSawScenePass.erase(c);

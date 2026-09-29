@@ -1700,6 +1700,16 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         }
     }
 
+    // ---- DLAA (taa.backend=dlaa, see dlaa.h). Decided BEFORE the dispatch: when it runs,
+    // the resolve below executes in prep mode (uReprojParams4.x) and writes DLSS's motion
+    // vectors into history[hw_] and its bias mask into hdepth[hw_] instead of a colour;
+    // DLSS then produces the frame and the copy-out delivers its output. Any condition not
+    // met here leaves this frame, untouched, to the TAA resolve.
+    const bool dlaaRun = g_taa.layers == 1 && g_taa.uboMap &&
+        mvdlaa::prepare(dd, g_taa.device, dd.phys, g_taa.w, g_taa.h, g_taa.format,
+                        g_taa.edImage != VK_NULL_HANDLE && g_taa.edView != VK_NULL_HANDLE,
+                        g_taa.hdepthView[0] != VK_NULL_HANDLE && g_taa.hdepthView[1] != VK_NULL_HANDLE);
+
     // One-time: the 1x1 comparison-sampler dummy leaves UNDEFINED layout the
     // first time any resolve records - sampling an UNDEFINED image is itself
     // the class of invalid use the dummy exists to prevent.
@@ -1762,6 +1772,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // The net's dz plane needs the depth history, so no depth history = no net.
     VkImageView nnView = nnaa::prepareInput(dd, cb, g_taa.w, g_taa.h, g_taa.layers);
     if (!(g_taa.hdepthView[0] && g_taa.hdepthView[1])) nnView = VK_NULL_HANDLE;
+    if (dlaaRun) nnView = VK_NULL_HANDLE;   // DLAA delivers the frame; the AA net has nothing to refine
     bar[1].image = g_taa.history[hw_];
     bar[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     bar[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -2033,6 +2044,24 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         // (see taa.comp): set per bind by the near-field logic in the bind
         // hook, 0 outside cockpit views.
         slot[23] = g_taaCockpitNearM;
+        // uReprojParams3: the light class. Additive pipelines (light billboards, runway and
+        // city lights, glows) are drawn unjittered and stamp 2 + their own contribution into
+        // the velocity alpha through a MAX blend. x = on (taa.light_class), y = how much of
+        // the pixel the light must supply (taa.light_dom) before the resolve takes the raw
+        // texel there instead of the un-jittered resample, which smeared a one-pixel light
+        // across its neighbours and pulsed it with the jitter (2026-09-13: jitter_scale=0
+        // restored the lights, varclip 4 changed nothing).
+        // DEFAULT OFF: the dimming turned out to be upstream (unjittered lights depth-tested
+        // against jittered terrain - taa.jitter_pulled fixes that); the marker stays for viz=12.
+        slot[24] = live::f("taa.light_class", "TAA_LIGHT_CLASS", 0.0f);
+        slot[25] = live::f("taa.light_dom", "TAA_LIGHT_DOM", 0.5f);
+        slot[26] = 0.0f;
+        slot[27] = 0.0f;
+        // uReprojParams4: x = DLSS prep mode (dlaa.h), y = also bias-mask light-class pixels.
+        slot[28] = dlaaRun ? 1.0f : 0.0f;
+        slot[29] = live::onoff("taa.dlss_bias_lights", nullptr, false) ? 1.0f : 0.0f;
+        slot[30] = 0.0f;
+        slot[31] = 0.0f;
     }
 
     VkDescriptorImageInfo ii[8];
@@ -2314,7 +2343,8 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // defined, and the sharpen pass below reuses this same block.
     const float sharpAmt  = taaSharpen();
     const bool  doSharpen = sharpAmt > 0.0f && g_taa.sharpImage != VK_NULL_HANDLE
-                            && g_taa.sharpView != VK_NULL_HANDLE;
+                            && g_taa.sharpView != VK_NULL_HANDLE
+                            && !dlaaRun;   // DLAA: history[hw_] holds vectors, and DLSS output is delivered as is
     pcv.sharpen       = sharpAmt;
     pcv.reactiveAlpha = taaReactiveAlpha();
     pcv.aoStrength    = taaAoStrength();
@@ -2399,6 +2429,10 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
             if (lastViz != -1) pcv.flags |= kTaaFlagReset;
             lastViz = pcv.viz; lastScale = pcv.velScale; lastSign = pcv.velYSign;
         }
+        // Leaving DLAA: history[] holds motion vectors from prep mode, not colour.
+        static bool lastDlaa = false;
+        if (lastDlaa && !dlaaRun) pcv.flags |= kTaaFlagReset;
+        lastDlaa = dlaaRun;
     }
     dd.cmdPushConstants(cb, g_taa.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                         0, sizeof(pcv), &pcv);
@@ -2406,13 +2440,37 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // z = layers, matching gl_GlobalInvocationID.z in the shader.
     dd.cmdDispatch(cb, (g_taa.w + 7) / 8, (g_taa.h + 7) / 8, g_taa.layers);
 
+    // ---- DLAA: the prep dispatch above wrote the vectors and the bias mask; DLSS makes
+    // the frame. Layouts at this point: scene SHADER_READ_ONLY (bar[0]), history[hw_] and
+    // hdepth[hw_] GENERAL, the engine depth SHADER_READ_ONLY. On failure dlaaOut stays
+    // null and the copy-out below is skipped, so the raw scene is shown for that frame.
+    VkImage dlaaOut = VK_NULL_HANDLE;
+    if (dlaaRun) {
+        mvdlaa::Inputs di{};
+        di.cb = cb;
+        di.sceneImg = g_taa.sceneImage; di.sceneView = g_taa.sceneView;
+        di.sceneFmt = g_taa.format;     di.sceneLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        di.depthImg = g_taa.edImage;    di.depthView = g_taa.edView;
+        di.depthFmt = g_taa.edFormat;   di.depthLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        di.mvImg = g_taa.history[hw_];  di.mvView = g_taa.historyView[hw_];
+        di.biasImg  = g_taa.hdepthView[hw_] ? g_taa.hdepth[hw_] : VK_NULL_HANDLE;
+        di.biasView = g_taa.hdepthView[hw_];
+        di.w = g_taa.w; di.h = g_taa.h;
+        di.proj = g_taaProjFull; di.reproj = g_taaReproj;
+        const bool unjit = (pcv.flags & kTaaFlagNoUnjitter) == 0;
+        di.sx = unjit ? pcv.sMulX * jitterX : 0.0f;
+        di.sy = unjit ? pcv.sMulY * jitterY : 0.0f;
+        di.reset = (pcv.flags & kTaaFlagReset) != 0;
+        dlaaOut = mvdlaa::evaluate(dd, di);
+    }
+
     // ---- TRAINING-DATA CAPTURE (nn.capture=1). Right here every input is in
     // a known layout: scene SHADER_READ_ONLY (bar[0]), velocity SHADER_READ_ONLY
     // (bar[2], put back below), the depth copy SHADER_READ_ONLY, and the history
     // just written is GENERAL. Each plane is transitioned out and back by the
     // harness itself, so the copy-back and the end transitions below see what
     // they expect.
-    {
+    if (!dlaaRun) {   // prep mode wrote vectors, not a resolved frame
         nncap::ResolvePlanes rp;
         rp.scene = g_taa.sceneImage;
         rp.velocity = g_mv.image;            rp.velocityFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -2533,6 +2591,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         // resolved history[hw_] untouched (it stays pristine as next frame's
         // sample source). Without the sharpen, copy history[hw_] as before.
         VkImage copySrc = doSharpen ? g_taa.sharpImage : (nnFinImg != VK_NULL_HANDLE ? nnFinImg : g_taa.history[hw_]);
+        // DLAA: deliver DLSS's output. If it did not run this frame, keep the barriers
+        // (history[hw_] is GENERAL like any copy source) but skip the copy itself, so the
+        // raw scene stays on screen instead of the prep pass's motion vectors.
+        const bool skipCopy = dlaaRun && dlaaOut == VK_NULL_HANDLE;
+        if (dlaaRun && dlaaOut != VK_NULL_HANDLE) copySrc = dlaaOut;
 
         VkImageMemoryBarrier pre[2];
         pre[0] = bar[0];
@@ -2556,8 +2619,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         cp.srcSubresource.layerCount = g_taa.layers;
         cp.dstSubresource = cp.srcSubresource;
         cp.extent.width = g_taa.w; cp.extent.height = g_taa.h; cp.extent.depth = 1;
-        dd.cmdCopyImage(cb, copySrc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        g_taa.sceneImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        if (!skipCopy)
+            dd.cmdCopyImage(cb, copySrc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            g_taa.sceneImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
         if (nnView != VK_NULL_HANDLE) nnaa::dumpScene(dd, cb, g_taa.sceneImage);   // taa.nn_dump: what X-Plane sees
 
         VkImageMemoryBarrier post = pre[1];

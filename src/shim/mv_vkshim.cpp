@@ -194,10 +194,15 @@ static std::wstring shimDir()
     wchar_t buf[MAX_PATH * 2]; GetModuleFileNameW(nullptr, buf, MAX_PATH * 2);
     std::wstring p = buf; return p.substr(0, p.find_last_of(L"\\/"));
 }
+// Chosen in ensureInit when the feature needs a different runtime: DLSS Super Resolution
+// (taa.backend=dlaa) loads NVIDIA's 2.13 set in MotionVectors\beta, which carries sl.dlss.dll;
+// the 2.12 set in MotionVectors\streamline carries only DLSS-D.
+static std::wstring g_slDirPick;
 static std::wstring slDir()
 {
     const char *e = getenv("TAA_SL_DIR");
     if (e && *e) { wchar_t w[MAX_PATH * 2]; MultiByteToWideChar(CP_UTF8, 0, e, -1, w, MAX_PATH * 2); return w; }
+    if (!g_slDirPick.empty()) return g_slDirPick;
     return shimDir() + L"\\MotionVectors\\streamline";
 }
 
@@ -225,6 +230,33 @@ static bool liveIniOn(const char *key)
     }
     fclose(f);
     return on;
+}
+
+// The last value of a key in %TEMP%\taa_live.ini, trimmed; empty when absent.
+static std::string liveIniStr(const char *key)
+{
+    char path[MAX_PATH]; DWORD n = GetTempPathA(MAX_PATH, path);
+    if (!n) return std::string();
+    snprintf(path + n, sizeof(path) - n, "taa_live.ini");
+    FILE *f = fopen(path, "rb"); if (!f) return std::string();
+    char line[512]; std::string val;
+    const size_t klen = strlen(key);
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == ';') continue;
+        if (strncmp(p, key, klen) != 0) continue;
+        const char *v = p + klen;
+        while (*v == ' ' || *v == '\t') v++;
+        if (*v != '=') continue;
+        v++;
+        while (*v == ' ' || *v == '\t') v++;
+        std::string s(v);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+        val = s;
+    }
+    fclose(f);
+    return val;
 }
 
 static void armLayer()
@@ -299,7 +331,21 @@ static void ensureInit()
     const bool wantRR = getenv("TAA_DLSSD")   != nullptr || liveIniOn("taa.dlssd");
     if (wantNR) g_slFeature = kMvFeatureDLSS_NR;
 
-    if (wantRR || wantNR) {
+    // taa.backend=dlaa|dlss: DLSS Super Resolution (feature 0) for the layer's DLAA backend.
+    // RR/NR, when also asked for, keep the single Streamline context.
+    std::string backend = liveIniStr("taa.backend");
+    if (const char *eb = getenv("TAA_BACKEND")) backend = eb;
+    const bool wantDLSS = (backend == "dlaa" || backend == "dlss") && !wantRR && !wantNR;
+    if (wantDLSS) {
+        g_slFeature = sl::kFeatureDLSS;
+        std::wstring beta = shimDir() + L"\\MotionVectors\\beta";
+        if (GetFileAttributesW((beta + L"\\sl.dlss.dll").c_str()) != INVALID_FILE_ATTRIBUTES)
+            g_slDirPick = beta;
+        shimTrace("SHIM: taa.backend=%s - arming Streamline DLSS (feature 0) from %ls",
+                  backend.c_str(), slDir().c_str());
+    }
+
+    if (wantRR || wantNR || wantDLSS) {
         std::wstring sl = slDir() + L"\\sl.interposer.dll";
         SetDllDirectoryW(slDir().c_str());
         g_sl = LoadLibraryW(sl.c_str());
