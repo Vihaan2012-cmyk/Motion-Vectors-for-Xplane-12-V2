@@ -1,51 +1,60 @@
-Motion Vectors for X-Plane 12 - version @VER@
+Motion Vectors for X-Plane 12 - version @VER@ (developer build)
 
 
 INSTALL
 
-1. Open your X-Plane 12 folder.
+1. Open your X-Plane 12 folder, the one that contains X-Plane.exe.
 2. Drag everything inside this zip into it.
 3. Choose Merge, and Replace, if Windows asks.
 
 You should then have:
 
-    X-Plane 12\MotionVectors\MotionVectorsLauncher.exe
+    X-Plane 12\vulkan-1.dll
+    X-Plane 12\vk_real_mv.dll
     X-Plane 12\MotionVectors\VkLayer_mv.dll
     X-Plane 12\MotionVectors\VkLayer_mv.json
+    X-Plane 12\MotionVectors\nn_aa.bin
+    X-Plane 12\MotionVectors\taa_live.ini
     X-Plane 12\Resources\plugins\MotionVectors\64\win.xpl
     X-Plane 12\Resources\plugins\FlyWithLua\Scripts\MotionVectors.lua
 
 
 RUN
 
-Start the sim with MotionVectorsLauncher.exe instead of X-Plane.exe.
-The mod does not load if you start X-Plane.exe directly.
+Start X-Plane the way you always do, from Steam or from X-Plane.exe.
+There is no launcher any more.
 
-Steam: right click X-Plane 12, Properties, Launch Options, and put in
+vulkan-1.dll beside X-Plane.exe is a small shim. Windows loads it instead
+of the system Vulkan loader, it forwards every Vulkan call to
+vk_real_mv.dll (an unmodified copy of the system loader), and it switches
+the Motion Vectors layer on in the MotionVectors folder.
 
-    "C:\path\to\X-Plane 12\MotionVectors\MotionVectorsLauncher.exe" %command%
+
+SETTINGS
+
+The mod reads this file, and changes apply in a few frames while the sim
+is running:
+
+    %TEMP%\taa_live.ini
+
+The shim does not create it. To use the shipped tuning, copy
+MotionVectors\taa_live.ini to %TEMP%\taa_live.ini once. Without the file,
+every setting falls back to its built-in default.
 
 
 TURN IT OFF
 
 In the sim: Plugins menu, FlyWithLua, Motion Vectors.
 
-Or set taa.enable=0 in the settings file while the sim is running.
-
-
-SETTINGS
-
-Edit this file while the sim is running, changes apply in a few frames:
-
-    %TEMP%\taa_live.ini
-
-MotionVectors\taa_live.ini.reference lists every key and its shipped value.
+Or set taa.enable=0 in %TEMP%\taa_live.ini while the sim is running.
 
 
 UNINSTALL
 
-Delete the five files listed under INSTALL. Nothing else is changed, and
-nothing was written to the registry.
+Delete vulkan-1.dll and vk_real_mv.dll from the X-Plane 12 folder. That
+alone returns X-Plane to stock. Then delete the MotionVectors folder, the
+Resources\plugins\MotionVectors folder and the MotionVectors.lua script.
+Nothing was written to the registry.
 
 
 REQUIREMENTS
@@ -54,30 +63,14 @@ X-Plane 12 running on Vulkan, not OpenGL.
 FlyWithLua, for the settings panel only. The mod works without it.
 
 
-NOTES
-
-Costs roughly 20 percent of frame rate at 4K.
-
-taa.reactive is off by default. If you fly a propeller aircraft and see
-artefacts around the propeller disc, set taa.reactive=1.
-
-
 ANTIVIRUS
 
-Some scanners flag MotionVectorsLauncher.exe. It is a false positive, and
-the reason is structural rather than suspicious: the launcher sets two
-environment variables and starts X-Plane.exe, which is the same shape as a
-loader, and it is small, new and unsigned.
+Some scanners flag vulkan-1.dll because it is a DLL placed beside a game
+that replaces a system library. That is exactly what it does, openly: it
+forwards the Vulkan API and loads the Motion Vectors layer. No networking,
+no registry, no file writes. The source is in the repository.
 
-The whole thing is 132 lines of source, in the repository, and the built
-binary imports exactly four Windows functions - SetEnvironmentVariableA,
-CreateProcessA, and LoadLibraryA/GetProcAddress from the C runtime. No
-networking, no registry, no file writes.
-
-You can build it yourself from source if you would rather not take that on
-trust.
 
 LICENCE
 
-GPL-3.0. Source: github.com/Vihaan2012-cmyk/Motion-Vectors-for-Xplane-12-V2
-Full text in LICENSE.txt.
+GPL-3.0-or-later. See LICENSE.txt.
