@@ -1710,6 +1710,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                         g_taa.edImage != VK_NULL_HANDLE && g_taa.edView != VK_NULL_HANDLE,
                         g_taa.hdepthView[0] != VK_NULL_HANDLE && g_taa.hdepthView[1] != VK_NULL_HANDLE);
 
+    // taa.gpu_timing=1: GPU time of each stage of this function, reported as PERF GPU.
+    // Each label names the span from its mark to the next one.
+    gpuTimeBegin(dd, cb);
+    gpuTimeMark(dd, cb, "setup");
+
     // One-time: the 1x1 comparison-sampler dummy leaves UNDEFINED layout the
     // first time any resolve records - sampling an UNDEFINED image is itself
     // the class of invalid use the dummy exists to prevent.
@@ -2441,7 +2446,9 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
                         0, sizeof(pcv), &pcv);
 
     // z = layers, matching gl_GlobalInvocationID.z in the shader.
+    gpuTimeMark(dd, cb, dlaaRun ? "prep" : "resolve");
     dd.cmdDispatch(cb, (g_taa.w + 7) / 8, (g_taa.h + 7) / 8, g_taa.layers);
+    gpuTimeMark(dd, cb, dlaaRun ? "dlaa" : "extras");
 
     // ---- DLAA: the prep dispatch above wrote the vectors and the bias mask; DLSS makes
     // the frame. Layouts at this point: scene SHADER_READ_ONLY (bar[0]), history[hw_] and
@@ -2515,6 +2522,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // touched, so the sharpen cannot compound - the mistake that turned an
     // in-resolve sharpen into runaway grain. Skipped entirely when taa.sharpen
     // is 0, in which case the copy below is byte-for-byte the old path.
+    gpuTimeMark(dd, cb, "sharpen");
     if (doSharpen) {
         VkImageMemoryBarrier sp[2];
         memset(sp, 0, sizeof(sp));
@@ -2602,6 +2610,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // Separate command, explicit ordering: everything the dispatch reads is
     // finished before anything is written back. In place would reintroduce the
     // neighbourhood race the read-only binding just removed.
+    gpuTimeMark(dd, cb, "copy");
     {
         // The sharpen wrote g_taa.sharpImage; copy THAT to screen and leave the
         // resolved history[hw_] untouched (it stays pristine as next frame's
@@ -2675,6 +2684,7 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                           0, nullptr, 0, nullptr, 1, &bar[2]);
+    gpuTimeMark(dd, cb, "end");
 
     // ---- COPY A STRIP OF HISTORY OUT, FOR THE CPU TO COMPARE.
     //

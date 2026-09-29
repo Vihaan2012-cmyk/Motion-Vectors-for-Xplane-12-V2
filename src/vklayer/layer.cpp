@@ -110,6 +110,10 @@ static std::mutex g_traceLock;
 // line because an unrelated site was noisy.
 static bool traceSiteAllow(const char *fmt, uint64_t *nth)
 {
+    // "PERF" lines are the periodic performance record (fps, VRAM, GPU spans): a
+    // throttled one froze on start-screen values for a whole flight (2026-09-29),
+    // which is exactly when it was needed. They rate-limit themselves.
+    if (fmt[0] == 'P' && strncmp(fmt, "PERF", 4) == 0) { *nth = 0; return true; }
     enum { kSlots = 1024 };
     static const char *keys[kSlots] = { nullptr };
     static uint64_t    hits[kSlots] = { 0 };
@@ -5380,8 +5384,13 @@ static bool        g_gpuTiming    = false;
 
 static bool gpuTimingOn()
 {
+    // Read once, at device creation: the query pool is created there. The ini key
+    // makes it reachable without a launcher; the environment still works.
     static int on = -1;
-    if (on < 0) { const char *e = getenv("TAA_GPU_TIMING"); on = (e && atoi(e)) ? 1 : 0; }
+    if (on < 0) {
+        const char *e = getenv("TAA_GPU_TIMING");
+        on = ((e && atoi(e)) || live::onoff("taa.gpu_timing", nullptr, false)) ? 1 : 0;
+    }
     return on != 0;
 }
 
@@ -5410,7 +5419,7 @@ static void gpuTimeReport(DeviceData &dd, uint64_t frames)
 {
     if (!g_gpuTiming || g_tsPool == VK_NULL_HANDLE || !dd.getQueryPoolResults) return;
     if (!g_tsPending || g_tsCount < 2) return;
-    if (frames % 300 != 0) return;
+    if (frames % 120 != 0) return;
 
     uint64_t vals[16];
     VkResult r = dd.getQueryPoolResults(dd.device, g_tsPool, 0, g_tsCount,
@@ -5419,14 +5428,14 @@ static void gpuTimeReport(DeviceData &dd, uint64_t frames)
     if (r != VK_SUCCESS) return;   // not ready; try again in 300 frames
 
     char line[512];
-    int  n = snprintf(line, sizeof(line), "GPU TIME:");
+    int  n = snprintf(line, sizeof(line), "PERF GPU:");
     double total = (double)(vals[g_tsCount - 1] - vals[0]) * g_tsPeriodNs / 1e6;
     for (uint32_t i = 0; i + 1 < g_tsCount && n < (int)sizeof(line) - 40; ++i) {
         double ms = (double)(vals[i + 1] - vals[i]) * g_tsPeriodNs / 1e6;
         n += snprintf(line + n, sizeof(line) - n, "  %s=%.2fms", g_tsNames[i], ms);
     }
     snprintf(line + n, sizeof(line) - n, "  | ours total %.2fms", total);
-    trace("%s", line);
+    trace("PERF%s", line + 4);   // literal "PERF" prefix: exempt from the site throttle
 }
 
 static uint32_t g_renderW = 0, g_renderH = 0;
@@ -9970,6 +9979,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL Layer_QueuePresentKHR(
         std::map<void*, DeviceData>::iterator dit;
         { std::lock_guard<std::mutex> g(g_lock); dit = g_devices.begin(); }
         if (dit != g_devices.end()) { g_tsPending = true; gpuTimeReport(dit->second, frames); }
+    }
+
+    // ---- THE PERFORMANCE RECORD, every ~2 s of wall time: fps and frame time over
+    // the window, and the driver's own VRAM budget against usage. Always on (one QPC
+    // read per present); taa.gpu_timing=1 adds the per-pass GPU spans (PERF GPU).
+    {
+        static LARGE_INTEGER qpf = {}, last = {};
+        static uint64_t lastFrames = 0;
+        if (!qpf.QuadPart) QueryPerformanceFrequency(&qpf);
+        LARGE_INTEGER nowPc; QueryPerformanceCounter(&nowPc);
+        if (!last.QuadPart) { last = nowPc; lastFrames = frames; }
+        const double dt = (double)(nowPc.QuadPart - last.QuadPart) / (double)qpf.QuadPart;
+        if (dt >= 2.0 && frames > lastFrames) {
+            const double fps = (double)(frames - lastFrames) / dt;
+            const int bMB = g_share ? (int)g_share->vramBudgetMB : 0;
+            const int uMB = g_share ? (int)g_share->vramUsageMB  : 0;
+            std::string be; live::lookup("taa.backend", be);
+            trace("PERF: %.1f fps  %.1f ms/frame  | VRAM %d / %d MB (%s%d MB)  | taa=%d backend=%s",
+                  fps, 1000.0 / fps, uMB, bMB, uMB > bMB ? "OVER by " : "headroom ",
+                  uMB > bMB ? uMB - bMB : bMB - uMB,
+                  live::onoff("taa.enable", "TAA_RESOLVE", false) ? 1 : 0,
+                  be.empty() ? "taa" : be.c_str());
+            last = nowPc; lastFrames = frames;
+        }
     }
 
     // Arm everything on the first present, unconditionally. Present runs no
