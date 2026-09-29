@@ -2449,6 +2449,19 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
     // null and the copy-out below is skipped, so the raw scene is shown for that frame.
     VkImage dlaaOut = VK_NULL_HANDLE;
     if (dlaaRun) {
+        // ---- THE PREP PASS MUST FINISH BEFORE DLSS READS IT.
+        //
+        // Both are compute work in this command buffer and the tagged resources stay in
+        // GENERAL, so Streamline has no layout change to hang a barrier on - without this
+        // one DLSS could read motion vectors that were half written or still last frame's,
+        // which is smear (2026-09-29: DLAA running at ~30 fps and still smearing).
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        dd.cmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                              1, &mb, 0, nullptr, 0, nullptr);
         mvdlaa::Inputs di{};
         di.cb = cb;
         di.sceneImg = g_taa.sceneImage; di.sceneView = g_taa.sceneView;
