@@ -648,7 +648,7 @@ local SETTINGS = {
     group = "TAA", help = "" },
   { key = "taa.unjitter", label = "unjitter", kind = "bool", def = true, lo = nil, hi = nil,
     group = "TAA", help = "The unjitter alignment - isolation knob for the aligned sampling, so its contribution can be removed live without touching the jitter itself." },
-  { key = "taa.varclip", label = "varclip", kind = "float", def = 8.0, lo = 0.5, hi = 16.0,
+  { key = "taa.varclip", label = "varclip", kind = "float", def = 1.5, lo = 0.5, hi = 16.0,
     group = "TAA", help = "8.0, not 1.25." },
   { key = "taa.vel_max", label = "vel_max", kind = "float", def = 1.0, lo = nil, hi = nil,
     group = "TAA", help = "" },

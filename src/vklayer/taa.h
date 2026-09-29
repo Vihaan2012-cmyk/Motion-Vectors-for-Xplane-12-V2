@@ -2060,8 +2060,11 @@ static void taaRecordResolve(DeviceData &dd, VkCommandBuffer cb,
         // uReprojParams4: x = DLSS prep mode (dlaa.h), y = also bias-mask light-class pixels.
         slot[28] = dlaaRun ? 1.0f : 0.0f;
         slot[29] = live::onoff("taa.dlss_bias_lights", nullptr, false) ? 1.0f : 0.0f;
-        slot[30] = 0.0f;
-        slot[31] = 0.0f;
+        // z: disocclusion reset (taa.comp), w: depth history bound. Without the depth
+        // history binding 14 aliases the colour history, so both stay off then.
+        const bool hdBound = g_taa.hdepthView[0] != VK_NULL_HANDLE && g_taa.hdepthView[1] != VK_NULL_HANDLE;
+        slot[30] = (hdBound && !dlaaRun && live::onoff("taa.disocc_reset", "TAA_DISOCC_RESET", true)) ? 1.0f : 0.0f;
+        slot[31] = hdBound ? 1.0f : 0.0f;
     }
 
     VkDescriptorImageInfo ii[8];

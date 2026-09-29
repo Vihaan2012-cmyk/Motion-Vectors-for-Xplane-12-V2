@@ -132,6 +132,8 @@ layout(binding = 6, std140) uniform ReprojData {
     // x: light class on (taa.light_class), y: dominance threshold (taa.light_dom)
     vec4 uReprojParams3;
     // x: DLSS prep mode (taa.backend=dlaa), y: bias-mask the light class too (taa.dlss_bias_lights)
+    // z: disocclusion reset (taa.disocc_reset), w: the depth history is really bound at 13/14
+    //    (when it is not, binding 14 aliases the colour history and must never be written)
     vec4 uReprojParams4;
 };
 
@@ -1173,7 +1175,8 @@ void main()
         float mw = texelFetch(uVelocity, ivec3(px, layer), 0).w;
         float bias = (abs(mw - 0.5) < 0.02 || (uReprojParams4.y > 0.5 && mw >= 1.5)) ? 1.0 : 0.0;
         imageStore(uHistory, ivec3(px, layer), vec4(hUv - uv, 0.0, 1.0));
-        imageStore(uHistDepthOut, ivec3(px, layer), vec4(bias, 0.0, 0.0, 1.0));
+        if (uReprojParams4.w > 0.5)
+            imageStore(uHistDepthOut, ivec3(px, layer), vec4(bias, 0.0, 0.0, 1.0));
         return;
     }
 
@@ -1747,6 +1750,8 @@ void main()
     if ((pc.flags & FLAG_RESET) != 0 || !valid || noVector) {
         if ((pc.flags & FLAG_NN) != 0)
             nnEmit(px, layer, size, uv, nnBase, nnBase * (currA / max(currRaw, vec3(1e-4))), S, velS, hUv, vec3(0.0), 0.0);
+        if (uReprojParams4.z > 0.5)   // keep the depth history continuous for the disocclusion test
+            imageStore(uHistDepthOut, ivec3(px, layer), vec4(velS.z, velS.x, velS.y, 0.0));
         imageStore(uHistory, ivec3(px, layer), vec4(currA, 1.0));
         return;
     }
@@ -2205,6 +2210,31 @@ void main()
         if (uReprojParams.w >= 1.0) currA = curr;
     }
 
+    // ---- DISOCCLUSION (taa.disocc_reset, uReprojParams4.z). Ground just uncovered by a
+    // moving tail or wing reprojects onto history that belongs to the airframe: white
+    // fuselage over light concrete sits inside the colour box, so the clamp keeps it and
+    // the airframe leaves a pale ghost (chase view, 2026-09-14). The depth history says
+    // what surface each history texel was; if none of the 3x3 around hUv was within 5% +
+    // 0.5 m of this pixel's depth, this is a different surface and history is dropped.
+    // Nine taps, not one, so a jittered silhouette - whose centre depth flips between
+    // airframe and ground every frame - keeps its anti-aliasing. Unknown depth (sky,
+    // first frame) never triggers it.
+    // Both depths are fp16 (max 65504): far terrain saturates to inf, and inf - inf is NaN,
+    // which would read as "different surface" and strip AA off the horizon every frame.
+    // Beyond 30 km the test is simply not applied.
+    if (uReprojParams4.z > 0.5 && !unwritten && velS.z > 0.0 && velS.z < 30000.0) {
+        vec2 dts = 1.0 / vec2(size);
+        bool same = false, known = false;
+        for (int dy = -1; dy <= 1 && !same; ++dy)
+            for (int dx = -1; dx <= 1 && !same; ++dx) {
+                float wp = texture(uHistDepthPrev, vec3(hUv + vec2(dx, dy) * dts, float(layer))).r;
+                if (!(wp > 0.0 && wp < 30000.0)) continue;
+                known = true;
+                if (abs(velS.z - wp) < 0.05 * max(velS.z, wp) + 0.5) same = true;
+            }
+        if (known && !same) a = 1.0;
+    }
+
     // ---- LIGHT CLASS (taa.light_class / taa.light_dom, uReprojParams3). Additive pipelines -
     // light billboards, runway and city lights - are drawn unjittered and MAX-blend 2 + their
     // own contribution into the velocity alpha (anything below 1.5 is ordinary coverage). The
@@ -2253,5 +2283,6 @@ void main()
     // 1 means it is raw current frame with nothing behind it. Storing it here
     // costs nothing and hands the next pass the one number it was missing.
     imageStore(uHistory, ivec3(px, layer), vec4(outc, a));
-    if ((pc.flags & FLAG_CONF_EXP) != 0) imageStore(uHistDepthOut, ivec3(px, layer), vec4(velS.z, velS.x, velS.y, 0.0));
+    if ((pc.flags & FLAG_CONF_EXP) != 0 || uReprojParams4.z > 0.5)
+        imageStore(uHistDepthOut, ivec3(px, layer), vec4(velS.z, velS.x, velS.y, 0.0));
 }

@@ -72,6 +72,33 @@ inline void writeTemplate()
 {
     FILE *f = fopen(path(), "r");
     if (f) { fclose(f); return; }        // never overwrite the user's edits
+    // ---- SEED FROM THE PACKAGED SETTINGS, NOT AN EMPTY TEMPLATE.
+    //
+    // %TEMP% is cleaned by Windows (Storage Sense, Disk Cleanup); when this file
+    // went, the empty template left taa.unlock unset and every tuned value that
+    // is not in the shipped table fell back to a compiled default (2026-09-28/29:
+    // four flights, all locked). The package ships the tuned file beside the
+    // layer DLL (MotionVectors\taa_live.ini); the development tree keeps it in
+    // config\. Copy whichever exists, only when there is no file at all.
+    {
+        HMODULE self = nullptr;
+        char mod[MAX_PATH * 2] = {0};
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)&writeTemplate, &self) && self &&
+            GetModuleFileNameA(self, mod, sizeof(mod))) {
+            std::string dir(mod);
+            dir = dir.substr(0, dir.find_last_of("\\/"));
+            const std::string cands[2] = { dir + "\\taa_live.ini",
+                                           dir + "\\..\\..\\config\\taa_live.ini" };
+            for (int i = 0; i < 2; ++i)
+                if (CopyFileA(cands[i].c_str(), path(), TRUE)) {
+                    trace("LIVE: %s was missing - seeded it from %s (the packaged, tuned "
+                          "settings) instead of an empty template", path(), cands[i].c_str());
+                    return;
+                }
+        }
+    }
     f = fopen(path(), "w");
     if (!f) return;
     fprintf(f,
@@ -408,7 +435,10 @@ static const Shipped kShipped[] = {
     { "taa.alpha_moving",      "0.35"   },
     { "taa.alpha_moving_px",   "3.0"    },
     { "taa.gain",              "4.0"    },
-    { "taa.varclip",           "8.0"    },
+    // 1.5, not 8.0: 8 was the pre-2026-09-11 value and barely clamps history -
+    // every flight on 2026-09-28/29 ran it after %TEMP% cleanup deleted the ini
+    // (no taa.unlock), and that was the residual smear and softness.
+    { "taa.varclip",           "1.5"    },
     { "taa.moved_dead",        "0.0"    },
     { "taa.moved_eps",         "0.0001" },
     { "taa.novec_alpha",       "0.05"   },
@@ -435,8 +465,8 @@ static const Shipped kShipped[] = {
     { "taa.quad_needs_pull",   "1"      },
     { "taa.scene_needs_depth", "1"      },
     // Near field. 0 disarms the near-field select, which is what caused the
-    // cockpit shake; 5.0 is the measured working value.
-    { "taa.nearfield_m",       "5.0"    },
+    // cockpit shake; 2.0 is the value every verified flight since 2026-09-11 used.
+    { "taa.nearfield_m",       "2.0"    },
     { "taa.nearfield_view",    "-1"     },
     // Sampling radius for the AO term. The STRENGTH stays user-facing; only the
     // radius is fixed, because it is a tuned number and not a preference.
