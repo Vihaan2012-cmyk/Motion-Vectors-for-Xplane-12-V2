@@ -4767,14 +4767,24 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
         2.0f,       // forest/lod_multiplier - push 3D trees further out (green
                     // sooner instead of dark impostors); TAA_FOREST_LOD tunes it
     };
+    // Live-ini keys for the same holds (read once, here), so they can be set without a
+    // launcher: environment > ini > default. 2026-09-29, 8 GB card: the defaults are
+    // quality-first and pushed X-Plane 0.6-0.85 GB over its VRAM budget with the A380.
+    static const char *kIniKeys[] = {
+        "vram.max_overdrive", "vram.size_fudge", "vram.downscale_cooldown", "vram.forest_lod"
+    };
     for (size_t i = 0; i < sizeof(g_held)/sizeof(g_held[0]); ++i) {
         const char *v = getenv(g_held[i].env);
+        double iv = 0.0;
+        const bool fromIni = !v && i < sizeof(kIniKeys)/sizeof(kIniKeys[0]) &&
+                             liveIniFloat(kIniKeys[i], &iv) && iv > 0.0;
         float want = v ? (float)atof(v)
-                       : (i < sizeof(kDefaults)/sizeof(kDefaults[0]) ? kDefaults[i] : 0.0f);
+                   : fromIni ? (float)iv
+                   : (i < sizeof(kDefaults)/sizeof(kDefaults[0]) ? kDefaults[i] : 0.0f);
         if (want == 0.0f) continue;
         g_held[i].want = want;
         xlog("hold: armed %s = %g%s", g_held[i].path, g_held[i].want,
-             v ? " (from environment)" : " (default)");
+             v ? " (from environment)" : fromIni ? " (from the live ini)" : " (default)");
     }
     return 1;
 }
