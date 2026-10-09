@@ -55,3 +55,9 @@ tools/nn/out/
 
 # Rust photo fetcher build output
 tools/photo/fetcher/target/
+
+# Generated locally, never source: build logs and the git-story history video
+build_*.log
+commits.log
+manim.cfg
+git-story_media/
