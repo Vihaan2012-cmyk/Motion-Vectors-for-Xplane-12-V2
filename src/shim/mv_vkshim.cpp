@@ -272,18 +272,120 @@ static std::string liveIniStr(const char *key)
     return val;
 }
 
+// ---- WHICH LAYERS THIS SHIM ARMS (shim 2.1).
+//
+// The shim can be shipped by more than one product (MotionVectors, and the FBW
+// A380X port's taxi-camera layer), so it arms only what is actually installed:
+//
+//   VK_LAYER_mv   when MotionVectors' manifest exists (dev or package layout);
+//   extra layers  listed in <X-Plane>\vk_extra_layers.ini, one per line:
+//                     LAYER_NAME|relative\dir\holding\the\manifest
+//                 '#' or ';' starts a comment. dir is resolved against the X-Plane
+//                 folder; absolute paths, drive letters and ".." are REJECTED -
+//                 this file decides which DLLs are loaded into the sim, so it must
+//                 not be able to point outside it. At most 8 entries.
+//
+// Extra layers go FIRST in VK_INSTANCE_LAYERS (closest to X-Plane, so they see its
+// unmodified calls); VK_LAYER_mv goes last. Nothing installed = no variables set,
+// a pure pass-through to vk_real_mv.dll. Runs from DllMain under the loader lock,
+// so the ini is read with plain Win32 calls and the report is traced later, from
+// ensureInit.
+static const char *kShimVersion = "2.1.0";
+static std::string g_armReport;   // traced on the first Vulkan call
+static bool g_mvArmed = false;    // VK_LAYER_mv armed: Streamline and the TAA_* flags belong to it
+
+static bool extraLayerNameOk(const std::string &n)
+{
+    if (n.empty() || n.size() > 128) return false;
+    for (char c : n) if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+    return true;
+}
+
+static bool extraLayerDirOk(const std::string &rel)
+{
+    if (rel.empty() || rel.size() > 200) return false;
+    if (rel[0] == '\\' || rel[0] == '/') return false;            // rooted
+    if (rel.find(':') != std::string::npos) return false;          // drive letter, stream
+    if (rel.find("..") != std::string::npos) return false;         // escaping the folder
+    return true;
+}
+
+static void readExtraLayers(const std::wstring &dir, std::vector<std::wstring> &names,
+                            std::vector<std::wstring> &paths)
+{
+    const std::wstring ini = dir + L"\\vk_extra_layers.ini";
+    HANDLE h = CreateFileW(ini.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[16384]; DWORD got = 0;
+    BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(h);
+    if (!ok) return;
+    buf[got] = 0;
+    const char *p = buf;
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;   // BOM
+    std::string all(p);
+    size_t pos = 0;
+    while (pos < all.size() && names.size() < 8) {
+        size_t e = all.find('\n', pos); if (e == std::string::npos) e = all.size();
+        std::string line = all.substr(pos, e - pos); pos = e + 1;
+        size_t c = line.find_first_of("#;"); if (c != std::string::npos) line.resize(c);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+        size_t s = line.find_first_not_of(" \t"); if (s == std::string::npos) continue;
+        line = line.substr(s);
+        size_t bar = line.find('|');
+        if (bar == std::string::npos) { g_armReport += "SHIM: vk_extra_layers.ini: skipped '" + line + "' (want NAME|dir)\n"; continue; }
+        std::string name = line.substr(0, bar), rel = line.substr(bar + 1);
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+        size_t rs = rel.find_first_not_of(" \t"); rel = (rs == std::string::npos) ? std::string() : rel.substr(rs);
+        for (char &ch : rel) if (ch == '/') ch = '\\';
+        while (!rel.empty() && rel.back() == '\\') rel.pop_back();
+        if (!extraLayerNameOk(name) || name == "VK_LAYER_mv") { g_armReport += "SHIM: vk_extra_layers.ini: REJECTED name '" + name + "'\n"; continue; }
+        if (!extraLayerDirOk(rel)) { g_armReport += "SHIM: vk_extra_layers.ini: REJECTED dir '" + rel + "' for " + name + " (must be relative, inside the X-Plane folder)\n"; continue; }
+        std::wstring wrel(rel.begin(), rel.end());
+        std::wstring abs = dir + L"\\" + wrel;
+        DWORD a = GetFileAttributesW(abs.c_str());
+        if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) { g_armReport += "SHIM: vk_extra_layers.ini: " + name + " - dir '" + rel + "' not found, skipped\n"; continue; }
+        bool dup = false; std::wstring wname(name.begin(), name.end());
+        for (const std::wstring &n : names) if (n == wname) dup = true;
+        if (dup) continue;
+        names.push_back(wname); paths.push_back(abs);
+        g_armReport += "SHIM: extra layer " + name + " from " + rel + "\n";
+    }
+}
+
+static std::wstring joinW(const std::vector<std::wstring> &v, wchar_t sep)
+{
+    std::wstring s;
+    for (size_t i = 0; i < v.size(); ++i) { if (i) s += sep; s += v[i]; }
+    return s;
+}
+
 static void armLayer()
 {
     std::wstring dir = shimDir();
     // Two layouts: the development tree keeps the layer in
     // MotionVectors\build\vklayer; the drag-and-drop package puts it directly
-    // in MotionVectors\. Probe for the manifest rather than assume either.
-    std::wstring layerPath = dir + L"\\MotionVectors\\build\\vklayer";
-    if (GetFileAttributesW((layerPath + L"\\VkLayer_mv.json").c_str()) == INVALID_FILE_ATTRIBUTES)
-        layerPath = dir + L"\\MotionVectors";
-    SetEnvironmentVariableW(L"VK_LAYER_PATH", layerPath.c_str());
-    SetEnvironmentVariableW(L"VK_INSTANCE_LAYERS", L"VK_LAYER_mv");
-    SetEnvironmentVariableW(L"VK_LOADER_LAYERS_ENABLE", L"VK_LAYER_mv");
+    // in MotionVectors\. Probe for the manifest rather than assume either - and
+    // arm nothing of ours when neither exists (the shim can be installed without us).
+    std::wstring mvPath;
+    const wchar_t *cands[2] = { L"\\MotionVectors\\build\\vklayer", L"\\MotionVectors" };
+    for (int i = 0; i < 2 && mvPath.empty(); ++i)
+        if (GetFileAttributesW((dir + cands[i] + L"\\VkLayer_mv.json").c_str()) != INVALID_FILE_ATTRIBUTES)
+            mvPath = dir + cands[i];
+
+    std::vector<std::wstring> names, paths;
+    readExtraLayers(dir, names, paths);
+    if (!mvPath.empty()) { names.push_back(L"VK_LAYER_mv"); paths.push_back(mvPath); g_mvArmed = true; }
+    else g_armReport += "SHIM: MotionVectors not installed (no VkLayer_mv.json) - VK_LAYER_mv not armed\n";
+
+    if (names.empty()) { g_armReport += "SHIM: no layers to arm - pass-through to vk_real_mv.dll\n"; return; }
+    SetEnvironmentVariableW(L"VK_LAYER_PATH", joinW(paths, L';').c_str());
+    SetEnvironmentVariableW(L"VK_INSTANCE_LAYERS", joinW(names, L';').c_str());
+    SetEnvironmentVariableW(L"VK_LOADER_LAYERS_ENABLE", joinW(names, L',').c_str());
+    std::wstring order = joinW(names, L' ');
+    g_armReport += "SHIM: armed (closest to X-Plane first): " + std::string(order.begin(), order.end()) + "\n";
+    if (!g_mvArmed) return;
     SetEnvironmentVariableW(L"TAA_VELOCITY", L"1");
     SetEnvironmentVariableW(L"TAA_LAYER_TRACE", L"1");
     // Tell the layer that the shim owns Streamline init - the layer must NOT
@@ -338,7 +440,15 @@ static void ensureInit()
     if (!g_real) { shimTrace("SHIM: FATAL cannot load %ls (%lu)", real.c_str(), GetLastError()); return; }
     realGIPA = (PFN_vkGetInstanceProcAddr)GetProcAddress(g_real, "vkGetInstanceProcAddr");
     realGDPA = (PFN_vkGetDeviceProcAddr)GetProcAddress(g_real, "vkGetDeviceProcAddr");
-    shimTrace("SHIM: ---- session start ---- real loader GIPA=%p GDPA=%p", (void*)realGIPA, (void*)realGDPA);
+    shimTrace("SHIM: ---- session start ---- shim %s, real loader GIPA=%p GDPA=%p", kShimVersion, (void*)realGIPA, (void*)realGDPA);
+    {   // what armLayer() decided under the loader lock, one line each
+        size_t s = 0;
+        while (s < g_armReport.size()) {
+            size_t e = g_armReport.find('\n', s); if (e == std::string::npos) e = g_armReport.size();
+            shimTrace("%s", g_armReport.substr(s, e - s).c_str());
+            s = e + 1;
+        }
+    }
 
     const bool wantNR = getenv("TAA_DLSS_NR") != nullptr || liveIniOn("taa.dlss_nr");
     const bool wantRR = getenv("TAA_DLSSD")   != nullptr || liveIniOn("taa.dlssd");
@@ -358,7 +468,11 @@ static void ensureInit()
                   backend.c_str(), slDir().c_str());
     }
 
-    if (wantRR || wantNR || wantDLSS) {
+    // Streamline serves VK_LAYER_mv only; with MotionVectors absent a stale %TEMP% ini
+    // must not make the shim load an interposer for a layer that is not there.
+    if ((wantRR || wantNR || wantDLSS) && !g_mvArmed)
+        shimTrace("SHIM: Streamline requested by the live ini but VK_LAYER_mv is not armed - not loading it");
+    if ((wantRR || wantNR || wantDLSS) && g_mvArmed) {
         std::wstring sl = slDir() + L"\\sl.interposer.dll";
         SetDllDirectoryW(slDir().c_str());
         g_sl = LoadLibraryW(sl.c_str());

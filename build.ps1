@@ -675,7 +675,11 @@ Write-Host "Building Vulkan shim (vulkan-1.dll)..."
 # The forwarding vulkan-1.dll shim: installs beside X-Plane.exe, forwards the
 # whole Vulkan API to vk_real_mv.dll (a copy of the system loader) via the .def,
 # implements the six loader entry points, and hosts Streamline for DLSS-D.
-& g++ -shared -o "$out\vulkan-1.dll" "$src\shim\mv_vkshim.cpp" "$src\shim\mv_vkshim.def" `
+# Version resource: installers of either product replace the shim only with a newer
+# FILEVERSION (src/shim/mv_vkshim.rc).
+& windres "$src\shim\mv_vkshim.rc" -O coff -o "$out\mv_vkshim_res.o"
+if ($LASTEXITCODE -ne 0) { throw "shim version resource failed" }
+& g++ -shared -o "$out\vulkan-1.dll" "$src\shim\mv_vkshim.cpp" "$src\shim\mv_vkshim.def" "$out\mv_vkshim_res.o" `
   -I"$vksdk\Include" -I"$root\third_party\Streamline\include" -m64 -O2 -std=c++17 -D__USE_MINGW_ANSI_STDIO=1 `
   -static -static-libgcc -static-libstdc++
 if ($LASTEXITCODE -ne 0) { throw "shim build failed" }

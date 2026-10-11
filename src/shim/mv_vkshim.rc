@@ -1,0 +1,34 @@
+// Version resource for the vulkan-1.dll shim. More than one product can install
+// this file (MotionVectors, the FBW A380X port), so installers compare FILEVERSION
+// and replace it only with a NEWER one - keep this in step with kShimVersion in
+// mv_vkshim.cpp. 2.1 = arms only what is installed + vk_extra_layers.ini.
+#include <winver.h>
+
+1 VERSIONINFO
+FILEVERSION     2,1,0,0
+PRODUCTVERSION  2,1,0,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "MotionVectors contributors"
+            VALUE "FileDescription",  "MotionVectors Vulkan shim - forwards to vk_real_mv.dll, arms VK_LAYER_mv and vk_extra_layers.ini layers"
+            VALUE "FileVersion",      "2.1.0.0"
+            VALUE "InternalName",     "mv_vkshim"
+            VALUE "LegalCopyright",   "GPL-3.0-or-later"
+            VALUE "OriginalFilename", "vulkan-1.dll"
+            VALUE "ProductName",      "MotionVectors"
+            VALUE "ProductVersion",   "2.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
