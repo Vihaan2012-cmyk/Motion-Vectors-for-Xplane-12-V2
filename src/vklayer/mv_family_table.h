@@ -2,7 +2,7 @@
 // (Resources/shaders/bin/spv.zip, hashed with the injection's FNV-1a-64).
 // Regenerate after an X-Plane update changes the shader pack.
 // Policy and reasoning live in the generator's header comment.
-// Packs merged: spv, spv.zip
+// Packs merged: 12.4.3 spv.zip, 12.4.4-b1 spv/, 12.4.4-b4 spv/ (2026-10-11, +6 masked post-process shaders)
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -881,6 +881,7 @@ static const uint64_t kMvMaskedVert[] = {
     0x03c62f3330393458ull, // resolve_0.spv
     0x06bdae11cb928c0full, // light_0.spv
     0x08009728e9ffb917ull, // acf_map_icon_0.spv
+    0x0c501575895361f6ull, // weather_apply_raster_0.spv
     0x0c508f9105d5f18cull, // ocean_meta_data_8.spv
     0x0ec586fe5028972dull, // ground_lights_0.spv
     0x0ffa5be28d641e04ull, // blur_2.spv
@@ -895,6 +896,7 @@ static const uint64_t kMvMaskedVert[] = {
     0x1e1401a8a0e6c8c7ull, // background_blur_0.spv
     0x1f8e0250218f674full, // acf_map_icon_0.spv
     0x1fce95ccd5598b7dull, // ocean_meta_data_12.spv
+    0x2168f6f4fadbf416ull, // cloud_categorize_0.spv
     0x22700b8df49ebda0ull, // light_vis_2.spv
     0x239ebf5a72948f9aull, // debug_10.spv
     0x24efa73eb4bdc7b9ull, // cloud_render_raster_0.spv
@@ -924,6 +926,7 @@ static const uint64_t kMvMaskedVert[] = {
     0x57e92b8da6021f85ull, // histo_debug_0.spv
     0x58a2e01018e7bf70ull, // hdr_0.spv
     0x5baf2254bda37c50ull, // debug_114.spv
+    0x5df7d4fe17acb2ecull, // volumetric_apply_0.spv
     0x6102668dd9d6054eull, // blit_0.spv
     0x64a300b323510f52ull, // ocean_meta_data_10.spv
     0x66b7f03bf624187bull, // cloud_render_raster_17.spv
@@ -933,6 +936,7 @@ static const uint64_t kMvMaskedVert[] = {
     0x6bf775e27e5c5427ull, // ocean_meta_data_4.spv
     0x6dbb8a86a7f31340ull, // light_3.spv
     0x6e4aa01dbb4bb91eull, // rain_forces_0.spv
+    0x70e8c79274f7e1d0ull, // scatter_render_atmosphere_0.spv
     0x731a626d6694e2bdull, // msaa_categorize_0.spv
     0x73d9aa1c72c62210ull, // light_3.spv
     0x74ebc20648d80e41ull, // debug_0.spv
@@ -975,6 +979,7 @@ static const uint64_t kMvMaskedVert[] = {
     0xa842cd8047f58c04ull, // hdr_2.spv
     0xa9001b6ddc865a62ull, // debug_39.spv
     0xa97de1ed67bde667ull, // ocean_readback_0.spv
+    0xaa91687b7c8233a5ull, // msaa_categorize_0.spv
     0xaadb947ff5a9483eull, // debug_115.spv
     0xad83f75086640098ull, // depth_resolve_0.spv
     0xb027de32f33676ccull, // volumetric_apply_0.spv
@@ -1011,6 +1016,7 @@ static const uint64_t kMvMaskedVert[] = {
     0xe51536ef59fa3a98ull, // depth_resolve_0.spv
     0xe63884284dc06e61ull, // rain_normals_0.spv
     0xeaf5a8c994b6561eull, // weather_apply_raster_0.spv
+    0xeb592a7037864788ull, // scatter_render_atmosphere_5.spv
     0xec311c208768f645ull, // ocean_readback_0.spv
     0xed09d8664098f091ull, // ssr_mesh_0.spv
     0xed9b3afa24d24c6full, // debug_86.spv
